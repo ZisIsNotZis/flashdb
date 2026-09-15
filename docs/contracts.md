@@ -1,6 +1,6 @@
 # flashdb — contracts
 
-Budget: 280 lines / 21,000 chars
+Budget: 280 lines / 26,000 chars
 
 The four interfaces that cannot be changed cheaply after implementation. Everything else in this repository is deferrable; these are not.
 
@@ -16,7 +16,7 @@ Tables are created and updated through a JSON schema description. No DDL text, n
 
 ### The request tree
 
-A request is a **structured tree**, never a string. There is no query parser, which is what makes canonicalization tractable: normalizing a typed tree is a small well-defined algorithm, whereas normalizing SQL text is unsolvable in practice.
+A request is a **structured tree**, never a query-language *text*. There is no query-language grammar to parse, which removes the lexer and the parser but **not the hard part**: SQL canonicalization is difficult because of relational equivalence — join reordering, predicate implication, projection pull-up, distributivity — not because SQL is text. A typed tree leaves every one of those equivalences intact (`review-04` L-16), as this design's own distributivity episode demonstrates.
 
 ```
 request:  [ stage, stage, ... ]            // array order = sequential (the former "&&")
@@ -26,16 +26,13 @@ stage:    { blocks: [ block, ... ],        // blocks are parallel and mutually i
 
 - **Sequence is array order.** No operator symbol.
 - **Parallelism is implicit** within a stage, which makes it a *physical* decision like every other physical decision.
-- **Fallback is a named key on a stage.** `(A && B) || (A && C)` is therefore **not expressible** — a fallback cannot contain stages — so the distributivity equivalence class that would violate canonicity never exists.
+- **Fallback is a named key on a stage**, and a fallback may contain only blocks, not stages. `(A && B) || (A && C)` is therefore not writable in its distributed form. **Corrected (`review-04` L-05):** the earlier claim that the equivalence class "cannot be expressed at all" is false — `A ; (B || C)` expresses the same intent; only the distributed spelling is banned. And the restriction **silently reversed an author requirement**: the decision log records that the author refused to restrict the grammar for this reason, because "one single request for all business is more important". Two-stage conditional branches ("if not stocked here, create a transfer request *and then* reserve incoming stock; otherwise decrement *and then* write a movement row") are inexpressible and need a second round trip, contradicting I5.
 
-Example — "find the customer by id, else by email, then fetch their orders":
+### Open — this grammar is a sketch, not a specification
 
-```json
-[ { find: { customer: { id: "..." } } },
-  { find: { customer: { email: "..." } },
-    ifEmpty: [ ... ] },
-  { find: { orders: { customer: "$1.customer_id", status: "open" } } } ]
-```
+A language review (`review-04`) found fourteen undefined or incoherent items, four of them load-bearing for the motivating inventory workload. **They are enumerated, with consequences and the specific question each poses, in `.scratch/03-grammar-decisions/`.** The load-bearing ones: `ifEmpty` has no defined meaning because no block shape declares a result type (L-01); the client-continuation contract is not implementable for read blocks (L-02); no predicate or expression language exists (L-03); canonicity needs a declared equivalence relation rather than the word "intent" (L-04); and two parallel blocks can both pass the same guard and both write (L-20).
+
+**No contract in this repository may be frozen until those are settled.**
 
 ### Blocks
 
@@ -48,27 +45,36 @@ Every block carries **two orthogonal annotations**, frozen into the format now b
 
 **Snapshot rule.** A predicate guarding a `write` is evaluated against the committing transaction's own snapshot, never against a later one. A `write` is never executed speculatively under any combination of these fields (I9).
 
-### Closed set of write shapes
+### Closed set of block shapes
 
-Only these are permitted. Anything else is rejected at the front-end, which keeps the engine's job finite, recovery simple, and makes "is this expressible in one request" a mechanical check the API can report to the user.
+Only these are permitted. Anything else is rejected at the front-end, which keeps the engine's job finite, recovery simple, and makes "is this expressible in one request" a mechanical check the API can report to the user. **Corrected (`review-04` L-07):** the previous list was labelled "write shapes" while three of its nine members are reads, and it omitted shapes the inventory workload needs.
 
-`insert` · `conditional-update-by-key` · `upsert` · `delete-by-key` · `multi-row-batch` (uniform shape) · `counter-add` · `read` · `aggregate` · `join`
+| Effect | Shapes |
+|---|---|
+| `read` | `read-by-key` · `read-by-predicate` · `aggregate` · `join` |
+| `write` | `insert` · `update-by-key` · `conditional-update-by-key` · `upsert` · `delete-by-key` · `counter-add` · `multi-row-batch` |
+| **missing and required** | `update-by-predicate` and `delete-by-predicate` (without them, "expire reservations older than 30 minutes" forces the client to enumerate keys, which it cannot at 10 TB); aggregate-to-write ("day close: compute days-of-cover per SKU and write it back"); expression-valued updates (`price = price * 1.1`, `stock = min(stock, cap)`); and a generated-key round-trip so a later block can reference a row this request inserted |
+
+`multi-row-batch` remains ambiguous: it does not say whether its rows are inserts, updates, upserts or deletes, and it overlaps the single-row shapes.
 
 ### Canonicity
 
 Single source of truth: **the same intent must not be expressible two ways.** This applies to schema design and to requests alike, including which fields are requested.
 
-- Achieved first by grammar: no nested queries, joins only implied by shared key fields, no optional or redundant parts, no defaults that change meaning, no `*` field lists, one predicate normal form.
+- **Corrected (`review-04` L-04):** this is achievable only as an idempotent normal form over a **declared, decidable equivalence relation `E`**, never as "one intent one way" — intent is in the user's head and is not a property of a request. `E` must be published, with the normalizer a section of the quotient: `normalize ∘ normalize = normalize`, and `x E y ⇒ normalize(x) = normalize(y)`. It must also terminate and be confluent, or two `E`-equal requests normalize differently depending on rewrite order — the exact failure the mechanism exists to prevent (`review-04` L-10).
+- **Known equivalence classes in the current grammar that `E` must collapse:** block order within a stage (blocks are declared mutually isolated); `ifEmpty: []` versus an absent `ifEmpty`; two sequential stages of independent reads versus one stage; the join spelling versus the shared-key-field spelling; and singleton `in` versus `==`.
+- **Intended scope:** no nested queries, joins only implied by shared key fields, no optional or redundant parts, no defaults that change meaning, no `*` field lists, one predicate normal form. Each of these is undecidable until `E` and the predicate language (L-03) exist.
 - Where grammar cannot reach, a **server-side authoritative normalizer** covers it (I12). Clients may normalize as a convenience; the server's canonical form is the pattern key.
-- The pattern key is `(normalizer_version, canonical_form)`. Without the version, upgrading the normalizer silently invalidates every pattern learned so far.
+- The pattern key is **`{grammar_version, normalizer_version, schema_version, service_class, canonical_form}`**. **Extended (`review-04` L-11):** the previous `(normalizer_version, canonical_form)` was not a stable identity. A schema change (column rename, type change, clustering key) leaves the same canonical form denoting a different pattern; `durability` (`durable`/`batched`/`lossy`) and `max_staleness` materially change latency and semantics, so aggregating them into one latency histogram makes the training signal multimodal; and the grammar and effect-annotation semantics were unversioned. These are cheap fields now and expensive to retrofit — this project's own argument for freezing interfaces.
+- **Normalizer-version lifecycle is unspecified.** A bump converts silent invalidation into loud invalidation, but the accumulated trace is still unusable until relearned: there is no old→new canonical mapping, no bump policy, and during a rolling deploy two servers can emit two versions.
 - **The acceptance grammar is versioned separately from the learning key** (`review-02` F16). A `normalizer_version` bump must invalidate only learned patterns; it must never change which request forms the server accepts. Accepted forms are guaranteed backward-compatible for at least one major version, and a rejected request returns a machine-applicable `explain_rejection` carrying the canonical form the server wanted.
-- If program-level fallback is ever added (open question), the normalizer becomes **effect-aware**: factoring a block across a fallback is sound only if that block is `read`. Factoring a write is a double-apply, i.e. data corruption, not canonicalization.
+- If program-level fallback is ever added (open question), the normalizer becomes **dependency-aware**. **Corrected (`review-04` L-09):** "is a read" is not a sufficient soundness condition — hoisting a read out of a conditional changes which snapshot it observes, so a read that sees the effect of a conditional write must not be hoisted either. The condition is *data dependency*: a block may be factored out only if it observes no effect, transitively, of any conditionally executed block. **Block-boundary rewrites are forbidden outright** (merging two `insert` blocks into one `multi-row-batch`, or folding two `counter-add` blocks into `+2`): the boundary is simultaneously the per-block atomicity unit (I6) and the `(request_id, block_id)` idempotency unit, so merging changes both the outcome document and the client's continuation logic. Canonical block boundaries and per-block idempotency are in unresolved tension.
 
 ### Leanness is machine-checked
 
 Users are required to state their requirement precisely, with a clear boundary — no overspill fields. The engine does the dirty work (field duplication, partitioning, physical arrangement) and the user is always given the cleanest possible query surface.
 
-Because the surface is canonical and lean-checkable, the engine can *compute* what is wrong with a request rather than guess, which is what makes the advisor (`learning.md`) possible at all.
+**Withdrawn (`review-04` L-17):** the claim that canonicity is what makes the advisor computable is false. The advisor's rules are statistical and value-dependent — entropy, mutual information, association rules — and those come from the trace, not from canonicity. Canonicity supplies a *stable aggregation key* and nothing more. See `learning.md` for the per-rule input list, including the rules the engine cannot compute at all.
 
 Two rules that a naive design gets wrong:
 
@@ -101,7 +107,7 @@ Consequences:
 
 - **Deadlock is impossible by construction.** Validation happens only at commit and never holds anything; there is no hold-and-wait. A lock manager, deadlock detector and lock timeouts are not needed.
 - **The only failure mode is retry.**
-- Validation at commit plus read-set coverage gives serializability for the single-round-trip model, stronger than snapshot isolation with first-committer-wins alone.
+- Validation at commit plus read-set coverage gives serializability for the single-round-trip model, stronger than snapshot isolation with first-committer-wins alone — **only when `max_staleness = 0`** (`review-04` L-19). A request that reads a snapshot N seconds old and then validates against *current* tile versions can commit on stale reads, which is not serializable. The isolation guarantee must therefore be stated per service-class value, and `max_staleness` belongs in the pattern key.
 
 ### Partial application and prefix commit
 
@@ -121,7 +127,7 @@ Never block. On conflict the request retries into the next batch, or the writes 
 
 ### What this model gives up
 
-**Cross-request invariants cannot be enforced.** "The sum of ledger entries is zero" spanning two requests is not expressible as an invariant. Both must be placed in one request, or the constraint becomes a monitored background assertion rather than an enforced one. This is the one place the model will bite a real user and it must be stated in the API documentation, not discovered.
+**Cross-request invariants cannot be enforced.** "The sum of ledger entries is zero" spanning two requests is not expressible as an invariant. **Corrected (`review-04` L-18):** the previous remedy — "both must be placed in one request" — is wrong, because a request is not all-or-nothing (I6) and a prefix can commit one block without the other. The correct rule is **both must be placed in one block**, and no shape can currently express a multi-entity atomic action in a single block. So either such a shape is added, or cross-block business atomicity is declared unenforceable and the client compensates. This is the one place the model will bite a real user and it must be stated in the API documentation, not discovered.
 
 ### Service classes
 

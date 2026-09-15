@@ -29,7 +29,7 @@ Motivating case: ~10 TB of data, ~128 GB RAM, heavily joined lookups. In that re
 ## Non-goals
 
 - Multi-node, replication, distributed commit. Deferred to the far future; the design must not preclude it, but nothing may be built for it now.
-- SQL, a text query language, or string parsing of any kind.
+- SQL, or a text query language. (**Corrected, `review-04` L-16:** an earlier wording said "or string parsing of any kind", which is false — requests and schemas arrive as JSON, constants are strings, and `$1.customer_id` is a string-encoded reference path requiring its own parser. The accurate claim is that there is no *query-language text grammar*.)
 - Interactive (multi-round-trip) transactions.
 - General-purpose engine parity. The target workload is IO-bound lookup and join on a single node; other workloads are allowed to be poor.
 - A physical layout guarantee of any kind, ever.
@@ -65,7 +65,7 @@ Invariants are load-bearing. A change that breaks one of these is an architectur
 - **I10 — One scalar objective.** Angriness (`objective.md`) is the only currency and the cost model is its predictor. Any new mechanism must express its cost and benefit in angriness.
 - **I11 — Promotions are funded, proven and deployed.** Every promotion draws from one shared finite budget, requires weight **and** stability **and** a demonstrated win, rolls out as a canary with an O(1) rollback, is recorded in the changelog, and stops at the knee.
 - **I12 — The server normalizer is authoritative.** Clients may normalize as a convenience; the server's canonical form is the pattern key. Requests are trees, never text.
-- **I13 — Reserved interfaces.** The following are frozen before implementation because they are cheap now and expensive to retrofit: self-describing tile header, per-tile version field, per-block effect annotation plus `harmless-if-not-applicable`, one commit point per request.
+- **I13 — Reserved interfaces.** The list is stated **once**, in `contracts.md` under "Reserved interfaces (frozen now)". It was previously duplicated here with four items while the contract listed six, and an invariant list that disagrees with the contract it summarizes is a live source-of-truth conflict (`review-04` L-23). Freezing `harmless-if-not-applicable` before its semantics are coherent (L-01, L-21) is also the wrong thing to freeze.
 
 ## Open questions
 
@@ -87,7 +87,8 @@ The optimisation and learning-theory review (`review-01`) added the following, a
 - **Per-tile estimation.** With ~10⁶ tiles and few pulls per arm, what pooling or shrinkage makes per-tile decisions statistically defensible (`review-01` F16).
 - **Credit assignment.** Angriness belongs to a request; the decision is per tile; tiles interfere through a shared cache. Which tile is credited or blamed for a request's angriness delta (`review-01` §2.14).
 - **Estimators and power.** No effect size, variance, sample size or cluster count is stated anywhere — for the sample gate, for canaries, for promotions or for traffic splits (`review-01` F8, F12).
-- **Anti-gaming ownership.** Who owns the trace and the load/latency measurement, and whether the learner can influence either. Background work charged at opportunity cost, not at the window's measured angriness (`review-01` F15).
+- **The request grammar is not a specification.** Fifteen undefined or incoherent items, and the five author decisions they depend on, are enumerated with consequences in `.scratch/03-grammar-decisions/`. They cover block result types and `ifEmpty` semantics, the outcome document and the client-continuation protocol, the predicate and expression language, the equivalence relation behind canonicity, the pattern key, intra-request write-write conflicts, and request-size bounds. **No contract in this repository may be frozen until those are settled.**
+- **Author decisions outstanding** — each changes design truth and is therefore not the agent's to take: (1) program-level fallback versus the stage-level restriction, which silently reversed an earlier author instruction that "one single request for all business is more important" (`review-04` L-05); (2) reject versus normalize non-canonical requests (`L-15`); (3) whether predicate-addressed writes are first-class (`L-07`); (4) whether results are ordered, and how top-N and pagination are expressed (`L-14`); (5) request-level versus per-block atomicity (`review-02` F4).
 
 ## Prior art
 

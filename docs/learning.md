@@ -112,11 +112,11 @@ Two layers, strictly ordered: **facts → LLM → validation.**
 
 ### Layer 1 — mechanical
 
-A data-mining problem over the trace, with a bounded ceiling: it can only propose changes expressible *within* the language.
+A data-mining problem over the trace, with a bounded ceiling: it can only propose changes expressible *within the request language* — add a predicate, drop a projection, group fields, move a block to the next stage. Proposals that reach outside the language, such as a schema merge or a new derived layout, are layer 2's territory; the two layers previously disagreed about their own scope (`review-04` L-17).
 
 - **Hidden predicates** — a projection column with near-zero entropy or one dominant mode that is not in the condition. "Field F is constant across 99.7% of these results; adding it as a condition enables pruning — estimated N×."
 - **Correlated predicates** — mutual information between condition fields.
-- **Unused projections** — the leanness lint. "You declared 12 columns and used 3; that is a lie about your requirement."
+- **Unused projections** — the leanness lint. **Corrected (`review-04` L-04, L-17):** the engine can only observe *within-request* use — a column returned to the client and used client-side is invisible to it — so the lint is restricted to columns no later block consumes, and it can no longer claim to know what a requirement "really" was.
 - **Independent-block violations** — a block that depends on a sibling's write, in a stage that asserts independence. "Move it to the next stage."
 - **Column clusters** — association-rule mining over fields requested together.
 - **Join paths that always co-occur** — derived-layout candidates.
@@ -136,7 +136,7 @@ Constraints, each of which decides whether this is an asset or a liability:
 - **The LLM proposes; the cost model disposes.** Layer 1's what-if model validates every structured suggestion before it is shown or applied. An LLM that invents a schema change and gets it applied is a data-loss bug with extra steps. Generator–verifier, and the verifier is mechanical.
 - **Strict ordering: facts → LLM → validation.** Wrong in either direction and it is either a hallucination or a useless parrot.
 - **Never in the hot path.** A budgeted periodic pass over the trace.
-- **Structured output is the valuable half.** Because the request surface is canonical, a suggestion is a machine-actionable diff the user can apply and the engine can validate — the canonicity constraint paying off a third time.
+- **Structured output is the valuable half.** Because the request surface is canonical, a suggestion about a *request* is a machine-actionable diff the engine can validate. **Qualified (`review-04` L-17):** this holds only for request-shaped suggestions. A schema change has no canonical form to diff against (`contracts.md`, L-08), so layer 2's schema proposals are advice in prose, not a diff.
 - **Nondeterminism and churn.** Version the advisor, keep output comparable over time, dedupe and rate-limit suggestions, or the advice itself oscillates exactly when the workload is drifting.
 
 ### Privacy tiers
