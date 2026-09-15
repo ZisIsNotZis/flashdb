@@ -1,6 +1,6 @@
 # flashdb — contracts
 
-Budget: 280 lines / 26,000 chars
+Budget: 320 lines / 34,000 chars  <!-- budget debt: see issue 01-design, "Budget debt" -->
 
 The four interfaces that cannot be changed cheaply after implementation. Everything else in this repository is deferrable; these are not.
 

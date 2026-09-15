@@ -1,6 +1,6 @@
 # flashdb — learning and adaptation
 
-Budget: 220 lines / 21,000 chars
+Budget: 220 lines / 23,000 chars  <!-- budget debt: see issue 01-design, "Budget debt" -->
 
 How the engine learns, how it changes, and how it talks to a human. Governed by Invariants I4 (off-path and scheduled), I10 (one scalar objective) and I11 (funded, proven, deployed).
 

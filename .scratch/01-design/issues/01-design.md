@@ -23,6 +23,20 @@ See `spec.md` — nine items. In short: six documents written to the project's d
 
 - Adversarial review is worth running before implementation, not after. The optimisation/learning-theory aspect alone invalidated the implementability of the objective layer, which is the layer everything else is priced against.
 - Recording findings as `Open` markers at the point of use — rather than deleting the wrong claim — preserves the reasoning that produced it while preventing a reader from trusting it.
+- **Do not record a blocker without measuring it.** `02-citation-verification` was opened as `deferred (blocked: no network)` on the strength of a dated note in `WORKSPACE.md`. A probe showed dblp and sigmod.org returning 200, so the verification was run instead of deferred, and it found four citation errors — including two the human reviewer could only call "unconfirmed".
+- **A decision backlog does not belong inside a design document.** `contracts.md` exceeded its size budget because unresolved findings accumulated inline; the fix was to move them to decision tickets (03, 04) and leave a pointer. The same mechanism is now the main source of budget debt (below).
+
+## Budget debt
+
+`contracts.md` and `learning.md` carry inline `review-0X` correction histories ("the previous text claimed X, which was wrong"). That is a **changelog inside a specification**, and it is why both files exceeded their declared budgets three times, each time patched by raising the number. Raising a budget to accommodate accumulated history is precisely what `R-DOC.6` exists to prevent.
+
+**Mechanism, in order of value:**
+
+1. **Procedure change, effective now:** findings from any further review land in this ticket first; only the *resolved design text* goes into the documents. No more inline correction histories.
+2. **Consolidation pass, after the final review and once decisions 03 and 04 are taken:** delete every "the previous text claimed…" clause, keeping the corrected statement. The history is already recorded here in full, so nothing is lost and `R-DOC.3` duplication is resolved.
+3. **Target:** bring `contracts.md` back to ≤260 lines and `learning.md` to ≤200 lines, both within `R-DOC.6`'s default character cap where possible; keep only genuinely oversized budgets, stated in both dimensions.
+
+Until then the declared budgets are marked `budget debt` in the file headers so the state is visible rather than silently tolerated.
 
 ## Comments
 
