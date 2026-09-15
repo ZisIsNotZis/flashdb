@@ -45,7 +45,7 @@ Terms used in this repository's docs, explained for a reader who is not a databa
 
 - **Trace** — the recorded workload: pattern shapes, counters, bytes, misses, latency histograms, load windows. The training set.
 - **Off-policy evaluation** — estimating what a *different* layout would have cost, when only the chosen layout was ever observed.
-- **Angriness** — the objective: a bounded S-curve penalty for exceeding the latency SLO under the current load, plus unserved-request terms. See `objective.md`.
+- **Angriness** — the objective: a bounded S-curve penalty for exceeding the latency SLO under the current load, plus credit terms (served fraction, deadline met) and penalty terms for unserved, wasted work, space and reorg/compile cost. One primitive covers every term — σ for penalty, 1 − σ for credit. See `objective.md` for the full term list and for its still-unresolved defects.
 - **SLO** — service level objective: the latency target a request is expected to meet.
 - **p99** — the 99th percentile. Used instead of the mean because latency distributions are heavy-tailed and the mean hides the failures.
 - **Error budget / burn rate** — the accumulated tolerable violation, and the speed at which it is being consumed. Angriness is the budget; its derivative is the burn rate.

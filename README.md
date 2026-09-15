@@ -22,6 +22,10 @@ Motivating case: ~10 TB, ~128 GB RAM, heavily joined lookups, where the scarce r
 | `docs/glossary.md` | encountering an unfamiliar term. |
 | `.scratch/01-design/decisions.md` | wanting the raw, attributed record of what was decided and why, round by round. |
 
+A reference to `R-DOC.*` or `R-TKT.*` in these documents points at the parent workspace policy, outside this repository. The size budget (`R-DOC.6`) and markdown style (`R-DOC.6.1`) rules live there and are deliberately not restated here; a review noted that this makes compliance unverifiable from this repository alone.
+
+**Review status.** A six-aspect adversarial review is in progress (fresh context, one reviewer per aspect, no shared history). Findings and dispositions are recorded in `.scratch/01-design/issues/01-design.md`. Where a review found a claim false, this repository **corrects the claim and marks the consequence `Open` at the point of use** rather than deleting it, so a reader can see what is settled and what is merely asserted.
+
 ## Goals
 
 - Highest throughput on a single modern Linux node, without trading correctness or crash-atomicity.

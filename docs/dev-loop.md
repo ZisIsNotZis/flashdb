@@ -21,11 +21,13 @@ TPC-C alone is insufficient: it is point-lookup heavy with negligible joins, whe
 | As-of join | fact joined to a time-versioned (SCD-2) dimension on `(sku, t)` intervals | range/predicate validation and time-based tiling |
 | Lost sales (anti-join) | demanded SKUs with no supply movement | the co-location trap: you cannot cluster for *absence* |
 | ABC / demand by SKU × region × month | flat scan plus aggregate | that specialization has not wrecked scans |
+| Uniform-random point lookups (adversarial) | no locality exists to exploit | the learner must recognise there is nothing to win and **not churn** — the anti-overfitting workload, and the one that fails a learner that reads noise as signal |
 
 Two harness rules:
 
 - **Zipfian access, not uniform.** Real inventory is skewed; TPC-C's generated distribution is not. A layout learned on a distribution that will never occur is worthless.
 - **Inject drift mid-run** — a new forecast query appears at 10× weight, a flash sale spikes one SKU, a monthly close report arrives with low weight but a hard deadline. That exercises drift response, evidence-gated promotion and the rare-but-urgent escape hatch in one experiment.
+- **Pre-register at least one falsification condition.** As specified, almost any measurement can be read as progress. At least one experiment must state, in advance, an observation that would prove the thesis wrong — for example: on the replenishment workload, collapsing fan-out must reduce dependent reads per request by at least the predicted factor, or the thesis fails. A benchmark set that cannot disconfirm anything is not a benchmark set.
 
 ## Harness
 
@@ -33,12 +35,12 @@ Two harness rules:
 generator → trace → deterministic replay → pluggable storage simulator → layout search → regret
 ```
 
-- **Metric: regret versus an oracle layout**, not absolute throughput. Absolute numbers are not comparable across layout experiments on one machine; regret is.
-- **Oracle: brute-force layout search on small instances.** Without a ground truth there is no way to know whether the learner is good or merely as good as its own cost model.
+- **Metric: relative regret versus an oracle layout**, not absolute throughput. **Corrected and still open (`review-01` F10):** raw regret is not comparable across workloads without normalisation, because a workload with little layout headroom shows small regret for any learner — normalise by `A_baseline − A_oracle` (or by `A_oracle`), and state whether the metric is static, dynamic or per-window regret, since a fixed-trace oracle penalises tracking a moving optimum while a per-window oracle is prescient.
+- **Oracle: brute-force layout search on small instances — which is not ground truth.** Brute-forcing the *same* cost model removes optimisation error only, not model error, so it cannot deliver the purpose it was given: it cannot tell whether the learner is good or merely as good as its own cost model. Ground truth would require executing layouts on hardware. Worse, the layout space is per-tile and heterogeneous, so a brute-forceable instance cannot exhibit the per-tile heterogeneity, drift or shared budget the design is about — the phenomenon under study is absent from the oracle's domain. The oracle's independence from the learner's model, and its scalarisation of the constrained problem, must be stated before regret means anything.
 - **Deterministic replay.** The same trace, byte for byte, against different layouts. Determinism is a hard requirement, because every promotion decision depends on it.
 - **Pluggable storage simulator with an explicit, calibratable cost model.** This is what makes counterfactual evaluation possible at all (`learning.md`, off-policy evaluation), and it is the reason millions of layout experiments can be run without touching a real device.
 - **Frozen, versioned replay corpora.** A trace is a dataset: freeze it, commit it with its hash, and treat changes to it as dataset changes. Results without a corpus hash are not comparable to anything.
-- **The cost model must be calibrated against measurements**, and its error must be tracked, because uncalibrated what-if prediction is optimistic — a promotion decided on an uncalibrated prediction is a guess wearing a number.
+- **The cost model must be calibrated against measurements**, and its error tracked, because uncalibrated what-if prediction is optimistic — a promotion decided on an uncalibrated prediction is a guess wearing a number. **Open (`review-01` F14):** which *functional* is calibrated is unspecified. A mean-calibrated simulator systematically mispredicts the percentile the penalty consumes, so the calibration target must be the same statistic `x` that `objective.md` penalises, with a quantile-calibration error metric, prediction intervals and drift/out-of-distribution diagnostics.
 
 ## Baselines
 

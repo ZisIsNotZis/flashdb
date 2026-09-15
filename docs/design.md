@@ -1,6 +1,8 @@
+Budget: 140 lines / 16,000 chars
+
 # flashdb — design
 
-Status: contract-level design draft. Synthesized from a 13-round brainstorm with the author (a data scientist, not a database engineer). The raw decision record lives in `.scratch/01-design/decisions.md`. Nothing is implemented; `flashdb` is an empty repository.
+Status: contract-level design draft, **under adversarial review**. Synthesized from a multi-round brainstorm with the author (a data scientist, not a database engineer); the raw attributed decision record lives in `.scratch/01-design/decisions.md`, and review findings and dispositions in `.scratch/01-design/issues/01-design.md`. Nothing is implemented; `flashdb` is an empty repository. Where a review found a claim false, the claim is corrected and its consequence marked `Open` at the point of use rather than deleted.
 
 Reading order: this file (thesis, invariants, open questions), then `objective.md`, `contracts.md`, `learning.md`, `dev-loop.md`, `glossary.md`.
 
@@ -54,7 +56,7 @@ Invariants are load-bearing. A change that breaks one of these is an architectur
 - **I1 — No layout guarantee.** Physical layout may change at any time, at any granularity, without notifying users. Every intermediate state is fully servable, correct and performant-enough; no operation requires a database-wide barrier.
 - **I2 — A bad layout may be slow, never wrong.** Correctness may never depend on a layout being current. Derived layouts are accelerators; the base copy is the truth.
 - **I3 — No global layout state.** Every layout decision is scoped to one tile and made independently. Mixed layouts in one table are normal.
-- **I4 — Analysis and optimization are off-path and scheduled.** No learning, profiling or advice work happens on a request's critical path. Expensive background work is scheduled into quiet load windows.
+- **I4 — Analysis and optimization are off-path and scheduled.** No learning, inference, advice generation or cost-model evaluation happens on a request's critical path. The request path only *records* counters and histograms; measurement is unavoidable and is not analysis (`review-01` D10 — the earlier wording said "no profiling", which the per-request trace contradicts). Expensive background work is scheduled into quiet load windows.
 - **I5 — One business request = one DB request.** The request is the unit of atomicity, the unit of pattern learning, and the unit of angriness attribution.
 - **I6 — Per-block atomicity, per-request commit record.** A block is all-or-nothing; a request is not. One commit record covers the request's blocks in one fsync. The database commits a durable prefix and reports it, and **never resumes a request**.
 - **I7 — No locks.** Read-set validation by tile version gives serializability for the single-round-trip model. The only failure mode is retry; deadlock is impossible by construction.
@@ -74,7 +76,18 @@ Honest list of what is not settled. Each is a real design fork, not a research n
 - **Heterogeneity ceiling.** How complex a layout policy the reader, solver, simulator and learner can actually sustain per table.
 - **Cost-model honesty.** Uncalibrated what-if prediction is optimistic in the literature. How much replay and canary calibration is needed before the predictor can be trusted for promotions is unknown and must be measured.
 - **Cold-start quality.** Whether layouts learned in the first weeks of a zero-data deployment are worth keeping or should be aggressively rewritten once the steady-state trace exists.
-- **Telemetry budget.** The exact share of cache and IO the trace store may consume.
+- **Telemetry budget.** The exact share of cache and IO the trace store may consume; `learning.md` gives ≈1% as a working target, which is a target and not a settled number.
+
+The optimisation and learning-theory review (`review-01`) added the following, all of which block implementation of the learner rather than of the engine:
+
+- **The estimand and the anchor.** Which functional of latency is penalised (mean / p95 / p99 / CVaR), whether the SLO anchor is a capability model for *that* functional, and what `k` is. Until this is settled the objective cannot be implemented (`objective.md`; `review-01` F1–F4).
+- **Aggregation and scalarisation.** Which window aggregator, and whether the objective is a pure sum or a constrained program with a shadow price. The current cap contradicts I10 (`review-01` F5, D1–D3).
+- **Identification for off-policy evaluation.** Estimator, overlap / ignorability / SUTVA / stationarity assumptions, and a randomisation scheme independent of the policy under test (`review-01` F9).
+- **Regret and the oracle.** Normalisation, static-versus-dynamic framing, and how the oracle can be made independent of the learner's own cost model (`review-01` F10).
+- **Per-tile estimation.** With ~10⁶ tiles and few pulls per arm, what pooling or shrinkage makes per-tile decisions statistically defensible (`review-01` F16).
+- **Credit assignment.** Angriness belongs to a request; the decision is per tile; tiles interfere through a shared cache. Which tile is credited or blamed for a request's angriness delta (`review-01` §2.14).
+- **Estimators and power.** No effect size, variance, sample size or cluster count is stated anywhere — for the sample gate, for canaries, for promotions or for traffic splits (`review-01` F8, F12).
+- **Anti-gaming ownership.** Who owns the trace and the load/latency measurement, and whether the learner can influence either. Background work charged at opportunity cost, not at the window's measured angriness (`review-01` F15).
 
 ## Prior art
 
