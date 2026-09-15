@@ -59,3 +59,42 @@ Dispositions:
 Deliberately **not** done: no design decision was taken unilaterally on the objective. `R-DOC.1(a)` reserves changed design truth to the author, so the findings are recorded as decisions-needed rather than resolved. A consolidated correction pass follows once the remaining five reviews return.
 
 Diff reviewed: `1c8f148` (revision under review). Reviewer: fresh-context subagent, aspect = optimisation / learning theory / statistics, no inherited conversation.
+
+- 2026-09-15 — pi / claude — **Review 02 (feasibility, methodology, adoption) received and dispositioned.** The reviewer read revision `1c8f148`; every defect was re-checked against the current tree at `ec0b8c1`, and findings already fixed there are marked as such rather than re-fixed. **Verdict: accept the substance — the plan as written is untestable, and its own motivating workload is unsupported.**
+
+Accepted, 18 findings (F1–F18). The load-bearing ones:
+
+| Finding | Core claim | Action |
+|---|---|---|
+| F1 | the oracle is either infeasible (per-tile, combinatorial) or rigged (uniform, and a per-tile learner beats it, so regret ≤ 0); a brute-forceable instance is smaller than cache, so the fan-out premise is never exercised | relaxed-oracle replacement recorded in `dev-loop.md` |
+| F2 | the harness cannot measure the objective: no service-time decomposition, no deadline field, no per-tile footprint, no reorg accounting — and group commit makes per-request fsync load-dependent, contradicting the anchor's load-independence claim | recorded; trace-v0 field list required |
+| F3 | the objective is not numerically frozen: `s` needs a user label set a thesis has no source for, and `cap` is undefined, so I10 is unenforceable | open question |
+| F4 | per-block atomicity contradicts the motivating `decrement stock iff insert lines`, so the inventory correctness oracle fails under crash injection | **needs an author decision** — see below |
+| F5 | `recomputable` derived tiles reachable from a durable root mean a crash yields wrongness, not slowness; `max_staleness` puts layout on the correctness path, so I2 is false as written | fixed in `contracts.md` (coverage/version rule, reachability rule) |
+| F6 | ten subsystems, no cut list, no schedule, no kill criterion | open; proposed v0 cut list recorded |
+| F7 | build order is not risk-ordered; step 1 cannot output a calibrated model when step 2 is its calibration target | corrected, with a proposed 0a/0b reorder recorded |
+| F8 | equal durability is unachievable at benchmark time, since the fault-injection harness is deferred | open |
+| F9 | the declared-layout control is missing, so a win over any other engine proves nothing about learning | two control baselines added |
+| F10 | one workload per hypothesis is not attribution — workloads differ on many axes | open; ablation family required |
+| F11 | the as-of join and anti-join workloads may not be expressible in the frozen grammar | open; write all five request trees before freezing |
+| F12 | TPC-C's distribution claim is overbroad (NURand hot set) and the reference is not free | recorded |
+| F13 | drift injection is a single unreplicated run with an undefined oracle | seeds/IQR/time-to-recover recorded |
+| F14 | recording is on-path as specified; the telemetry carve-out is unstated | recording path specified; carve-out marked open |
+| F15 | the effect annotation is ill-typed (a third "additionally" value), so read/write eligibility is undecidable | fixed: two orthogonal fields plus a snapshot rule |
+| F16 | a `normalizer_version` bump can change which requests are accepted, so a routine upgrade can refuse production traffic | fixed: acceptance grammar versioned separately from the learning key |
+| F17 | the LLM advisor violates I10 (no angriness price), has no success metric and no label source | open; recommended cut from v1 |
+| F18 | no observation can refute the thesis, because every candidate refutation is pre-labelled not-a-measurement | falsification contract recorded |
+
+**Needs an author decision — F4.** Per-block atomicity (the author's Round 6 instruction) contradicts the motivating workload, whose correctness oracle requires `decrement stock iff insert lines` to be atomic. Either (a) make request-level atomicity the default and per-block the opt-in — recommended, because one commit record already covers the whole request so only *publishing* a partial prefix costs extra, and it inverts the default at no cost — or (b) keep per-block atomicity and define a documented client-side compensation contract, with a reference client included in the correctness oracle. `design.md` I5 was also asserting request-level atomicity in contradiction to I6; corrected to remove the claim.
+
+Already fixed at `ec0b8c1`, no action: size-budget headers now state lines and chars, the telemetry-share contradiction, the glossary's angriness definition, the `I4` wording, and the round count in `design.md`.
+
+Rejected, with reason:
+
+- *"Normalizer is mandatory or conditional"* — not a contradiction. I12 settles that a server-side normalizer exists; the open question is only whether it must additionally be *effect-aware*, which depends on whether program-level fallback is ever added.
+- *"Reviewer count disagreement"* — `spec.md` says "at least five" and six were spawned. A satisfied floor is not a contradiction.
+- *"`contracts.md` exceeds its character budget"* — true of `1c8f148`; the header at `ec0b8c1` declares both lines and chars and both are within it. The ambiguity the reviewer identified was real, and stating both is the fix.
+
+Missing-items list (§2, twelve items) accepted in full. Highest value: the absent client-side contract for prefix commits (the client is part of the safety claim and does not exist in this repository), the absence of any effort, schedule or kill criterion, the absence of a measurable performance target, and the absence of any write-side budget analysis — every workload hypothesis in `dev-loop.md` is read-side.
+
+Diff reviewed: `1c8f148`. Reviewer: fresh-context subagent, aspect = feasibility / methodology / adoption.

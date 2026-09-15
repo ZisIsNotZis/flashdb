@@ -4,7 +4,7 @@ Ticket: `.scratch/01-design/issues/01-design.md`
 
 ## Problem
 
-The author has a design thesis for a new database engine (tiled storage whose physical layout is learned from the workload, IO-bound single-node, one round trip per business request, one scalar objective pricing every decision) developed over thirteen rounds of brainstorming. It exists only as conversation. It must become a written, reviewable design with frozen interfaces before any implementation begins, and it must be challenged adversarially before it is trusted.
+The author has a design thesis for a new database engine (tiled storage whose physical layout is learned from the workload, IO-bound single-node, one round trip per business request, one scalar objective pricing every decision) developed over an extended multi-round brainstorming session. It exists only as conversation. It must become a written, reviewable design with frozen interfaces before any implementation begins, and it must be challenged adversarially before it is trusted.
 
 ## Outcome
 
@@ -18,8 +18,8 @@ A written design of record under `docs/`, plus a raw attributed decision log, pl
 4. `docs/learning.md` states how the engine adapts, promotes, rolls out, predicts, advises and talks to a human.
 5. `docs/dev-loop.md` states the workloads, the harness, the baselines, the build order and the fatal risk.
 6. `docs/glossary.md` defines every term the other documents use, for a reader who is not a database engineer.
-7. Every doc respects the size budget of `R-DOC.6` (≤200 lines or 12,000 chars, or an explicit `Budget:` header) and the markdown style of `R-DOC.6.1` (one item per physical line, no manual wrapping).
-8. A fresh-context adversarial review has been run from at least five distinct aspects, every finding is recorded with its disposition, and no finding is left undispositioned.
+7. Every doc respects the size budget of `R-DOC.6` (≤200 lines or 12,000 chars, or an explicit `Budget:` header) and the markdown style of `R-DOC.6.1` (one item per physical line, no manual wrapping). Both rules live in the parent workspace policy, outside this repository; `README.md` records that.
+8. A fresh-context adversarial review has been run from at least five distinct aspects (six were spawned, one per aspect), every finding is recorded with its disposition, and no finding is left undispositioned.
 9. The repository is committed so the reviewed revision is identifiable by hash.
 
 ## Non-goals

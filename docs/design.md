@@ -2,7 +2,7 @@ Budget: 140 lines / 16,000 chars
 
 # flashdb — design
 
-Status: contract-level design draft, **under adversarial review**. Synthesized from a multi-round brainstorm with the author (a data scientist, not a database engineer); the raw attributed decision record lives in `.scratch/01-design/decisions.md`, and review findings and dispositions in `.scratch/01-design/issues/01-design.md`. Nothing is implemented; `flashdb` is an empty repository. Where a review found a claim false, the claim is corrected and its consequence marked `Open` at the point of use rather than deleted.
+Status: contract-level design draft, **under adversarial review**. Synthesized from a multi-round brainstorm with the author (a data scientist, not a database engineer); the raw attributed decision record lives in `.scratch/01-design/decisions.md`, and review findings and dispositions in `.scratch/01-design/issues/01-design.md`. Nothing is implemented; `flashdb` currently contains design documents, a decision log, a spec and a ticket, and no engine code. Where a review found a claim false, the claim is corrected and its consequence marked `Open` at the point of use rather than deleted.
 
 Reading order: this file (thesis, invariants, open questions), then `objective.md`, `contracts.md`, `learning.md`, `dev-loop.md`, `glossary.md`.
 
@@ -36,7 +36,7 @@ Motivating case: ~10 TB of data, ~128 GB RAM, heavily joined lookups. In that re
 
 ## Architecture at a glance
 
-| Component | Responsibility | Contract |
+| Component | Responsibility | Detail lives in |
 |---|---|---|
 | Front-end normalizer | Parse the structured request tree, canonicalize it, reject non-canonical forms, enforce leanness | `contracts.md` (logical model) |
 | Block evaluator | Execute the stage/block program with per-block atomicity and effect-aware conditions | `contracts.md` (logical model, transaction model) |
@@ -57,7 +57,7 @@ Invariants are load-bearing. A change that breaks one of these is an architectur
 - **I2 — A bad layout may be slow, never wrong.** Correctness may never depend on a layout being current. Derived layouts are accelerators; the base copy is the truth.
 - **I3 — No global layout state.** Every layout decision is scoped to one tile and made independently. Mixed layouts in one table are normal.
 - **I4 — Analysis and optimization are off-path and scheduled.** No learning, inference, advice generation or cost-model evaluation happens on a request's critical path. The request path only *records* counters and histograms; measurement is unavoidable and is not analysis (`review-01` D10 — the earlier wording said "no profiling", which the per-request trace contradicts). Expensive background work is scheduled into quiet load windows.
-- **I5 — One business request = one DB request.** The request is the unit of atomicity, the unit of pattern learning, and the unit of angriness attribution.
+- **I5 — One business request = one DB request.** The request is the unit of pattern learning and the unit of angriness attribution. **It is not the unit of atomicity** — that is the block (I6). This conflicts with the motivating inventory workload's `decrement stock iff insert lines`; the conflict and its options are recorded in the ticket as `review-02` F4 and need an author decision.
 - **I6 — Per-block atomicity, per-request commit record.** A block is all-or-nothing; a request is not. One commit record covers the request's blocks in one fsync. The database commits a durable prefix and reports it, and **never resumes a request**.
 - **I7 — No locks.** Read-set validation by tile version gives serializability for the single-round-trip model. The only failure mode is retry; deadlock is impossible by construction.
 - **I8 — Tiles are immutable and self-describing.** Reorg is: write a new tile, fsync, flip the root, garbage-collect the old tile. A tile header describes its own layout so any reader can consume any tile.

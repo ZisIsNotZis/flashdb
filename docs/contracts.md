@@ -1,6 +1,6 @@
 # flashdb — contracts
 
-Budget: 280 lines / 18,000 chars
+Budget: 280 lines / 21,000 chars
 
 The four interfaces that cannot be changed cheaply after implementation. Everything else in this repository is deferrable; these are not.
 
@@ -39,13 +39,14 @@ Example — "find the customer by id, else by email, then fetch their orders":
 
 ### Blocks
 
-Every block carries an **effect annotation**, which is frozen into the format now because the normalizer's soundness depends on it:
+Every block carries **two orthogonal annotations**, frozen into the format now because the normalizer's soundness and the scheduler's predication strategy both depend on them (`review-02` F15 — the earlier three-value table was ill-typed: it presented a third exclusive value while saying "additionally", leaving read-set validation and speculation eligibility undecidable).
 
-| Annotation | Meaning |
-|---|---|
-| `read` | reads only; safe to predicate and to speculate |
-| `write` | mutates; never predicated, never speculated |
-| `harmless-if-not-applicable` | additionally a no-op when its predicate is false, so the scheduler may run it unconditionally without predicting anything |
+| Field | Values | Meaning |
+|---|---|---|
+| `effect` | `read` \| `write` | `read` is safe to predicate and to speculate; `write` is never predicated and never speculated, regardless of the other field |
+| `applicability` | `conditional` \| `harmless-if-not-applicable` | `harmless-if-not-applicable` means the block is a no-op when its predicate is false, so the scheduler may run it unconditionally without predicting anything |
+
+**Snapshot rule.** A predicate guarding a `write` is evaluated against the committing transaction's own snapshot, never against a later one. A `write` is never executed speculatively under any combination of these fields (I9).
 
 ### Closed set of write shapes
 
@@ -60,6 +61,7 @@ Single source of truth: **the same intent must not be expressible two ways.** Th
 - Achieved first by grammar: no nested queries, joins only implied by shared key fields, no optional or redundant parts, no defaults that change meaning, no `*` field lists, one predicate normal form.
 - Where grammar cannot reach, a **server-side authoritative normalizer** covers it (I12). Clients may normalize as a convenience; the server's canonical form is the pattern key.
 - The pattern key is `(normalizer_version, canonical_form)`. Without the version, upgrading the normalizer silently invalidates every pattern learned so far.
+- **The acceptance grammar is versioned separately from the learning key** (`review-02` F16). A `normalizer_version` bump must invalidate only learned patterns; it must never change which request forms the server accepts. Accepted forms are guaranteed backward-compatible for at least one major version, and a rejected request returns a machine-applicable `explain_rejection` carrying the canonical form the server wanted.
 - If program-level fallback is ever added (open question), the normalizer becomes **effect-aware**: factoring a block across a fallback is sound only if that block is `read`. Factoring a write is a double-apply, i.e. data corruption, not canonicalization.
 
 ### Leanness is machine-checked
@@ -105,6 +107,8 @@ Consequences:
 
 If a request dies mid-program, the durable commit record holds a **prefix** of its blocks. The database reports exactly which blocks applied.
 
+**Open — this conflicts with the motivating workload (`review-02` F4), and needs an author decision.** The inventory correctness oracle requires `decrement stock iff insert lines` to hold atomically, which per-block atomicity does not provide: a crash or mid-request failure can leave the decrement applied and the lines missing. Two options: **(a)** make request-level atomicity the default and per-block the opt-in — nearly free, because one commit record already covers the whole request, so only the *publication* of a partial prefix costs extra; **(b)** keep per-block atomicity and define a documented client-side compensation contract, with a reference client included in the correctness oracle. Option (a) is recommended because the motivating example needs it and it inverts the default at no cost.
+
 **The database never resumes a request.** It commits a prefix and reports it; the *client* continues via per-block idempotency keys. This is the rule that keeps the engine out of the durable-workflow business and out of needing a progress log — and a progress log would quietly reintroduce the payload WAL that Contract 3 removes.
 
 ### Idempotency
@@ -126,9 +130,9 @@ Each request carries an explicit class — never an implicit engine guess, or th
 | Field | Values |
 |---|---|
 | `durability` | `durable` (fsync before ack) · `batched` (ack after the group's fsync; **default**) · `lossy` (ack immediately, bounded loss window) |
-| `max_staleness` | reader may read a snapshot up to N seconds old; lets a derived layout be used as soon as it is consistent enough |
+| `max_staleness` | reader may read a snapshot up to N seconds old. A derived layout is served only when its coverage metadata proves it contains every row matching the predicate **and** its version matches the base snapshot. `max_staleness` governs how stale the base snapshot may be, never how stale a derived copy may be relative to that base (`review-02` F5). |
 | `shedable` | may be dropped under overload, with a priority class |
-| `recomputable` | never fsync; rebuild or drop on loss. Used for trace, statistics, and derived layouts |
+| `recomputable` | never fsync; rebuild or drop on loss. Applies to engine-owned tables (trace, statistics) and to read-only derived tiles. **A `recomputable` tile must never be reachable from a durable root unless its contents are proven rebuildable before first read** — otherwise a crash can leave a durable root pointing at a tile that was never made durable, which is wrongness, not slowness (`review-02` F5). |
 
 `recomputable` is a substantial win, not a footnote: the trace store, statistics and every derived layout stop paying fsync entirely, freeing a large share of the IO budget for foreground work.
 

@@ -10,14 +10,15 @@ How the engine learns, how it changes, and how it talks to a human. Governed by 
 
 ## The trace
 
-The trace is the training set, and it is the same table that feeds the learner, the advisor and the deploy history. Three consumers, one table.
+The trace is the training set. Three consumers read it: the learner, the advisor and the deploy history. **These are two tables, not one** (`review-02` §3): a `trace` table holding observations, and a separate `suggestions` table holding advice plus the human accept/reject record, which doubles as the deploy changelog. The earlier phrasing called both "one table", which left the identity undefined.
 
 Recorded per pattern: shape (canonical form), request count, load window, bytes read, tiles touched, dependent misses, queue occupancy, latency histogram, wasted work, conflict/retry rate, rows returned, projection usage.
 
 Two rules:
 
 - **Shapes, not values.** Column *statistics* are permitted; raw values and per-row data are not. This is a privacy boundary and a size boundary at once.
-- **The telemetry store obeys its own design.** It is a tiled, tiered, quantized store: sketch-based counters (HLL for cardinality, HDR/t-digest for latency), tiered rollup (minute → hour → day, recent fine, aged coarse, then evicted), percentiles never means, and a hard cap on its share of cache (target ≈1%; `design.md` still lists the exact share as an open question). If the engine cannot store its own metrics efficiently, that is the first thing it has to say about itself.
+- **The recording path must be specified, or I4 is false.** Per-request counters and latency histograms are written on the request path; I4 permits that only as bounded measurement, never as analysis. The write path is per-CPU lock-free ring buffers flushed off-path, with a stated bound on the on-path cost (`review-02` F14).
+- **The telemetry store obeys its own design.** It is a tiled, tiered, quantized store: sketch-based counters (HLL for cardinality, HDR/t-digest for latency), tiered rollup (minute → hour → day, recent fine, aged coarse, then evicted), percentiles never means, and a hard cap on its share of cache (target ≈1%; `design.md` still lists the exact share as an open question). **Open (`review-02` F14):** whether that share is carved out of the single shared budget that promotions compete for is unstated, and it changes the promotion economics. If the engine cannot store its own metrics efficiently, that is the first thing it has to say about itself.
 
 ## Pattern keys
 
