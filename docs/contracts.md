@@ -45,6 +45,8 @@ Every block carries **two orthogonal annotations**, frozen into the format now b
 
 **Snapshot rule.** A predicate guarding a `write` is evaluated against the committing transaction's own snapshot, never against a later one. A `write` is never executed speculatively under any combination of these fields (I9).
 
+**The annotation is server-derived, never trusted from the client (`review-05` SS-20).** `harmless-if-not-applicable` is what licenses unconditional execution, so a client-supplied value would let a buggy or hostile caller mark a non-idempotent write harmless and have it applied twice — "a double-apply, i.e. data corruption", by this document's own words. The closed shape set constrains *shape*, not safety. The server must derive the annotation from the canonical block shape and reject a client declaration that disagrees.
+
 ### Closed set of block shapes
 
 Only these are permitted. Anything else is rejected at the front-end, which keeps the engine's job finite, recovery simple, and makes "is this expressible in one request" a mechanical check the API can report to the user. **Corrected (`review-04` L-07):** the previous list was labelled "write shapes" while three of its nine members are reads, and it omitted shapes the inventory workload needs.
@@ -101,7 +103,12 @@ Status: settled.
 
 Every tile read records `(tile, version)`. At commit the versions are re-checked; any mismatch means retry.
 
-This is not merely cheap, it is **free in the right currency**: tiles are immutable, so a tile version is a well-defined validation granule. A range or predicate read validates by validating whole tiles, so **phantom protection comes for free** in O(number of tiles read) integer comparisons — compare with predicate locking.
+This is cheap in the right currency: tiles are immutable, so a tile version is a plausible validation granule. **But the previous claim that "phantom protection comes for free" is false (`review-05` SS-05), for two reasons.**
+
+1. **Tile-set changes are invisible to per-tile versions.** A reader enumerates the tiles for key range `[1,100]` from root `R1` and reads `T1`. A writer inserts key 50 and splits `T1` into `T1a[1,49]` and `T1b[50,100]`, then flips the root. `T1` was not *mutated*, it was *replaced*, so its version is unchanged and validation **passes** — and the phantom is missed. The same hole lets a reader return rows from an obsolete snapshot after a merge. Validation must therefore be against a **root generation / snapshot epoch**, re-enumerating range membership at commit, or against the routing structure.
+2. **False conflicts scale with rows per tile.** One granule per tile means any write to any row invalidates every concurrent reader of any *other* row in the same tile. At an ~8 MB tile that is ~10⁵ rows per granule. Under the Zipfian skew this design mandates, hot tiles are rewritten continuously, so "the only failure mode is retry" becomes a retry storm; a bounded retry/backoff policy and an admission rule are required.
+
+Open questions this leaves: whether pure read-only requests validate at all (they have no commit), and what the guaranteed isolation level is per service class.
 
 Consequences:
 
@@ -138,6 +145,7 @@ Each request carries an explicit class — never an implicit engine guess, or th
 | `durability` | `durable` (fsync before ack) · `batched` (ack after the group's fsync; **default**) · `lossy` (ack immediately, bounded loss window) |
 | `max_staleness` | reader may read a snapshot up to N seconds old. A derived layout is served only when its coverage metadata proves it contains every row matching the predicate **and** its version matches the base snapshot. `max_staleness` governs how stale the base snapshot may be, never how stale a derived copy may be relative to that base (`review-02` F5). |
 | `shedable` | may be dropped under overload, with a priority class |
+| `deadline` | **added (`review-05` SS-19):** `objective.md` prices "requests that exceed a completion deadline" and `dev-loop.md` requires a workload with a hard deadline, but no request field carried one — a priced term with no interface cannot be computed, and deadline-aware batching has no input. Either this field exists or the deadline term and the batching rule are removed. |
 | `recomputable` | never fsync; rebuild or drop on loss. Applies to engine-owned tables (trace, statistics) and to read-only derived tiles. **A `recomputable` tile must never be reachable from a durable root unless its contents are proven rebuildable before first read** — otherwise a crash can leave a durable root pointing at a tile that was never made durable, which is wrongness, not slowness (`review-02` F5). |
 
 `recomputable` is a substantial win, not a footnote: the trace store, statistics and every derived layout stop paying fsync entirely, freeing a large share of the IO budget for foreground work.
@@ -148,7 +156,12 @@ Status: design settled in outline; several assumptions must be validated by faul
 
 ### No payload WAL
 
-The conventional WAL exists mainly to turn scattered in-place page writes into a sequential append, and to give a cheap durability point. Here, **tiles are already immutable and append-only, so the data path is already sequential** and a payload WAL buys nothing.
+The conventional WAL exists to turn scattered in-place page writes into a sequential append, to give a cheap durability point, and **to make a small update durable without rewriting a large object**. **Corrected (`review-05` SS-04, SS-25):** the arguments previously given here were wrong on both counts.
+
+- "The data path is already sequential" is false. A preallocated file overwritten in place produces *reused holes*, which are random writes in steady state. The sound argument for no payload WAL is **immutability plus the root flip**, not sequentiality.
+- "A payload WAL buys nothing" is false for the motivating workload. **There is no update path specified here, and an immutable ~8 MB tile means a one-row stock decrement rewrites the whole tile.** At 5,000 stock operations per second concentrated on one hot SKU, that is tens of GB/s of write traffic before any derived copy — which would consume the entire shared budget and saturate the device. A payload WAL exists precisely to avoid this.
+
+A mutation granularity must therefore be chosen — per-tile delta/overlay tiles with their own read-merge and durability rules, or a smaller mutable granule — together with a **write-amplification budget in bytes per second** that the objective charges. Until then this contract's durability design has no viable write path for the workload it was written for. Tracked in `04-storage-soundness`.
 
 Atomicity comes from immutability instead of from a log:
 
@@ -162,7 +175,17 @@ The WAL degenerates into a ~64-byte **commit record**, which can be folded into 
 
 ### Physical layout of the root
 
-- One preallocated file, overwritten in place, so no directory entries are ever created and a single `fdatasync` flushes data and root together.
+- **Commit ordering — corrected (`review-05` SS-01).** The previous text claimed "a single `fdatasync` flushes data and root together", while the commit recipe below says `write tile(s) → fsync → flip root`. Those are different protocols and the single-barrier version is **unsound**: `fdatasync` is a *completion* barrier, not an *ordering* barrier, so on a crash the root page can be durable while a tile it references is not. Recovery would then dereference a half-written tile.
+
+Three viable protocols; one must be chosen and stated once:
+
+| Protocol | Cost | Note |
+|---|---|---|
+| Two barriers: tiles → `fdatasync` → root → `fdatasync` | 2 flushes per commit group | simplest to reason about |
+| One barrier + **self-validating commit**: per-tile content checksums recorded in the commit record, and recovery falls back to the previous root if any referenced tile fails validation | 1 flush, plus a checksum on every tile read at recovery | needs the checksum schema (missing entirely — see `04-storage-soundness`) |
+| Root in a separate file with its own barrier | 2 flushes, independent ordering | separates reorg traffic from the commit barrier |
+
+Until this is chosen, **the crash-atomicity claim in Contract 3 is unsound** and Contract 2's "one fsync" cannot be counted. A single shared file and a single fd also mean one `fdatasync` flushes *all* dirty pages, including background reorg staging, so foreground commit latency is coupled to reorg — the coupling the quiet-window policy is supposed to avoid (`SS-11`).
 - Root stored as **A/B pages with a checksum and a sequence number**; a torn write is detected by checksum and the highest valid sequence wins. (The same trick as LMDB's meta pages.)
 
 ### Recovery
@@ -200,8 +223,8 @@ Status: settled.
 
 - **Immutable.** A tile is never mutated in place.
 - **Self-describing.** The header names the layout, the column group, the clustering key and the encoding, so any reader can consume any tile without external metadata.
-- **Relocatable.** The tile is self-contained, so a reorg is a copy.
-- **Versioned.** A per-tile version field is reserved now, for read-set validation (Contract 2) and for version-checked layout authority (`learning.md`).
+- **Relocatable — with a caveat (`review-05` SS-06, SS-09).** Tile *payloads* are position-independent, but "the tile is self-contained" is not yet true: a parent tile storing child addresses cannot be relocated without rewriting every referrer, and a durable tile-id→file-offset map is itself global state. Nor is a reorg a `memcpy` — `glossary.md` defines it as *rewriting tiles into a different arrangement* (read → regroup → re-encode → rebuild directory → write); only pure *relocation* is a copy. What relocatability costs is unpriced: stable addresses, raw child pointers, page-cache readahead state (relocating a hot tile re-faults its pages), and cross-tile references wider than 32 bits at 10 TB.
+- **Versioned.** A per-tile version field is reserved now, for read-set validation (Contract 2) and for version-checked layout authority (`learning.md`). **Ambiguity to resolve (`review-05` SS-16):** for an *immutable* tile, "version" can only mean content identity (a hash), which lives outside the tile — otherwise the version is mutated in place, contradicting immutability and re-introducing the in-place ordering problem of SS-01. If it lives outside, validation is a question about the root mapping, not the tile, and the tile is no longer fully self-describing. One of the two must give.
 
 ### Directory and offsets
 

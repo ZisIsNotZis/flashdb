@@ -18,6 +18,8 @@ Three claims distinguish it:
 
 Motivating case: ~10 TB of data, ~128 GB RAM, heavily joined lookups. In that regime the scarce resource is not bytes but the number of **dependent** random reads per request. With 8 MB tiles, ~1.3% of the tile set is cache-resident, so the design goal is to collapse each request's fan-out into as few dependent reads as possible and to make the remaining reads independent.
 
+**Corrected (`review-05` SS-14, SS-22).** 1.3% is the *resident fraction of bytes*, and it holds only if all 128 GB is available to base tiles — real RAM must also hold the routing and root structures, tile directories, the trace store (its own ≈1% cap), compiled programs, and derived layouts, which are second copies. More importantly, resident-bytes fraction is the wrong statistic for the conclusion: under the Zipfian skew this design mandates, a 1.3% resident set can serve the majority of *requests*, so "the scarce resource is dependent random reads" does not follow from 1.3%. The metric must be the **hit fraction of requests**, with a stated cache owner and eviction policy. And the fan-out bound is not arbitrary — it is bounded below by the number of logical hops, since hop-3 addresses are not knowable at hop 1; that lower bound is never stated and is not priced.
+
 ## Goals
 
 - Highest throughput on a single modern Linux node; correctness and crash-atomicity never traded away for it.
@@ -41,7 +43,7 @@ Motivating case: ~10 TB of data, ~128 GB RAM, heavily joined lookups. In that re
 | Front-end normalizer | Parse the structured request tree, canonicalize it, reject non-canonical forms, enforce leanness | `contracts.md` (logical model) |
 | Block evaluator | Execute the stage/block program with per-block atomicity and effect-aware conditions | `contracts.md` (logical model, transaction model) |
 | Planner / compiler | Turn a canonical pattern into a specialized program plus a declared set of required physical properties | `contracts.md` (layout contract) |
-| Batcher / scheduler | Merge in-flight requests, issue one batched IO submission, allocate outstanding-IO slots and the commit group | `dev-loop.md` |
+| Batcher / scheduler | Merge in-flight requests, issue one batched IO submission, allocate outstanding-IO slots and the commit group | **No document — this pointer was dangling (`review-05` SS-18).** `dev-loop.md` describes the development loop and contains none of it. Mergeability, maximum wait, slot allocation, admission control, group-commit sizing, head-of-line rules and the group-fsync protocol are all unspecified. Tracked in `04-storage-soundness`. |
 | Executor | Read tiles through the self-describing tile directory; pure reads may be predicated or speculated | `contracts.md` (layout contract) |
 | Storage | Immutable, self-describing, relocatable tiles; one root pointer flip per commit record | `contracts.md` (layout, durability) |
 | Durability | Commit record plus group fsync; orphan GC; no payload WAL | `contracts.md` (durability and failure) |

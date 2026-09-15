@@ -100,7 +100,7 @@ The general form is **access prediction** (temporal), of which branch prediction
 Hard rules:
 
 - **Speculate reads, never writes** (I9). A speculative write requires undo, which reintroduces exactly the MVCC/GC machinery this design removed.
-- **Price waste in queue slots, not bytes.** A wasted 100 µs read costs a slot a real request could have used.
+- **Price waste in queue slots, not bytes.** A wasted read costs a slot a real request could have used. **Corrected (`review-05` SS-07):** the earlier claim that "a wasted read is free on an unsaturated device" is false for rotating media, where an unsaturated device is precisely where a wasted read costs *most* — it adds a seek and a rotation to the critical path of the demand read behind it, so 20 dependent reads on a 7200 rpm disk is ~180–240 ms rather than 1.6 ms. The device class must therefore enter the policy: **no speculative prefetch on seek-bound devices**, and the HDD policy (sorted batch sweep) must be written into the contracts rather than asserted in the glossary. **Also (`SS-23`):** speculative traffic must be tagged in the trace, or it inflates `bytes read` and `tiles touched` and biases the learner against layouts that were merely prefetched.
 - **Only pays when the guard needs a fresh read.** If the condition is answerable from data already in hand, there is no stall to hide.
 - **Gate on load mode.** The idle/latency mode is the speculation budget; under load, speculation is off or hard-bounded.
 

@@ -128,6 +128,8 @@ Both look "over SLO" in absolute terms; what differs is the residual against eac
 
 The numbers are illustrative, not measurements, and they silently set **`k = 1`, `s = 1 ms` and `a = 0`** — `a = 0` contradicts the formula's own `a > 0`, and feeding milliseconds straight into σ contradicts `s` being the normalisation that keeps angriness a rate (`review-03` §3). Three of the four parameters are therefore pinned by the example and none is justified. The example cannot validate the parameterisation; it only illustrates the comparison.
 
+**It is also arithmetically inconsistent with its own tile size (`review-05` SS-03, SS-12).** It bills a tile read as one ~80 µs miss — 4 KB-class latency — while the design's tile is 8 MB: 8 MB at ~7 GB/s is **~1.14 ms of transfer alone**, roughly the entire claimed un-collapsed fan-out, and the stated 1 MB read is ~143 µs, already above the stated 0.09 ms before any latency is added. The comparison therefore prices 20 small reads against one read priced as if it too were small. Two things must be defined before the arithmetic means anything: the **access granule** (device block, sub-tile page, or the whole tile — and if sub-tile, locating the page requires the tile directory, which is a *second* dependent read), and a **bandwidth term** beside the latency term. Also, with `a = 0, s = 1` the sigmoid *is* centred on the SLO, which the section above forbids; and because it saturates, a 17× service-time improvement scores 0.72 against 1.00, giving the objective almost no gradient exactly where the storage decisions are made.
+
 ## Operational reading
 
 This objective is an SRE error budget under a different name: accumulated angriness **is** the budget consumed, and its derivative is the **burn rate**.
