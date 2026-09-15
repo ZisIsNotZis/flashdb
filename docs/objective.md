@@ -126,7 +126,7 @@ One request, 10 ms base service time, 1 MB read per request.
 
 Both look "over SLO" in absolute terms; what differs is the residual against each layout's own capability. That is the comparison the objective is built to make.
 
-The numbers are illustrative, not measurements, and they silently set **`k = 1` and `a = 0`** — `a = 0` contradicts the formula's own `a > 0`, and it is exactly this gap that `review-01` F13/F18 identifies as the parameterisation defect. The example therefore cannot validate the parameterisation; it only illustrates the comparison.
+The numbers are illustrative, not measurements, and they silently set **`k = 1`, `s = 1 ms` and `a = 0`** — `a = 0` contradicts the formula's own `a > 0`, and feeding milliseconds straight into σ contradicts `s` being the normalisation that keeps angriness a rate (`review-03` §3). Three of the four parameters are therefore pinned by the example and none is justified. The example cannot validate the parameterisation; it only illustrates the comparison.
 
 ## Operational reading
 

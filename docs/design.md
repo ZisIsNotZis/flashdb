@@ -55,7 +55,7 @@ Invariants are load-bearing. A change that breaks one of these is an architectur
 
 - **I1 — No layout guarantee.** Physical layout may change at any time, at any granularity, without notifying users. Every intermediate state is fully servable, correct and performant-enough; no operation requires a database-wide barrier.
 - **I2 — A bad layout may be slow, never wrong.** Correctness may never depend on a layout being current. Derived layouts are accelerators; the base copy is the truth.
-- **I3 — No global layout state.** Every layout decision is scoped to one tile and made independently. Mixed layouts in one table are normal.
+- **I3 — No global layout state.** Every layout decision is scoped to one tile and made independently; mixed layouts in one table are normal. **The shared budget of I11 is not layout state** (`review-03` PA-10): it is a global *resource constraint* arbitrated from local statistics, not a global descriptor of how any tile is arranged. As originally worded I3 and the shared budget appeared to contradict each other, which also undercut the novelty claim.
 - **I4 — Analysis and optimization are off-path and scheduled.** No learning, inference, advice generation or cost-model evaluation happens on a request's critical path. The request path only *records* counters and histograms; measurement is unavoidable and is not analysis (`review-01` D10 — the earlier wording said "no profiling", which the per-request trace contradicts). Expensive background work is scheduled into quiet load windows.
 - **I5 — One business request = one DB request.** The request is the unit of pattern learning and the unit of angriness attribution. **It is not the unit of atomicity** — that is the block (I6). This conflicts with the motivating inventory workload's `decrement stock iff insert lines`; the conflict and its options are recorded in the ticket as `review-02` F4 and need an author decision.
 - **I6 — Per-block atomicity, per-request commit record.** A block is all-or-nothing; a request is not. One commit record covers the request's blocks in one fsync. The database commits a durable prefix and reports it, and **never resumes a request**.
@@ -91,20 +91,8 @@ The optimisation and learning-theory review (`review-01`) added the following, a
 
 ## Prior art
 
-The design occupies ground that is partly occupied. Every claim below was recalled from memory and **must be verified before it is cited as fact in any external document**.
+Positioning, the unverified-citation ledger, and the demoted novelty claim live in `prior-art.md`. In summary:
 
-| Area | Nearest prior art | What remains open here |
-|---|---|---|
-| Page-level hybrid layout | PAX (Ailamaki et al., ~2001); fractured mirrors | tile granularity at cache level rather than page level |
-| Block-level adaptive clustering | Snowflake micro-partitions + automatic clustering; Databricks liquid clustering; Google Napa / Tesseract | learned policy down the cache hierarchy, per tile, one mechanism |
-| Compression as an IO strategy | C-Store (~2005); BtrBlocks | per-tile encoding as a learned property, jointly with clustering |
-| Variable-length data without indirection | Umbra (Neumann et al.) | per-tile directory making reorg a memcpy |
-| Adaptive indexing / learning from zero | database cracking (Idreos et al., ~2007); adaptive indexing; ArcaDB / NoDB | the online reorg mechanism and drift handling |
-| Adaptive LSM shape | Monkey, Dostoevsky, LSM-bush (Dayan, Idraos et al.) | the same idea applied to tiled storage, not to LSM levels |
-| Offline layout search | index/table advisors (AutoAdmin, DTA) | trace-replay oracle with regret as the metric |
-| Compiled query variants | HyPer / Umbra; adaptive execution of compiled queries (Menon, Leis, Neumann, ICDE 2018) | profile-guided, offline, tiered specialization of *layout + code* jointly |
-| Learned physical tuning | self-driving DBMS work (CMU Peloton, ~2017) | angriness as a single scalar with a calibrated predictor |
-| Advisor | `EXPLAIN`, Oracle SQL Tuning Advisor, MongoDB performance advisor | advice on logical request shape, as a first-class response field, with predicted gain |
-| Operational discipline | SRE error budgets and burn rates | error budget as the objective function itself |
-
-Nothing found so far combines: layout-as-materialized-view with continuous drift, one scalar angriness objective, per-tile learned policy under a shared budget, and canonicity-enforced requests as the learning key. That combination is the defensible contribution.
+- **Every mechanism in this design is established prior work.** Continuous budgeted re-layout without downtime is shipped (Snowflake, Redshift ATO, Databricks liquid clustering). Fine-grained adaptive layout created from the query mix with the raw data as fallback is **H2O** (SIGMOD 2014) — the closest work in existence to the core mechanism. Adaptive indexing from zero is database cracking. Multiple physical layouts of one logical table with the base as fallback is fractured mirrors and C-Store's WS/RS split. Layout-as-materialized-view is the view-selection literature, which is NP-hard. Per-chunk encoding selection is BtrBlocks. One scalar objective with per-component budgets is Monkey/Dostoevsky. Joint representation and execution specialization is Data Blocks. Automatic tuning with validation and rollback is Oracle Automatic Indexing. And learned physical design synthesised from the workload is **SageDB** (CIDR 2019), which is this thesis's actual neighbourhood.
+- **What survives is narrower:** a per-tile *learned* policy rather than a heuristic selector; sufficiency of one shared budget across heterogeneous decision types; and grammar-enforced canonicity making the learning key exact. All three are claims about method and measurement, and all three are falsifiable.
+- The previous claim here — that nothing combines these — was **false as written** and contradicted the table directly above it.
