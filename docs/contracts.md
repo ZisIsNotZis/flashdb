@@ -1,6 +1,6 @@
 # flashdb — contracts
 
-Budget: 320 lines / 34,000 chars  <!-- budget debt: see issue 01-design, "Budget debt" -->
+Budget: 335 lines / 34,000 chars  <!-- budget debt: see issue 01-design, "Budget debt" -->
 
 The four interfaces that cannot be changed cheaply after implementation. Everything else in this repository is deferrable; these are not.
 
@@ -16,23 +16,61 @@ Tables are created and updated through a JSON schema description. No DDL text, n
 
 ### The request tree
 
-A request is a **structured tree**, never a query-language *text*. There is no query-language grammar to parse, which removes the lexer and the parser but **not the hard part**: SQL canonicalization is difficult because of relational equivalence — join reordering, predicate implication, projection pull-up, distributivity — not because SQL is text. A typed tree leaves every one of those equivalences intact (`review-04` L-16), as this design's own distributivity episode demonstrates.
+A request is a **named set of blocks**, not an ordered list. Names are identities and the syntax has no positional order, so "parallel blocks run in any order" is structural rather than a convention. Ordering exists only where it is declared:
 
 ```
-request:  [ stage, stage, ... ]            // array order = sequential (the former "&&")
-stage:    { blocks: [ block, ... ],        // blocks are parallel and mutually isolated ("&")
-            ifEmpty: [ block, ... ] }      // optional single fallback ("||")
+request:  { <name>: <block>, ... }             // an object: no positional order
+block:    { needs: [<name>, ...],              // declared dependencies: the only ordering
+            <shape>: { ... },                  // exactly one shape per block
+            else: <block> | [<block>, ...] }   // runs when the block did not achieve its goal
 ```
 
-- **Sequence is array order.** No operator symbol.
-- **Parallelism is implicit** within a stage, which makes it a *physical* decision like every other physical decision.
-- **Fallback is a named key on a stage**, and a fallback may contain only blocks, not stages. `(A && B) || (A && C)` is therefore not writable in its distributed form. **Corrected (`review-04` L-05):** the earlier claim that the equivalence class "cannot be expressed at all" is false — `A ; (B || C)` expresses the same intent; only the distributed spelling is banned. And the restriction **silently reversed an author requirement**: the decision log records that the author refused to restrict the grammar for this reason, because "one single request for all business is more important". Two-stage conditional branches ("if not stocked here, create a transfer request *and then* reserve incoming stock; otherwise decrement *and then* write a movement row") are inexpressible and need a second round trip, contradicting I5.
+- **Declared order is honoured.** `needs` is sequence (`&&`), `else` is fallback (`||`); the operators became named fields, and execution order is derived from the graph rather than from position.
+- **Undeclared is parallel.** Blocks with no `needs` path between them may run concurrently in any order. Reading a key another block writes without declaring the edge yields whichever state results — the author's "consequences are yours".
+- **Same-key writes with no declared edge are rejected at the front-end**, not guessed: the engine refuses what it cannot order. Decidable for key-addressed shapes, and it is the mechanical check the API reports.
+- **A block is a transaction**: every write in it applies atomically or none does, and it may span tables. A read block returns rows or empty; a write block returns `ok` or `failed`.
+- **QBE, actually.** Shared variable names across blocks (`$find.sku`) are QBE's join trick — the same mechanism Query-by-Example used to join example forms — and a write is an *example of the row as it should exist*, not a command. Writes collapse to two shapes: `put` (match + row; upsert, with `when` narrowing it to present-only or absent-only) and `del`. Six shapes: `get` · `scan` · `agg` · `join` · `put` · `del`.
 
-### Open — this grammar is a sketch, not a specification
+Example — "place an order: find the stock row (by sku, else by an alternate sku), decrement it and write the movement and the order line atomically, else write a backorder":
 
-A language review (`review-04`) found fourteen undefined or incoherent items, four of them load-bearing for the motivating inventory workload. **They are enumerated, with consequences and the specific question each poses, in `.scratch/03-grammar-decisions/`.** The load-bearing ones: `ifEmpty` has no defined meaning because no block shape declares a result type (L-01); the client-continuation contract is not implementable for read blocks (L-02); no predicate or expression language exists (L-03); canonicity needs a declared equivalence relation rather than the word "intent" (L-04); and two parallel blocks can both pass the same guard and both write (L-20).
+```json
+{ "id": "ord-8812",
+  "class": { "durability": "batched", "retry_horizon_s": 300 },
+  "blocks": {
+    "find": { "get":   { "table": "stock", "where": { "sku": "$sku", "loc": "$loc" } },
+              "else":  { "get":   { "table": "product", "where": { "alt_sku": "$sku" } } } },
+    "book":  { "needs": ["find"],
+               "put": [ { "table": "stock", "where": { "sku": "$find.sku", "loc": "$loc" },
+                          "row":  { "on_hand": "$find.on_hand - $qty" },
+                          "when": { "on_hand": { "ge": "$qty" } } },
+                        { "table": "stock_movement", "row": { "sku": "$find.sku", "loc": "$loc",
+                                                               "delta": "-$qty" } },
+                        { "table": "order_line", "row": { "order_id": "$order_id",
+                                                           "sku": "$find.sku", "qty": "$qty" } } ],
+               "else": [ { "table": "backorder", "row": { "sku": "$find.sku", "qty": "$qty" } } ] } } }
+```
 
-**No contract in this repository may be frozen until those are settled.**
+`$find.on_hand` addresses the *applied* result of `find`, including its `else`. The `when` guard belongs to the whole `book` block: if it is false, all three writes roll back and `else` runs.
+
+### Outcome and failure detail
+
+Every block reports `{ name, status }` with `status` ∈ `ok | empty | failed | skipped`, and a failed block carries a **structured, exhaustive reason** — no prose:
+
+```json
+{ "block": "book", "status": "failed", "reason": "when_false",
+  "op": 0, "table": "stock",
+  "where": { "sku": "A1", "loc": "L1" },
+  "when":  { "on_hand": { "ge": "$qty" } },
+  "bound": { "on_hand": 0, "$qty": 3, "$find.sku": "A1" } }
+```
+
+`reason` ∈ `when_false | conflict | not_found | validation | dependency_failed | shed | key_overlap | internal`, plus `op`, `table`, `where`/`key`, the condition exactly as written, and `bound` — the actual values bound at failure, including referenced bindings. A client needs this to decide retry, compensate, or abort; no field requires natural language.
+
+### Open — remaining after this redesign
+
+**Closed here:** L-01, L-05, L-06, L-11, L-12, L-13, L-14, L-18, L-20.
+**Still open:** L-02 (dedup-replay response and retention semantics), L-04 (`E` as a normalizer, not a list), L-07 (row cap, aggregate-to-write, generated-key round-trip), L-08 (schema canonicity), L-16 (wire-form canonicalization), and the expression grammar (`$name.field`, arithmetic, `where` operators) needs one page of exact rules.
+
 
 ### Blocks
 

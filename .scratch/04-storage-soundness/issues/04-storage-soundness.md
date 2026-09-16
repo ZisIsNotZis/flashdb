@@ -64,6 +64,18 @@ None of the following exists anywhere in the repository, and each is load-bearin
 4. A durability test matrix names the supported filesystems and device classes, and a fault-injection harness exists before any throughput number is claimed.
 5. No claim in `contracts.md` rests on in-place overwrite semantics without naming the filesystem assumption.
 
+## Resolution (partial, 2026-09-15, from the author)
+
+**SS-04 resolved: keep the WAL, memtable and background compaction.** The author delegated this decision with one constraint — minimise the "transaction tax" — and the WAL is the low-tax choice, not the high-tax one: it makes a 100-byte update durable without rewriting an 8 MB tile, whereas the immutable-tile-only alternative pays tens of GB/s of write amplification on a hot SKU. Consequences: a payload WAL stays; writes go to a memtable and are journalled per block with their `$n` bindings; background compaction rewrites tiles into the learned layout; and the write-amplification budget is charged in bytes per second to the shared budget.
+
+**Isolation is reduced to the minimum real workloads use,** per the author's constraint: block-level atomicity, optimistic validation of the keys a block touches, conflicts retried per block. **Range reads are not serializable by default** — they see a snapshot; serializable range semantics are opt-in via re-enumeration at commit, which also removes the retry-storm risk SS-05 identified for hot tiles.
+
+**Device: NVMe-only for v1.** SATA SSD, RAID and rotational media are explicitly unsupported; the device descriptor and the sorted-sweep policy are deferred with them.
+
+**Scale: v0 targets the ratio, not the absolutes.** 10 TB / 128 GB (78:1) is a far target; v0 runs cgroup-limited at the same or a stated ratio, and the ratio itself becomes an experimental variable the harness can sweep.
+
+Still open: SS-01 (commit ordering protocol), SS-02 (reader epochs), SS-05 (snapshot generation), and the missing-mechanism list.
+
 ## Not in scope
 
 Re-running the storage review. This ticket resolves the findings it produced.

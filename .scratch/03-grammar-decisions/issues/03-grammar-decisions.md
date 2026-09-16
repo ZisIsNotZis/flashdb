@@ -51,6 +51,17 @@ The items were recorded inline in `contracts.md`, which pushed that file past it
 3. A golden-corpus test exists that fails when a canonicalization rule is removed.
 4. No item remains in an undecidable state: for each, a fresh agent can determine compliance by reading the contract.
 
+## Resolution (2026-09-15, from the author)
+
+**D5 — per-block atomicity, reaffirmed.** The author re-confirmed his round-6 instruction: a block is the atomicity unit, not the request, and he had already answered this. The recommendation for whole-request atomicity is **withdrawn**, and the design now honours per-block atomicity soundly. Consequences, all accepted:
+
+- **A block is a transaction and may span tables.** "Decrement stock iff available, then insert the movement row" is one block containing several writes, applied atomically. Without a multi-write block shape, per-block atomicity makes that motivating case unexpressible (L-18) — so the shape is added rather than the atomicity model changed.
+- **`else` is defined per block kind,** which resolves L-01: a read block's result is `rows` or empty, a write block's is `ok` or `failed`. `else` means "the block did not achieve its goal" — zero rows for a read, guard-false or conflict for a write. Writes never return empty, so `if_empty`-on-write is a validation error rather than an ambiguity.
+- **Bindings are journalled (L-02).** Each block's WAL record carries the `$n` bindings it consumed, so dedup-replay returns recorded bindings for completed blocks instead of re-reading post-write state. Idempotent *observation* is thereby achieved, not just idempotent application. Retention becomes `retry_horizon_s`, a declared field of the service class, so it is a client contract rather than a decorative engine detail.
+- **Intra-stage key overlap is rejected at the front-end** (L-20): two parallel blocks writing the same key is decidable and rejected, so the stock-oversell case cannot arise.
+
+**D1–D4 — set to the assistant's recommendations as defaults, veto-able:** program-level `else` is allowed (D1); the server always normalizes and returns the canonical form, rejecting only malformed trees (D2); predicate-addressed writes exist with a bounded row cap (D3); `order` / `limit` / `after` exist on read shapes (D4). These are defaults taken under the author's standing instruction to keep the transaction tax minimal; any of them can be overruled.
+
 ## Not in scope
 
 Re-running the language review. This ticket resolves the findings it produced.
