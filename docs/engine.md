@@ -49,8 +49,8 @@ block executes against snapshot + its own overlay (RAM)
 
 ## Tiles, pages, access granule (SS-03 resolved)
 
-- Tile file ≈ **32 MB** (autotunable), holding **64 KB pages**; a page = checksum + a run of documents contiguous in key order + per-page key bounds. Page directory (~8 KB per tile at 512 pages) lives in the manifest and is cached LRU in RAM.
-- **The access granule is the page.** A point read = one 64 KB read ≈ ~130 µs (32 µs transfer + ~100 µs latency), not 1.14 ms. The earlier arithmetic that billed a tile read at 80 µs is withdrawn.
+- Tile file ≈ **32 MB** (autotunable), holding **16 KB pages** (default set from the device calibration in `.scratch/05-engine-v0/evidence/analysis.md`: 16 K QD1 = 106 µs vs 64 K = 188 µs on the reference NVMe — a 40 % point-read saving for 4× fewer directory entries at negligible bandwidth cost on a ~820 MiB/s device); a page = checksum + a run of documents contiguous in key order + per-page key bounds. Page directory (~8 KB per tile at 512 pages) lives in the manifest and is cached LRU in RAM.
+- **The access granule is the page.** Measured on the reference NVMe (`review-05` SS-03 demanded this be defined, not assumed): a point read = one 16 KB page ≈ **106 µs** at QD1 (94 µs at 4 KB); a batch of 20 independent 4 KB reads at QD32 ≈ **207 µs** vs **1 886 µs** serialized — a 9.3× batching gain; a whole 8 MB tile read sequentially would cost **~10 ms**, which **falsifies** the original collapse-into-a-tile premise at ~820 MiB/s and confirms the page-granule design. The earlier arithmetic that billed a tile read at 80 µs is withdrawn.
 - A fan-out (order → its movements) = one prefix scan over `R/…/<order-handle>/` (contiguous, usually one page) + N *independent* point reads. **Dependent depth = 1 + independent fan-out.** Multi-hop relations cost one dependent read per hop, and the trace records follow-depth (SS-22).
 - Kernel page cache is the block cache in v0; "cache" means it, with hit-fraction-of-requests as the metric (SS-14).
 
@@ -78,7 +78,7 @@ The keyspace makes the thesis concrete: **materialized prefixes are the layout.*
 | which `U` lookup prefixes to materialize (hot non-unique probes) | primary order = document handle |
 | which `R` reverse prefixes to retain (co-location of index entries) | all schema-declared `x-ref` reverse tiles materialized at create |
 | encoding per prefix (zstd level; BtrBlocks-class later) | compaction style (universal) |
-| compaction trigger per prefix-region | page size 64 KB; tile target 32 MB |
+| compaction trigger per prefix-region | page size 16 KB (calibrated); tile target 32 MB |
 
 Clustering-key learning (physically re-sorting documents) is deferred to v1 — it needs dual copies or a handle map and is not required to test the thesis. v0 has no speculation, so speculative/demand trace tagging is moot (SS-23 noted for v1).
 
@@ -95,7 +95,7 @@ Clustering-key learning (physically re-sorting documents) is deferred to v1 — 
 |---|---|
 | SS-01 | one WAL barrier on the foreground; background checkpoint protocol; orphans collected |
 | SS-02 | immutable whole files + unlink-deferred by fd + snapshot horizon |
-| SS-03 | page granule (64 KB), directory in manifest/LRU, bandwidth + latency priced |
+| SS-03 | page granule (16 KB, calibrated by experiment 0a), directory in manifest/LRU, bandwidth + latency priced |
 | SS-04 | WAL + memtable + compaction; write-amplification budget |
 | SS-05 | snapshot reads + first-committer-wins on matched docs; scans unvalidated by design |
 | SS-06 | two named global structures: the keyspace layout (in the manifest) and the WAL position; tiles never relocated |

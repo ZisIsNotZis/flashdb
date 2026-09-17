@@ -3,3 +3,9 @@
 *.log
 target/
 build/
+
+# rust
+/target
+__pycache__/
+*.pyc
+.venv/

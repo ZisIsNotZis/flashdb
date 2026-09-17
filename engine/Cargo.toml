@@ -1,0 +1,5 @@
+[package]
+name = "flashdb-engine"
+version = "0.1.0"
+edition = "2021"
+description = "flashdb storage engine: log-structured document store with a learned keyspace layout"
