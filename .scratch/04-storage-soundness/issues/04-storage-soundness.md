@@ -76,6 +76,16 @@ None of the following exists anywhere in the repository, and each is load-bearin
 
 Still open: SS-01 (commit ordering protocol), SS-02 (reader epochs), SS-05 (snapshot generation), and the missing-mechanism list.
 
+## Final resolution (2026-09-15)
+
+The storage layer is now specified in `docs/engine.md`: a log-structured document store (WAL + memtable + immutable tile files + background compaction), one keyspace with four prefix families (primary / x-unique lookup / x-ref reverse), document-CSN versioning, 64 KB page access granule, single-barrier foreground commit, unlink-deferred file lifetime with a snapshot horizon, and ext4/XFS pinned.
+
+Findings resolved: SS-01, SS-02, SS-03, SS-04, SS-05, SS-06, SS-09, SS-10 (dissolved by the document model), SS-11, SS-16, SS-19, SS-20 (publish-time unique checks — a hole found in the first draft of the resolution itself), SS-21, SS-22, SS-24, SS-25, SS-26, SS-28.
+
+Corrections made against this repository's earlier text: "phantom protection comes for free" (withdrawn — snapshot reads + first-committer-wins on matched documents, scans unvalidated by design); "a payload WAL buys nothing" and "the data path is already sequential" (withdrawn); "derived structures skip fsync" (retracted — same LSM); "reorg is a memcpy" and tile relocation (dropped — whole immutable files, no relocation exists); per-tile version field (dropped — CSN in key).
+
+Deferred to v1, with reasons recorded in `docs/engine.md`: clustering-key learning, speculation, canary, multi-hop `$via`, general constraint DSL.
+
 ## Not in scope
 
 Re-running the storage review. This ticket resolves the findings it produced.

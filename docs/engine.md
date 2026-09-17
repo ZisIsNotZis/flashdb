@@ -1,0 +1,110 @@
+# flashdb — storage engine (v0)
+
+Budget: 170 lines / 26,000 chars
+
+The storage layer resolves ticket `04-storage-soundness`. Shape chosen: **a log-structured document store** — WAL + memtable + immutable tile files + background compaction. Every mechanism is standard LSM practice; the thesis lives in the key-space layout and the learned policy, not here. This document supersedes the tile/relocation/root-flip ideas recorded in earlier rounds; the decisions it encodes were made to close `review-05`.
+
+Reference scale (v0, cgroup-limited): 200 GB data, 8 GB RAM, one NVMe. Data:RAM ≈ 25:1.
+
+## Key space — one LSM, four prefix families
+
+One keyspace, keys sorted byte-wise, every entry versioned by the **CSN** (commit sequence number) of the block that wrote it. A document is never split; a document handle is engine-assigned, 64-bit, never reused.
+
+```
+P/<entity>/<handle>                              → document (primary)
+U/<entity>/<unique-field>/<value>                → handle   (x-unique: enforcement + lookup)
+R/<entity>/<ref-field>/<target-handle>/<source>  → ø        (x-ref reverse: automatic backward)
+```
+
+- `U` **is** the uniqueness enforcement: a write checks the entry absent (or self) before publish. It is also the lookup path for unique-field probes. One structure, two roles.
+- `R` **is** the automatic backward traversal: prefix scan `R/<entity>/<ref>/<target>/` returns all referencing handles, contiguously — co-location of index entries by key order is free. `reverse: "unique"` = at most one entry per target; second insert → `reverse_unique_violation`.
+- An entity with no declared `x-unique` has no `U` prefix: references to it always `cannot_resolve`, and it is reachable only by scan. Consistent with the reference model.
+
+All four families live in the same LSM, so one WAL covers everything (see Corrections: the earlier claim that derived structures skip fsync is retracted).
+
+## Foreground commit — one barrier (SS-01 resolved)
+
+```
+block executes against snapshot + its own overlay (RAM)
+  → validate: read-set versions + constraints on overlay final state + x-ref resolution
+  → serialize: one WAL record = all keyspace mutations of the block (P/U/R, payloads included)
+  → group commit: batch pending blocks, assign CSNs, append in CSN order, ONE fdatasync(WAL)
+  → apply batch to memtable → publish CSNs → ack
+```
+
+- Exactly **one** durability barrier per commit group, and it is on a log — there is no foreground structure over tiles, so the SS-01 ordering hazard (root durable, tile not) cannot arise. Tiles are written only by background compaction.
+- The memtable is applied **after** the fsync returns: a reader can never see a block whose WAL record is not yet durable.
+- Crash before fsync: torn tail cut at the last valid record (per-record crc32c + length); those blocks were never acked; clients retry. CSN gaps are harmless.
+- `fdatasync` targets the WAL fd only — compaction barriers never delay the foreground (SS-11 resolved).
+- Group commit: flush when the oldest pending block has waited **2 ms** or 128 blocks are pending, whichever first. `durable` class = its own immediate flush.
+
+## Snapshots and validation (SS-05 resolved, honestly)
+
+- A snapshot **is a CSN**. Read = newest version with CSN ≤ snapshot, skipping tombstones; the block's own overlay is checked first.
+- **Claimed isolation: snapshot reads + first-committer-wins on matched documents.** Not serializable; range scans are not validated. This is the minimal tax, and the previous "phantom protection comes for free" claim is withdrawn rather than patched.
+- **Validation set** = every document a block *matched or read by key*: check its current committed CSN == the CSN at read. Probe-condition fields are part of the read set, so the concurrent-decrement oversell resolves: loser retries, re-probes, matches nothing, backorders (SS-20).
+- Two concurrent blocks writing the same unique value: the **unique check runs at publish**, against the memtable that already contains the winner's entry → loser retries. Publish-time, not validate-time — without this, duplicates slip through (`review-05` follow-up found this hole in the first draft of this document).
+- Blocks of one request commit independently, in dependency order. Resolution domain = committed state (including earlier blocks of the same request) + the block's own overlay.
+- Unconstrained by design: scans see a snapshot; phantoms are possible and **documented, not prevented**.
+
+## Tiles, pages, access granule (SS-03 resolved)
+
+- Tile file ≈ **32 MB** (autotunable), holding **64 KB pages**; a page = checksum + a run of documents contiguous in key order + per-page key bounds. Page directory (~8 KB per tile at 512 pages) lives in the manifest and is cached LRU in RAM.
+- **The access granule is the page.** A point read = one 64 KB read ≈ ~130 µs (32 µs transfer + ~100 µs latency), not 1.14 ms. The earlier arithmetic that billed a tile read at 80 µs is withdrawn.
+- A fan-out (order → its movements) = one prefix scan over `R/…/<order-handle>/` (contiguous, usually one page) + N *independent* point reads. **Dependent depth = 1 + independent fan-out.** Multi-hop relations cost one dependent read per hop, and the trace records follow-depth (SS-22).
+- Kernel page cache is the block cache in v0; "cache" means it, with hit-fraction-of-requests as the metric (SS-14).
+
+## Compaction, manifest, checkpoint, recovery (SS-02, SS-21 resolved)
+
+- Compaction: pick inputs → merge-iterate in key order → write new whole tile files → `fdatasync` each → write new manifest page → `fdatasync` → flip. Crash before the flip: the new files are orphans, collected at recovery. Harmless by construction.
+- **Version dropping horizon** = the minimum CSN among active reader snapshots. Versions below the horizon are dropped; above it, kept. Readers register their snapshot CSN in a registry; a reader past its timeout is aborted and deregistered.
+- **A tile file is unlinked only when no reader holds it open** (fd-count per file; POSIX keeps the inode alive for open fds). The engine never writes into a file a reader may hold, so the allocator-reuse hazard of SS-02 cannot arise. Unlink-deferred files sit on a trash list persisted in the manifest; recovery re-attempts.
+- Manifest: one small file, **A/B pages, checksum + monotonic seq**, no rename; recovery takes the valid page with the highest seq (SS-26: two consecutive torn writes leave both invalid only if both tear — the write-always-inactive-page discipline plus per-page checksum bounds this to a double-torn-write window; accepted, documented).
+- Checkpoint: when 128 MB of WAL has accumulated since the last one (or 5 minutes). Checkpoint = flush memtable to an L0 file + fsync + manifest update + WAL rotation. **Recovery budget: replay ≤ 128 MB ≈ ~1–2 s** on the reference NVMe.
+- **Filesystems pinned: ext4 and XFS.** btrfs/ZFS/f2fs unsupported in v0 (CoW allocation semantics break the preallocated-WAL cost model). Tile allocation = whole files, so there is **no free-space map** on the tile side; the WAL is preallocated and rotated (SS-21).
+
+## Write path and budget (SS-04 resolved)
+
+- A one-field update = a ~200 B WAL record + a memtable entry. Hot-SKU decrements never touch a tile.
+- Write amplification = compaction bytes written ÷ user bytes written, measured live, budgeted (default ≤ 10×, charged to the shared budget). Budget exhaustion → compaction throttles, writes slow — visible, priced, never silently violated.
+- The "already sequential" justification is withdrawn; the sound argument for the WAL is small-update durability, which the workload needs.
+
+## What the learner controls in v0
+
+The keyspace makes the thesis concrete: **materialized prefixes are the layout.**
+
+| Learned (offline chooser, v0) | Fixed (v0) |
+|---|---|
+| which `U` lookup prefixes to materialize (hot non-unique probes) | primary order = document handle |
+| which `R` reverse prefixes to retain (co-location of index entries) | all schema-declared `x-ref` reverse tiles materialized at create |
+| encoding per prefix (zstd level; BtrBlocks-class later) | compaction style (universal) |
+| compaction trigger per prefix-region | page size 64 KB; tile target 32 MB |
+
+Clustering-key learning (physically re-sorting documents) is deferred to v1 — it needs dual copies or a handle map and is not required to test the thesis. v0 has no speculation, so speculative/demand trace tagging is moot (SS-23 noted for v1).
+
+## Corrections recorded against earlier documents
+
+- **SS-16:** there is **no per-tile version field**. Versioning is per-document CSN in the key; validation is read-set CSN comparison; "self-describing tile" keeps layout metadata only.
+- **SS-24:** derived prefixes live in the same LSM and **do pay fsync**; the earlier claim that they skip it is retracted. `recomputable` now means: the prefix may be dropped and rebuilt from `P/` by scan, without violating I2.
+- **SS-18:** the scheduler contract is the group-commit paragraph above; v0 has no request-rewriting batcher, no admission control beyond the in-flight block cap (1024) and shed-by-class.
+- **SS-19:** `deadline` exists in the service class; v0 uses it only for shed priority and accounting, not for constraint evaluation.
+
+## Resolution checklist
+
+| Finding | Resolution |
+|---|---|
+| SS-01 | one WAL barrier on the foreground; background checkpoint protocol; orphans collected |
+| SS-02 | immutable whole files + unlink-deferred by fd + snapshot horizon |
+| SS-03 | page granule (64 KB), directory in manifest/LRU, bandwidth + latency priced |
+| SS-04 | WAL + memtable + compaction; write-amplification budget |
+| SS-05 | snapshot reads + first-committer-wins on matched docs; scans unvalidated by design |
+| SS-06 | two named global structures: the keyspace layout (in the manifest) and the WAL position; tiles never relocated |
+| SS-09 | no relocation exists; compaction priced as LSM merge I/O; page-cache invalidation on tile drop |
+| SS-10 | dead — documents are atomic |
+| SS-11 | foreground fsyncs only the WAL fd |
+| SS-16 | no per-tile version; CSN in key |
+| SS-19/20 | deadline field; probe fields in read set; unique checks at publish |
+| SS-21 | whole-file allocation; WAL preallocated + rotated; ext4/XFS pinned; recovery ≤ ~2 s |
+| SS-22 | hop bound = dependent reads per hop, recorded in trace |
+| SS-24 | same LSM; recomputable = rebuildable prefix; fsync-saving claim retracted |
+| SS-25/26/28 | sequential claim retracted; A/B discipline + double-torn window documented; tile size owned by this document (32 MB target, autotunable) |

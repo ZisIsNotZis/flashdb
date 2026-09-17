@@ -15,6 +15,7 @@ Motivating case: ~10 TB, ~128 GB RAM, heavily joined lookups, where the scarce r
 | File | Read it when |
 |---|---|
 | `docs/design.md` | first. Thesis, goals/non-goals, architecture, the 13 invariants, open questions. |
+| `docs/engine.md` | designing or reviewing the storage engine itself: WAL, memtable, tiles, snapshots, compaction, recovery. |
 | `docs/prior-art.md` | before claiming novelty, and before believing any citation in this repository. Unverified entries are marked. |
 | `docs/objective.md` | reasoning about any trade-off, or about what "better" means here. The angriness objective. |
 | `docs/contracts.md` | before writing any code. The four frozen contracts and six reserved interfaces. |
