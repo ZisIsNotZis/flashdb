@@ -62,6 +62,37 @@ The items were recorded inline in `contracts.md`, which pushed that file past it
 
 **D1–D4 — set to the assistant's recommendations as defaults, veto-able:** program-level `else` is allowed (D1); the server always normalizes and returns the canonical form, rejecting only malformed trees (D2); predicate-addressed writes exist with a bounded row cap (D3); `order` / `limit` / `after` exist on read shapes (D4). These are defaults taken under the author's standing instruction to keep the transaction tax minimal; any of them can be overruled.
 
+## Addendum: reference model — v2（2026-09-15，修订，撤销同日 v1）
+
+**撤销 v1 的“引用必须声明 key”。** 技术理由：每个 `x-unique` 为了执行唯一性检查**本来就必须**带查找结构，所以所有解析路径已经物化——“选哪条路”没有成本。关系库逼你选外键，是因为每条路径都要你声明并维护一个索引；这里没有这笔成本，模糊性是免费的。v1 的错误是把关系库的成本模型带进了一个没有这个成本的模型。
+
+**Schema 只声明目标类型：**`"order": { "x-ref": "Order" }`——一个字都不多说。
+
+**值由业务怎么方便怎么写：**
+
+- 唯一字段片段：`{ "order_no": "SO-1" }` 或 `{ "trace_id": "TR-9" }`
+- 组合唯一：`{ "sku": "A1", "loc": "L1" }`
+- 经由其他实体：`{ "$via": { "Ticket": { "ticket_no": "TK-7" } }, "follow": "order" }`——`follow` 必须是中间实体上声明的 `x-ref` 字段；v0 单跳，多跳后话。
+
+**解析不变量（每次提交检查）：**
+
+1. 收集目标实体全部已声明的 `x-unique`；
+2. 引用值**完整覆盖**某条 unique → 尝试解析；多条被覆盖且全部指向同一文档 → 成功；不一致 → `ambiguous_reference`；零覆盖 → `cannot_resolve`；
+3. 片段里的**非唯一字段在解析后逐个校验**（不符 → `reference_condition_false`）——片段就是 probe，所以“必须是服务订单”写作 `{ "order_no": "SO-1", "type": "service" }`，不需要专门语法；
+4. “逻辑上只能指向一个”因此成为可检查的提交时不变量，而不是数据巧合。
+
+**解析域：**已提交状态 + 当前请求的待写块——同一请求先建订单、后建工单按 `order_no` 引用，必须能解析，否则引用模型在“一个请求建全套”的场景下自相矛盾。
+
+**规范化：**写入时解析为内部句柄存储，业务给的形态是输入不是存储状态；输入形态记入 trace 作为访问路径权重。两种业务用不同路径不是污染——是该实体真实拥有两条在用的解析路径，学习器两条都养着，反正结构本来就在。
+
+**推论：没有任何已声明 unique 的实体不可被引用**（必然 `cannot_resolve`）。想被引用，就声明一个 unique——这正好是作者“必须设定为 unique”的本意，只是落点从“引用方声明”移到了“目标方声明”。
+
+**子类型解析：**`x-ref` 指向子类型时按继承根的唯一结构解析，命中后校验 `_type` 在目标子树内，否则按 `not_found` 处理。
+
+**保留（与 v1 相同）：**`x-extends` 单继承、唯一性作用域 = 继承根、`_type` 引擎管理、probe 父类型命中全部子类型、数组引用逐项解析、`on_delete` 默认 restrict、`$ref`/`$defs` 是结构复用而 `x-ref` 是数据引用、引用解析本质是“最多命中一个”的 probe。
+
+**未决：**读 `x-ref` 字段返回句柄还是自动浅填充——v0 倾向句柄，自动填充按需后置；多跳 `$via`（`follow` 数组）后话。
+
 ## Not in scope
 
 Re-running the language review. This ticket resolves the findings it produced.
