@@ -244,12 +244,12 @@ mod tests {
         }
         {
             let (mut w, records) = Wal::open_or_recover(&p).unwrap();
-            assert_eq!(records.len(), 1, "撕裂尾不应出现在恢复结果里");
+            assert_eq!(records.len(), 2, "撕裂尾之前的完整记录必须全部恢复");
             w.append(b"three").unwrap();
             w.sync().unwrap();
         }
         let (records, _) = replay(&p).unwrap();
-        assert_eq!(records, vec![b"one".to_vec(), b"three".to_vec()]);
+        assert_eq!(records, vec![b"one".to_vec(), b"two".to_vec(), b"three".to_vec()]);
         remove(&p);
     }
 
