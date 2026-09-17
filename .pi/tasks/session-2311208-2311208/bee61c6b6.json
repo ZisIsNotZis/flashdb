@@ -1,0 +1,17 @@
+{
+  "id": "bee61c6b6",
+  "name": "0a-redo watcher v2",
+  "command": "WAIT_LIMIT=28800 bash /home/z/vibe/flashdb/bench/0a-redo.sh",
+  "description": "0a-redo watcher v2: same load-guarded benchmark, now waits up to 8h for an idle window (exits 42 if not), samples loadavg/idle every 5s throughout",
+  "status": "running",
+  "outputPath": ".pi/tasks/session-2311208-2311208/bee61c6b6.output",
+  "cwd": "/home/z/vibe/flashdb",
+  "startTime": 1789633143133,
+  "pid": 2716790,
+  "bytesWritten": 0,
+  "isAgent": false,
+  "notified": false,
+  "notifyOnCompletion": true,
+  "triggerOnCompletion": true,
+  "timeoutSeconds": 32400
+}

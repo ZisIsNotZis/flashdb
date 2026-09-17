@@ -13,7 +13,7 @@ EV=/home/z/vibe/flashdb/.scratch/05-engine-v0/evidence/0a-redo
 IDLE_NEED=85        # 要求的 cpu idle %
 CONSEC=3            # 需连续命中的采样数
 SAMPLE_SEC=5
-WAIT_LIMIT=7200     # 最长等待 2h，超时 exit 42
+WAIT_LIMIT=${WAIT_LIMIT:-7200}   # 可用环境变量覆盖
 RUN_SEC=15
 LOAD_CEIL=4.0       # 运行期间 load1 超过此值 → 标记 interference
 
