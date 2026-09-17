@@ -25,9 +25,18 @@ Need-review: yes（每个有行为的里程碑）
 2. 实验 0b：离线 layout 搜索 vs declared-layout 控制。
 3. 引擎骨架：keys（已完成）→ WAL + memtable + `P/` 点读 + 按块提交。
 
+## 勘误（2026-09-17）：实验 0a 数据污染
+
+作者告知测量期间机器在跑渲染负载。`evidence/analysis.md` 已标记污染：
+绝对常量作废，"设备尾 p99 ≈ 10× 均值"结论最可疑（渲染争用即典型尾延迟来源），
+相对方向降级为假设。`docs/engine.md` 的 16 KB 页默认改为 provisional。
+
+**方法论守卫（永久）：基准脚本必须记录运行期间的 `/proc/loadavg` 与 iostat 采样，
+负载超阈值则结果标记 contaminated，不进校准。空闲后重跑 experiment 0a-redo。**
+
 ## Acceptance criteria
 
-1. 实验 0a 数据可复现（fio 命令 + JSON 在 evidence/）。
+1. 实验 0a 数据可复现（fio 命令 + JSON 在 evidence/）——**需在空闲机器上重跑（0a-redo），且带负载守卫**。
 2. 键空间编码有属性测试（排序不变量、roundtrip、非法名拒绝）。
 3. `cargo test` 全绿；harness 生成器可产出确定性 trace（同 seed 同字节）。
 
