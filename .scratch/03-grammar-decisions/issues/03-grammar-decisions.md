@@ -125,6 +125,10 @@ The items were recorded inline in `contracts.md`, which pushed that file past it
 
 块内执行顺序：op 按列表序应用（同字段后写覆盖先写）；约束校验只看终态，与顺序无关。引用语境下的反向穿透用 `$via` 表达。
 
+## Addendum 5: 请求参数对象（实现时发现的缺口，2026-09-17）
+
+实现 trace 生成器时发现：示例里的 `$sku`、`$email`、`$qty` 是客户端参数，但契约从未定义它们住在哪里。补上：**请求顶层增加 `params` 对象**；`$name` 引用 `params[name]`，`$block.field` 引用块结果，块内 `as:` 引用同块兄弟输出。三种 `$` 来源在语法层面可区分，normalizer 的模式键只含形状不含 params 值（模板/实例分离，与既有决定一致）。
+
 ## Not in scope
 
 Re-running the language review. This ticket resolves the findings it produced.

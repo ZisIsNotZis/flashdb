@@ -1,0 +1,8 @@
+[project]
+name = "flashdb-harness"
+version = "0.1.0"
+description = "flashdb workload generator / trace / replay harness"
+requires-python = ">=3.12"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
