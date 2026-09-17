@@ -136,6 +136,14 @@ pub fn decode_primary(key: &[u8]) -> Option<(&[u8], u64, u64)> {
     Some((entity, handle, csn))
 }
 
+/// 从任意键尾解出 CSN（所有键都以 `~csn` 结尾，故与实体/字段名无关）。
+pub fn key_csn(key: &[u8]) -> Option<u64> {
+    if key.len() < 8 {
+        return None;
+    }
+    Some(!u64::from_be_bytes(key[key.len() - 8..].try_into().ok()?))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
