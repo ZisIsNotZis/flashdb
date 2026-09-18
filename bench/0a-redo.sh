@@ -1,36 +1,40 @@
 #!/usr/bin/env bash
-# 实验 0a-redo：带负载守卫的设备微基准。
+# 实验 0a-redo：分级负载守卫的设备微基准。
 #
-# 行为：等待 CPU 空闲窗口（连续采样 idle ≥ 85%），然后运行 fio 套件，
-# 全程每秒采样 /proc/loadavg 与 /proc/stat，结束后依据采样数据把本轮
-# 判定为 clean 或 contaminated。判定、采样日志与 fio JSON 全部落盘。
+# 两级窗口：
+#   clean        — 连续 3 采样 idle ≥ 85%（理想条件，可作校准输入）
+#   reduced-load — 连续 4 采样 idle ≥ 50%（次优条件，结果标注为参考值）
 #
-# 退出码：0 = 完成且有判定；42 = 等待超时未获空闲窗口。
+# 运行期间每秒采样 loadavg/idle 写入 CSV；结束后按运行期最大 load1 与
+# 等级综合判定 clean / reduced-load / interference_detected。
+#
+# 退出码：0 = 完成且有判定；42 = 等待超时未获任何窗口。
 set -u
 
 BENCH_DIR=/home/z/hf/flashdb-bench
 EV=/home/z/vibe/flashdb/.scratch/05-engine-v0/evidence/0a-redo
-IDLE_NEED=85        # 要求的 cpu idle %
-CONSEC=3            # 需连续命中的采样数
+STRICT=85
+FALLBACK=50
+CONSEC=3
+FB_CONSEC=4
 SAMPLE_SEC=5
-WAIT_LIMIT=${WAIT_LIMIT:-7200}   # 可用环境变量覆盖
+WAIT_LIMIT=${WAIT_LIMIT:-86400}   # 默认 24h，可用环境变量覆盖
 RUN_SEC=15
-LOAD_CEIL=4.0       # 运行期间 load1 超过此值 → 标记 interference
+LOAD_CEIL=4.0
 
 mkdir -p "$EV"
 
 read_cpu() {
-    # → "busy idle"（jiffies）
     read -r _ u n s i w q sq st _ < /proc/stat
     echo $((u + n + s + q + sq + st)) $((i + w))
 }
 
 log() { echo "$(date -Is) $*" | tee -a "$EV/run.log"; }
 
-# ---------- 1. 等待空闲窗口 ----------
-log "waiting for idle window (idle>=${IDLE_NEED}% x${CONSEC}, sample=${SAMPLE_SEC}s, limit=${WAIT_LIMIT}s)"
+# ---------- 1. 等待窗口（分级） ----------
+log "waiting: strict(>=${STRICT}% x${CONSEC}) preferred, fallback(>=${FALLBACK}% x${FB_CONSEC}), limit=${WAIT_LIMIT}s"
 prev=$(read_cpu)
-consec=0
+strict_n=0; fb_n=0; mode=""
 t0=$(date +%s)
 while :; do
     sleep "$SAMPLE_SEC"
@@ -42,17 +46,21 @@ while :; do
     [ "$dt" -le 0 ] && continue
     idle=$(( (ci - pi) * 100 / dt ))
     log "wait: idle=${idle}%"
-    if [ "$idle" -ge "$IDLE_NEED" ]; then
-        consec=$((consec + 1))
-        [ "$consec" -ge "$CONSEC" ] && { log "idle window acquired"; break; }
+    if [ "$idle" -ge "$STRICT" ]; then
+        strict_n=$((strict_n + 1)); fb_n=$((fb_n + 1))
+        if [ "$strict_n" -ge "$CONSEC" ]; then mode="clean"; log "strict window acquired"; break; fi
+    elif [ "$idle" -ge "$FALLBACK" ]; then
+        fb_n=$((fb_n + 1)); strict_n=0
+        if [ "$fb_n" -ge "$FB_CONSEC" ]; then mode="reduced-load"; log "fallback window acquired"; break; fi
     else
-        consec=0
+        strict_n=0; fb_n=0
     fi
     [ $(( $(date +%s) - t0 )) -ge "$WAIT_LIMIT" ] && {
-        log "GIVE UP: no idle window within ${WAIT_LIMIT}s"; exit 42; }
+        log "GIVE UP: no window within ${WAIT_LIMIT}s"; exit 42; }
 done
+[ -z "$mode" ] && { log "no window"; exit 42; }
 
-# ---------- 2. 启动全程采样器 ----------
+# ---------- 2. 全程采样器 ----------
 SAMPLER="$EV/loadlog.csv"
 echo "ts,load1,idle_pct" > "$SAMPLER"
 ( while :; do
@@ -65,11 +73,9 @@ echo "ts,load1,idle_pct" > "$SAMPLER"
     echo "$(date -Is),$l,$idle" >> "$SAMPLER"
   done ) &
 SAMPLER_PID=$!
+trap 'kill "$SAMPLER_PID" 2>/dev/null || true' EXIT
 
-cleanup() { kill "$SAMPLER_PID" 2>/dev/null || true; }
-trap cleanup EXIT
-
-# ---------- 3. 预分配测试文件 ----------
+# ---------- 3. 测试文件 ----------
 if [ ! -f "$BENCH_DIR/f.8g" ]; then
     mkdir -p "$BENCH_DIR"
     fio --name=prep --filename="$BENCH_DIR/f.8g" --size=8G --rw=write \
@@ -95,12 +101,12 @@ run_fio seq    read     1048576 8  libaio
 # ---------- 5. 判定 ----------
 kill "$SAMPLER_PID" 2>/dev/null; wait "$SAMPLER_PID" 2>/dev/null || true
 max_load=$(awk -F, 'NR>1 && $2+0>m {m=$2+0} END{print m}' "$SAMPLER")
-verdict=clean
-awk -F, 'NR>1 && $2+0>4.0 {bad=1} END{exit !bad}' "$SAMPLER" && verdict=interference_detected
+verdict="$mode"
+awk -F, 'NR>1 && $2+0>4.0 {bad=1} END{exit !bad}' "$SAMPLER" && verdict="interference_detected"
 
-python3 - "$EV" "$verdict" "$max_load" <<'PY'
-import json, sys, os
-ev, verdict, max_load = sys.argv[1], sys.argv[2], float(sys.argv[3])
+python3 - "$EV" "$verdict" "$max_load" "$mode" <<'PY'
+import json, sys
+ev, verdict, max_load, mode = sys.argv[1], sys.argv[2], float(sys.argv[3]), sys.argv[4]
 def lat(name):
     j = json.load(open(f"{ev}/fio-{name}.json"))["jobs"][0]["read"]
     p = j["clat_ns"]["percentile"]
@@ -109,8 +115,12 @@ def lat(name):
             "p99_us": round(p.get("99.000000", 0)/1000, 1)}
 out = {
   "experiment": "0a-redo",
+  "window_mode": mode,
   "verdict": verdict,
   "max_load1_during_run": max_load,
+  "note": ("ideal window; usable as calibration input" if verdict == "clean" and mode == "clean"
+           else "fallback window; results are indicative, re-run when truly idle" if verdict == "clean"
+           else "load spike detected during the run; discard"),
   "device": "Colorful CN600 2TB (/home/z/hf, no encryption)",
   "results": {n: lat(f"4k-{n}") for n in ["qd1", "qd8", "qd32", "qd64"]},
   "results_16k": {"qd1": lat("16k-qd1"), "qd32": lat("16k-qd32")},
@@ -120,5 +130,5 @@ out = {
 json.dump(out, open(f"{ev}/summary.json", "w"), indent=1)
 print(json.dumps(out, indent=1))
 PY
-log "verdict=$verdict max_load1=$max_load — done"
-[ "$verdict" = "clean" ]
+log "mode=$mode verdict=$verdict max_load1=$max_load — done"
+[ "$verdict" != "interference_detected" ]
