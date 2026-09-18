@@ -18,6 +18,23 @@ pub const R: u8 = b'R';
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InvalidName;
 
+impl std::fmt::Display for InvalidName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "invalid keyspace name: empty or contains 0x00")
+    }
+}
+
+impl std::error::Error for InvalidName {}
+
+impl From<InvalidName> for std::io::Error {
+    fn from(_: InvalidName) -> Self {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "invalid keyspace name: empty or contains 0x00",
+        )
+    }
+}
+
 /// 拒绝空名称与含 0x00 的名称。
 pub fn check_name(name: &[u8]) -> Result<(), InvalidName> {
     if name.is_empty() || name.contains(&0) {
