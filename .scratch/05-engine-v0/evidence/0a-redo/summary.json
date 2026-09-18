@@ -1,0 +1,50 @@
+{
+ "experiment": "0a-redo",
+ "window_mode": "reduced-load",
+ "verdict": "interference_detected",
+ "max_load1_during_run": 17.13,
+ "note": "load spike detected during the run; discard",
+ "device": "Colorful CN600 2TB (/home/z/hf, no encryption)",
+ "results": {
+  "qd1": {
+   "iops": 1389.6,
+   "mean_us": 717.1,
+   "p99_us": 3784.7
+  },
+  "qd8": {
+   "iops": 50548.1,
+   "mean_us": 153.1,
+   "p99_us": 1876.0
+  },
+  "qd32": {
+   "iops": 205236.9,
+   "mean_us": 152.5,
+   "p99_us": 301.1
+  },
+  "qd64": {
+   "iops": 205336.8,
+   "mean_us": 308.4,
+   "p99_us": 757.8
+  }
+ },
+ "results_16k": {
+  "qd1": {
+   "iops": 7988.3,
+   "mean_us": 124.1,
+   "p99_us": 199.7
+  },
+  "qd32": {
+   "iops": 43626.1,
+   "mean_us": 726.9,
+   "p99_us": 3653.6
+  }
+ },
+ "results_64k": {
+  "qd1": {
+   "iops": 5118.6,
+   "mean_us": 194.1,
+   "p99_us": 995.3
+  }
+ },
+ "seq_bw_MiB_s": 828.1
+}
