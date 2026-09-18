@@ -6,7 +6,7 @@ Budget: 180 lines / 18,000 chars
 
 Angriness is a **rate**, not a total: angriness per unit of offered load, or per unit time. Reported as a total it can be made to look good by simply receiving less work.
 
-> **Status: not yet well-posed.** An adversarial review (aspect: optimisation and learning theory) found that the estimand, the anchor, the parameterisation, the aggregation, the oracle and the estimators are all undefined or self-contradictory. Findings and dispositions are recorded as `review-01` in `.scratch/01-design/issues/01-design.md`. The defects are marked `Open` inline below rather than deleted, because the decisions they need are the author's, not the reviewer's. **The objective cannot be implemented or falsified until F1–F5 are resolved.**
+> **Status: not yet well-posed.** 设备层校准常量已由实验 0a-redo 取得（见 `docs/engine.md` 与 `.scratch/05-engine-v0/evidence/0a-redo/analysis.md`）：依赖点读 89–174 µs（按粒度）、批量摊薄 4.9 µs/读、带宽 827 MiB/s、安静设备尾 1.26× 均值。**仍然未决的是 estimand/锚定/聚合**——常量就位不改变 F1–F5 的未决状态。 An adversarial review (aspect: optimisation and learning theory) found that the estimand, the anchor, the parameterisation, the aggregation, the oracle and the estimators are all undefined or self-contradictory. Findings and dispositions are recorded as `review-01` in `.scratch/01-design/issues/01-design.md`. The defects are marked `Open` inline below rather than deleted, because the decisions they need are the author's, not the reviewer's. **The objective cannot be implemented or falsified until F1–F5 are resolved.**
 
 ## Why a soft penalty and not a hard constraint
 

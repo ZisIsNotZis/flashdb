@@ -1,3 +1,9 @@
+2026-09-19T02:42:10+08:00 waiting: strict(>=85% x3) preferred, fallback(>=50% x4), limit=86400s
+2026-09-19T02:42:15+08:00 wait: idle=72%
+2026-09-19T02:42:20+08:00 wait: idle=74%
+2026-09-19T02:42:25+08:00 wait: idle=73%
+2026-09-19T02:42:30+08:00 wait: idle=78%
+2026-09-19T02:42:30+08:00 fallback window acquired
 {
  "experiment": "0a-redo",
  "window_mode": "reduced-load",
@@ -48,3 +54,4 @@
  },
  "seq_bw_MiB_s": 826.9
 }
+2026-09-19T02:44:32+08:00 mode=reduced-load verdict=reduced-load max_load1=2.74 min_idle=0 — done

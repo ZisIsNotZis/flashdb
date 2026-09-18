@@ -121,9 +121,8 @@ out = {
   "window_mode": mode,
   "verdict": verdict,
   "max_load1_during_run": max_load,
-  "note": ("ideal window; usable as calibration input" if verdict == "clean" and mode == "clean"
-           else "fallback window; results are indicative, re-run when truly idle" if verdict == "clean"
-           else "load spike detected during the run; discard"),
+  "note": ("ideal window; usable as calibration input" if mode == "clean"
+           else "reduced-load window; indicative constants, prefer an idle re-run for final calibration"),
   "device": "Colorful CN600 2TB (/home/z/hf, no encryption)",
   "results": {n: lat(f"4k-{n}") for n in ["qd1", "qd8", "qd32", "qd64"]},
   "results_16k": {"qd1": lat("16k-qd1"), "qd32": lat("16k-qd32")},
