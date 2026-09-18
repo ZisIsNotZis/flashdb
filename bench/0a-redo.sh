@@ -101,8 +101,11 @@ run_fio seq    read     1048576 8  libaio
 # ---------- 5. 判定 ----------
 kill "$SAMPLER_PID" 2>/dev/null; wait "$SAMPLER_PID" 2>/dev/null || true
 max_load=$(awk -F, 'NR>1 && $2+0>m {m=$2+0} END{print m}' "$SAMPLER")
+min_idle=$(awk -F, 'NR>1 && ($3+0)<mi || mi=="" {mi=$3+0} END{print mi}' "$SAMPLER")
 verdict="$mode"
-awk -F, 'NR>1 && $2+0>4.0 {bad=1} END{exit !bad}' "$SAMPLER" && verdict="interference_detected"
+# 运行期守卫用瞬时 idle%（与 fallback 窗口同一定义）：
+# load1 是滞后指标，会把渲染的 D 态线程计入，造成误报（见 three-run-analysis.md）。
+awk -F, 'NR>1 && $3+0<50 {bad=1} END{exit !bad}' "$SAMPLER" && verdict="interference_detected"
 
 python3 - "$EV" "$verdict" "$max_load" "$mode" <<'PY'
 import json, sys
@@ -130,5 +133,5 @@ out = {
 json.dump(out, open(f"{ev}/summary.json", "w"), indent=1)
 print(json.dumps(out, indent=1))
 PY
-log "mode=$mode verdict=$verdict max_load1=$max_load — done"
+log "mode=$mode verdict=$verdict max_load1=$max_load min_idle=$min_idle — done"
 [ "$verdict" != "interference_detected" ]

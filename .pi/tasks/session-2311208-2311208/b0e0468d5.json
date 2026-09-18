@@ -1,0 +1,21 @@
+{
+  "id": "b0e0468d5",
+  "name": "0a-redo watcher v5",
+  "command": "WAIT_LIMIT=86400 bash /home/z/vibe/flashdb/bench/0a-redo.sh",
+  "description": "0a-redo watcher v5: same tiered windows, now targeting the latency-calibration re-run on an idle machine; bandwidth constants already secured",
+  "status": "failed",
+  "outputPath": ".pi/tasks/session-2311208-2311208/b0e0468d5.output",
+  "cwd": "/home/z/vibe/flashdb",
+  "startTime": 1789756737744,
+  "endTime": 1789756880831,
+  "exitCode": 1,
+  "signal": null,
+  "pid": 4062733,
+  "bytesWritten": 1272,
+  "isAgent": false,
+  "error": "Exited with code 1",
+  "notified": true,
+  "notifyOnCompletion": true,
+  "triggerOnCompletion": true,
+  "timeoutSeconds": 172800
+}
