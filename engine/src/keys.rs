@@ -161,6 +161,19 @@ pub fn key_csn(key: &[u8]) -> Option<u64> {
     Some(!u64::from_be_bytes(key[key.len() - 8..].try_into().ok()?))
 }
 
+/// 解析反向引用键：`R | entity | 0 | field | 0 | target(8) | source(8) | ~csn(8)`
+/// → (target, source, csn)。非 R 键或长度不足返回 None。
+pub fn decode_reverse(key: &[u8]) -> Option<(u64, u64, u64)> {
+    if key.first() != Some(&R) || key.len() < 26 {
+        return None;
+    }
+    let body = &key[key.len() - 24..];
+    let target = u64::from_be_bytes(body[..8].try_into().ok()?);
+    let source = u64::from_be_bytes(body[8..16].try_into().ok()?);
+    let csn = !u64::from_be_bytes(body[16..24].try_into().ok()?);
+    Some((target, source, csn))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

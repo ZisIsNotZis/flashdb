@@ -48,6 +48,15 @@ impl Memtable {
         self.get(prefix, u64::MAX).is_some()
     }
 
+    /// 前缀下的全部条目（含版本历史；调用方自行按 CSN 过滤）。
+    pub fn scan(&self, prefix: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
+        self.entries
+            .range(prefix.to_vec()..)
+            .take_while(|(k, _)| k.starts_with(prefix))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
+    }
+
     /// 已有条目数（测试与统计）。
     pub fn len(&self) -> usize {
         self.entries.len()

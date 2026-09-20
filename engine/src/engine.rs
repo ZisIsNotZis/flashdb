@@ -91,6 +91,37 @@ impl Engine {
         self.csn
     }
 
+    /// 反向查找：当前指向 `target` 的全部 source 句柄。
+    /// 按 source 取最新 CSN ≤ snapshot；tombstone（空 value）剔除。
+    pub fn reverse_lookup(
+        &self,
+        entity: &[u8],
+        field: &[u8],
+        target: u64,
+        snapshot: u64,
+    ) -> io::Result<Vec<u64>> {
+        check_name(entity)?;
+        check_name(field)?;
+        let pfx = keys::reverse_prefix(entity, field, target)?;
+        let mut newest: HashMap<u64, (u64, bool)> = HashMap::new();
+        for (key, value) in self.mt.scan(&pfx) {
+            let Some((_, source, csn)) = keys::decode_reverse(&key) else { continue };
+            if csn > snapshot {
+                continue;
+            }
+            let alive = !value.is_empty();
+            match newest.get_mut(&source) {
+                Some(e) if e.0 >= csn => {}
+                _ => {
+                    newest.insert(source, (csn, alive));
+                }
+            }
+        }
+        let mut out: Vec<u64> = newest.into_iter().filter(|(_, (_, a))| *a).map(|(s, _)| s).collect();
+        out.sort();
+        Ok(out)
+    }
+
     /// 快照点读：`snapshot` 取块开始时的 [`Engine::csn`]。
     pub fn get(&self, entity: &[u8], handle: u64, snapshot: u64) -> io::Result<Option<&[u8]>> {
         check_name(entity)?;
@@ -580,6 +611,30 @@ mod tests {
             .unwrap();
         assert!(matches!(out, Outcome::Conflict(_)));
         assert!(get_ok(&e, "Stock", 12).is_none(), "违约块的合法写也必须不存在——overlay 整体丢弃");
+        remove(&p);
+    }
+
+    #[test]
+    fn reverse_lookup_tracks_lifecycle() {
+        let p = tmp("rev.wal");
+        let mut e = Engine::create(&p).unwrap();
+        let ref_op = |source: u64| Op::PutReverse {
+            entity: b"ServiceTicket".to_vec(),
+            field: b"order".to_vec(),
+            target: 101,
+            source,
+        };
+        e.commit_block(b"r1", &[ref_op(201)]).unwrap();
+        e.commit_block(b"r2", &[ref_op(202)]).unwrap();
+        assert_eq!(e.reverse_lookup(b"ServiceTicket", b"order", 101, u64::MAX).unwrap(), vec![201, 202]);
+        // 删除 201 的反向条目 → 202 保留
+        e.commit_block(b"r3", &[Op::DelReverse {
+            entity: b"ServiceTicket".to_vec(), field: b"order".to_vec(),
+            target: 101, source: 201,
+        }]).unwrap();
+        assert_eq!(e.reverse_lookup(b"ServiceTicket", b"order", 101, u64::MAX).unwrap(), vec![202]);
+        // 旧快照仍能看到 201
+        assert_eq!(e.reverse_lookup(b"ServiceTicket", b"order", 101, 2).unwrap(), vec![201, 202]);
         remove(&p);
     }
 
