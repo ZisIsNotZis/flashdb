@@ -1,2 +1,2 @@
-# file=/home/z/hf/flashdb-bench/f.8g size=8589934592 mode=qd32 load1=1.54
-qd32: iops=204947 mean=154.3us p99=299us max=700us (n=96000)
+# file=/home/z/hf/flashdb-bench/f.8g size=8589934592 mode=qd32 load1=4.13
+qd32: iops=203658 mean=154.0us p99=324us max=3810us (n=96000)

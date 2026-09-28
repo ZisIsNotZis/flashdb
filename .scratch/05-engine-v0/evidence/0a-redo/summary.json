@@ -2,49 +2,49 @@
  "experiment": "0a-redo",
  "window_mode": "reduced-load",
  "verdict": "reduced-load",
- "max_load1_during_run": 6.7,
+ "max_load1_during_run": 4.54,
  "note": "reduced-load window; indicative constants, prefer an idle re-run for final calibration",
  "device": "Colorful CN600 2TB (/home/z/hf, no encryption)",
  "results": {
   "qd1": {
-   "iops": 11127.4,
-   "mean_us": 89.2,
-   "p99_us": 112.1
+   "iops": 10300.0,
+   "mean_us": 96.3,
+   "p99_us": 191.5
   },
   "qd8": {
-   "iops": 77589.8,
-   "mean_us": 98.0,
-   "p99_us": 160.8
+   "iops": 75284.4,
+   "mean_us": 101.3,
+   "p99_us": 212.0
   },
   "qd32": {
-   "iops": 205658.4,
-   "mean_us": 152.5,
-   "p99_us": 280.6
+   "iops": 202923.6,
+   "mean_us": 154.1,
+   "p99_us": 321.5
   },
   "qd64": {
-   "iops": 205477.4,
-   "mean_us": 308.1,
-   "p99_us": 733.2
+   "iops": 205095.0,
+   "mean_us": 308.7,
+   "p99_us": 774.1
   }
  },
  "results_16k": {
   "qd1": {
-   "iops": 8963.3,
-   "mean_us": 110.9,
-   "p99_us": 166.9
+   "iops": 8447.2,
+   "mean_us": 117.4,
+   "p99_us": 205.8
   },
   "qd32": {
-   "iops": 53635.6,
-   "mean_us": 589.4,
-   "p99_us": 1515.5
+   "iops": 53469.4,
+   "mean_us": 591.9,
+   "p99_us": 1597.4
   }
  },
  "results_64k": {
   "qd1": {
-   "iops": 5718.7,
-   "mean_us": 174.0,
-   "p99_us": 230.4
+   "iops": 5347.8,
+   "mean_us": 185.8,
+   "p99_us": 301.1
   }
  },
- "seq_bw_MiB_s": 826.9
+ "seq_bw_MiB_s": 831.0
 }

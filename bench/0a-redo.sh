@@ -9,7 +9,7 @@
 # 等级综合判定 clean / reduced-load / interference_detected。
 #
 # 退出码：0 = 完成且有判定；42 = 等待超时未获任何窗口。
-set -u
+set -eu
 
 BENCH_DIR=/home/z/hf/flashdb-bench
 EV=/home/z/vibe/flashdb/.scratch/05-engine-v0/evidence/0a-redo
@@ -76,6 +76,7 @@ SAMPLER_PID=$!
 trap 'kill "$SAMPLER_PID" 2>/dev/null || true' EXIT
 
 # ---------- 3. 测试文件 ----------
+command -v fio >/dev/null 2>&1 || { log "fio missing — cannot run full calibration"; exit 127; }
 if [ ! -f "$BENCH_DIR/f.8g" ]; then
     mkdir -p "$BENCH_DIR"
     fio --name=prep --filename="$BENCH_DIR/f.8g" --size=8G --rw=write \
@@ -83,16 +84,13 @@ if [ ! -f "$BENCH_DIR/f.8g" ]; then
 fi
 
 # ---------- 4. fio 套件 ----------
-if ! command -v fio >/dev/null 2>&1; then
-    log "fio NOT INSTALLED — clearing stale fio JSONs, skipping fio suite (Rust bench still runs)"
-    rm -f "$EV"/fio-*.json
-fi
+rm -f "$EV"/fio-*.json "$EV"/summary.json
 run_fio() { # name rw bs qd engine
-    command -v fio >/dev/null 2>&1 || return 1
     fio --name="$1" --filename="$BENCH_DIR/f.8g" --rw="$2" --bs="$3" \
         --iodepth="$4" --ioengine="$5" --direct=1 --runtime="$RUN_SEC" \
         --time_based=1 --size=8G --output-format=json \
-        --output="$EV/fio-$1.json" >/dev/null 2>&1
+        --output="$EV/fio-$1.json" >/dev/null 2>&1 || { log "fio $1 failed"; exit 1; }
+    [ -s "$EV/fio-$1.json" ] || { log "fio $1 produced no JSON"; exit 1; }
 }
 run_fio 4k-qd1  randread 4096  1  psync
 run_fio 4k-qd8  randread 4096  8  libaio
@@ -115,11 +113,13 @@ fi
 # ---------- 5. 判定 ----------
 kill "$SAMPLER_PID" 2>/dev/null; wait "$SAMPLER_PID" 2>/dev/null || true
 max_load=$(awk -F, 'NR>1 && $2+0>m {m=$2+0} END{print m}' "$SAMPLER")
-min_idle=$(awk -F, 'NR>1 && ($3+0)<mi || mi=="" {mi=$3+0} END{print mi+0}' "$SAMPLER")
+min_idle=$(awk -F, 'NR>1 && NF==3 {if (!seen || $3+0<mi) mi=$3+0; seen=1} END{if (!seen) exit 1; print mi}' "$SAMPLER")
 verdict="$mode"
-# 运行期守卫用瞬时 idle%（与 fallback 窗口同一定义）：
-# load1 是滞后指标，会把渲染的 D 态线程计入，造成误报（见 three-run-analysis.md）。
-awk -F, 'NR>1 && $3+0<50 {bad=1} END{exit !bad}' "$SAMPLER" && verdict="interference_detected"
+# 按整个运行期最低瞬时 idle 重新评级，不能仅凭进入窗口时的等级报 clean。
+# load1 是滞后指标，会把渲染的 D 态线程计入（见 three-run-analysis.md）。
+if [ "$min_idle" -lt 50 ]; then verdict="interference_detected"
+elif [ "$min_idle" -lt 85 ]; then verdict="reduced-load"
+fi
 
 python3 - "$EV" "$verdict" "$max_load" "$mode" <<'PY'
 import json, sys
@@ -135,12 +135,11 @@ out = {
   "window_mode": mode,
   "verdict": verdict,
   "max_load1_during_run": max_load,
-  "note": ("ideal window; usable as calibration input" if mode == "clean"
-           else "reduced-load window; indicative constants, prefer an idle re-run for final calibration"),
+  "note": ("ideal window; usable as calibration input" if verdict == "clean"
+           else "reduced-load run; indicative constants, prefer an idle re-run for final calibration"
+           if verdict == "reduced-load" else "interference detected; discard measurements"),
   "device": "Colorful CN600 2TB (/home/z/hf, no encryption)",
-  "results": ({n: lat(f"4k-{n}") for n in ["qd1", "qd8", "qd32", "qd64"]}
-              if all(os.path.exists(f"{ev}/fio-4k-{n}.json") for n in ["qd1", "qd8", "qd32", "qd64"])
-              else "fio suite not run (fio missing)"),
+  "results": {n: lat(f"4k-{n}") for n in ["qd1", "qd8", "qd32", "qd64"]},
   "results_16k": {"qd1": lat("16k-qd1"), "qd32": lat("16k-qd32")},
   "results_64k": {"qd1": lat("64k-qd1")},
   "seq_bw_MiB_s": round(json.load(open(f"{ev}/fio-seq.json"))["jobs"][0]["read"]["bw_bytes"]/2**20, 1),

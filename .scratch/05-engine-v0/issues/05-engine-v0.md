@@ -36,16 +36,9 @@ Need-review: yes（每个有行为的里程碑）
 
 ## Addendum: 实验 0a-redo 完成（2026-09-28）
 
-守望 v6/v7 完成：reduced-load 窗口（运行期 min_idle 81%、瞬时守卫通过），
-fio + 自研 Rust 基准（O_DIRECT pread）双工具交叉验证。
+2026-09-28 09:15 的 v7 运行里 fio 缺失，脚本误用 09-19 旧 JSON 并退出 0；旧“双工具交叉验证”及“149 µs 为 16K 真成本 / 差额是 syscall 税”的结论**撤销**。脚本现要求 fio 存在，清除旧结果，任何 fio 失败即非零退出。
 
-- **QD32 4K：204,947（Rust）vs 205,658（fio）—— 0.3% 一致**，自研工具与
-  fio 互相验证通过，且 Rust 路径就是引擎将用的真实访问模式。
-- **引擎真实依赖页读 = 149 µs**（含 syscall 路径；fio 设备裸延迟 89–111 µs）。
-- 带宽常量：≥717 MiB/s（负载下）/ 827 MiB/s（近空闲）。
-- 环境事实：断电重启丢失了 fio 安装；`0a-redo.sh` 已加"fio 缺失时清陈旧
-  JSON 并跳过"守卫；Rust 基准零依赖不受影响。
-- 分析：`evidence/0a-redo/nvme-bench-analysis.md`。
+2026-09-28 10:34–10:36 同窗口重新运行：8 个 fio JSON 新生成；reduced-load（133 个采样，最低 idle 57%）；4K QD1 fio/Rust 同为 **96.3 µs**，4K QD32 **202,924/203,658 IOPS**（差约 0.36%）；16K QD1 fio **117.4 µs**，Rust 未测 16K；fio 1M QD8 顺序 **831 MiB/s**。仅供 reduced-load 参考，不冒称 clean-idle。分析：`evidence/0a-redo/nvme-bench-analysis.md`。
 
 ## 2026-09-28 — 唯一索引发布检查缺陷（Agent）
 

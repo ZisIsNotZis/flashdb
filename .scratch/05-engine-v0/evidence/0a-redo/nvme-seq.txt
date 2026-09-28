@@ -1,2 +1,2 @@
-# file=/home/z/hf/flashdb-bench/f.8g size=8589934592 mode=seq load1=6.7
-seq: bw = 716.7 MiB/s
+# file=/home/z/hf/flashdb-bench/f.8g size=8589934592 mode=seq load1=4.13
+seq: bw = 737.2 MiB/s
