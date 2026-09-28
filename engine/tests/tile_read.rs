@@ -283,6 +283,25 @@ fn tile_mutation_after_open_returns_error_in_child_process() {
 }
 
 #[test]
+fn point_read_checks_traversed_records_not_unrelated_later_entries() {
+    let files = Files::new();
+    let mut e = Engine::create(&files.wal).unwrap();
+    e.commit_block(b"one", &[doc(1, b"first"), doc(2, b"second")]).unwrap();
+    e.build_tile(&files.tile, 1).unwrap();
+    let mut bytes = fs::read(&files.tile).unwrap();
+    let first_key = u32::from_le_bytes(bytes[68..72].try_into().unwrap()) as usize;
+    let first_value = u32::from_le_bytes(bytes[72..76].try_into().unwrap()) as usize;
+    let second = 68 + 12 + first_key + first_value;
+    let second_key = u32::from_le_bytes(bytes[second..second + 4].try_into().unwrap()) as usize;
+    bytes[second + 12 + second_key] ^= 1;
+    fs::write(&files.tile, bytes).unwrap();
+    assert_eq!(e.get(b"E", 1, 1).unwrap(), Some(b"first".to_vec()),
+        "point lookup need not verify an unrelated later record");
+    assert_eq!(e.get(b"E", 2, 1).unwrap_err().kind(), ErrorKind::InvalidData,
+        "a traversed corrupt record must fail without process crash");
+}
+
+#[test]
 fn tile_mutation_child() {
     let Ok(wal) = std::env::var("FLASHDB_TILE_CHILD_WAL") else { return };
     let tile = PathBuf::from(std::env::var("FLASHDB_TILE_CHILD_TILE").unwrap());

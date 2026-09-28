@@ -69,8 +69,9 @@ fn header(cutoff: u64, digest: &[u8; 32], count: u64, size: u64) -> [u8; HEADER]
     h
 }
 
-// Positional reads never expose borrowed file-backed bytes; a truncated or changed
-// file yields an I/O error, even if it was valid when opened.
+// Positional reads never expose borrowed file-backed bytes. Truncation and
+// corruption of a record actually traversed yield io::Error, not SIGBUS/panic;
+// an early point lookup does not revalidate unrelated later records.
 fn read_exact_at(file: &File, mut bytes: &mut [u8], mut offset: u64) -> io::Result<()> {
     while !bytes.is_empty() {
         match file.read_at(bytes, offset) {

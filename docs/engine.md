@@ -4,7 +4,7 @@ Budget: 170 lines / 26,000 chars
 
 The storage layer resolves ticket `04-storage-soundness`. Shape chosen: **a log-structured document store** — WAL + memtable + immutable tile files + background compaction. Every mechanism is standard LSM practice; the thesis lives in the key-space layout and the learned policy, not here. This document supersedes the tile/relocation/root-flip ideas recorded in earlier rounds; the decisions it encodes were made to close `review-05`.
 
-Reference scale (v0, cgroup-limited): 200 GB data, 8 GB RAM, one NVMe. Data:RAM ≈ 25:1.
+Reference scale (v0, cgroup-limited): 200 GB data, 8 GB RAM, one NVMe. Data:RAM ≈ 25:1. **Implementation status:** the current prototype has one explicit WAL-retained checksummed tile, safe sequential positional reads, and cross-tier P/U/R merge. It does **not** yet implement the 16 KiB page/directory format, manifest publication, automatic checkpoint, compaction, WAL rotation, bounded RAM or recovery-time targets described below.
 
 ## Key space — one LSM, four prefix families
 
