@@ -9,3 +9,19 @@ build/
 __pycache__/
 *.pyc
 .venv/
+
+# Common local caches and temporary workspaces
+node_modules/
+.pi/
+worktrees/
+.worktrees/
+.DS_Store
+
+# Local secrets, test caches, and generated logs
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.cache/
+.env
+.env.*
+!.env.example
