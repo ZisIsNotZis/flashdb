@@ -137,39 +137,42 @@ impl Engine {
         if let Some(&csn) = self.dedup.get(block_id) {
             return Ok(Outcome::AlreadyCommitted { csn });
         }
-        let csn = self.csn + 1;
+        let csn = self.csn.checked_add(1).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "CSN exhausted"))?;
 
-        // publish 前置检查：本块的 unique 排队彼此也要可见（同块内冲突）。
-        let mut pending: HashMap<Vec<u8>, u64> = HashMap::new();
+        // WAL 之前校验全部键名，避免同步成功后 apply_op 的 unwrap 崩溃。
+        // 唯一前缀包含 handle；按 handle 分组取最新版本，不能让较小 handle
+        // 的 tombstone 遮蔽较大 handle 的活条目。overlay 中同键最后操作胜出。
+        let mut touched: HashMap<Vec<u8>, (Vec<u8>, Vec<u8>, Vec<u8>, HashMap<u64, bool>)> = HashMap::new();
         for op in ops {
-            if let Op::PutUnique { entity, field, value, handle } = op {
-                check_name(entity)?;
-                check_name(field)?;
-                // publish 检查必须对"不含 handle 的唯一前缀"——否则只能看见
-                // 自己的条目，永远查不到别的 handle 占用了这个名字（SS-20 同类洞）。
-                let pfx = keys::unique_prefix(entity, field, value)?;
-                if let Some(h) = self.mt.get(&pfx, u64::MAX) {
-                    if h != handle.to_be_bytes() {
-                        return Ok(Outcome::Conflict(Conflict {
-                            kind: "x_unique",
-                            entity: entity.clone(),
-                            field: field.clone(),
-                            value: value.clone(),
-                        }));
-                    }
+            match op {
+                Op::PutDoc { entity, doc, .. } => {
+                    check_name(entity)?;
+                    if doc.is_empty() { return Err(io::Error::new(io::ErrorKind::InvalidInput, "empty document")); }
                 }
-                // 本块内已排队的同值（不同 handle）→ 冲突
-                if let Some(&h) = pending.get(&pfx) {
-                    if h != *handle {
-                        return Ok(Outcome::Conflict(Conflict {
-                            kind: "x_unique",
-                            entity: entity.clone(),
-                            field: field.clone(),
-                            value: value.clone(),
-                        }));
-                    }
+                Op::DelDoc { entity, .. } => { check_name(entity)?; }
+                Op::PutReverse { entity, field, .. } | Op::DelReverse { entity, field, .. } => {
+                    check_name(entity)?; check_name(field)?;
                 }
-                pending.insert(pfx, *handle);
+                Op::PutUnique { entity, field, value, handle }
+                | Op::DelUnique { entity, field, value, handle } => {
+                    let pfx = keys::unique_prefix(entity, field, value)?;
+                    let entry = touched.entry(pfx).or_insert_with(||
+                        (entity.clone(), field.clone(), value.clone(), HashMap::new()));
+                    entry.3.insert(*handle, matches!(op, Op::PutUnique { .. }));
+                }
+            }
+        }
+        for (pfx, (entity, field, value, overlay)) in touched {
+            let mut live: HashMap<u64, bool> = HashMap::new();
+            for (key, val) in self.mt.scan(&pfx) {
+                if key.len() < pfx.len() + 16 { continue; }
+                let handle = u64::from_be_bytes(key[pfx.len()..pfx.len() + 8].try_into().unwrap());
+                // 键按 handle 升序、每个 handle 内按 CSN 降序排列。
+                live.entry(handle).or_insert(!val.is_empty());
+            }
+            live.extend(overlay);
+            if live.values().filter(|&&alive| alive).take(2).count() > 1 {
+                return Ok(Outcome::Conflict(Conflict { kind: "x_unique", entity, field, value }));
             }
         }
 
@@ -388,6 +391,54 @@ mod tests {
         assert_eq!(out, Outcome::Committed { csn: 1 });
         let doc = get_ok(&e, "Stock", 11).unwrap();
         assert_eq!(doc, br#"{"sku":"P-42","loc":"L1","on_hand":6}"#);
+        remove(&p);
+    }
+
+    #[test]
+    fn unique_tombstone_of_lower_handle_does_not_hide_live_higher_handle() {
+        let p = tmp("unique_tombstone_shadow.wal");
+        let mut e = Engine::create(&p).unwrap();
+        let idx = |handle| Op::PutUnique {
+            entity: b"Customer".to_vec(), field: b"email".to_vec(),
+            value: b"a@x.com".to_vec(), handle,
+        };
+        e.commit_block(b"first", &[idx(1)]).unwrap();
+        e.commit_block(b"remove", &[Op::DelUnique {
+            entity: b"Customer".to_vec(), field: b"email".to_vec(),
+            value: b"a@x.com".to_vec(), handle: 1,
+        }]).unwrap();
+        e.commit_block(b"second", &[idx(2)]).unwrap();
+        assert!(matches!(e.commit_block(b"third", &[idx(3)]).unwrap(), Outcome::Conflict(_)));
+        remove(&p);
+    }
+
+    #[test]
+    fn unique_transfer_and_last_overlay_operation() {
+        let p = tmp("unique_transfer.wal");
+        let mut e = Engine::create(&p).unwrap();
+        let make = |handle| Op::PutUnique {
+            entity: b"Customer".to_vec(), field: b"email".to_vec(),
+            value: b"a@x.com".to_vec(), handle,
+        };
+        e.commit_block(b"first", &[make(1)]).unwrap();
+        let del = Op::DelUnique {
+            entity: b"Customer".to_vec(), field: b"email".to_vec(),
+            value: b"a@x.com".to_vec(), handle: 1,
+        };
+        assert!(matches!(e.commit_block(b"transfer", &[del, make(2)]).unwrap(), Outcome::Committed { .. }));
+        assert!(matches!(e.commit_block(b"third", &[make(3)]).unwrap(), Outcome::Conflict(_)));
+        remove(&p);
+    }
+
+    #[test]
+    fn invalid_name_does_not_append_wal_or_advance_csn() {
+        let p = tmp("invalid_name.wal");
+        let mut e = Engine::create(&p).unwrap();
+        assert!(e.commit_block(b"bad", &[Op::DelDoc { entity: b"bad\0name".to_vec(), handle: 1 }]).is_err());
+        assert_eq!(e.csn(), 0);
+        drop(e);
+        let e = Engine::open(&p).unwrap();
+        assert_eq!(e.csn(), 0);
         remove(&p);
     }
 

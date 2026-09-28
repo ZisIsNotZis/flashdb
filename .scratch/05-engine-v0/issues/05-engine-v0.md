@@ -47,6 +47,10 @@ fio + 自研 Rust 基准（O_DIRECT pread）双工具交叉验证。
   JSON 并跳过"守卫；Rust 基准零依赖不受影响。
 - 分析：`evidence/0a-redo/nvme-bench-analysis.md`。
 
+## 2026-09-28 — 唯一索引发布检查缺陷（Agent）
+
+发现并复现：`U` 前缀按 handle 再按 CSN 排序；原先只读此前缀第一项，低 handle 墓碑会遮蔽较高 handle 的活索引，导致第三个文档可占同一 `x-unique` 值。新增回归测试先失败；修复为按 handle 各取最新版本，再合并块的终态 overlay 检查活 owner 数 ≤1；同块释放并转移允许。所有 Op 的名称在 WAL 写入前验证，避免写入成功后 `unwrap` 崩溃。`cargo test -p flashdb-engine -q` 30/30；`git diff --check -- engine` 通过。Need-review: yes；独立验证工具入参契约矛盾（`provided` 同时要求和禁止 `reason`），暂以新旧行为对照与 scoped self-review 留证，后续复核。
+
 ## Acceptance criteria
 
 1. 实验 0a 数据可复现（fio 命令 + JSON 在 evidence/）——**需在空闲机器上重跑（0a-redo），且带负载守卫**。

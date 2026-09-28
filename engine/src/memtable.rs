@@ -43,11 +43,6 @@ impl Memtable {
         None
     }
 
-    /// 前缀下是否存在任何条目（发布时唯一性检查的糖）。
-    pub fn exists(&self, prefix: &[u8]) -> bool {
-        self.get(prefix, u64::MAX).is_some()
-    }
-
     /// 前缀下的全部条目（含版本历史；调用方自行按 CSN 过滤）。
     pub fn scan(&self, prefix: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
         self.entries
@@ -106,21 +101,6 @@ mod tests {
         m.apply(keys::primary_key(b"Order", 1, 1).unwrap(), b"o".to_vec());
         let stock_pfx = keys::primary_prefix(b"Stock", 1).unwrap();
         assert_eq!(m.get(&stock_pfx, u64::MAX), None);
-    }
-
-    #[test]
-    fn unique_occupancy_follows_latest_state() {
-        let mut m = Memtable::new();
-        let taken = keys::unique_prefix(b"Customer", b"email", b"a@x.com").unwrap();
-        let free = keys::unique_prefix(b"Customer", b"email", b"free@x.com").unwrap();
-        m.apply(keys::unique_key(b"Customer", b"email", b"a@x.com", 9, 1).unwrap(), b"h1".to_vec());
-        assert!(m.exists(&taken), "publish 检查：已占用");
-        assert!(!m.exists(&free));
-        // 同一 email 被删除后 → 释放
-        let mut m2 = Memtable::new();
-        m2.apply(keys::unique_key(b"Customer", b"email", b"a@x.com", 9, 1).unwrap(), b"h1".to_vec());
-        m2.apply(keys::unique_key(b"Customer", b"email", b"a@x.com", 9, 2).unwrap(), Vec::new());
-        assert!(!m2.exists(&taken), "tombstone 后唯一性释放");
     }
 
     #[test]

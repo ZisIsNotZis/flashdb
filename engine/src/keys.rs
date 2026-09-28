@@ -77,8 +77,8 @@ pub fn primary_prefix(entity: &[u8], handle: u64) -> Result<Vec<u8>, InvalidName
 
 /// 唯一索引键：`U | entity | 0 | field | 0 | len(4 BE) | value | handle(8 BE) | ~csn(8 BE)`
 ///
-/// 存在性检查 = 对 `unique_prefix` 做前缀扫（至多一个当前条目，由引擎在
-/// publish 时强制）；值非唯一字段进不了这个前缀。
+/// 占用检查需遍历此前缀，**按 handle 分组取最新版本**并忽略 tombstone；
+/// 不能对整个前缀只读第一条（较小 handle 的墓碑会遮蔽较大 handle 的活条目）。
 pub fn unique_key(
     entity: &[u8],
     field: &[u8],
