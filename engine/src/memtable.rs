@@ -43,13 +43,18 @@ impl Memtable {
         None
     }
 
-    /// 前缀下的全部条目（含版本历史；调用方自行按 CSN 过滤）。
-    pub fn scan(&self, prefix: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
+    /// Borrowed prefix traversal (including all historical versions). The iterator
+    /// borrows both the memtable and prefix for its lifetime; callers filter CSNs.
+    pub fn scan_iter<'a>(&'a self, prefix: &'a [u8]) -> impl Iterator<Item = (&'a [u8], &'a [u8])> + 'a {
         self.entries
             .range(prefix.to_vec()..)
-            .take_while(|(k, _)| k.starts_with(prefix))
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect()
+            .take_while(move |(k, _)| k.starts_with(prefix))
+            .map(|(k, v)| (k.as_slice(), v.as_slice()))
+    }
+
+    /// 前缀下的全部条目（含版本历史；调用方自行按 CSN 过滤）。
+    pub fn scan(&self, prefix: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
+        self.scan_iter(prefix).map(|(k, v)| (k.to_vec(), v.to_vec())).collect()
     }
 
     /// 已有条目数（测试与统计）。

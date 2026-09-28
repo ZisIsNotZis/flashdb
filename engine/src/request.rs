@@ -1,4 +1,4 @@
-//! Deliberately narrow inventory `order_flow` adapter, not a general request grammar.
+//! Deliberately narrow inventory generator adapter, not a general request grammar.
 //!
 //! Catalog for this slice: Stock has unique (sku,loc) via `sku_loc` (JSON array
 //! encoding), Customer has unique email; StockMovement has unique movement_no and
@@ -184,6 +184,130 @@ fn lookup(engine: &Engine, catalog: &Catalog, key: &[u8]) -> io::Result<Option<(
         .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "dangling unique index"))?;
     let row: Value = serde_json::from_slice(doc).map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?;
     Ok(Some((handle, row)))
+}
+
+fn document_row(bytes: &[u8], entity: &str) -> io::Result<Value> {
+    let row: Value = serde_json::from_slice(bytes).map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?;
+    if !row.is_object() {
+        return Err(io::Error::new(ErrorKind::InvalidData, format!("{entity} document is not an object")));
+    }
+    Ok(row)
+}
+
+fn read_text<'a>(value: &'a Value, label: &str) -> io::Result<&'a str> {
+    let s = text(value, label)?;
+    if s.starts_with('$') || s.starts_with("-$") {
+        return Err(invalid(format!("unsupported {label} expression")));
+    }
+    Ok(s)
+}
+
+#[derive(Clone, Copy)]
+enum ReadKind { Stock, Customer, Movements }
+
+fn validate_read(req: &Value) -> io::Result<ReadKind> {
+    fields(req, "request", &["id", "class", "blocks"])?;
+    let id = text(&req["id"], "request id")?;
+    if id.len() > 1024 { return Err(invalid("request id too long")); }
+    if serde_json::to_vec(req).map_err(io::Error::other)?.len() > 65536 {
+        return Err(invalid("request exceeds 64 KiB"));
+    }
+    fields(&req["blocks"], "blocks", &["q"])?;
+    let q = &req["blocks"]["q"];
+    let kind = if q.get("get").is_some() {
+        fields(q, "stock block", &["get"])?;
+        fields(&q["get"], "get", &["Stock"])?;
+        fields(&q["get"]["Stock"], "Stock lookup", &["where"])?;
+        fields(&q["get"]["Stock"]["where"], "Stock where", &["sku", "loc"])?;
+        read_text(&q["get"]["Stock"]["where"]["sku"], "sku")?;
+        read_text(&q["get"]["Stock"]["where"]["loc"], "loc")?;
+        ReadKind::Stock
+    } else {
+        fields(q, "find block", &["find"])?;
+        let find = object(&q["find"], "find")?;
+        if find.contains_key("Customer") {
+            fields(&q["find"], "find", &["Customer"])?;
+            fields(&q["find"]["Customer"], "Customer lookup", &["email"])?;
+            read_text(&q["find"]["Customer"]["email"], "email")?;
+            ReadKind::Customer
+        } else {
+            fields(&q["find"], "find", &["StockMovement"])?;
+            fields(&q["find"]["StockMovement"], "StockMovement scan", &["where", "order", "limit"])?;
+            let scan = &q["find"]["StockMovement"];
+            fields(&scan["where"], "StockMovement where", &["order_no"])?;
+            read_text(&scan["where"]["order_no"], "order_no")?;
+            require(&scan["order"], json!(["movement_no"]), "movement order")?;
+            require(&scan["limit"], json!(100), "movement limit")?;
+            ReadKind::Movements
+        }
+    };
+    let class = &req["class"];
+    match kind {
+        ReadKind::Stock => fields(class, "class", &["durability", "max_staleness"])?,
+        ReadKind::Customer => fields(class, "class", &["durability"])?,
+        ReadKind::Movements => fields(class, "class", &["durability", "max_staleness"])?,
+    }
+    require(&class["durability"], json!("batched"), "durability")?;
+    match kind {
+        ReadKind::Stock => require(&class["max_staleness"], json!(2), "max_staleness")?,
+        ReadKind::Movements => require(&class["max_staleness"], json!(5), "max_staleness")?,
+        ReadKind::Customer => {},
+    }
+    Ok(kind)
+}
+
+/// Dispatch only the four inventory templates emitted by the v0 generator.
+/// Read blocks observe one current CSN and never publish or journal results.
+/// Movement scans traverse the P prefix (not a unique order_no index), retain
+/// only the first 100 matching rows ordered by (movement_no, handle), and may
+/// still cost a full entity scan. No concurrent isolation or read replay claim.
+pub fn execute_request(engine: &mut Engine, req: &Value) -> io::Result<RequestResult> {
+    if req.get("blocks").and_then(Value::as_object)
+        .is_some_and(|blocks| blocks.contains_key("cust") && blocks.contains_key("take")) {
+        return execute_order_flow(engine, req);
+    }
+    let kind = validate_read(req)?;
+    let snapshot = engine.csn();
+    let row = match kind {
+        ReadKind::Stock => {
+            let where_ = &req["blocks"]["q"]["get"]["Stock"]["where"];
+            let sku = where_["sku"].as_str().unwrap();
+            let loc = where_["loc"].as_str().unwrap();
+            let match_ = lookup(engine, &STOCK, &stock_key(sku, loc))?;
+            match match_ {
+                Some((_, row)) if row["sku"] == sku && row["loc"] == loc => Some(row),
+                Some(_) => return Err(io::Error::new(ErrorKind::InvalidData, "Stock U/P disagreement")),
+                None => None,
+            }
+        }
+        ReadKind::Customer => {
+            let email = req["blocks"]["q"]["find"]["Customer"]["email"].as_str().unwrap();
+            let match_ = lookup(engine, &CUSTOMER, email.as_bytes())?;
+            match match_ {
+                Some((_, row)) if row["email"] == email => Some(row),
+                Some(_) => return Err(io::Error::new(ErrorKind::InvalidData, "Customer U/P disagreement")),
+                None => None,
+            }
+        }
+        ReadKind::Movements => {
+            let order_no = req["blocks"]["q"]["find"]["StockMovement"]["where"]["order_no"].as_str().unwrap();
+            let mut rows = BTreeMap::new();
+            engine.scan_primary(MOVEMENT.entity.as_bytes(), snapshot, |handle, doc| {
+                let row = document_row(doc, MOVEMENT.entity)?;
+                let actual_order = row["order_no"].as_str()
+                    .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "StockMovement.order_no is not a string"))?;
+                let movement_no = row["movement_no"].as_str()
+                    .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "StockMovement.movement_no is not a string"))?;
+                if actual_order == order_no {
+                    rows.insert((movement_no.to_owned(), handle), row);
+                    if rows.len() > 100 { rows.pop_last(); }
+                }
+                Ok(())
+            })?;
+            if rows.is_empty() { None } else { Some(Value::Array(rows.into_values().collect())) }
+        }
+    };
+    Ok(BTreeMap::from([("q".into(), result(if row.is_some() { "ok" } else { "empty" }, None, row))]))
 }
 
 fn unique(catalog: &Catalog, value: Vec<u8>, handle: u64) -> Op {

@@ -174,6 +174,36 @@ impl Engine {
         Ok(self.mt.get(&pfx, snapshot))
     }
 
+    /// Visit each live primary document once at a CSN snapshot. The scan walks
+    /// the whole entity prefix (including historical versions); callers must
+    /// bound their returned rows separately when filtering or ordering results.
+    pub fn scan_primary(
+        &self,
+        entity: &[u8],
+        snapshot: u64,
+        mut visit: impl FnMut(u64, &[u8]) -> io::Result<()>,
+    ) -> io::Result<()> {
+        check_name(entity)?;
+        let mut prefix = keys::primary_prefix(entity, 0)?;
+        prefix.truncate(prefix.len() - 8);
+        let mut last_handle = None;
+        for (key, value) in self.mt.scan_iter(&prefix) {
+            let (key_entity, handle, csn) = keys::decode_primary(key)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "malformed primary key"))?;
+            if key_entity != entity {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "primary entity mismatch"));
+            }
+            if csn > snapshot || last_handle == Some(handle) {
+                continue;
+            }
+            last_handle = Some(handle);
+            if !value.is_empty() {
+                visit(handle, &value)?;
+            }
+        }
+        Ok(())
+    }
+
     /// 原子提交一个块。唯一约束冲突 → `Outcome::Conflict`（未写 WAL，调用方直接报业务错误）。
     pub fn commit_block(&mut self, block_id: &[u8], ops: &[Op]) -> io::Result<Outcome> {
         if block_id.is_empty() {
