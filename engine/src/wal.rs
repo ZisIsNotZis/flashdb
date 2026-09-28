@@ -4,8 +4,8 @@
 //!
 //! 恢复规则（SS-01 的机制落点）：
 //!
-//! - 顺序扫描；记录长度非法 / 载荷校验失败 / 文件截断 → 停在最后一条完整记录，
-//!   其后视为撕裂尾；
+//! - 顺序扫描；不完整头/载荷视为撕裂尾；**完整**坏长度或 CRC 错误则
+//!   拒绝恢复，避免把可能已确认的损坏记录当作可丢弃尾部；
 //! - 全零头部（预分配但从未写过的区域）视作日志尾；
 //! - 空载荷不合法（一条提交记录最少含块标识），写入即拒绝——否则全零区域会被
 //!   解析成合法的空记录；
@@ -146,7 +146,8 @@ impl Wal {
 }
 
 /// 顺序扫描 WAL，返回（完整记录, 有效字节数）。
-/// 撕裂尾、校验失败、全零区域：静默停止——它们之后的字节从不是已承认的提交。
+/// 不完整尾和全零区域停止；完整帧 CRC/长度损坏时失败并保留原文件。
+/// 不完整尾仍无法与外部截断的已确认数据区分；不要据此声称抗任意介质损坏。
 pub fn replay(path: impl AsRef<Path>) -> io::Result<(Vec<Vec<u8>>, u64)> {
     let file = File::open(path.as_ref())?;
     let mut r = BufReader::with_capacity(1 << 16, file);
@@ -160,8 +161,11 @@ pub fn replay(path: impl AsRef<Path>) -> io::Result<(Vec<Vec<u8>>, u64)> {
             Err(e) => return Err(e),
         }
         let len = u32::from_le_bytes(header[..4].try_into().unwrap()) as usize;
-        if len == 0 || len > MAX_RECORD {
-            break; // 全零（预分配未写）或垃圾长度 → 日志尾
+        if len == 0 {
+            break; // 全零（预分配未写）→ 日志尾
+        }
+        if len > MAX_RECORD {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "WAL record length exceeds limit"));
         }
         let mut payload = vec![0u8; len];
         match r.read_exact(&mut payload) {
@@ -170,7 +174,9 @@ pub fn replay(path: impl AsRef<Path>) -> io::Result<(Vec<Vec<u8>>, u64)> {
             Err(e) => return Err(e),
         }
         if crc32c(&payload) != u32::from_le_bytes(header[4..].try_into().unwrap()) {
-            break; // 撕裂或损坏 → 尾
+            // A complete bad frame might be an acknowledged record corrupted
+            // after sync. Never silently truncate it as an unacknowledged tail.
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "WAL record CRC mismatch"));
         }
         records.push(payload);
         valid += (HEADER + len) as u64;
@@ -248,20 +254,39 @@ mod tests {
     }
 
     #[test]
-    fn corrupted_payload_stops_replay() {
+    fn complete_corrupt_frame_fails_closed_without_truncation() {
         let p = tmp("corrupt.wal");
         let mut w = Wal::create(&p).unwrap();
         w.append(b"one").unwrap();
         w.append(b"two").unwrap();
         w.append(b"three").unwrap();
+        w.sync().unwrap();
         drop(w);
-        // 翻转第三条记录载荷的一个字节
+        // 模拟已确认记录的介质损坏：翻转第三条记录载荷的一个字节
         let mut bytes = fs::read(&p).unwrap();
         let off = bytes.len() - 2;
         bytes[off] ^= 0xFF;
         fs::write(&p, &bytes).unwrap();
-        let (records, _) = replay(&p).unwrap();
-        assert_eq!(records.len(), 2, "crc 损坏必须停在最后一条完整记录");
+        assert_eq!(replay(&p).unwrap_err().kind(), io::ErrorKind::InvalidData);
+        assert_eq!(Wal::open_or_recover(&p).err().unwrap().kind(), io::ErrorKind::InvalidData);
+        assert_eq!(fs::read(&p).unwrap(), bytes, "失败时不得截断原始证据");
+        remove(&p);
+    }
+
+    #[test]
+    fn impossible_nonzero_length_fails_closed() {
+        let p = tmp("bad_length.wal");
+        let mut w = Wal::create(&p).unwrap();
+        w.append(b"acknowledged").unwrap();
+        w.sync().unwrap();
+        drop(w);
+        let mut f = OpenOptions::new().append(true).open(&p).unwrap();
+        f.write_all(&u32::MAX.to_le_bytes()).unwrap();
+        f.write_all(&[0u8; 4]).unwrap();
+        drop(f);
+        let before = fs::read(&p).unwrap();
+        assert_eq!(Wal::open_or_recover(&p).err().unwrap().kind(), io::ErrorKind::InvalidData);
+        assert_eq!(fs::read(&p).unwrap(), before);
         remove(&p);
     }
 

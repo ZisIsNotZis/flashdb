@@ -34,7 +34,7 @@ block executes against snapshot + its own overlay (RAM)
 
 - Exactly **one** durability barrier per commit group, and it is on a log — there is no foreground structure over tiles, so the SS-01 ordering hazard (root durable, tile not) cannot arise. Tiles are written only by background compaction.
 - The memtable is applied **after** the fsync returns: a reader can never see a block whose WAL record is not yet durable.
-- Crash before fsync: torn tail cut at the last valid record (per-record crc32c + length); those blocks were never acked; clients retry. CSN gaps are harmless.
+- Crash before fsync: an **incomplete** WAL tail is cut at the last valid record; the client may retry, while a complete but unacknowledged record may recover and dedup. A complete CRC-bad frame or impossible length fails closed instead of silently truncating possibly acknowledged data. This still does not distinguish externally truncated acknowledged data from an incomplete unacknowledged tail; the current prototype is not yet evidence of power-loss durability. CSN gaps are harmless.
 - `fdatasync` targets the WAL fd only — compaction barriers never delay the foreground (SS-11 resolved).
 - Group commit: flush when the oldest pending block has waited **2 ms** or 128 blocks are pending, whichever first. `durable` class = its own immediate flush.
 
