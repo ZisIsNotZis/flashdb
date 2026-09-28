@@ -4,7 +4,7 @@
 //! 只保证：**一个块的全部变更要么原子发布（获得一个 CSN），要么整体不存在。**
 //!
 //! 提交时序（SS-01）：
-//! 1. publish 前置检查（唯一性，对当前 memtable + 本块已排队 unique）；
+//! 1. publish 前置检查（唯一性，对 memtable + 可选只读 tile + 本块已排队 unique）；
 //! 2. WAL 追加记录 → `fdatasync`（唯一前台屏障）；
 //! 3. 应用到 memtable → 推进 CSN → 应答。
 //!
@@ -14,11 +14,14 @@
 
 use std::collections::HashMap;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+use sha2::{Digest, Sha256};
 
 use crate::keys::{self, check_name};
 use crate::memtable::Memtable;
-use crate::wal::Wal;
+use crate::tile::Tile;
+use crate::wal::{self, Wal};
 
 const MAGIC: &[u8; 4] = b"FDB1";
 
@@ -54,6 +57,8 @@ pub enum Outcome {
 pub struct Engine {
     wal: Wal,
     mt: Memtable,
+    tile: Option<Tile>,
+    wal_path: PathBuf,
     csn: u64,
     dedup: HashMap<Vec<u8>, u64>,
     max_handle: u64,
@@ -63,17 +68,34 @@ impl Engine {
     /// 新建（空库）。
     pub fn create(wal_path: impl AsRef<Path>) -> io::Result<Engine> {
         Ok(Engine {
-            wal: Wal::create(wal_path)?,
+            wal: Wal::create(&wal_path)?,
             mt: Memtable::new(),
+            tile: None,
+            wal_path: wal_path.as_ref().to_path_buf(),
             csn: 0,
             dedup: HashMap::new(),
             max_handle: 0,
         })
     }
 
-    /// 从 WAL 恢复：重放全部记录，重建 memtable / CSN / 幂等表。
+    /// Recover wholly from WAL; does not automatically discover tile candidates.
     pub fn open(wal_path: impl AsRef<Path>) -> io::Result<Engine> {
+        Self::open_impl(wal_path.as_ref(), None)
+    }
+
+    /// Explicit prototype recovery: a missing, corrupt or WAL-mismatched tile fails
+    /// closed. To rebuild from retained WAL, explicitly call `open` instead.
+    pub fn open_with_tile(wal_path: impl AsRef<Path>, tile_path: impl AsRef<Path>) -> io::Result<Engine> {
+        Self::open_impl(wal_path.as_ref(), Some(Tile::open(tile_path.as_ref())?))
+    }
+
+    fn open_impl(wal_path: &Path, tile: Option<Tile>) -> io::Result<Engine> {
         let (wal, records) = Wal::open_or_recover(wal_path)?;
+        if let Some(t) = &tile {
+            if wal_digest(&records, t.cutoff())? != *t.digest() {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "tile WAL prefix mismatch"));
+            }
+        }
         let mut mt = Memtable::new();
         let mut csn = 0u64;
         let mut dedup = HashMap::new();
@@ -81,13 +103,58 @@ impl Engine {
         for payload in &records {
             let (rec_csn, block_id, ops) = decode_payload(payload)?;
             max_handle = max_handle.max(ops.iter().map(op_handle).max().unwrap_or(0));
-            for op in &ops {
-                apply_op(&mut mt, op, rec_csn);
+            if tile.as_ref().is_none_or(|t| rec_csn > t.cutoff()) {
+                for op in &ops { apply_op(&mut mt, op, rec_csn); }
             }
             csn = csn.max(rec_csn);
             dedup.insert(block_id, rec_csn);
         }
-        Ok(Engine { wal, mt, csn, dedup, max_handle })
+        Ok(Engine { wal, mt, tile, wal_path: wal_path.to_path_buf(), csn, dedup, max_handle })
+    }
+
+    /// Build one immutable P/U/R tile containing *all* WAL-published versions at or
+    /// before cutoff. No automatic discovery, checkpoint, manifest or WAL rotation.
+    /// A failed build leaves the serving memtable intact; a successful build evicts
+    /// covered versions only after the file is synced and verified.
+    pub fn build_tile(&mut self, tile_path: impl AsRef<Path>, cutoff: u64) -> io::Result<()> {
+        if self.tile.is_some() || cutoff > self.csn {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "tile already active or cutoff exceeds CSN"));
+        }
+        let (records, _) = wal::replay(&self.wal_path)?;
+        if records.last().map(|r| decode_payload(r).map(|v| v.0)).transpose()? != Some(self.csn) && self.csn != 0 {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "WAL differs from serving state"));
+        }
+        let digest = wal_digest(&records, cutoff)?;
+        let tile = Tile::write(tile_path.as_ref(), cutoff, &digest, &self.mt)?;
+        self.mt.evict_through(cutoff);
+        self.tile = Some(tile);
+        Ok(())
+    }
+
+    /// Prototype inspection hook: proves tile-covered versions are no longer served
+    /// from the memtable (not a bound on WAL recovery or total RAM).
+    pub fn serving_memtable_entries(&self) -> usize { self.mt.len() }
+
+    // Prototype traversal starts at the tile's beginning for each lookup; there is
+    // no page directory or bounded-I/O point-read claim. Entries stay borrowed.
+    fn scan_merged<'a>(&'a self, prefix: &[u8]) -> impl Iterator<Item = (&'a [u8], &'a [u8])> + 'a {
+        let mut mem = self.mt.scan_iter(prefix).peekable();
+        let disk_prefix = prefix.to_vec();
+        let mut disk = self.tile.iter().flat_map(|t| t.entries())
+            .filter(move |(key, _)| key.starts_with(&disk_prefix)).peekable();
+        std::iter::from_fn(move || match (mem.peek(), disk.peek()) {
+            (Some((mk, _)), Some((dk, _))) => {
+                if mk <= dk {
+                    let equal = mk == dk;
+                    let out = mem.next();
+                    if equal { disk.next(); }
+                    out
+                } else { disk.next() }
+            }
+            (Some(_), None) => mem.next(),
+            (None, Some(_)) => disk.next(),
+            (None, None) => None,
+        })
     }
 
     /// 已发布的最新 CSN。新块的快照从这里取。
@@ -125,7 +192,7 @@ impl Engine {
         check_name(field)?;
         let pfx = keys::reverse_prefix(entity, field, target)?;
         let mut newest: HashMap<u64, (u64, bool)> = HashMap::new();
-        for (key, value) in self.mt.scan(&pfx) {
+        for (key, value) in self.scan_merged(&pfx) {
             let Some((_, source, csn)) = keys::decode_reverse(&key) else { continue };
             if csn > snapshot {
                 continue;
@@ -149,7 +216,7 @@ impl Engine {
         let pfx = keys::unique_prefix(entity, field, value)?;
         let mut seen = std::collections::HashSet::new();
         let mut owner = None;
-        for (key, val) in self.mt.scan(&pfx) {
+        for (key, val) in self.scan_merged(&pfx) {
             if key.len() != pfx.len() + 16 {
                 return Err(io::Error::new(io::ErrorKind::InvalidData, "malformed unique key"));
             }
@@ -157,7 +224,7 @@ impl Engine {
             let csn = keys::key_csn(&key).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing CSN"))?;
             if csn > snapshot || !seen.insert(handle) { continue; }
             if val.is_empty() { continue; }
-            if val.as_slice() != handle.to_be_bytes() {
+            if val != handle.to_be_bytes() {
                 return Err(io::Error::new(io::ErrorKind::InvalidData, "unique value disagrees with handle"));
             }
             if owner.replace(handle).is_some() {
@@ -171,7 +238,12 @@ impl Engine {
     pub fn get(&self, entity: &[u8], handle: u64, snapshot: u64) -> io::Result<Option<&[u8]>> {
         check_name(entity)?;
         let pfx = keys::primary_prefix(entity, handle)?;
-        Ok(self.mt.get(&pfx, snapshot))
+        for (key, value) in self.scan_merged(&pfx) {
+            if keys::key_csn(key).is_some_and(|csn| csn <= snapshot) {
+                return Ok(if value.is_empty() { None } else { Some(value) });
+            }
+        }
+        Ok(None)
     }
 
     /// Visit each live primary document once at a CSN snapshot. The scan walks
@@ -187,7 +259,7 @@ impl Engine {
         let mut prefix = keys::primary_prefix(entity, 0)?;
         prefix.truncate(prefix.len() - 8);
         let mut last_handle = None;
-        for (key, value) in self.mt.scan_iter(&prefix) {
+        for (key, value) in self.scan_merged(&prefix) {
             let (key_entity, handle, csn) = keys::decode_primary(key)
                 .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "malformed primary key"))?;
             if key_entity != entity {
@@ -239,7 +311,7 @@ impl Engine {
         }
         for (pfx, (entity, field, value, overlay)) in touched {
             let mut live: HashMap<u64, bool> = HashMap::new();
-            for (key, val) in self.mt.scan(&pfx) {
+            for (key, val) in self.scan_merged(&pfx) {
                 if key.len() < pfx.len() + 16 { continue; }
                 let handle = u64::from_be_bytes(key[pfx.len()..pfx.len() + 8].try_into().unwrap());
                 // 键按 handle 升序、每个 handle 内按 CSN 降序排列。
@@ -263,6 +335,26 @@ impl Engine {
         self.dedup.insert(block_id.to_vec(), csn);
         Ok(Outcome::Committed { csn })
     }
+}
+
+// Bind a tile to the exact WAL prefix which produced it; the WAL remains the only
+// recovery authority. Length delimiters prevent ambiguous concatenation of records.
+fn wal_digest(records: &[Vec<u8>], cutoff: u64) -> io::Result<[u8; 32]> {
+    let mut hash = Sha256::new();
+    let mut last = 0u64;
+    for payload in records {
+        let (csn, _, _) = decode_payload(payload)?;
+        if csn == 0 || csn <= last {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "WAL CSN reordering"));
+        }
+        if csn <= cutoff {
+            hash.update((payload.len() as u64).to_le_bytes());
+            hash.update(payload);
+        }
+        last = csn;
+    }
+    if cutoff > last { return Err(io::Error::new(io::ErrorKind::InvalidData, "tile cutoff exceeds WAL")); }
+    Ok(hash.finalize().into())
 }
 
 // ---------- op → memtable ----------
