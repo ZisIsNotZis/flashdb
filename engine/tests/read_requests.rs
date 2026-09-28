@@ -129,6 +129,27 @@ fn movement_scan_caps_total_retained_bytes() {
 }
 
 #[test]
+fn movement_cap_applies_to_final_top_100_not_evicted_prefix() {
+    let p = path();
+    let mut e = Engine::create(&p).unwrap();
+    let req: Value = serde_json::from_str(MOVEMENTS).unwrap();
+    for n in 0..17 {
+        let row = json!({"order_no":"O00000007", "movement_no":format!("Z{n:03}"), "data":"x".repeat(63 * 1024)});
+        e.commit_block(format!("large-{n}").as_bytes(), &[put("StockMovement", n + 1, &row)]).unwrap();
+    }
+    for n in 0..100 {
+        let row = json!({"order_no":"O00000007", "movement_no":format!("A{n:03}")});
+        e.commit_block(format!("small-{n}").as_bytes(), &[put("StockMovement", n + 18, &row)]).unwrap();
+    }
+    let out = execute_request(&mut e, &req).unwrap();
+    let rows = out["q"].row.as_ref().unwrap().as_array().unwrap();
+    assert_eq!(rows.len(), 100);
+    assert_eq!(rows[0]["movement_no"], "A000");
+    assert_eq!(rows[99]["movement_no"], "A099");
+    std::fs::remove_file(p).unwrap();
+}
+
+#[test]
 fn malformed_shapes_and_invalid_documents_fail_closed_without_read_writes() {
     let p = path();
     let mut e = Engine::create(&p).unwrap();

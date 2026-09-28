@@ -331,12 +331,15 @@ pub fn execute_request(engine: &mut Engine, req: &Value) -> io::Result<RequestRe
                     if rows.len() > 100 {
                         if let Some((_, (_, removed_size))) = rows.pop_last() { retained_bytes -= removed_size; }
                     }
-                    if retained_bytes > MAX_MOVEMENT_RESULT_BYTES {
-                        return Err(io::Error::new(ErrorKind::InvalidData, "movement result exceeds byte cap"));
-                    }
                 }
                 Ok(())
             })?;
+            // Selection may evict earlier, larger rows: enforce the result cap
+            // only on the final ordered top-100. Transient retention stays bounded
+            // by 101 * MAX_MOVEMENT_DOC_BYTES (<6.4 MiB of encoded documents).
+            if retained_bytes > MAX_MOVEMENT_RESULT_BYTES {
+                return Err(io::Error::new(ErrorKind::InvalidData, "movement result exceeds byte cap"));
+            }
             if rows.is_empty() { None } else { Some(Value::Array(rows.into_values().map(|(row, _)| row).collect())) }
         }
     };
