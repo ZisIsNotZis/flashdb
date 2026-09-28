@@ -106,6 +106,12 @@ impl Engine {
         self.dedup.get(block_id).copied()
     }
 
+    /// 请求标识已用于另一意图（包含旧式未携带意图的 block id）时拒绝重放。
+    /// 当前原型的幂等表保留整个 WAL 生命周期；后续须实现保留期限。
+    pub fn request_intent_conflicts(&self, request_prefix: &[u8], intent_prefix: &[u8]) -> bool {
+        self.dedup.keys().any(|id| id.starts_with(request_prefix) && !id.starts_with(intent_prefix))
+    }
+
     /// 反向查找：当前指向 `target` 的全部 source 句柄。
     /// 按 source 取最新 CSN ≤ snapshot；tombstone（空 value）剔除。
     pub fn reverse_lookup(

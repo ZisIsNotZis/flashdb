@@ -71,6 +71,23 @@ fn generator_order_flow_atomic_success_dedup_and_reopen() {
 }
 
 #[test]
+fn same_id_different_payload_must_not_acknowledge_old_commit() {
+    let p = path();
+    let mut engine = Engine::create(&p).unwrap();
+    fixture(&mut engine, 8);
+    let req = request();
+    assert_eq!(execute_order_flow(&mut engine, &req).unwrap()["take"].status, "ok");
+    let mut changed = req;
+    changed["params"]["qty"] = json!(4);
+    assert!(execute_order_flow(&mut engine, &changed).is_err(), "same id but different intent must be rejected");
+    drop(engine);
+    let mut reopened = Engine::open(&p).unwrap();
+    assert!(execute_order_flow(&mut reopened, &changed).is_err(), "recovery must preserve intent check");
+    assert_eq!(reopened.csn(), 2);
+    std::fs::remove_file(p).unwrap();
+}
+
+#[test]
 fn insufficient_stock_only_backorder_and_replay() {
     let p = path();
     let mut engine = Engine::create(&p).unwrap();

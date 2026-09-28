@@ -48,6 +48,12 @@ Need-review: yes（每个有行为的里程碑）
 
 新增 `Engine::unique_lookup`：按 handle 各取快照内最新版本，检查索引 value 与句柄一致；多个活 owner 返回损坏错误，不任意选择。测试覆盖删除、同块转移、历史快照、WAL 恢复，`cargo test -p flashdb-engine -q` 31/31，通过 `git diff --check`。此辅助是请求翻译层唯一 probe 的前置依赖。
 
+## 2026-09-28 — 库存请求适配器（worker → Agent 集成中）
+
+隔离工作树实现 `engine/src/request.rs`，仅支持 harness `order_flow` 的精确 `cust → take` 模板，不声称通用语法。`cf2cd99` 集成后 `cargo test --workspace --offline` 为 31 个单元 + 4 个集成测试全绿；端到端涵盖库存成功扣减并同时写 movement/order、欠库存回退 backorder、反向引用、WAL 恢复。Agent 增加同一请求 ID 不同 payload 的回归：原实现错误确认旧提交，正在修复（本票据后续记录最终 revision）。
+
+限制：读取绑定尚未随 WAL 记载，读块重放不可返回原观察；没有通用读集冲突验证、TTL 幂等保留、通用请求规范化/任意 DAG。使用者不可将此原型当成完整事务接口。独立审查进行中。
+
 ## Acceptance criteria
 
 1. 实验 0a 数据可复现（fio 命令 + JSON 在 evidence/）——**需在空闲机器上重跑（0a-redo），且带负载守卫**。

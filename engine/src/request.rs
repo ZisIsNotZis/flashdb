@@ -64,9 +64,28 @@ fn text<'a>(v: &'a Value, label: &str) -> io::Result<&'a str> {
         .ok_or_else(|| invalid(format!("{label} must be a nonempty string without NUL")))
 }
 
-fn block_id(id: &str, name: &str) -> Vec<u8> {
-    // Length-delimited request id prevents collisions such as (a/b,c) vs (a,b/c).
-    format!("{}:{id}:{name}", id.len()).into_bytes()
+fn request_prefix(id: &str) -> Vec<u8> {
+    // Length-delimited request id prevents prefix collisions between distinct ids.
+    format!("{}:{id}:", id.len()).into_bytes()
+}
+
+fn intent_prefix(req: &Value) -> io::Result<Vec<u8>> {
+    let mut prefix = request_prefix(req["id"].as_str().unwrap());
+    // serde_json's object map is canonically ordered for this prototype. Retain
+    // the complete intent rather than a non-cryptographic hash: no collision can
+    // acknowledge a different payload, and WAL replay reconstructs it verbatim.
+    let payload = serde_json::to_vec(req).map_err(io::Error::other)?;
+    if payload.len() > 65536 { return Err(invalid("request exceeds 64 KiB")); }
+    prefix.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    prefix.extend_from_slice(&payload);
+    prefix.push(0);
+    Ok(prefix)
+}
+
+fn block_id(intent: &[u8], name: &str) -> Vec<u8> {
+    let mut id = intent.to_vec();
+    id.extend_from_slice(name.as_bytes());
+    id
 }
 
 fn read_shape(v: &Value, entity: &str) -> io::Result<()> {
@@ -203,11 +222,15 @@ fn publish(engine: &mut Engine, id: &[u8], ops: &[Op]) -> io::Result<BlockResult
 pub fn execute_order_flow(engine: &mut Engine, req: &Value) -> io::Result<RequestResult> {
     let has_read_fallback = validate(req)?;
     let id = req["id"].as_str().unwrap();
+    let intent = intent_prefix(req)?;
+    if engine.request_intent_conflicts(&request_prefix(id), &intent) {
+        return Err(invalid("request id reused with different payload"));
+    }
     let params = &req["params"];
     let cust = &req["blocks"]["cust"];
     let mut results = BTreeMap::new();
-    let take_id = block_id(id, "take");
-    let else_id = block_id(id, "take/else");
+    let take_id = block_id(&intent, "take");
+    let else_id = block_id(&intent, "take/else");
     // Write replay must not re-evaluate stock or turn a previously committed
     // order into a backorder. The original read row is deliberately unavailable.
     if let Some(csn) = engine.committed_block_csn(&take_id) {
