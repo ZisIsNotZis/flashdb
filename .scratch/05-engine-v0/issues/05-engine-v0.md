@@ -44,6 +44,10 @@ Need-review: yes（每个有行为的里程碑）
 
 发现并复现：`U` 前缀按 handle 再按 CSN 排序；原先只读此前缀第一项，低 handle 墓碑会遮蔽较高 handle 的活索引，导致第三个文档可占同一 `x-unique` 值。新增回归测试先失败；修复为按 handle 各取最新版本，再合并块的终态 overlay 检查活 owner 数 ≤1；同块释放并转移允许。所有 Op 的名称在 WAL 写入前验证，避免写入成功后 `unwrap` 崩溃。`cargo test -p flashdb-engine -q` 30/30；`git diff --check -- engine` 通过。Need-review: yes；独立验证工具入参契约矛盾（`provided` 同时要求和禁止 `reason`），暂以新旧行为对照与 scoped self-review 留证，后续复核。
 
+## 2026-09-28 — 唯一字段读取辅助（Agent）
+
+新增 `Engine::unique_lookup`：按 handle 各取快照内最新版本，检查索引 value 与句柄一致；多个活 owner 返回损坏错误，不任意选择。测试覆盖删除、同块转移、历史快照、WAL 恢复，`cargo test -p flashdb-engine -q` 31/31，通过 `git diff --check`。此辅助是请求翻译层唯一 probe 的前置依赖。
+
 ## Acceptance criteria
 
 1. 实验 0a 数据可复现（fio 命令 + JSON 在 evidence/）——**需在空闲机器上重跑（0a-redo），且带负载守卫**。

@@ -122,6 +122,30 @@ impl Engine {
         Ok(out)
     }
 
+    /// 按已声明唯一字段解析句柄；每个 handle 只采用快照内最新版本。
+    /// 如观察到多个活 owner，则索引已损坏，不能任意选一个。
+    pub fn unique_lookup(&self, entity: &[u8], field: &[u8], value: &[u8], snapshot: u64) -> io::Result<Option<u64>> {
+        let pfx = keys::unique_prefix(entity, field, value)?;
+        let mut seen = std::collections::HashSet::new();
+        let mut owner = None;
+        for (key, val) in self.mt.scan(&pfx) {
+            if key.len() != pfx.len() + 16 {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "malformed unique key"));
+            }
+            let handle = u64::from_be_bytes(key[pfx.len()..pfx.len() + 8].try_into().unwrap());
+            let csn = keys::key_csn(&key).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing CSN"))?;
+            if csn > snapshot || !seen.insert(handle) { continue; }
+            if val.is_empty() { continue; }
+            if val.as_slice() != handle.to_be_bytes() {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "unique value disagrees with handle"));
+            }
+            if owner.replace(handle).is_some() {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "duplicate unique owners"));
+            }
+        }
+        Ok(owner)
+    }
+
     /// 快照点读：`snapshot` 取块开始时的 [`Engine::csn`]。
     pub fn get(&self, entity: &[u8], handle: u64, snapshot: u64) -> io::Result<Option<&[u8]>> {
         check_name(entity)?;
@@ -439,6 +463,27 @@ mod tests {
         drop(e);
         let e = Engine::open(&p).unwrap();
         assert_eq!(e.csn(), 0);
+        remove(&p);
+    }
+
+    #[test]
+    fn unique_lookup_tracks_snapshot_and_reassignment() {
+        let p = tmp("unique_lookup.wal");
+        let mut e = Engine::create(&p).unwrap();
+        let field = b"email";
+        let value = b"a@x.com";
+        let put = |handle| Op::PutUnique { entity: b"Customer".to_vec(), field: field.to_vec(), value: value.to_vec(), handle };
+        let del = |handle| Op::DelUnique { entity: b"Customer".to_vec(), field: field.to_vec(), value: value.to_vec(), handle };
+        assert_eq!(e.unique_lookup(b"Customer", field, value, 0).unwrap(), None);
+        e.commit_block(b"one", &[put(1)]).unwrap();
+        e.commit_block(b"transfer", &[del(1), put(2)]).unwrap();
+        assert_eq!(e.unique_lookup(b"Customer", field, value, 1).unwrap(), Some(1));
+        assert_eq!(e.unique_lookup(b"Customer", field, value, 2).unwrap(), Some(2));
+        e.commit_block(b"delete", &[del(2)]).unwrap();
+        assert_eq!(e.unique_lookup(b"Customer", field, value, 3).unwrap(), None);
+        drop(e);
+        let e = Engine::open(&p).unwrap();
+        assert_eq!(e.unique_lookup(b"Customer", field, value, 2).unwrap(), Some(2));
         remove(&p);
     }
 
