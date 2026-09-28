@@ -62,15 +62,17 @@ pub struct Wal {
 }
 
 impl Wal {
-    /// 新建（截断已有文件）。
+    /// 仅新建：绝不截断已有 WAL；同步父目录使新文件名先于提交可持久。
     pub fn create(path: impl AsRef<Path>) -> io::Result<Wal> {
+        let path = path.as_ref();
         let file = OpenOptions::new()
             .read(true)
             .write(true)
-            .create(true)
-            .truncate(true)
-            .open(path.as_ref())?;
-        Ok(Wal { file, path: path.as_ref().to_path_buf(), valid_len: 0, poisoned: false,
+            .create_new(true)
+            .open(path)?;
+        let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+        File::open(parent)?.sync_all()?;
+        Ok(Wal { file, path: path.to_path_buf(), valid_len: 0, poisoned: false,
             #[cfg(test)] inject_partial_append: false, #[cfg(test)] inject_sync_error: false })
     }
 
@@ -198,6 +200,18 @@ mod tests {
     fn crc32c_matches_known_check_value() {
         assert_eq!(crc32c(b"123456789"), 0xE306_9283);
         assert_eq!(crc32c(b""), 0);
+    }
+
+    #[test]
+    fn create_never_truncates_existing_wal() {
+        let p = tmp("create_new.wal");
+        let mut w = Wal::create(&p).unwrap();
+        w.append(b"acknowledged").unwrap();
+        w.sync().unwrap();
+        drop(w);
+        assert_eq!(Wal::create(&p).err().unwrap().kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(replay(&p).unwrap().0, vec![b"acknowledged".to_vec()]);
+        remove(&p);
     }
 
     #[test]
