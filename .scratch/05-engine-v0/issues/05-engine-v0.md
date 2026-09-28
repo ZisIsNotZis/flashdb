@@ -54,6 +54,10 @@ Need-review: yes（每个有行为的里程碑）
 
 限制：读取绑定尚未随 WAL 记载，读块重放不可返回原观察；没有通用读集冲突验证、TTL 幂等保留、通用请求规范化/任意 DAG。使用者不可将此原型当成完整事务接口。独立审查超时，但尾部结果标记三个 P1：不同 payload 错误重放（已修，回归测试）、唯一冲突误写欠单（此窄适配器以 `WouldBlock` 拒绝，不作为缺货 fallback；通用合同对冲突可触发 else 的表述仍须设计澄清）、过长 WAL 记录提交后恢复丢失（append 写前按 MAX_RECORD 拒绝，回归测试）。保留审查输出在子任务记录；不要把超时当作无发现。
 
+## 2026-09-28 — 独立复审修正（Agent）
+
+Fresh reviewer 针对 `761ee4c..2a8f6c4`（审查材料 741 行）确认先前三项 P1 已修，又发现跨实体同一 `order_no` 可先有 Order 后有 Backorder（反向亦然）；原有 U 前缀只在各实体内独立。适配器现于单写者 `&mut Engine` 边界检查两实体 `order_no`，任一已存在则返回 `AlreadyExists`，不发布另一状态。回归测试覆盖两种顺序与 reopen；`cargo test --workspace --offline -q` 32 单元 + 6 集成通过，`git diff --check` 通过。独立复审此前 verdict BLOCK 对旧 diff 有效；此项修复经 scoped self-review 和回归验证，最终 revision 待下方提交记录。仍待通用契约决定冲突是否进入 `else`；此窄适配器只在库存条件失败时生成欠单。
+
 ## Acceptance criteria
 
 1. 实验 0a 数据可复现（fio 命令 + JSON 在 evidence/）——**需在空闲机器上重跑（0a-redo），且带负载守卫**。

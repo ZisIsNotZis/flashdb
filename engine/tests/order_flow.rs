@@ -127,6 +127,43 @@ fn read_fallback_binds_applied_result_and_missing_customer_skips_write() {
 }
 
 #[test]
+fn order_and_backorder_numbers_are_exclusive_across_requests_and_reopen() {
+    // First a fulfilled order, then an understocked request with the same
+    // business order number but a distinct request id.
+    let p = path();
+    let mut engine = Engine::create(&p).unwrap();
+    fixture(&mut engine, 8);
+    let first = request();
+    execute_order_flow(&mut engine, &first).unwrap();
+    let mut second = request();
+    second["id"] = json!("r-00000002");
+    second["params"]["qty"] = json!(100);
+    let err = execute_order_flow(&mut engine, &second).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+    assert_eq!(engine.csn(), 2);
+    assert_eq!(engine.unique_lookup(b"Backorder", b"order_no", b"O00000001", engine.csn()).unwrap(), None);
+    drop(engine);
+    let mut engine = Engine::open(&p).unwrap();
+    assert_eq!(execute_order_flow(&mut engine, &second).unwrap_err().kind(), std::io::ErrorKind::AlreadyExists);
+    std::fs::remove_file(p).unwrap();
+
+    // Reverse sequence: a backorder followed by a now-fulfillable request.
+    let p = path();
+    let mut engine = Engine::create(&p).unwrap();
+    fixture(&mut engine, 2);
+    execute_order_flow(&mut engine, &first).unwrap();
+    engine.commit_block(b"restock", &[Op::PutDoc { entity: b"Stock".to_vec(), handle: 10,
+        doc: serde_json::to_vec(&json!({"sku":"S000001","loc":"L000","on_hand":10})).unwrap() }]).unwrap();
+    second["params"]["qty"] = json!(1);
+    assert_eq!(execute_order_flow(&mut engine, &second).unwrap_err().kind(), std::io::ErrorKind::AlreadyExists);
+    assert_eq!(engine.unique_lookup(b"Order", b"order_no", b"O00000001", engine.csn()).unwrap(), None);
+    drop(engine);
+    let mut engine = Engine::open(&p).unwrap();
+    assert_eq!(execute_order_flow(&mut engine, &second).unwrap_err().kind(), std::io::ErrorKind::AlreadyExists);
+    std::fs::remove_file(p).unwrap();
+}
+
+#[test]
 fn malformed_or_conflicting_request_cannot_partially_write() {
     let p = path();
     let mut engine = Engine::create(&p).unwrap();
@@ -144,12 +181,13 @@ fn malformed_or_conflicting_request_cannot_partially_write() {
     assert!(execute_order_flow(&mut engine, &req).is_err());
     assert_eq!(engine.csn(), 1);
     // Publish-time unique conflict: stock/movement/order all roll back.
-    engine.commit_block(b"occupied", &[Op::PutUnique {entity:b"Order".to_vec(), field:b"order_no".to_vec(), value:b"O00000001".to_vec(), handle:50}]).unwrap();
+    engine.commit_block(b"occupied", &[Op::PutUnique {entity:b"StockMovement".to_vec(), field:b"movement_no".to_vec(), value:b"M00000001".to_vec(), handle:50}]).unwrap();
     let err = execute_order_flow(&mut engine, &request()).unwrap_err();
     assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
     assert_eq!(engine.csn(), 2);
     assert_eq!(count(&engine), 5);
-    assert_eq!(engine.unique_lookup(b"StockMovement", b"movement_no", b"M00000001", engine.csn()).unwrap(), None);
+    assert_eq!(engine.unique_lookup(b"StockMovement", b"movement_no", b"M00000001", engine.csn()).unwrap(), Some(50));
+    assert_eq!(engine.get(b"StockMovement", 50, engine.csn()).unwrap(), None, "no movement document was published");
     assert_eq!(engine.unique_lookup(b"Backorder", b"order_no", b"O00000001", engine.csn()).unwrap(), None);
     std::fs::remove_file(p).unwrap();
 }

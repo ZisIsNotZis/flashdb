@@ -265,6 +265,16 @@ pub fn execute_order_flow(engine: &mut Engine, req: &Value) -> io::Result<Reques
     };
     results.insert("cust".into(), result("ok", None, Some(customer.clone())));
     bindings.insert("cust".into(), customer);
+    // One logical order must not exist both as a fulfilled Order and a
+    // Backorder. Their entity-local U prefixes cannot enforce this by
+    // themselves; the single-writer &mut Engine boundary serializes the check
+    // with publication in this prototype.
+    let order_no = text(&params["order_no"], "order_no")?;
+    for catalog in [&ORDER, &BACKORDER] {
+        if engine.unique_lookup(catalog.entity.as_bytes(), catalog.unique.as_bytes(), order_no.as_bytes(), engine.csn())?.is_some() {
+            return Err(io::Error::new(ErrorKind::AlreadyExists, "order number already used"));
+        }
+    }
     let sku = text(&params["sku"], "sku")?;
     let loc = text(&params["loc"], "loc")?;
     let qty = params["qty"].as_i64().unwrap();
