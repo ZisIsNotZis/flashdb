@@ -225,6 +225,9 @@ fn read_text<'a>(value: &'a Value, label: &str) -> io::Result<&'a str> {
 #[derive(Clone, Copy)]
 enum ReadKind { Stock, Customer, Movements }
 
+const MAX_MOVEMENT_DOC_BYTES: usize = 64 * 1024;
+const MAX_MOVEMENT_RESULT_BYTES: usize = 1024 * 1024;
+
 fn validate_read(req: &Value) -> io::Result<ReadKind> {
     fields(req, "request", &["id", "class", "blocks"])?;
     let id = text(&req["id"], "request id")?;
@@ -310,19 +313,31 @@ pub fn execute_request(engine: &mut Engine, req: &Value) -> io::Result<RequestRe
         ReadKind::Movements => {
             let order_no = req["blocks"]["q"]["find"]["StockMovement"]["where"]["order_no"].as_str().unwrap();
             let mut rows = BTreeMap::new();
+            let mut retained_bytes = 0usize;
             engine.scan_primary(MOVEMENT.entity.as_bytes(), snapshot, |handle, doc| {
+                if doc.len() > MAX_MOVEMENT_DOC_BYTES {
+                    return Err(io::Error::new(ErrorKind::InvalidData, "movement document exceeds scan byte cap"));
+                }
                 let row = document_row(doc, MOVEMENT.entity)?;
                 let actual_order = row["order_no"].as_str()
                     .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "StockMovement.order_no is not a string"))?;
                 let movement_no = row["movement_no"].as_str()
                     .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "StockMovement.movement_no is not a string"))?;
                 if actual_order == order_no {
-                    rows.insert((movement_no.to_owned(), handle), row);
-                    if rows.len() > 100 { rows.pop_last(); }
+                    if let Some((_, old_size)) = rows.insert((movement_no.to_owned(), handle), (row, doc.len())) {
+                        retained_bytes -= old_size;
+                    }
+                    retained_bytes += doc.len();
+                    if rows.len() > 100 {
+                        if let Some((_, (_, removed_size))) = rows.pop_last() { retained_bytes -= removed_size; }
+                    }
+                    if retained_bytes > MAX_MOVEMENT_RESULT_BYTES {
+                        return Err(io::Error::new(ErrorKind::InvalidData, "movement result exceeds byte cap"));
+                    }
                 }
                 Ok(())
             })?;
-            if rows.is_empty() { None } else { Some(Value::Array(rows.into_values().collect())) }
+            if rows.is_empty() { None } else { Some(Value::Array(rows.into_values().map(|(row, _)| row).collect())) }
         }
     };
     Ok(BTreeMap::from([("q".into(), result(if row.is_some() { "ok" } else { "empty" }, None, row))]))

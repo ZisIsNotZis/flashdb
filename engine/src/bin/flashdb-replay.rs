@@ -17,11 +17,11 @@ struct Output<'a> {
     blocks: &'a flashdb_engine::request::RequestResult,
 }
 
-fn run() -> io::Result<()> {
+fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<_> = std::env::args_os().collect();
     if args.len() != 3 {
         return Err(io::Error::new(io::ErrorKind::InvalidInput,
-            "usage: flashdb-replay <existing-wal> <trace.jsonl>"));
+            "usage: flashdb-replay <existing-wal> <trace.jsonl>").into());
     }
     let mut engine = Engine::open(&args[1])?;
     let trace = BufReader::new(File::open(&args[2])?);

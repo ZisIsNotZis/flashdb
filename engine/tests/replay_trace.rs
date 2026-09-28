@@ -1,5 +1,5 @@
 use flashdb_engine::engine::{Engine, Op};
-use flashdb_engine::replay::replay_jsonl;
+use flashdb_engine::replay::{replay_jsonl, ReplayStage};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, BufReader, Cursor};
@@ -135,17 +135,57 @@ fn mixed_generator_corpus_executes_and_recovers_with_independent_stock_oracle() 
 }
 
 #[test]
+fn repeated_hot_key_depletes_stock_then_backorders_without_movement() {
+    let p = path();
+    let mut e = Engine::create(&p).unwrap();
+    let trace = include_str!("../../harness/tests/fixtures/hot_orders_seed42.jsonl");
+    let first: Value = serde_json::from_str(trace.lines().next().unwrap()).unwrap();
+    let email = first["params"]["email"].as_str().unwrap();
+    let stock = json!({"sku":"S000001","loc":"L000","on_hand":4});
+    e.commit_block(b"hot-bootstrap", &[
+        Op::PutDoc { entity:b"Stock".to_vec(), handle:1, doc:serde_json::to_vec(&stock).unwrap() },
+        Op::PutUnique { entity:b"Stock".to_vec(), field:b"sku_loc".to_vec(), value:serde_json::to_vec(&["S000001","L000"]).unwrap(), handle:1 },
+        Op::PutDoc { entity:b"Customer".to_vec(), handle:2, doc:serde_json::to_vec(&json!({"email":email})).unwrap() },
+        Op::PutUnique { entity:b"Customer".to_vec(), field:b"email".to_vec(), value:email.as_bytes().to_vec(), handle:2 },
+    ]).unwrap();
+    let mut seen = Vec::new();
+    let summary = replay_jsonl(&mut e, Cursor::new(trace.as_bytes()), |_, req, out| {
+        seen.push((req["params"]["order_no"].as_str().unwrap().to_owned(),
+            out["take"].status, out.get("take/else").map(|b| b.status)));
+        Ok(())
+    }).unwrap();
+    assert_eq!(summary.requests, 2);
+    assert_eq!(summary.sha256, "d803afa5bd8cd459abbadb9e9bd707b491c96c2ccdedf372b7a94930e8758855");
+    assert_eq!(seen, vec![("O00000001".into(), "ok", None), ("O00000002".into(), "failed", Some("ok"))]);
+    let stock: Value = serde_json::from_slice(e.get(b"Stock", 1, e.csn()).unwrap().unwrap()).unwrap();
+    assert_eq!(stock["on_hand"], 0);
+    assert!(e.unique_lookup(b"Order", b"order_no", b"O00000001", e.csn()).unwrap().is_some());
+    assert_eq!(e.unique_lookup(b"Order", b"order_no", b"O00000002", e.csn()).unwrap(), None);
+    assert!(e.unique_lookup(b"Backorder", b"order_no", b"O00000002", e.csn()).unwrap().is_some());
+    assert_eq!(e.unique_lookup(b"StockMovement", b"movement_no", b"M00000002", e.csn()).unwrap(), None);
+    drop(e);
+    let mut e = Engine::open(&p).unwrap();
+    let csn = e.csn();
+    replay_jsonl(&mut e, Cursor::new(trace.as_bytes()), |_, _, _| Ok(())).unwrap();
+    assert_eq!(e.csn(), csn);
+    std::fs::remove_file(p).unwrap();
+}
+
+#[test]
 fn malformed_or_partial_trace_stops_at_line_without_claiming_hash() {
     let cases = [
-        (b"{}\n".as_slice(), io::ErrorKind::InvalidInput),
-        (b"not-json\n".as_slice(), io::ErrorKind::InvalidData),
-        (b"{\"id\":1}".as_slice(), io::ErrorKind::InvalidData),
+        (b"{}\n".as_slice(), io::ErrorKind::InvalidInput, ReplayStage::Execute),
+        (b"not-json\n".as_slice(), io::ErrorKind::InvalidData, ReplayStage::Parse),
+        (b"{\"id\":1}".as_slice(), io::ErrorKind::InvalidData, ReplayStage::Parse),
+        (b"{\"id\":\"a\",\"id\":\"b\"}\n".as_slice(), io::ErrorKind::InvalidData, ReplayStage::Parse),
+        (b"{\"blocks\":{\"q\":{\"x\":1,\"x\":2}}}\n".as_slice(), io::ErrorKind::InvalidData, ReplayStage::Parse),
     ];
-    for (input, kind) in cases {
+    for (input, kind, stage) in cases {
         let p = path();
         let mut e = Engine::create(&p).unwrap();
         let err = replay_jsonl(&mut e, Cursor::new(input), |_, _, _| Ok(())).unwrap_err();
         assert_eq!(err.kind(), kind);
+        assert_eq!(err.stage, stage);
         assert!(err.to_string().contains("trace line 1"));
         assert_eq!(e.csn(), 0);
         std::fs::remove_file(p).unwrap();
@@ -155,6 +195,28 @@ fn malformed_or_partial_trace_stops_at_line_without_claiming_hash() {
     let long = vec![b' '; 65_538];
     let err = replay_jsonl(&mut e, Cursor::new(long), |_, _, _| Ok(())).unwrap_err();
     assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    assert_eq!(err.stage, ReplayStage::Parse);
     assert!(err.to_string().contains("trace line 1"));
+    std::fs::remove_file(p).unwrap();
+
+    let p = path();
+    let mut e = Engine::create(&p).unwrap();
+    e.commit_block(b"bad-movement", &[Op::PutDoc {
+        entity:b"StockMovement".to_vec(), handle:1, doc:b"not-json".to_vec(),
+    }]).unwrap();
+    let request = json!({"id":"r1","class":{"durability":"batched","max_staleness":5},
+        "blocks":{"q":{"find":{"StockMovement":{"where":{"order_no":"O1"}},"order":["movement_no"],"limit":100}}}});
+    let input = format!("{}\n", serde_json::to_string(&request).unwrap());
+    let err = replay_jsonl(&mut e, Cursor::new(input.as_bytes()), |_, _, _| Ok(())).unwrap_err();
+    assert_eq!(err.stage, ReplayStage::Execute);
+    assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    let clean = json!({"id":"r2","class":{"durability":"batched"},
+        "blocks":{"q":{"find":{"Customer":{"email":"nobody@example.com"}}}}});
+    let input = format!("{}\n", serde_json::to_string(&clean).unwrap());
+    let err = replay_jsonl(&mut e, Cursor::new(input.as_bytes()), |_, _, _| {
+        Err(io::Error::new(io::ErrorKind::BrokenPipe, "sink closed"))
+    }).unwrap_err();
+    assert_eq!(err.stage, ReplayStage::Output);
+    assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
     std::fs::remove_file(p).unwrap();
 }

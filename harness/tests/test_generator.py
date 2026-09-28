@@ -7,7 +7,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from flashdb_harness.generator import Generator, Zipf, Rng, render
+from flashdb_harness.generator import Generator, Zipf, Rng, render, main
 
 
 def render_bytes(seed: int, n: int = 500) -> bytes:
@@ -53,9 +53,24 @@ def test_order_flow_fixture_matches_generator():
 
 
 def test_mixed_replay_corpus_is_frozen():
-    fixture = (Path(__file__).parent / "fixtures" / "mixed_seed42_20.jsonl").read_text()
-    assert fixture == "".join(line + "\n" for line in render(Generator(42, 20).requests()))
-    assert hashlib.sha256(fixture.encode()).hexdigest() == "929822594483301f5951e98746c60932d7bfd82408780555a231e9d0a28c5264"
+    fixture = (Path(__file__).parent / "fixtures" / "mixed_seed42_20.jsonl").read_bytes()
+    expected = "".join(line + "\n" for line in render(Generator(42, 20).requests())).encode("utf-8")
+    assert fixture == expected
+    assert hashlib.sha256(fixture).hexdigest() == "929822594483301f5951e98746c60932d7bfd82408780555a231e9d0a28c5264"
+
+
+def test_file_output_uses_frozen_lf_bytes(tmp_path):
+    out = tmp_path / "trace.jsonl"
+    assert main(["--seed", "42", "--requests", "20", "--out", str(out)]) == 0
+    assert out.read_bytes() == (Path(__file__).parent / "fixtures" / "mixed_seed42_20.jsonl").read_bytes()
+
+
+def test_hot_order_corpus_is_frozen():
+    g = Generator(42, 2, n_customers=2, n_sku=1, n_loc=1)
+    expected = "".join(line + "\n" for line in render(iter([g.order_flow(), g.order_flow()]))).encode("utf-8")
+    fixture = (Path(__file__).parent / "fixtures" / "hot_orders_seed42.jsonl").read_bytes()
+    assert fixture == expected
+    assert hashlib.sha256(fixture).hexdigest() == "d803afa5bd8cd459abbadb9e9bd707b491c96c2ccdedf372b7a94930e8758855"
 
 
 def test_order_flow_exercises_motivating_case():

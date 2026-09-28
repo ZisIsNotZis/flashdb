@@ -213,9 +213,9 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--locs", type=int, default=8)
     ap.add_argument("--theta", type=float, default=1.0)
     ap.add_argument("--out", default="-")
-    a = ap.parse_args()
+    a = ap.parse_args(argv)
     g = Generator(a.seed, a.requests, a.customers, a.skus, a.locs, a.theta)
-    out = sys.stdout if a.out == "-" else open(a.out, "w", encoding="utf-8")
+    out = sys.stdout if a.out == "-" else open(a.out, "w", encoding="utf-8", newline="\n")
     for line in render(g.requests()):
         out.write(line + "\n")
     if out is not sys.stdout:

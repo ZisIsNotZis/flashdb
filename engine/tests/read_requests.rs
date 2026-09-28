@@ -114,6 +114,21 @@ fn movement_scan_uses_snapshot_primary_versions_tombstones_and_ordered_top_100()
 }
 
 #[test]
+fn movement_scan_caps_total_retained_bytes() {
+    let p = path();
+    let mut e = Engine::create(&p).unwrap();
+    let req: Value = serde_json::from_str(MOVEMENTS).unwrap();
+    for n in 0..60 {
+        let row = json!({"order_no":"O00000007", "movement_no":format!("M{n:03}"), "data":"x".repeat(20_000)});
+        e.commit_block(format!("wide-{n}").as_bytes(), &[put("StockMovement", n + 1, &row)]).unwrap();
+    }
+    let err = execute_request(&mut e, &req).unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::InvalidData);
+    assert!(err.to_string().contains("result exceeds byte cap"));
+    std::fs::remove_file(p).unwrap();
+}
+
+#[test]
 fn malformed_shapes_and_invalid_documents_fail_closed_without_read_writes() {
     let p = path();
     let mut e = Engine::create(&p).unwrap();
@@ -157,6 +172,11 @@ fn malformed_shapes_and_invalid_documents_fail_closed_without_read_writes() {
             value: serde_json::to_vec(&["S004353", "L005"]).unwrap(), handle: 10 },
     ]).unwrap();
     assert_eq!(execute_request(&mut e, &stock).unwrap_err().kind(), ErrorKind::InvalidData);
+    let huge = json!({"order_no":"O00000007", "movement_no":"Mlarge", "data":"x".repeat(65_536)});
+    e.commit_block(b"large-movement", &[put("StockMovement", 100, &huge)]).unwrap();
+    let err = execute_request(&mut e, &scan).unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::InvalidData);
+    assert!(err.to_string().contains("byte cap"));
     drop(e);
     std::fs::remove_file(p).unwrap();
 }
