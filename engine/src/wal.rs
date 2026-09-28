@@ -54,6 +54,11 @@ pub struct Wal {
     #[allow(dead_code)]
     path: PathBuf,
     valid_len: u64,
+    poisoned: bool,
+    #[cfg(test)]
+    inject_partial_append: bool,
+    #[cfg(test)]
+    inject_sync_error: bool,
 }
 
 impl Wal {
@@ -65,7 +70,8 @@ impl Wal {
             .create(true)
             .truncate(true)
             .open(path.as_ref())?;
-        Ok(Wal { file, path: path.as_ref().to_path_buf(), valid_len: 0 })
+        Ok(Wal { file, path: path.as_ref().to_path_buf(), valid_len: 0, poisoned: false,
+            #[cfg(test)] inject_partial_append: false, #[cfg(test)] inject_sync_error: false })
     }
 
     /// 打开已存在的 WAL：扫描到最后的完整记录，截断撕裂尾，定位到文件尾。
@@ -75,11 +81,13 @@ impl Wal {
         let mut file = OpenOptions::new().write(true).open(path.as_ref())?;
         file.set_len(valid_len)?;
         file.seek(SeekFrom::Start(valid_len))?;
-        Ok((Wal { file, path: path.as_ref().to_path_buf(), valid_len }, records))
+        Ok((Wal { file, path: path.as_ref().to_path_buf(), valid_len, poisoned: false,
+            #[cfg(test)] inject_partial_append: false, #[cfg(test)] inject_sync_error: false }, records))
     }
 
     /// 追加一条记录（未持久化；调用方随后 `sync`）。拒绝空载荷和恢复器无法读取的超长载荷。
     pub fn append(&mut self, payload: &[u8]) -> io::Result<()> {
+        self.ensure_writable()?;
         if payload.is_empty() || payload.len() > MAX_RECORD {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "WAL payload length out of bounds"));
         }
@@ -87,14 +95,46 @@ impl Wal {
         frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
         frame.extend_from_slice(&crc32c(payload).to_le_bytes());
         frame.extend_from_slice(payload);
-        self.file.write_all(&frame)?;
+        #[cfg(test)]
+        if self.inject_partial_append {
+            self.inject_partial_append = false;
+            // Reproduce a short frame, then an I/O error. Do not let a later
+            // append go past the invalid tail before recovery truncates it.
+            if let Err(e) = self.file.write_all(&frame[..HEADER + 1]) {
+                self.poisoned = true;
+                return Err(e);
+            }
+            self.poisoned = true;
+            return Err(io::Error::new(io::ErrorKind::Other, "injected partial WAL append"));
+        }
+        if let Err(e) = self.file.write_all(&frame) {
+            self.poisoned = true;
+            return Err(e);
+        }
         self.valid_len += frame.len() as u64;
         Ok(())
     }
 
-    /// `fdatasync`：调用返回后，此前所有 append 的记录对崩溃持久。
-    pub fn sync(&self) -> io::Result<()> {
-        self.file.sync_data()
+    /// `fdatasync`：失败后写者中毒，必须重新打开并重放 WAL 才能继续。
+    pub fn sync(&mut self) -> io::Result<()> {
+        self.ensure_writable()?;
+        #[cfg(test)]
+        if self.inject_sync_error {
+            self.inject_sync_error = false;
+            self.poisoned = true;
+            return Err(io::Error::new(io::ErrorKind::Other, "injected WAL sync failure"));
+        }
+        if let Err(e) = self.file.sync_data() {
+            self.poisoned = true;
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    fn ensure_writable(&self) -> io::Result<()> {
+        if self.poisoned {
+            Err(io::Error::new(io::ErrorKind::Other, "WAL writer poisoned; reopen for recovery"))
+        } else { Ok(()) }
     }
 
     /// 有效字节数（不含撕裂尾）。
@@ -259,6 +299,46 @@ mod tests {
         let mut w = Wal::create(&p).unwrap();
         assert_eq!(w.append(b"").unwrap_err().kind(), io::ErrorKind::InvalidInput);
         assert_eq!(w.valid_len(), 0);
+        remove(&p);
+    }
+
+    #[test]
+    fn partial_append_poison_prevents_later_ack_and_reopen_truncates() {
+        let p = tmp("partial_poison.wal");
+        let mut w = Wal::create(&p).unwrap();
+        w.append(b"good").unwrap();
+        w.sync().unwrap();
+        let good_end = w.valid_len();
+        w.inject_partial_append = true;
+        assert!(w.append(b"bad").is_err());
+        assert_eq!(w.valid_len(), good_end);
+        assert!(w.append(b"later").unwrap_err().to_string().contains("poisoned"));
+        assert!(w.sync().is_err());
+        drop(w);
+        let (mut w, records) = Wal::open_or_recover(&p).unwrap();
+        assert_eq!(records, vec![b"good".to_vec()]);
+        assert_eq!(w.valid_len(), good_end);
+        w.append(b"later").unwrap();
+        w.sync().unwrap();
+        assert_eq!(replay(&p).unwrap().0, vec![b"good".to_vec(), b"later".to_vec()]);
+        remove(&p);
+    }
+
+    #[test]
+    fn sync_failure_poison_requires_recovery_before_more_writes() {
+        let p = tmp("sync_poison.wal");
+        let mut w = Wal::create(&p).unwrap();
+        w.append(b"complete-but-unacked").unwrap();
+        w.inject_sync_error = true;
+        assert!(w.sync().is_err());
+        assert!(w.append(b"must-not-follow").is_err());
+        drop(w);
+        // A full frame may be recovered even if its sync/ack failed; retry
+        // dedup in Engine owns the uncertainty after reopening.
+        let (mut w, records) = Wal::open_or_recover(&p).unwrap();
+        assert_eq!(records, vec![b"complete-but-unacked".to_vec()]);
+        w.append(b"after-recovery").unwrap();
+        w.sync().unwrap();
         remove(&p);
     }
 
