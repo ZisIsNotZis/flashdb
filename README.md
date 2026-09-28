@@ -1,42 +1,42 @@
 # flashdb
 
-A relational store for single-node, IO-bound workloads whose **physical layout is learned from the workload rather than declared**.
+Experimental single-node document store for IO-bound workloads. Its research goal is to learn physical layout from workload traces rather than require users to declare a layout. **The learned-layout engine is not implemented yet.**
 
-Status: **design only.** Nothing is implemented. The repository currently contains contracts and the decision record behind them.
+## Current state
 
-## What it is meant to be, in one paragraph
+- Rust prototype: versioned P/U/R keys, WAL with CRC and torn-tail recovery, memtable snapshots, per-block atomic commit, unique-value enforcement and reverse lookup. This is an in-memory index backed by a WAL, **not** a complete LSM: no tile files, compaction, manifest, or general request executor yet.
+- Python harness: deterministic inventory request generator (SplitMix64, integer Zipf), with a JSONL trace shape.
+- Device calibration: `bench/0a-redo.sh` runs fio and a Rust `O_DIRECT read_at` microbenchmark under a CPU-idle guard. The latest measurements are *reduced-load references*, not clean-idle calibration; see `.scratch/05-engine-v0/evidence/0a-redo/nvme-bench-analysis.md`.
+- Design and open decisions are recorded in `docs/` and `.scratch/`. The proposed request contract is broader than the implemented prototype and is not yet a production API.
 
-**Nothing below is built; this is the design, stated in the present tense of intent.** Storage is tiled — not rows, not columns — and every tile's arrangement *would be* chosen by a per-tile learned policy and drift continuously. No layout is ever guaranteed to a user; every intermediate state must be fully servable, so layout never needs a migration project. A single scalar objective (angriness) is intended to price every decision — layout, reorganization timing, promotion tier, speculation, compilation, advice — through one calibrated cost model. Requests are structured trees, not SQL text, with a canonicity rule that makes one intent expressible one way, because the request is also the unit of learning and of attribution.
+## Run the existing tests
 
-Motivating case: ~10 TB, ~128 GB RAM, heavily joined lookups, where the scarce resource is the number of *dependent* random reads per request rather than bytes.
+Requires Rust 1.98.1. From the repository root:
+
+```sh
+cargo test --workspace
+```
+
+For the Python harness, use Python 3.12 and `uv`:
+
+```sh
+cd harness
+uv run --with pytest pytest
+```
+
+The fio calibration additionally requires `fio` and an idle NVMe; do not run it on a busy host or assume its hard-coded benchmark path is safe for another environment.
 
 ## Documentation
 
-| File | Read it when |
+| File | Purpose |
 |---|---|
-| `docs/design.md` | first. Thesis, goals/non-goals, architecture, the 13 invariants, open questions. |
-| `docs/engine.md` | designing or reviewing the storage engine itself: WAL, memtable, tiles, snapshots, compaction, recovery. |
-| `docs/prior-art.md` | before claiming novelty, and before believing any citation in this repository. Unverified entries are marked. |
-| `docs/objective.md` | reasoning about any trade-off, or about what "better" means here. The angriness objective. |
-| `docs/contracts.md` | before writing any code. The four frozen contracts and six reserved interfaces. |
-| `docs/learning.md` | working on adaptation, promotion, canary, the advisor, or the human feedback loop. |
-| `docs/dev-loop.md` | planning work, building the harness, or designing workloads and benchmarks. |
-| `docs/glossary.md` | encountering an unfamiliar term. |
-| `.scratch/01-design/decisions.md` | wanting the raw, attributed record of what was decided and why, round by round. |
+| `docs/design.md` | Research thesis, scope and invariants. |
+| `docs/engine.md` | Intended LSM, snapshots, tiles and recovery. |
+| `docs/contracts.md` | Proposed request, transaction and layout contracts; check status/open sections. |
+| `docs/objective.md` | Cost objective; several author decisions remain open. |
+| `docs/learning.md` | Offline learning and later adaptation. |
+| `docs/dev-loop.md` | Workload, validation and experiment plan. |
+| `docs/glossary.md` | Terminology. |
+| `docs/prior-art.md` | Prior-art notes; verify citations before external use. |
 
-A reference to `R-DOC.*` or `R-TKT.*` in these documents points at the parent workspace policy, outside this repository. The size budget (`R-DOC.6`) and markdown style (`R-DOC.6.1`) rules live there and are deliberately not restated here; a review noted that this makes compliance unverifiable from this repository alone.
-
-**Citation caveat.** Every prior-art entry in this repository was recalled from memory and is **unverified**; entries a reviewer could not confirm are marked `[unverified]` in `docs/prior-art.md`, and at least one entry cited in an earlier revision (a Google system called "Tesseract") could not be identified by either the author or the reviewer and has been removed. Do not cite anything from this repository as fact. External verification was not possible from this machine.
-
-**Review status.** A six-aspect adversarial review is in progress (fresh context, one reviewer per aspect, no shared history). Findings and dispositions are recorded in `.scratch/01-design/issues/01-design.md`. Where a review found a claim false, this repository **corrects the claim and marks the consequence `Open` at the point of use** rather than deleting it, so a reader can see what is settled and what is merely asserted.
-
-## Goals
-
-- Highest throughput on a single modern Linux node, without trading correctness or crash-atomicity.
-- Layout, encoding and scheduling derived from the observed workload, per tile.
-- One round trip per business request; the request is the unit of learning and of attribution, and the **block** is the unit of atomicity.
-- Continuous background adaptation with no migration project and no downtime.
-
-## Non-goals
-
-Multi-node and replication (deferred, not precluded). SQL or any text query language. Interactive multi-round-trip transactions. General-purpose engine parity. Any guarantee about physical layout, ever.
+Reference target: one NVMe and data:RAM ≥20:1 in a cgroup-limited experiment (for example 200 GB / 8 GB). Multi-node operation, online drift and SQL are outside v0 scope.
