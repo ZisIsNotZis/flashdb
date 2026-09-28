@@ -202,7 +202,7 @@ fn lookup(engine: &Engine, catalog: &Catalog, key: &[u8]) -> io::Result<Option<(
     let Some(handle) = engine.unique_lookup(catalog.entity.as_bytes(), catalog.unique.as_bytes(), key, snapshot)? else { return Ok(None) };
     let doc = engine.get(catalog.entity.as_bytes(), handle, snapshot)?
         .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "dangling unique index"))?;
-    let row: Value = serde_json::from_slice(doc).map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?;
+    let row: Value = serde_json::from_slice(&doc).map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?;
     Ok(Some((handle, row)))
 }
 

@@ -97,18 +97,19 @@ impl Engine {
             }
         }
         let mut mt = Memtable::new();
+        let mut covered = Memtable::new();
         let mut csn = 0u64;
         let mut dedup = HashMap::new();
         let mut max_handle = 0;
         for payload in &records {
             let (rec_csn, block_id, ops) = decode_payload(payload)?;
             max_handle = max_handle.max(ops.iter().map(op_handle).max().unwrap_or(0));
-            if tile.as_ref().is_none_or(|t| rec_csn > t.cutoff()) {
-                for op in &ops { apply_op(&mut mt, op, rec_csn); }
-            }
+            let destination = if tile.as_ref().is_some_and(|t| rec_csn <= t.cutoff()) { &mut covered } else { &mut mt };
+            for op in &ops { apply_op(destination, op, rec_csn); }
             csn = csn.max(rec_csn);
             dedup.insert(block_id, rec_csn);
         }
+        if let Some(t) = &tile { t.verify_projection(&covered, t.cutoff())?; }
         Ok(Engine { wal, mt, tile, wal_path: wal_path.to_path_buf(), csn, dedup, max_handle })
     }
 
@@ -125,7 +126,13 @@ impl Engine {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "WAL differs from serving state"));
         }
         let digest = wal_digest(&records, cutoff)?;
+        let mut expected = Memtable::new();
+        for payload in &records {
+            let (csn, _, ops) = decode_payload(payload)?;
+            if csn <= cutoff { for op in &ops { apply_op(&mut expected, op, csn); } }
+        }
         let tile = Tile::write(tile_path.as_ref(), cutoff, &digest, &self.mt)?;
+        tile.verify_projection(&expected, cutoff)?;
         self.mt.evict_through(cutoff);
         self.tile = Some(tile);
         Ok(())
@@ -135,26 +142,30 @@ impl Engine {
     /// from the memtable (not a bound on WAL recovery or total RAM).
     pub fn serving_memtable_entries(&self) -> usize { self.mt.len() }
 
-    // Prototype traversal starts at the tile's beginning for each lookup; there is
-    // no page directory or bounded-I/O point-read claim. Entries stay borrowed.
-    fn scan_merged<'a>(&'a self, prefix: &[u8]) -> impl Iterator<Item = (&'a [u8], &'a [u8])> + 'a {
+    // Sequential, checksum-verified traversal. No index or bounded-I/O point read.
+    // A failed read aborts before callers can publish a block based on partial state.
+    fn scan_merged(&self, prefix: &[u8], mut visit: impl FnMut(&[u8], &[u8]) -> io::Result<bool>) -> io::Result<()> {
         let mut mem = self.mt.scan_iter(prefix).peekable();
-        let disk_prefix = prefix.to_vec();
-        let mut disk = self.tile.iter().flat_map(|t| t.entries())
-            .filter(move |(key, _)| key.starts_with(&disk_prefix)).peekable();
-        std::iter::from_fn(move || match (mem.peek(), disk.peek()) {
-            (Some((mk, _)), Some((dk, _))) => {
-                if mk <= dk {
-                    let equal = mk == dk;
-                    let out = mem.next();
-                    if equal { disk.next(); }
-                    out
-                } else { disk.next() }
+        let mut disk = self.tile.iter().flat_map(|tile| tile.entries());
+        let mut next_disk = next_matching(&mut disk, prefix)?;
+        while mem.peek().is_some() || next_disk.is_some() {
+            let use_mem = match (mem.peek(), next_disk.as_ref()) {
+                (Some((mk, _)), Some((dk, _))) => mk <= &dk.as_slice(),
+                (Some(_), None) => true,
+                _ => false,
+            };
+            if use_mem {
+                let (key, value) = mem.next().unwrap();
+                let equal = next_disk.as_ref().is_some_and(|(dk, _)| key == dk);
+                if !visit(key, value)? { return Ok(()); }
+                if equal { next_disk = next_matching(&mut disk, prefix)?; }
+            } else {
+                let (key, value) = next_disk.take().unwrap();
+                if !visit(&key, &value)? { return Ok(()); }
+                next_disk = next_matching(&mut disk, prefix)?;
             }
-            (Some(_), None) => mem.next(),
-            (None, Some(_)) => disk.next(),
-            (None, None) => None,
-        })
+        }
+        Ok(())
     }
 
     /// 已发布的最新 CSN。新块的快照从这里取。
@@ -192,11 +203,9 @@ impl Engine {
         check_name(field)?;
         let pfx = keys::reverse_prefix(entity, field, target)?;
         let mut newest: HashMap<u64, (u64, bool)> = HashMap::new();
-        for (key, value) in self.scan_merged(&pfx) {
-            let Some((_, source, csn)) = keys::decode_reverse(&key) else { continue };
-            if csn > snapshot {
-                continue;
-            }
+        self.scan_merged(&pfx, |key, value| {
+            let Some((_, source, csn)) = keys::decode_reverse(key) else { return Ok(true); };
+            if csn > snapshot { return Ok(true); }
             let alive = !value.is_empty();
             match newest.get_mut(&source) {
                 Some(e) if e.0 >= csn => {}
@@ -204,7 +213,8 @@ impl Engine {
                     newest.insert(source, (csn, alive));
                 }
             }
-        }
+            Ok(true)
+        })?;
         let mut out: Vec<u64> = newest.into_iter().filter(|(_, (_, a))| *a).map(|(s, _)| s).collect();
         out.sort();
         Ok(out)
@@ -216,34 +226,37 @@ impl Engine {
         let pfx = keys::unique_prefix(entity, field, value)?;
         let mut seen = std::collections::HashSet::new();
         let mut owner = None;
-        for (key, val) in self.scan_merged(&pfx) {
+        self.scan_merged(&pfx, |key, val| {
             if key.len() != pfx.len() + 16 {
                 return Err(io::Error::new(io::ErrorKind::InvalidData, "malformed unique key"));
             }
             let handle = u64::from_be_bytes(key[pfx.len()..pfx.len() + 8].try_into().unwrap());
             let csn = keys::key_csn(&key).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing CSN"))?;
-            if csn > snapshot || !seen.insert(handle) { continue; }
-            if val.is_empty() { continue; }
+            if csn > snapshot || !seen.insert(handle) || val.is_empty() { return Ok(true); }
             if val != handle.to_be_bytes() {
                 return Err(io::Error::new(io::ErrorKind::InvalidData, "unique value disagrees with handle"));
             }
             if owner.replace(handle).is_some() {
                 return Err(io::Error::new(io::ErrorKind::InvalidData, "duplicate unique owners"));
             }
-        }
+            Ok(true)
+        })?;
         Ok(owner)
     }
 
     /// 快照点读：`snapshot` 取块开始时的 [`Engine::csn`]。
-    pub fn get(&self, entity: &[u8], handle: u64, snapshot: u64) -> io::Result<Option<&[u8]>> {
+    pub fn get(&self, entity: &[u8], handle: u64, snapshot: u64) -> io::Result<Option<Vec<u8>>> {
         check_name(entity)?;
         let pfx = keys::primary_prefix(entity, handle)?;
-        for (key, value) in self.scan_merged(&pfx) {
+        let mut result = None;
+        self.scan_merged(&pfx, |key, value| {
             if keys::key_csn(key).is_some_and(|csn| csn <= snapshot) {
-                return Ok(if value.is_empty() { None } else { Some(value) });
+                result = if value.is_empty() { None } else { Some(value.to_vec()) };
+                return Ok(false);
             }
-        }
-        Ok(None)
+            Ok(true)
+        })?;
+        Ok(result)
     }
 
     /// Visit each live primary document once at a CSN snapshot. The scan walks
@@ -259,21 +272,19 @@ impl Engine {
         let mut prefix = keys::primary_prefix(entity, 0)?;
         prefix.truncate(prefix.len() - 8);
         let mut last_handle = None;
-        for (key, value) in self.scan_merged(&prefix) {
+        self.scan_merged(&prefix, |key, value| {
             let (key_entity, handle, csn) = keys::decode_primary(key)
                 .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "malformed primary key"))?;
             if key_entity != entity {
                 return Err(io::Error::new(io::ErrorKind::InvalidData, "primary entity mismatch"));
             }
-            if csn > snapshot || last_handle == Some(handle) {
-                continue;
-            }
+            if csn > snapshot || last_handle == Some(handle) { return Ok(true); }
             last_handle = Some(handle);
             if !value.is_empty() {
-                visit(handle, &value)?;
+                visit(handle, value)?;
             }
-        }
-        Ok(())
+            Ok(true)
+        })
     }
 
     /// 原子提交一个块。唯一约束冲突 → `Outcome::Conflict`（未写 WAL，调用方直接报业务错误）。
@@ -311,12 +322,13 @@ impl Engine {
         }
         for (pfx, (entity, field, value, overlay)) in touched {
             let mut live: HashMap<u64, bool> = HashMap::new();
-            for (key, val) in self.scan_merged(&pfx) {
-                if key.len() < pfx.len() + 16 { continue; }
+            self.scan_merged(&pfx, |key, val| {
+                if key.len() < pfx.len() + 16 { return Ok(true); }
                 let handle = u64::from_be_bytes(key[pfx.len()..pfx.len() + 8].try_into().unwrap());
                 // 键按 handle 升序、每个 handle 内按 CSN 降序排列。
                 live.entry(handle).or_insert(!val.is_empty());
-            }
+                Ok(true)
+            })?;
             live.extend(overlay);
             if live.values().filter(|&&alive| alive).take(2).count() > 1 {
                 return Ok(Outcome::Conflict(Conflict { kind: "x_unique", entity, field, value }));
@@ -335,6 +347,17 @@ impl Engine {
         self.dedup.insert(block_id.to_vec(), csn);
         Ok(Outcome::Committed { csn })
     }
+}
+
+fn next_matching(
+    disk: &mut impl Iterator<Item = io::Result<(Vec<u8>, Vec<u8>)>>,
+    prefix: &[u8],
+) -> io::Result<Option<(Vec<u8>, Vec<u8>)>> {
+    for entry in disk {
+        let (key, value) = entry?;
+        if key.starts_with(prefix) { return Ok(Some((key, value))); }
+    }
+    Ok(None)
 }
 
 // Bind a tile to the exact WAL prefix which produced it; the WAL remains the only

@@ -35,8 +35,8 @@ fn tile_evicts_verified_p_u_r_and_merges_snapshots_tombstones_and_publish_unique
     assert_eq!(e.serving_memtable_entries(), 6);
     e.build_tile(&files.tile, 2).unwrap();
     assert_eq!(e.serving_memtable_entries(), 0, "all P/U/R covered versions actually left serving memtable");
-    assert_eq!(e.get(b"E", 1, 1).unwrap(), Some(b"old".as_slice()));
-    assert_eq!(e.get(b"E", 1, 2).unwrap(), Some(b"covered-update".as_slice()));
+    assert_eq!(e.get(b"E", 1, 1).unwrap(), Some(b"old".to_vec()));
+    assert_eq!(e.get(b"E", 1, 2).unwrap(), Some(b"covered-update".to_vec()));
     assert_eq!(e.unique_lookup(b"E", b"u", b"v", 2).unwrap(), Some(1));
     assert_eq!(e.reverse_lookup(b"E", b"r", 10, 2).unwrap(), vec![21, 22]);
     assert_eq!(scan(&e, 2), vec![(1, b"covered-update".to_vec()), (2, b"keep".to_vec())]);
@@ -55,7 +55,7 @@ fn tile_evicts_verified_p_u_r_and_merges_snapshots_tombstones_and_publish_unique
             match snapshot { 1 => vec![21], 2 => vec![21, 22], 3 => vec![22, 23], _ => vec![23] });
     }
     assert_eq!(e.get(b"E", 1, 3).unwrap(), None);
-    assert_eq!(e.get(b"E", 1, 4).unwrap(), Some(b"new".as_slice()));
+    assert_eq!(e.get(b"E", 1, 4).unwrap(), Some(b"new".to_vec()));
     drop(e);
     let mut e = Engine::open_with_tile(&files.wal, &files.tile).unwrap();
     assert_eq!(e.serving_memtable_entries(), 8, "replay did not rematerialize verified <=2 versions");
@@ -78,13 +78,13 @@ fn cutoff_before_latest_replays_only_uncovered_versions_and_checks_tile_owner() 
     e.commit_block(b"two", &[doc(1, b"two"), del_reverse(3)]).unwrap();
     e.build_tile(&files.tile, 1).unwrap();
     assert_eq!(e.serving_memtable_entries(), 2);
-    assert_eq!(e.get(b"E", 1, 1).unwrap(), Some(b"one".as_slice()));
-    assert_eq!(e.get(b"E", 1, 2).unwrap(), Some(b"two".as_slice()));
+    assert_eq!(e.get(b"E", 1, 1).unwrap(), Some(b"one".to_vec()));
+    assert_eq!(e.get(b"E", 1, 2).unwrap(), Some(b"two".to_vec()));
     assert_eq!(e.reverse_lookup(b"E", b"r", 10, 2).unwrap(), Vec::<u64>::new());
     drop(e);
     let mut e = Engine::open_with_tile(&files.wal, &files.tile).unwrap();
     assert_eq!(e.serving_memtable_entries(), 2);
-    assert_eq!(e.get(b"E", 1, 1).unwrap(), Some(b"one".as_slice()));
+    assert_eq!(e.get(b"E", 1, 1).unwrap(), Some(b"one".to_vec()));
     assert!(matches!(e.commit_block(b"reject", &[unique(2)]).unwrap(), Outcome::Conflict(_)));
     e.commit_block(b"transfer", &[del_unique(1), unique(2)]).unwrap();
     assert_eq!(e.unique_lookup(b"E", b"u", b"v", 1).unwrap(), Some(1));
@@ -99,7 +99,7 @@ fn covered_tombstones_hide_older_tile_versions_and_allow_new_owners() {
     e.commit_block(b"two", &[del_doc(1), del_unique(1), del_reverse(3)]).unwrap();
     e.build_tile(&files.tile, 2).unwrap();
     assert_eq!(e.serving_memtable_entries(), 0);
-    assert_eq!(e.get(b"E", 1, 1).unwrap(), Some(b"original".as_slice()));
+    assert_eq!(e.get(b"E", 1, 1).unwrap(), Some(b"original".to_vec()));
     assert_eq!(e.get(b"E", 1, 2).unwrap(), None);
     assert_eq!(e.unique_lookup(b"E", b"u", b"v", 2).unwrap(), None);
     assert!(e.reverse_lookup(b"E", b"r", 10, 2).unwrap().is_empty());
@@ -129,7 +129,7 @@ fn interrupted_build_and_corrupt_or_missing_tile_fail_closed_wal_rebuild_explici
     drop(e);
     assert!(Engine::open_with_tile(&files.wal, &files.tile).is_err());
     let mut from_wal = Engine::open(&files.wal).unwrap();
-    assert_eq!(from_wal.get(b"E", 1, 1).unwrap(), Some(b"persisted".as_slice()));
+    assert_eq!(from_wal.get(b"E", 1, 1).unwrap(), Some(b"persisted".to_vec()));
     fs::remove_file(&files.tile).unwrap();
     from_wal.build_tile(&files.tile, 1).unwrap();
     assert_eq!(from_wal.serving_memtable_entries(), 0);
@@ -142,7 +142,7 @@ fn interrupted_build_and_corrupt_or_missing_tile_fail_closed_wal_rebuild_explici
     }] {
         fs::write(&files.tile, damaged).unwrap();
         assert!(Engine::open_with_tile(&files.wal, &files.tile).is_err());
-        assert_eq!(Engine::open(&files.wal).unwrap().get(b"E", 1, 1).unwrap(), Some(b"persisted".as_slice()));
+        assert_eq!(Engine::open(&files.wal).unwrap().get(b"E", 1, 1).unwrap(), Some(b"persisted".to_vec()));
     }
     fs::remove_file(&files.tile).unwrap();
     assert!(Engine::open_with_tile(&files.wal, &files.tile).is_err());
@@ -184,11 +184,11 @@ fn large_document_stays_readable_and_unsupported_key_never_evicts_any_entry() {
     e.commit_block(b"large", &[doc(1, &large)]).unwrap();
     e.build_tile(&files.tile, 1).unwrap();
     assert_eq!(e.serving_memtable_entries(), 0);
-    assert_eq!(e.get(b"E", 1, 1).unwrap(), Some(large.as_slice()));
+    assert_eq!(e.get(b"E", 1, 1).unwrap(), Some(large.to_vec()));
     drop(e);
     let e = Engine::open_with_tile(&files.wal, &files.tile).unwrap();
     assert_eq!(e.serving_memtable_entries(), 0);
-    assert_eq!(e.get(b"E", 1, 1).unwrap(), Some(large.as_slice()));
+    assert_eq!(e.get(b"E", 1, 1).unwrap(), Some(large.to_vec()));
     drop(e);
 
     let other = files.dir.join("oversized.wal");
@@ -201,9 +201,102 @@ fn large_document_stays_readable_and_unsupported_key_never_evicts_any_entry() {
     assert_eq!(e.build_tile(&candidate, 1).unwrap_err().kind(), ErrorKind::InvalidData);
     assert_eq!(e.serving_memtable_entries(), 2);
     assert!(Engine::open_with_tile(&other, &candidate).is_err(), "partial unsupported candidate cannot serve reads");
-    assert_eq!(e.get(b"E", 2, 1).unwrap(), Some(b"safe".as_slice()));
+    assert_eq!(e.get(b"E", 2, 1).unwrap(), Some(b"safe".to_vec()));
     assert_eq!(e.unique_lookup(b"E", b"u", &key, 1).unwrap(), Some(2));
     drop(e);
     let e = Engine::open(&other).unwrap();
-    assert_eq!(e.get(b"E", 2, 1).unwrap(), Some(b"safe".as_slice()));
+    assert_eq!(e.get(b"E", 2, 1).unwrap(), Some(b"safe".to_vec()));
+}
+
+// Independent CRC recomputation: the file's own checksums remain valid, but the
+// unchanged WAL must still reject a different P/U/R projection on open.
+fn crc32c(bytes: &[u8]) -> u32 {
+    let mut crc = !0u32;
+    for &byte in bytes {
+        crc ^= byte as u32;
+        for _ in 0..8 { crc = (crc >> 1) ^ (if crc & 1 != 0 { 0x82f6_3b78 } else { 0 }); }
+    }
+    !crc
+}
+
+#[test]
+fn tile_value_with_recomputed_crc_disagrees_with_retained_wal() {
+    let files = Files::new();
+    let mut e = Engine::create(&files.wal).unwrap();
+    e.commit_block(b"one", &[doc(1, b"original")]).unwrap();
+    e.build_tile(&files.tile, 1).unwrap();
+    drop(e);
+    let mut tile = fs::read(&files.tile).unwrap();
+    let key_len = u32::from_le_bytes(tile[68..72].try_into().unwrap()) as usize;
+    let value_len = u32::from_le_bytes(tile[72..76].try_into().unwrap()) as usize;
+    let start = 80;
+    tile[start + key_len] ^= 1;
+    let crc = crc32c(&tile[start..start + key_len + value_len]);
+    tile[76..80].copy_from_slice(&crc.to_le_bytes());
+    fs::write(&files.tile, tile).unwrap();
+    let err = Engine::open_with_tile(&files.wal, &files.tile).err().unwrap();
+    assert_eq!(err.kind(), ErrorKind::InvalidData);
+    assert!(err.to_string().contains("disagrees with WAL"));
+    assert_eq!(Engine::open(&files.wal).unwrap().get(b"E", 1, 1).unwrap(), Some(b"original".to_vec()));
+}
+
+#[test]
+fn tile_malformed_key_with_valid_crc_returns_error_not_panic() {
+    let files = Files::new();
+    let mut e = Engine::create(&files.wal).unwrap();
+    e.commit_block(b"one", &[doc(1, b"original")]).unwrap();
+    e.build_tile(&files.tile, 1).unwrap();
+    drop(e);
+    let mut tile = fs::read(&files.tile).unwrap();
+    let key_len = u32::from_le_bytes(tile[68..72].try_into().unwrap()) as usize;
+    let value_len = u32::from_le_bytes(tile[72..76].try_into().unwrap()) as usize;
+    let start = 80;
+    tile[start..start + key_len].fill(b'x');
+    tile[start] = b'U';
+    tile[start + key_len - 1] = 0;
+    let crc = crc32c(&tile[start..start + key_len + value_len]);
+    tile[76..80].copy_from_slice(&crc.to_le_bytes());
+    fs::write(&files.tile, tile).unwrap();
+    assert_eq!(Engine::open_with_tile(&files.wal, &files.tile).err().unwrap().kind(), ErrorKind::InvalidData);
+}
+
+#[test]
+fn tile_mutation_after_open_returns_error_in_child_process() {
+    let files = Files::new();
+    let mut e = Engine::create(&files.wal).unwrap();
+    e.commit_block(b"one", &[doc(1, &vec![b'x'; 2 * 1024 * 1024])]).unwrap();
+    e.build_tile(&files.tile, 1).unwrap();
+    drop(e);
+    let pristine = fs::read(&files.tile).unwrap();
+    for mode in ["truncate", "modify"] {
+        fs::write(&files.tile, &pristine).unwrap();
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "tile_mutation_child", "--nocapture"])
+            .env("FLASHDB_TILE_CHILD_WAL", &files.wal)
+            .env("FLASHDB_TILE_CHILD_TILE", &files.tile)
+            .env("FLASHDB_TILE_CHILD_MODE", mode)
+            .output().unwrap();
+        let output = String::from_utf8_lossy(&child.stdout);
+        assert!(child.status.success() && output.contains("test tile_mutation_child ... ok"),
+            "{mode} child failed or did not run (including signal/crash): {output} {}", String::from_utf8_lossy(&child.stderr));
+    }
+}
+
+#[test]
+fn tile_mutation_child() {
+    let Ok(wal) = std::env::var("FLASHDB_TILE_CHILD_WAL") else { return };
+    let tile = PathBuf::from(std::env::var("FLASHDB_TILE_CHILD_TILE").unwrap());
+    let e = Engine::open_with_tile(wal, &tile).unwrap();
+    match std::env::var("FLASHDB_TILE_CHILD_MODE").unwrap().as_str() {
+        "truncate" => OpenOptions::new().write(true).open(&tile).unwrap().set_len(0).unwrap(),
+        "modify" => {
+            let f = OpenOptions::new().write(true).open(&tile).unwrap();
+            use std::os::unix::fs::FileExt;
+            let at = f.metadata().unwrap().len() - 1;
+            f.write_at(b"z", at).unwrap();
+        }
+        other => panic!("unexpected mode {other}"),
+    }
+    let err = e.get(b"E", 1, 1).unwrap_err();
+    assert!(matches!(err.kind(), ErrorKind::InvalidData | ErrorKind::UnexpectedEof), "{err}");
 }

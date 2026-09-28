@@ -35,7 +35,7 @@ fn request() -> Value {
     })
 }
 fn get(engine: &Engine, entity: &str, handle: u64) -> Value {
-    serde_json::from_slice(engine.get(entity.as_bytes(), handle, engine.csn()).unwrap().unwrap()).unwrap()
+    serde_json::from_slice(&engine.get(entity.as_bytes(), handle, engine.csn()).unwrap().unwrap()).unwrap()
 }
 fn count(engine: &Engine) -> i64 { get(engine, "Stock", 10)["on_hand"].as_i64().unwrap() }
 

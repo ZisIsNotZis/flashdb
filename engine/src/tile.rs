@@ -1,13 +1,11 @@
 //! Explicit, WAL-retained immutable tile prototype. No manifest, checkpoint, or WAL retirement.
-//! The file is validated before it can displace any serving memtable entries. A read-only,
-//! file-backed mapping supplies borrowed values for Engine::get without copying the entire file
-//! into a Vec; this is not a bounded-RAM or bounded-recovery claim.
+//! The file is validated before it can displace any serving memtable entries. Reads use
+//! owned, checksum-verified record buffers; this is not a bounded-recovery claim.
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, ErrorKind, Seek, SeekFrom, Write};
-use std::os::fd::AsRawFd;
+use std::os::unix::fs::FileExt;
 use std::path::Path;
-use std::ptr::NonNull;
 use std::sync::LazyLock;
 
 use crate::keys;
@@ -45,7 +43,7 @@ fn valid_key(key: &[u8]) -> bool {
         keys::U | keys::R => {
             let Some(first) = key[1..].iter().position(|&b| b == 0) else { return false };
             if first == 0 { return false; }
-            let tail = &key[first + 2..];
+            let Some(tail) = key.get(first + 2..) else { return false };
             let Some(second) = tail.iter().position(|&b| b == 0) else { return false };
             if second == 0 { return false; }
             let rest = &tail[second + 1..];
@@ -71,31 +69,70 @@ fn header(cutoff: u64, digest: &[u8; 32], count: u64, size: u64) -> [u8; HEADER]
     h
 }
 
-// POSIX MAP_PRIVATE read-only mapping: no tile-sized allocation, stable borrowed values
-// while the Engine holds the fd. The tile file must not be externally modified or truncated
-// while open (immutable file contract); reopen verifies it again.
-struct Mapping { ptr: NonNull<u8>, len: usize }
-impl Mapping {
-    fn new(file: &File) -> io::Result<Self> {
-        let len = usize::try_from(file.metadata()?.len()).map_err(|_| invalid("tile size overflow"))?;
-        if len < HEADER || len > isize::MAX as usize { return Err(invalid("tile size out of bounds")); }
-        unsafe extern "C" {
-            fn mmap(addr: *mut std::ffi::c_void, length: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut std::ffi::c_void;
+// Positional reads never expose borrowed file-backed bytes; a truncated or changed
+// file yields an I/O error, even if it was valid when opened.
+fn read_exact_at(file: &File, mut bytes: &mut [u8], mut offset: u64) -> io::Result<()> {
+    while !bytes.is_empty() {
+        match file.read_at(bytes, offset) {
+            Ok(0) => return Err(io::Error::new(ErrorKind::UnexpectedEof, "tile truncated during read")),
+            Ok(n) => {
+                offset = offset.checked_add(n as u64).ok_or_else(|| invalid("tile offset overflow"))?;
+                bytes = &mut bytes[n..];
+            }
+            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
         }
-        let ptr = unsafe { mmap(std::ptr::null_mut(), len, 1, 2, file.as_raw_fd(), 0) };
-        if ptr as isize == -1 { return Err(io::Error::last_os_error()); }
-        Ok(Self { ptr: NonNull::new(ptr.cast()).expect("mmap non-null"), len })
     }
-    fn bytes(&self) -> &[u8] { unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.len) } }
+    Ok(())
 }
-impl Drop for Mapping {
-    fn drop(&mut self) {
-        unsafe extern "C" { fn munmap(addr: *mut std::ffi::c_void, length: usize) -> i32; }
-        unsafe { munmap(self.ptr.as_ptr().cast(), self.len); }
+
+pub(crate) struct Tile { file: File, header: [u8; HEADER], cutoff: u64, digest: [u8; 32], count: u64, size: u64 }
+
+struct Entries<'a> { tile: &'a Tile, pos: u64, left: u64, checked: bool, done: bool }
+impl Iterator for Entries<'_> {
+    type Item = io::Result<(Vec<u8>, Vec<u8>)>;
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.done { return None; }
+        let result = (|| {
+            if !self.checked {
+                self.checked = true;
+                if self.tile.file.metadata()?.len() != self.tile.size { return Err(invalid("tile size changed")); }
+                let mut h = [0; HEADER];
+                read_exact_at(&self.tile.file, &mut h, 0)?;
+                if h != self.tile.header { return Err(invalid("tile header changed")); }
+            }
+            if self.left == 0 {
+                if self.pos != self.tile.size { return Err(invalid("tile trailing bytes")); }
+                return Ok(None);
+            }
+            let mut hdr = [0; RECORD];
+            read_exact_at(&self.tile.file, &mut hdr, self.pos)?;
+            let k = u32::from_le_bytes(hdr[..4].try_into().unwrap()) as usize;
+            let v = u32::from_le_bytes(hdr[4..8].try_into().unwrap()) as usize;
+            if !(18..=MAX_KEY).contains(&k) || v > MAX_VALUE { return Err(invalid("tile entry length out of bounds")); }
+            let start = self.pos.checked_add(RECORD as u64).ok_or_else(|| invalid("tile offset overflow"))?;
+            let mid = start.checked_add(k as u64).ok_or_else(|| invalid("tile key size overflow"))?;
+            let end = mid.checked_add(v as u64).ok_or_else(|| invalid("tile value size overflow"))?;
+            if end > self.tile.size { return Err(invalid("tile entry exceeds file")); }
+            let mut key = vec![0; k];
+            let mut value = vec![0; v];
+            read_exact_at(&self.tile.file, &mut key, start)?;
+            read_exact_at(&self.tile.file, &mut value, mid)?;
+            if entry_checksum(&key, &value) != u32::from_le_bytes(hdr[8..12].try_into().unwrap()) {
+                return Err(invalid("tile record checksum"));
+            }
+            self.pos = end;
+            self.left -= 1;
+            Ok(Some((key, value)))
+        })();
+        match result {
+            Ok(Some(entry)) => Some(Ok(entry)),
+            Ok(None) => { self.done = true; None }
+            Err(e) => { self.done = true; Some(Err(e)) }
+        }
     }
 }
 
-pub(crate) struct Tile { _file: File, mapping: Mapping, cutoff: u64, digest: [u8; 32], count: u64 }
 impl Tile {
     pub(crate) fn write(path: &Path, cutoff: u64, digest: &[u8; 32], mt: &Memtable) -> io::Result<Self> {
         // create_new never replaces a verified tile. A failed/crashed build leaves a partial
@@ -129,59 +166,45 @@ impl Tile {
 
     pub(crate) fn open(path: &Path) -> io::Result<Self> {
         let file = File::open(path)?;
-        let mapping = Mapping::new(&file)?;
-        let bytes = mapping.bytes();
-        if &bytes[..8] != MAGIC || checksum(&bytes[..64]) != u32::from_le_bytes(bytes[64..68].try_into().unwrap()) {
+        let size = file.metadata()?.len();
+        if size < HEADER as u64 { return Err(invalid("tile header truncated")); }
+        let mut h = [0; HEADER];
+        read_exact_at(&file, &mut h, 0)?;
+        if &h[..8] != MAGIC || checksum(&h[..64]) != u32::from_le_bytes(h[64..68].try_into().unwrap()) {
             return Err(invalid("tile header checksum/magic"));
         }
-        let cutoff = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
-        let digest = bytes[16..48].try_into().unwrap();
-        let count = u64::from_le_bytes(bytes[48..56].try_into().unwrap());
-        let size = u64::from_le_bytes(bytes[56..64].try_into().unwrap());
-        if size != bytes.len() as u64 || count > (bytes.len() - HEADER) as u64 / (RECORD as u64 + 18) {
-            return Err(invalid("tile truncated or entry count invalid"));
+        let cutoff = u64::from_le_bytes(h[8..16].try_into().unwrap());
+        let digest = h[16..48].try_into().unwrap();
+        let count = u64::from_le_bytes(h[48..56].try_into().unwrap());
+        if u64::from_le_bytes(h[56..64].try_into().unwrap()) != size
+            || count > (size - HEADER as u64) / (RECORD as u64 + 18) {
+            return Err(invalid("tile size/count invalid"));
         }
-        let mut pos = HEADER;
-        let mut previous: Option<&[u8]> = None;
-        for _ in 0..count {
-            let (key, _value, next) = parse(bytes, pos)?;
-            if !valid_key(key) || keys::key_csn(key).is_none_or(|csn| csn > cutoff)
-                || previous.is_some_and(|prev| prev >= key) {
+        let tile = Self { file, header: h, cutoff, digest, count, size };
+        let mut previous: Option<Vec<u8>> = None;
+        for entry in tile.entries() {
+            let (key, _) = entry?;
+            if !valid_key(&key) || keys::key_csn(&key).is_none_or(|csn| csn > cutoff)
+                || previous.as_ref().is_some_and(|prev| prev >= &key) {
                 return Err(invalid("tile key order/encoding/cutoff"));
             }
             previous = Some(key);
-            pos = next;
         }
-        if pos != bytes.len() { return Err(invalid("tile trailing bytes")); }
-        Ok(Self { _file: file, mapping, cutoff, digest, count })
+        Ok(tile)
     }
     pub(crate) fn cutoff(&self) -> u64 { self.cutoff }
     pub(crate) fn digest(&self) -> &[u8; 32] { &self.digest }
-    pub(crate) fn entries(&self) -> impl Iterator<Item = (&[u8], &[u8])> {
-        let bytes = self.mapping.bytes();
-        let mut pos = HEADER;
-        (0..self.count).map(move |_| {
-            // All entries and offsets were checked by open; file is immutable while in use.
-            let (key, value, next) = parse(bytes, pos).expect("verified tile entry");
-            pos = next;
-            (key, value)
-        })
+    pub(crate) fn entries(&self) -> impl Iterator<Item = io::Result<(Vec<u8>, Vec<u8>)>> + '_ {
+        Entries { tile: self, pos: HEADER as u64, left: self.count, checked: false, done: false }
     }
-}
 
-fn parse(bytes: &[u8], pos: usize) -> io::Result<(&[u8], &[u8], usize)> {
-    let hdr = bytes.get(pos..pos.checked_add(RECORD).ok_or_else(|| invalid("tile offset overflow"))?)
-        .ok_or_else(|| invalid("tile record header truncated"))?;
-    let k = u32::from_le_bytes(hdr[..4].try_into().unwrap()) as usize;
-    let v = u32::from_le_bytes(hdr[4..8].try_into().unwrap()) as usize;
-    if k < 18 || k > MAX_KEY || v > MAX_VALUE { return Err(invalid("tile entry length out of bounds")); }
-    let start = pos + RECORD;
-    let mid = start.checked_add(k).ok_or_else(|| invalid("tile key size overflow"))?;
-    let end = mid.checked_add(v).ok_or_else(|| invalid("tile value size overflow"))?;
-    let key = bytes.get(start..mid).ok_or_else(|| invalid("tile key truncated"))?;
-    let value = bytes.get(mid..end).ok_or_else(|| invalid("tile value truncated"))?;
-    if entry_checksum(key, value) != u32::from_le_bytes(hdr[8..12].try_into().unwrap()) {
-        return Err(invalid("tile record checksum"));
+    pub(crate) fn verify_projection(&self, expected: &Memtable, cutoff: u64) -> io::Result<()> {
+        let mut actual = self.entries();
+        for (key, value) in expected.entries().filter(|(key, _)| keys::key_csn(key).is_some_and(|csn| csn <= cutoff)) {
+            let (got_key, got_value) = actual.next().ok_or_else(|| invalid("tile missing WAL entry"))??;
+            if got_key != key || got_value != value { return Err(invalid("tile entry disagrees with WAL")); }
+        }
+        if let Some(entry) = actual.next() { entry?; return Err(invalid("tile contains extra WAL entry")); }
+        Ok(())
     }
-    Ok((key, value, end))
 }

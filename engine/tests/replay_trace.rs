@@ -100,7 +100,7 @@ fn mixed_generator_corpus_executes_and_recovers_with_independent_stock_oracle() 
     for ((sku, loc), count) in &expected {
         let key = serde_json::to_vec(&[sku, loc]).unwrap();
         let h = engine.unique_lookup(b"Stock", b"sku_loc", &key, after_csn).unwrap().unwrap();
-        let doc: Value = serde_json::from_slice(engine.get(b"Stock", h, after_csn).unwrap().unwrap()).unwrap();
+        let doc: Value = serde_json::from_slice(&engine.get(b"Stock", h, after_csn).unwrap().unwrap()).unwrap();
         assert_eq!(doc["on_hand"], *count);
         assert!(*count >= 0);
     }
@@ -157,7 +157,7 @@ fn repeated_hot_key_depletes_stock_then_backorders_without_movement() {
     assert_eq!(summary.requests, 2);
     assert_eq!(summary.sha256, "d803afa5bd8cd459abbadb9e9bd707b491c96c2ccdedf372b7a94930e8758855");
     assert_eq!(seen, vec![("O00000001".into(), "ok", None), ("O00000002".into(), "failed", Some("ok"))]);
-    let stock: Value = serde_json::from_slice(e.get(b"Stock", 1, e.csn()).unwrap().unwrap()).unwrap();
+    let stock: Value = serde_json::from_slice(&e.get(b"Stock", 1, e.csn()).unwrap().unwrap()).unwrap();
     assert_eq!(stock["on_hand"], 0);
     assert!(e.unique_lookup(b"Order", b"order_no", b"O00000001", e.csn()).unwrap().is_some());
     assert_eq!(e.unique_lookup(b"Order", b"order_no", b"O00000002", e.csn()).unwrap(), None);
