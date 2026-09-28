@@ -56,6 +56,7 @@ pub struct Engine {
     mt: Memtable,
     csn: u64,
     dedup: HashMap<Vec<u8>, u64>,
+    max_handle: u64,
 }
 
 impl Engine {
@@ -66,6 +67,7 @@ impl Engine {
             mt: Memtable::new(),
             csn: 0,
             dedup: HashMap::new(),
+            max_handle: 0,
         })
     }
 
@@ -75,20 +77,33 @@ impl Engine {
         let mut mt = Memtable::new();
         let mut csn = 0u64;
         let mut dedup = HashMap::new();
+        let mut max_handle = 0;
         for payload in &records {
             let (rec_csn, block_id, ops) = decode_payload(payload)?;
+            max_handle = max_handle.max(ops.iter().map(op_handle).max().unwrap_or(0));
             for op in &ops {
                 apply_op(&mut mt, op, rec_csn);
             }
             csn = csn.max(rec_csn);
             dedup.insert(block_id, rec_csn);
         }
-        Ok(Engine { wal, mt, csn, dedup })
+        Ok(Engine { wal, mt, csn, dedup, max_handle })
     }
 
     /// 已发布的最新 CSN。新块的快照从这里取。
     pub fn csn(&self) -> u64 {
         self.csn
+    }
+
+    /// Next globally unused handle. The caller reserves further handles locally within
+    /// one block; only successfully published handles advance the persisted high-water mark.
+    pub fn next_handle(&self) -> io::Result<u64> {
+        self.max_handle.checked_add(1).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "handles exhausted"))
+    }
+
+    /// Whether a block was published (including after WAL recovery).
+    pub fn committed_block_csn(&self, block_id: &[u8]) -> Option<u64> {
+        self.dedup.get(block_id).copied()
     }
 
     /// 反向查找：当前指向 `target` 的全部 source 句柄。
@@ -208,12 +223,21 @@ impl Engine {
             apply_op(&mut self.mt, op, csn);
         }
         self.csn = csn;
+        self.max_handle = self.max_handle.max(ops.iter().map(op_handle).max().unwrap_or(0));
         self.dedup.insert(block_id.to_vec(), csn);
         Ok(Outcome::Committed { csn })
     }
 }
 
 // ---------- op → memtable ----------
+
+fn op_handle(op: &Op) -> u64 {
+    match op {
+        Op::PutDoc { handle, .. } | Op::DelDoc { handle, .. }
+        | Op::PutUnique { handle, .. } | Op::DelUnique { handle, .. } => *handle,
+        Op::PutReverse { target, source, .. } | Op::DelReverse { target, source, .. } => (*target).max(*source),
+    }
+}
 
 fn apply_op(mt: &mut Memtable, op: &Op, csn: u64) {
     match op {
