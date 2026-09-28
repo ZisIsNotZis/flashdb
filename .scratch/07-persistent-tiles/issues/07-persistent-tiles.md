@@ -22,6 +22,12 @@ Evolve the current WAL+memtable prototype toward `docs/engine.md`: immutable til
 
 One immutable persisted tile can be written and read through in a test at a snapshot, with CRC/torn-file detection and WAL retained as recovery authority. No acknowledged state can disappear across injected crashes; new writes over tile state must be visible and unique checks must consult both tiers. If this cannot be done safely as a narrow slice, document the blocker rather than pretending it is a checkpoint.
 
+## Design checkpoint — 2026-09-28
+
+Read-only Designer run `228c2b3b-6565-49d9-af91-ee06243d0f57` recommends A: harden WAL write/sync failure poison and define immutable tile codec → B: WAL-retained tile read-through → C: manifest/checkpoint → D: WAL rotation with durable dedup/CSN/handle metadata → E: compaction/snapshot pins → F: scale claims. First tile slice must actually evict covered versions from serving memtable after verified tile creation; on reopen replay WAL for metadata but skip only a verified covered prefix. Cross-tier P/U/R latest-visible/tombstone and uniqueness checks must be tested. A missing/corrupt tile fails closed (or explicitly rebuilds from retained WAL); no silent fallback. No WAL retirement or bounded recovery claim in B.
+
+Two future user-owned choices are not blockers for B: arbitrary historical snapshots vs expiring registered snapshots (recommend leases before version dropping); large manifest layout at 32 MiB/16 KiB = 2,048 pages/tile, not 512 (recommend A/B roots referencing synced immutable directory generations). L-02 dedup retention remains open, so retain WAL and permanent dedup for now. Routine correction: compaction must keep the newest version at/below the oldest active snapshot, not drop all below it. Source of truth `docs/engine.md` needs this correction before compaction implementation.
+
 ## Next action
 
-Consume read-only storage design analysis (`Designer` run `228c2b3b-6565-49d9-af91-ee06243d0f57`), refine slice boundaries, then implement with separate validation/review. No user decision yet identified.
+Parent hardens `wal.rs` append/sync failure poisoning in current worktree. Isolated worker builds an explicit, WAL-retained immutable tile read-through slice (no manifest or rotation), with actual tile-serving tests and crash/corruption cases. Integrate after independent review. No user decision required for this slice.
