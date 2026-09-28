@@ -52,6 +52,12 @@ def test_order_flow_fixture_matches_generator():
     assert fixture == next(render([Generator(42, 1).order_flow()])) + "\n"
 
 
+def test_mixed_replay_corpus_is_frozen():
+    fixture = (Path(__file__).parent / "fixtures" / "mixed_seed42_20.jsonl").read_text()
+    assert fixture == "".join(line + "\n" for line in render(Generator(42, 20).requests()))
+    assert hashlib.sha256(fixture.encode()).hexdigest() == "929822594483301f5951e98746c60932d7bfd82408780555a231e9d0a28c5264"
+
+
 def test_order_flow_exercises_motivating_case():
     g = Generator(1, 50)
     flows = [r for r in g.requests() if "take" in r["blocks"]]

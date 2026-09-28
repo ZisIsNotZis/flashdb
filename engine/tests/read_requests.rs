@@ -13,7 +13,7 @@ fn path() -> PathBuf {
 // Literal JSONL records emitted by Generator(42, 200).requests() in generator.py.
 const STOCK: &str = r#"{"blocks":{"q":{"get":{"Stock":{"where":{"loc":"L005","sku":"S004353"}}}}},"class":{"durability":"batched","max_staleness":2},"id":"r-00000005"}"#;
 const CUSTOMER: &str = r#"{"blocks":{"q":{"find":{"Customer":{"email":"c002269@example.com"}}}},"class":{"durability":"batched"},"id":"r-00000012"}"#;
-const MOVEMENTS: &str = r#"{"blocks":{"q":{"find":{"StockMovement":{"where":{"order_no":"O00000007"},"limit":100,"order":["movement_no"]}}}},"class":{"durability":"batched","max_staleness":5},"id":"r-00000018"}"#;
+const MOVEMENTS: &str = r#"{"blocks":{"q":{"find":{"StockMovement":{"where":{"order_no":"O00000007"}},"limit":100,"order":["movement_no"]}}},"class":{"durability":"batched","max_staleness":5},"id":"r-00000018"}"#;
 
 fn put(entity: &str, handle: u64, value: &Value) -> Op {
     Op::PutDoc { entity: entity.as_bytes().to_vec(), handle, doc: serde_json::to_vec(value).unwrap() }
@@ -122,8 +122,8 @@ fn malformed_shapes_and_invalid_documents_fail_closed_without_read_writes() {
     let customer: Value = serde_json::from_str(CUSTOMER).unwrap();
     let mut rejected = Vec::new();
     for (base, path, value) in [
-        (&scan, vec!["blocks", "q", "find", "StockMovement", "limit"], json!(101)),
-        (&scan, vec!["blocks", "q", "find", "StockMovement", "order"], json!(["order_no"])),
+        (&scan, vec!["blocks", "q", "find", "limit"], json!(101)),
+        (&scan, vec!["blocks", "q", "find", "order"], json!(["order_no"])),
         (&scan, vec!["class", "max_staleness"], json!(2)),
         (&stock, vec!["blocks", "q", "get", "Stock", "where", "sku"], json!("$sku")),
         (&customer, vec!["class", "durability"], json!("lossy")),
@@ -137,6 +137,9 @@ fn malformed_shapes_and_invalid_documents_fail_closed_without_read_writes() {
     let mut extra = scan.clone();
     extra["blocks"]["q"]["else"] = json!({"put":{"Stock":{}}});
     rejected.push(extra);
+    let mut large = stock.clone();
+    large["blocks"]["q"]["get"]["Stock"]["where"]["sku"] = json!("S".repeat(128 * 1024));
+    rejected.push(large);
     for req in rejected {
         assert_eq!(execute_request(&mut e, &req).unwrap_err().kind(), ErrorKind::InvalidInput);
     }

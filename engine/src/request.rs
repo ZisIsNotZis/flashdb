@@ -11,8 +11,9 @@
 //! class scheduling, concurrent writers, or durable read-result replay.
 
 use std::collections::BTreeMap;
-use std::io::{self, ErrorKind};
+use std::io::{self, ErrorKind, Write};
 
+use serde::Serialize;
 use serde_json::{json, Map, Value};
 
 use crate::engine::{Engine, Op, Outcome};
@@ -29,7 +30,7 @@ const MOVEMENT: Catalog = Catalog { entity: "StockMovement", unique: "movement_n
 const ORDER: Catalog = Catalog { entity: "Order", unique: "order_no", reference: Some("buyer") };
 const BACKORDER: Catalog = Catalog { entity: "Backorder", unique: "order_no", reference: None };
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Serialize)]
 pub struct BlockResult {
     pub status: &'static str,
     pub csn: Option<u64>,
@@ -40,6 +41,24 @@ pub type RequestResult = BTreeMap<String, BlockResult>;
 
 fn invalid(message: impl Into<String>) -> io::Error {
     io::Error::new(ErrorKind::InvalidInput, message.into())
+}
+
+struct SizeLimit { bytes: usize }
+
+impl Write for SizeLimit {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if buf.len() > 65_536usize.saturating_sub(self.bytes) {
+            return Err(invalid("request exceeds 64 KiB"));
+        }
+        self.bytes += buf.len();
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> io::Result<()> { Ok(()) }
+}
+
+fn check_request_size(req: &Value) -> io::Result<()> {
+    serde_json::to_writer(SizeLimit { bytes: 0 }, req)
+        .map_err(|e| invalid(format!("request size/serialization: {e}")))
 }
 
 fn object<'a>(v: &'a Value, label: &str) -> io::Result<&'a Map<String, Value>> {
@@ -108,6 +127,7 @@ fn read_shape(v: &Value, entity: &str) -> io::Result<()> {
 
 fn validate(req: &Value) -> io::Result<bool> {
     fields(req, "request", &["id", "class", "params", "blocks"])?;
+    check_request_size(req)?;
     text(&req["id"], "request id")?;
     if req["id"].as_str().unwrap().len() > 1024 { return Err(invalid("request id too long")); }
     fields(&req["class"], "class", &["durability", "retry_horizon_s"])?;
@@ -209,9 +229,7 @@ fn validate_read(req: &Value) -> io::Result<ReadKind> {
     fields(req, "request", &["id", "class", "blocks"])?;
     let id = text(&req["id"], "request id")?;
     if id.len() > 1024 { return Err(invalid("request id too long")); }
-    if serde_json::to_vec(req).map_err(io::Error::other)?.len() > 65536 {
-        return Err(invalid("request exceeds 64 KiB"));
-    }
+    check_request_size(req)?;
     fields(&req["blocks"], "blocks", &["q"])?;
     let q = &req["blocks"]["q"];
     let kind = if q.get("get").is_some() {
@@ -231,13 +249,13 @@ fn validate_read(req: &Value) -> io::Result<ReadKind> {
             read_text(&q["find"]["Customer"]["email"], "email")?;
             ReadKind::Customer
         } else {
-            fields(&q["find"], "find", &["StockMovement"])?;
-            fields(&q["find"]["StockMovement"], "StockMovement scan", &["where", "order", "limit"])?;
-            let scan = &q["find"]["StockMovement"];
-            fields(&scan["where"], "StockMovement where", &["order_no"])?;
-            read_text(&scan["where"]["order_no"], "order_no")?;
-            require(&scan["order"], json!(["movement_no"]), "movement order")?;
-            require(&scan["limit"], json!(100), "movement limit")?;
+            fields(&q["find"], "find", &["StockMovement", "order", "limit"])?;
+            fields(&q["find"]["StockMovement"], "StockMovement scan", &["where"])?;
+            let find = &q["find"];
+            fields(&find["StockMovement"]["where"], "StockMovement where", &["order_no"])?;
+            read_text(&find["StockMovement"]["where"]["order_no"], "order_no")?;
+            require(&find["order"], json!(["movement_no"]), "movement order")?;
+            require(&find["limit"], json!(100), "movement limit")?;
             ReadKind::Movements
         }
     };

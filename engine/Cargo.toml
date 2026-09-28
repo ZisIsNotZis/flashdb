@@ -5,4 +5,6 @@ edition = "2021"
 description = "flashdb storage engine: log-structured document store with a learned keyspace layout"
 
 [dependencies]
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
