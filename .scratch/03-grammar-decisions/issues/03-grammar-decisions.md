@@ -129,6 +129,10 @@ The items were recorded inline in `contracts.md`, which pushed that file past it
 
 实现 trace 生成器时发现：示例里的 `$sku`、`$email`、`$qty` 是客户端参数，但契约从未定义它们住在哪里。补上：**请求顶层增加 `params` 对象**；`$name` 引用 `params[name]`，`$block.field` 引用块结果，块内 `as:` 引用同块兄弟输出。三种 `$` 来源在语法层面可区分，normalizer 的模式键只含形状不含 params 值（模板/实例分离，与既有决定一致）。
 
+## Clarification（2026-09-28，作者：`else` 是条件，不是异常处理）
+
+本节覆盖前文 D5 中“guard-false **或 conflict** 都进入 `else`”的过宽表述，而不改动每块原子性。`else` 仅接预期中的条件不满足：读 probe 无匹配、写 probe/`when` 为 false；业务唯一性或其他约束冲突是原则性错误，直接失败，绝不默认重试或走 `else`。仅由并发时机造成的乐观读集验证不一致可在新快照上有界重试；重试后若业务条件不满足，才进入 `else`。`docs/contracts.md` 的请求树、结果分类与冲突策略和 `docs/engine.md` 的发布行为已按此解释更新。当前窄版适配器把 `x_unique` 映射为 `AlreadyExists`；未来瞬时竞争需单独结果类型，不能复用同一 `Conflict` 概念。
+
 ## Not in scope
 
 Re-running the language review. This ticket resolves the findings it produced.

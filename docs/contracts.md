@@ -22,10 +22,10 @@ A request is a **named set of blocks**, not an ordered list. Names are identitie
 request:  { <name>: <block>, ... }             // an object: no positional order
 block:    { needs: [<name>, ...],              // declared dependencies: the only ordering
             <shape>: { ... },                  // exactly one shape per block
-            else: <block> | [<block>, ...] }   // runs when the block did not achieve its goal
+            else: <block> | [<block>, ...] }   // runs only on an expected condition miss
 ```
 
-- **Declared order is honoured.** `needs` is sequence (`&&`), `else` is fallback (`||`); the operators became named fields, and execution order is derived from the graph rather than from position.
+- **Declared order is honoured.** `needs` is sequence (`&&`), `else` is conditional fallback (`if`/`else`), not exception handling; execution order is derived from the graph rather than from position. A read with no match or a write whose explicit probe/`when` is false takes `else`. A unique constraint violation, malformed input, validation error or internal failure is an exception and does **not** take `else`. Timing contention from concurrent optimistic validation may be retried with a fresh snapshot, subject to a bounded retry policy; it is distinct from business constraint failure.
 - **Undeclared is parallel.** Blocks with no `needs` path between them may run concurrently in any order. Reading a key another block writes without declaring the edge yields whichever state results — the author's "consequences are yours".
 - **Same-key writes with no declared edge are rejected at the front-end**, not guessed: the engine refuses what it cannot order. Decidable for key-addressed shapes, and it is the mechanical check the API reports.
 - **A block is a transaction**: every write in it applies atomically or none does, and it may span tables. A read block returns rows or empty; a write block returns `ok` or `failed`.
@@ -64,7 +64,7 @@ Every block reports `{ name, status }` with `status` ∈ `ok | empty | failed | 
   "bound": { "on_hand": 0, "$qty": 3, "$find.sku": "A1" } }
 ```
 
-`reason` ∈ `when_false | conflict | not_found | validation | dependency_failed | shed | key_overlap | internal`, plus `op`, `table`, `where`/`key`, the condition exactly as written, and `bound` — the actual values bound at failure, including referenced bindings. A client needs this to decide retry, compensate, or abort; no field requires natural language.
+`reason` distinguishes `when_false` (expected, eligible for `else`), `not_found` on an explicit expected probe (eligible for `else`), `unique_violation` and other business constraint failures (terminal exception), `contention` (timing-dependent optimistic validation mismatch, eligible for bounded retry), and `validation | dependency_failed | shed | key_overlap | internal` (not implicit `else` triggers). Include `op`, `table`, `where`/`key`, the condition as written, and `bound` values. A client can distinguish retry from business failure without parsing prose. The exhaustive wire taxonomy remains to be frozen with L-02.
 
 ### Open — remaining after this redesign
 
@@ -139,7 +139,7 @@ Status: settled.
 
 ### Read-set validation
 
-Every tile read records `(tile, version)`. At commit the versions are re-checked; any mismatch means retry.
+A timing-dependent read-set version mismatch at commit is a candidate for bounded retry on a fresh snapshot. A uniqueness/constraint violation is a business error and must not be retried merely because it shares a legacy `conflict` label. The v0 key/CSN validation design is in `engine.md`; the tile-version scheme below is historical design context.
 
 This is cheap in the right currency: tiles are immutable, so a tile version is a plausible validation granule. **But the previous claim that "phantom protection comes for free" is false (`review-05` SS-05), for two reasons.**
 
@@ -151,7 +151,7 @@ Open questions this leaves: whether pure read-only requests validate at all (the
 Consequences:
 
 - **Deadlock is impossible by construction.** Validation happens only at commit and never holds anything; there is no hold-and-wait. A lock manager, deadlock detector and lock timeouts are not needed.
-- **The only failure mode is retry.**
+- **Only timing-dependent contention is retryable by default.** Invalid input, uniqueness and other business constraints fail directly; expected predicate misses may take `else`.
 - Validation at commit plus read-set coverage gives serializability for the single-round-trip model, stronger than snapshot isolation with first-committer-wins alone — **only when `max_staleness = 0`** (`review-04` L-19). A request that reads a snapshot N seconds old and then validates against *current* tile versions can commit on stale reads, which is not serializable. The isolation guarantee must therefore be stated per service-class value, and `max_staleness` belongs in the pattern key.
 
 ### Partial application and prefix commit
@@ -168,7 +168,7 @@ Because the client can crash after commit and before acknowledgement, every requ
 
 ### Conflict policy
 
-Never block. On conflict the request retries into the next batch, or the writes are coalesced (see mergeable encodings, `learning.md`). Under contention the engine prefers aggregate throughput over single-request latency.
+Do not conflate business conflicts with timing contention. A unique/index constraint collision is a terminal business error (no automatic retry or `else`). Only a read-set validation mismatch attributable to concurrent publication may be retried on a new snapshot, with bounded attempts/backoff; it must not silently become an `else` branch. Coalescing is allowed only where a declared mergeable operation preserves semantics (see `learning.md`).
 
 ### What this model gives up
 

@@ -34,7 +34,8 @@ pub enum Op {
     DelReverse { entity: Vec<u8>, field: Vec<u8>, target: u64, source: u64 },
 }
 
-/// 发布冲突：可重试。携带哪条唯一约束、在哪个实体上冲突。
+/// 唯一约束冲突：业务错误，不是并发时机竞争，不应自动重试或触发 else。
+/// 保留早期 `Conflict` 类型名作为 v0 内部 API；未来并发验证失败需独立类型。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Conflict {
     pub kind: &'static str,
@@ -174,7 +175,7 @@ impl Engine {
         Ok(self.mt.get(&pfx, snapshot))
     }
 
-    /// 原子提交一个块。冲突 → `Outcome::Conflict`（未写 WAL，调用方重试）。
+    /// 原子提交一个块。唯一约束冲突 → `Outcome::Conflict`（未写 WAL，调用方直接报业务错误）。
     pub fn commit_block(&mut self, block_id: &[u8], ops: &[Op]) -> io::Result<Outcome> {
         if block_id.is_empty() {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "empty block_id"));
@@ -518,7 +519,7 @@ mod tests {
     }
 
     #[test]
-    fn unique_conflict_then_retry() {
+    fn unique_violation_then_distinct_value_succeeds() {
         let p = tmp("uniq.wal");
         let mut e = Engine::create(&p).unwrap();
         let put_c = |e: &mut Engine, handle: u64, email: &[u8], bid: &[u8]| {

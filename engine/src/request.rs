@@ -202,9 +202,11 @@ fn result(status: &'static str, csn: Option<u64>, row: Option<Value>) -> BlockRe
 fn publish(engine: &mut Engine, id: &[u8], ops: &[Op]) -> io::Result<BlockResult> {
     match engine.commit_block(id, ops)? {
         Outcome::Committed { csn } | Outcome::AlreadyCommitted { csn } => Ok(result("ok", Some(csn), None)),
-        // Only a false stock guard means "backorder". A uniqueness conflict is
-        // retryable/rejectable, not evidence that inventory is insufficient.
-        Outcome::Conflict(_) => Err(io::Error::new(ErrorKind::WouldBlock, "unique publish conflict; retry block")),
+        // Only a false stock guard means "backorder". x-unique is a business
+        // constraint violation, not a timing conflict and never an else trigger.
+        Outcome::Conflict(conflict) if conflict.kind == "x_unique" =>
+            Err(io::Error::new(ErrorKind::AlreadyExists, "unique constraint violation")),
+        Outcome::Conflict(_) => Err(io::Error::other("unclassified publish conflict")),
     }
 }
 
@@ -217,10 +219,10 @@ fn publish(engine: &mut Engine, id: &[u8], ops: &[Op]) -> io::Result<BlockResult
 ///
 /// Failed reads are not durable outcomes; clients needing exact original read
 /// bindings across retries must wait for the later general request journal.
-/// Likewise the engine's dedup currently has no expiry or payload fingerprint.
-/// Same request id with changed payload is therefore not supported.
-/// A publish conflict leaves the write set unapplied and returns WouldBlock;
-/// this narrow adapter does not run a business backorder on a unique conflict.
+/// The engine's dedup has no expiry; this adapter persists the complete
+/// canonical request payload in its write block id to reject changed intent.
+/// A unique publish conflict leaves the write set unapplied and returns
+/// AlreadyExists, never a backorder. Only timing contention may be retried.
 pub fn execute_order_flow(engine: &mut Engine, req: &Value) -> io::Result<RequestResult> {
     let has_read_fallback = validate(req)?;
     let id = req["id"].as_str().unwrap();

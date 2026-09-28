@@ -58,6 +58,10 @@ Need-review: yes（每个有行为的里程碑）
 
 Fresh reviewer 针对 `761ee4c..2a8f6c4`（审查材料 741 行）确认先前三项 P1 已修，又发现跨实体同一 `order_no` 可先有 Order 后有 Backorder（反向亦然）；原有 U 前缀只在各实体内独立。适配器现于单写者 `&mut Engine` 边界检查两实体 `order_no`，任一已存在则返回 `AlreadyExists`，不发布另一状态。回归测试覆盖两种顺序与 reopen；`cargo test --workspace --offline -q` 32 单元 + 6 集成通过，`git diff --check` 通过。独立复审此前 verdict BLOCK 对旧 diff 有效；此项修复经 scoped self-review 和回归验证，最终 revision 待下方提交记录。仍待通用契约决定冲突是否进入 `else`；此窄适配器只在库存条件失败时生成欠单。
 
+## 2026-09-28 — 作者确认条件与异常边界（Agent）
+
+作者指出 `else` 对应 `if`：只有预期中可作为条件的失败才走回退；业务唯一性冲突是原则性异常，直接失败；仅并发时机造成的锁/乐观验证竞争可能重试。实现将当前唯一性 `Outcome::Conflict { kind: "x_unique" }` 映射 `AlreadyExists`，不再错误地返回表示时机竞争的 `WouldBlock`；未来并发验证失败另设结果类型。测试覆盖发生唯一冲突时不写欠单。通用规则已写回 `docs/contracts.md`，引擎设计 `docs/engine.md` 同步；当前仍无并发读集验证，不声称已支持自动重试。`cargo test --workspace --offline -q` 32 单元 + 6 集成通过，`git diff --check` 通过。
+
 ## Acceptance criteria
 
 1. 实验 0a 数据可复现（fio 命令 + JSON 在 evidence/）——**需在空闲机器上重跑（0a-redo），且带负载守卫**。

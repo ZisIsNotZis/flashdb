@@ -183,7 +183,7 @@ fn malformed_or_conflicting_request_cannot_partially_write() {
     // Publish-time unique conflict: stock/movement/order all roll back.
     engine.commit_block(b"occupied", &[Op::PutUnique {entity:b"StockMovement".to_vec(), field:b"movement_no".to_vec(), value:b"M00000001".to_vec(), handle:50}]).unwrap();
     let err = execute_order_flow(&mut engine, &request()).unwrap_err();
-    assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
+    assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
     assert_eq!(engine.csn(), 2);
     assert_eq!(count(&engine), 5);
     assert_eq!(engine.unique_lookup(b"StockMovement", b"movement_no", b"M00000001", engine.csn()).unwrap(), Some(50));
