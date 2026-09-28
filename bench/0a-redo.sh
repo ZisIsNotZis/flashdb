@@ -83,7 +83,12 @@ if [ ! -f "$BENCH_DIR/f.8g" ]; then
 fi
 
 # ---------- 4. fio 套件 ----------
+if ! command -v fio >/dev/null 2>&1; then
+    log "fio NOT INSTALLED — clearing stale fio JSONs, skipping fio suite (Rust bench still runs)"
+    rm -f "$EV"/fio-*.json
+fi
 run_fio() { # name rw bs qd engine
+    command -v fio >/dev/null 2>&1 || return 1
     fio --name="$1" --filename="$BENCH_DIR/f.8g" --rw="$2" --bs="$3" \
         --iodepth="$4" --ioengine="$5" --direct=1 --runtime="$RUN_SEC" \
         --time_based=1 --size=8G --output-format=json \
@@ -110,7 +115,7 @@ fi
 # ---------- 5. 判定 ----------
 kill "$SAMPLER_PID" 2>/dev/null; wait "$SAMPLER_PID" 2>/dev/null || true
 max_load=$(awk -F, 'NR>1 && $2+0>m {m=$2+0} END{print m}' "$SAMPLER")
-min_idle=$(awk -F, 'NR>1 && ($3+0)<mi || mi=="" {mi=$3+0} END{print mi}' "$SAMPLER")
+min_idle=$(awk -F, 'NR>1 && ($3+0)<mi || mi=="" {mi=$3+0} END{print mi+0}' "$SAMPLER")
 verdict="$mode"
 # 运行期守卫用瞬时 idle%（与 fallback 窗口同一定义）：
 # load1 是滞后指标，会把渲染的 D 态线程计入，造成误报（见 three-run-analysis.md）。
@@ -133,7 +138,9 @@ out = {
   "note": ("ideal window; usable as calibration input" if mode == "clean"
            else "reduced-load window; indicative constants, prefer an idle re-run for final calibration"),
   "device": "Colorful CN600 2TB (/home/z/hf, no encryption)",
-  "results": {n: lat(f"4k-{n}") for n in ["qd1", "qd8", "qd32", "qd64"]},
+  "results": ({n: lat(f"4k-{n}") for n in ["qd1", "qd8", "qd32", "qd64"]}
+              if all(os.path.exists(f"{ev}/fio-4k-{n}.json") for n in ["qd1", "qd8", "qd32", "qd64"])
+              else "fio suite not run (fio missing)"),
   "results_16k": {"qd1": lat("16k-qd1"), "qd32": lat("16k-qd32")},
   "results_64k": {"qd1": lat("64k-qd1")},
   "seq_bw_MiB_s": round(json.load(open(f"{ev}/fio-seq.json"))["jobs"][0]["read"]["bw_bytes"]/2**20, 1),

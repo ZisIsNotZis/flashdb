@@ -34,6 +34,19 @@ Need-review: yes（每个有行为的里程碑）
 **方法论守卫（永久）：基准脚本必须记录运行期间的 `/proc/loadavg` 与 iostat 采样，
 负载超阈值则结果标记 contaminated，不进校准。空闲后重跑 experiment 0a-redo。**
 
+## Addendum: 实验 0a-redo 完成（2026-09-28）
+
+守望 v6/v7 完成：reduced-load 窗口（运行期 min_idle 81%、瞬时守卫通过），
+fio + 自研 Rust 基准（O_DIRECT pread）双工具交叉验证。
+
+- **QD32 4K：204,947（Rust）vs 205,658（fio）—— 0.3% 一致**，自研工具与
+  fio 互相验证通过，且 Rust 路径就是引擎将用的真实访问模式。
+- **引擎真实依赖页读 = 149 µs**（含 syscall 路径；fio 设备裸延迟 89–111 µs）。
+- 带宽常量：≥717 MiB/s（负载下）/ 827 MiB/s（近空闲）。
+- 环境事实：断电重启丢失了 fio 安装；`0a-redo.sh` 已加"fio 缺失时清陈旧
+  JSON 并跳过"守卫；Rust 基准零依赖不受影响。
+- 分析：`evidence/0a-redo/nvme-bench-analysis.md`。
+
 ## Acceptance criteria
 
 1. 实验 0a 数据可复现（fio 命令 + JSON 在 evidence/）——**需在空闲机器上重跑（0a-redo），且带负载守卫**。

@@ -1,0 +1,29 @@
+{
+  "id": "b78c34ce9",
+  "name": "0a-redo watcher v7",
+  "command": "WAIT_LIMIT=86400 bash /home/z/vibe/flashdb/bench/0a-redo.sh",
+  "description": "0a-redo watcher v7: tiered windows; runs fio suite AND the Rust O_DIRECT pread benchmark in the same guarded idle window; per-second load sampling; self-grades clean/reduced-load/interference",
+  "status": "completed",
+  "outputPath": ".pi/tasks/01a0a53e-e275-71a1-acf7-f852270cff6f-6637/b78c34ce9.output",
+  "cwd": "/home/z/vibe/flashdb",
+  "startTime": 1790558083613,
+  "endTime": 1790558116808,
+  "exitCode": 0,
+  "signal": null,
+  "pid": 32850,
+  "bytesWritten": 1306,
+  "isAgent": false,
+  "surviveReload": false,
+  "notified": true,
+  "notifyOnCompletion": true,
+  "triggerOnCompletion": true,
+  "timeoutSeconds": 93600,
+  "shellPolicy": {
+    "policy": "inherit",
+    "executable": "/usr/bin/zsh",
+    "argvPrefix": [
+      "-c"
+    ],
+    "dialect": "posix"
+  }
+}
