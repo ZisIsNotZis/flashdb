@@ -13,9 +13,8 @@
 //! 强制执行本切片未实现，已记录在 ticket 04/03。
 
 use std::collections::HashMap;
-use std::fs;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use crate::keys::{self, check_name};
 use crate::memtable::Memtable;
@@ -420,6 +419,8 @@ fn put_bytes(v: &mut Vec<u8>, b: &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::path::PathBuf;
     use std::process;
 
     fn tmp(name: &str) -> PathBuf {

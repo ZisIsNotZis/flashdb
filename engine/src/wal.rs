@@ -14,7 +14,7 @@
 //!
 //! 持久化时序由调用方保证（SS-01）：`append` → `sync` → 之后才允许发布 CSN。
 
-use std::fs::{self, File, OpenOptions};
+use std::fs::{File, OpenOptions};
 use std::io::{self, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
@@ -139,12 +139,13 @@ pub fn replay(path: impl AsRef<Path>) -> io::Result<(Vec<Vec<u8>>, u64)> {
 /// 仅删除文件（测试与工具用）。
 #[cfg(test)]
 pub(crate) fn remove(path: impl AsRef<Path>) {
-    fs::remove_file(path).ok();
+    std::fs::remove_file(path).ok();
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use std::process;
 
     fn tmp(name: &str) -> PathBuf {
