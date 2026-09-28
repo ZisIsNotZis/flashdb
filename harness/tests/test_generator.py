@@ -47,6 +47,11 @@ def test_requests_are_structurally_valid():
                 assert dep in r["blocks"], f"needs 引用不存在的块 {dep}"
 
 
+def test_order_flow_fixture_matches_generator():
+    fixture = (Path(__file__).parent / "fixtures" / "order_flow_seed42.jsonl").read_text()
+    assert fixture == next(render([Generator(42, 1).order_flow()])) + "\n"
+
+
 def test_order_flow_exercises_motivating_case():
     g = Generator(1, 50)
     flows = [r for r in g.requests() if "take" in r["blocks"]]

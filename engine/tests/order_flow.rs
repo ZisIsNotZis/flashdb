@@ -40,6 +40,36 @@ fn get(engine: &Engine, entity: &str, handle: u64) -> Value {
 fn count(engine: &Engine) -> i64 { get(engine, "Stock", 10)["on_hand"].as_i64().unwrap() }
 
 #[test]
+fn actual_python_generator_fixture_executes_through_engine() {
+    let line = include_str!("../../harness/tests/fixtures/order_flow_seed42.jsonl").trim_end();
+    let req: Value = serde_json::from_str(line).unwrap();
+    let sku = req["params"]["sku"].as_str().unwrap();
+    let loc = req["params"]["loc"].as_str().unwrap();
+    let email = req["params"]["email"].as_str().unwrap();
+    let qty = req["params"]["qty"].as_i64().unwrap();
+    let p = path();
+    let mut engine = Engine::create(&p).unwrap();
+    let stock = json!({"sku":sku,"loc":loc,"on_hand":qty + 1});
+    let customer = json!({"email":email});
+    engine.commit_block(b"fixture-seed", &[
+        Op::PutDoc {entity:b"Stock".to_vec(), handle:10, doc:serde_json::to_vec(&stock).unwrap()},
+        Op::PutUnique {entity:b"Stock".to_vec(), field:b"sku_loc".to_vec(),
+            value:serde_json::to_vec(&[sku,loc]).unwrap(), handle:10},
+        Op::PutDoc {entity:b"Customer".to_vec(), handle:20, doc:serde_json::to_vec(&customer).unwrap()},
+        Op::PutUnique {entity:b"Customer".to_vec(), field:b"email".to_vec(),
+            value:email.as_bytes().to_vec(), handle:20},
+    ]).unwrap();
+    assert_eq!(execute_order_flow(&mut engine, &req).unwrap()["take"].status, "ok");
+    assert_eq!(get(&engine, "Stock", 10)["on_hand"], 1);
+    let order_no = req["params"]["order_no"].as_str().unwrap();
+    assert!(engine.unique_lookup(b"Order", b"order_no", order_no.as_bytes(), engine.csn()).unwrap().is_some());
+    drop(engine);
+    let engine = Engine::open(&p).unwrap();
+    assert_eq!(get(&engine, "Stock", 10)["on_hand"], 1);
+    std::fs::remove_file(p).unwrap();
+}
+
+#[test]
 fn generator_order_flow_atomic_success_dedup_and_reopen() {
     let p = path();
     let mut engine = Engine::create(&p).unwrap();

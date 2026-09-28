@@ -62,6 +62,10 @@ Fresh reviewer 针对 `761ee4c..2a8f6c4`（审查材料 741 行）确认先前�
 
 作者指出 `else` 对应 `if`：只有预期中可作为条件的失败才走回退；业务唯一性冲突是原则性异常，直接失败；仅并发时机造成的锁/乐观验证竞争可能重试。实现将当前唯一性 `Outcome::Conflict { kind: "x_unique" }` 映射 `AlreadyExists`，不再错误地返回表示时机竞争的 `WouldBlock`；未来并发验证失败另设结果类型。测试覆盖发生唯一冲突时不写欠单。通用规则已写回 `docs/contracts.md`，引擎设计 `docs/engine.md` 同步；当前仍无并发读集验证，不声称已支持自动重试。`cargo test --workspace --offline -q` 32 单元 + 6 集成通过，`git diff --check` 通过。
 
+## 2026-09-28 — 三层连通夹具（Agent）
+
+`harness/tests/fixtures/order_flow_seed42.jsonl` 由 `Generator(42, 1).order_flow()` 的 `render` 形式生成；Python 测试锁定字节一致性。Rust 集成测试加载**同一文件**，按请求 params 初始化 Stock/Customer，执行库存原子块并验证扣减、订单唯一查找、WAL reopen；不是手工临摹请求形状。`cargo test --workspace --offline -q` 32 单元 + 7 集成通过，`cd harness && uv run --with pytest pytest -q` 7/7，`git diff --check` 通过。仍仅覆盖 `order_flow` 模板，不代表所有 trace 种类/通用 DAG 已支持。
+
 ## Acceptance criteria
 
 1. 实验 0a 数据可复现（fio 命令 + JSON 在 evidence/）——**需在空闲机器上重跑（0a-redo），且带负载守卫**。
