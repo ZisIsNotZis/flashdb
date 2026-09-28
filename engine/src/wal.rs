@@ -162,7 +162,21 @@ pub fn replay(path: impl AsRef<Path>) -> io::Result<(Vec<Vec<u8>>, u64)> {
         }
         let len = u32::from_le_bytes(header[..4].try_into().unwrap()) as usize;
         if len == 0 {
-            break; // 全零（预分配未写）→ 日志尾
+            // Only an entirely zero remainder is a preallocated tail. A
+            // zeroed acknowledged frame header followed by its old payload
+            // must fail closed instead of truncating that committed record.
+            if header[4..].iter().any(|&b| b != 0) {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "WAL zero-length header has nonzero CRC"));
+            }
+            let mut remainder = [0u8; 8192];
+            loop {
+                let n = r.read(&mut remainder)?;
+                if n == 0 { break; }
+                if remainder[..n].iter().any(|&b| b != 0) {
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, "WAL zero tail contains data"));
+                }
+            }
+            break;
         }
         if len > MAX_RECORD {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "WAL record length exceeds limit"));
@@ -271,6 +285,25 @@ mod tests {
         assert_eq!(Wal::open_or_recover(&p).err().unwrap().kind(), io::ErrorKind::InvalidData);
         assert_eq!(fs::read(&p).unwrap(), bytes, "失败时不得截断原始证据");
         remove(&p);
+    }
+
+    #[test]
+    fn zeroed_acknowledged_header_does_not_truncate_record() {
+        for zero_crc in [false, true] {
+            let p = tmp(if zero_crc { "zero_full_header.wal" } else { "zero_length.wal" });
+            let mut w = Wal::create(&p).unwrap();
+            w.append(b"first").unwrap();
+            w.append(b"acknowledged-second").unwrap();
+            w.sync().unwrap();
+            drop(w);
+            let mut bytes = fs::read(&p).unwrap();
+            let second = HEADER + b"first".len();
+            bytes[second..second + if zero_crc { HEADER } else { 4 }].fill(0);
+            fs::write(&p, &bytes).unwrap();
+            assert_eq!(Wal::open_or_recover(&p).err().unwrap().kind(), io::ErrorKind::InvalidData);
+            assert_eq!(fs::read(&p).unwrap(), bytes, "failure must preserve WAL evidence");
+            remove(&p);
+        }
     }
 
     #[test]
