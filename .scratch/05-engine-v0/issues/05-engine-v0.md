@@ -52,7 +52,7 @@ Need-review: yes（每个有行为的里程碑）
 
 隔离工作树实现 `engine/src/request.rs`，仅支持 harness `order_flow` 的精确 `cust → take` 模板，不声称通用语法。`cf2cd99` 集成后 `cargo test --workspace --offline` 为 31 个单元 + 4 个集成测试全绿；端到端涵盖库存成功扣减并同时写 movement/order、欠库存回退 backorder、反向引用、WAL 恢复。Agent 增加同一请求 ID 不同 payload 的回归：原实现错误确认旧提交，正在修复（本票据后续记录最终 revision）。
 
-限制：读取绑定尚未随 WAL 记载，读块重放不可返回原观察；没有通用读集冲突验证、TTL 幂等保留、通用请求规范化/任意 DAG。使用者不可将此原型当成完整事务接口。独立审查进行中。
+限制：读取绑定尚未随 WAL 记载，读块重放不可返回原观察；没有通用读集冲突验证、TTL 幂等保留、通用请求规范化/任意 DAG。使用者不可将此原型当成完整事务接口。独立审查超时，但尾部结果标记三个 P1：不同 payload 错误重放（已修，回归测试）、唯一冲突误写欠单（此窄适配器以 `WouldBlock` 拒绝，不作为缺货 fallback；通用合同对冲突可触发 else 的表述仍须设计澄清）、过长 WAL 记录提交后恢复丢失（append 写前按 MAX_RECORD 拒绝，回归测试）。保留审查输出在子任务记录；不要把超时当作无发现。
 
 ## Acceptance criteria
 

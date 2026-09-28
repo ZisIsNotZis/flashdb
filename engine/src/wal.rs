@@ -78,12 +78,11 @@ impl Wal {
         Ok((Wal { file, path: path.as_ref().to_path_buf(), valid_len }, records))
     }
 
-    /// 追加一条记录（未持久化；调用方随后 `sync`）。拒绝空载荷。
+    /// 追加一条记录（未持久化；调用方随后 `sync`）。拒绝空载荷和恢复器无法读取的超长载荷。
     pub fn append(&mut self, payload: &[u8]) -> io::Result<()> {
-        assert!(
-            !payload.is_empty(),
-            "empty WAL payloads are invalid: a preallocated zero region would replay as a record"
-        );
+        if payload.is_empty() || payload.len() > MAX_RECORD {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "WAL payload length out of bounds"));
+        }
         let mut frame = Vec::with_capacity(HEADER + payload.len());
         frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
         frame.extend_from_slice(&crc32c(payload).to_le_bytes());
@@ -254,10 +253,22 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "empty WAL payloads")]
     fn empty_payload_rejected() {
         let p = tmp("empty.wal");
         let mut w = Wal::create(&p).unwrap();
-        w.append(b"").unwrap();
+        assert_eq!(w.append(b"").unwrap_err().kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(w.valid_len(), 0);
+        remove(&p);
+    }
+
+    #[test]
+    fn oversized_payload_cannot_be_acknowledged_then_lost_on_replay() {
+        let p = tmp("oversized.wal");
+        let mut w = Wal::create(&p).unwrap();
+        let oversized = vec![1u8; MAX_RECORD + 1];
+        assert_eq!(w.append(&oversized).unwrap_err().kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(w.valid_len(), 0);
+        assert_eq!(p.metadata().unwrap().len(), 0);
+        remove(&p);
     }
 }

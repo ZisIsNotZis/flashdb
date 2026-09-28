@@ -145,12 +145,11 @@ fn malformed_or_conflicting_request_cannot_partially_write() {
     assert_eq!(engine.csn(), 1);
     // Publish-time unique conflict: stock/movement/order all roll back.
     engine.commit_block(b"occupied", &[Op::PutUnique {entity:b"Order".to_vec(), field:b"order_no".to_vec(), value:b"O00000001".to_vec(), handle:50}]).unwrap();
-    let out = execute_order_flow(&mut engine, &request()).unwrap();
-    assert_eq!(out["take"].status, "failed");
-    assert_eq!(out["take/else"].status, "ok");
-    assert_eq!(engine.csn(), 3);
+    let err = execute_order_flow(&mut engine, &request()).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
+    assert_eq!(engine.csn(), 2);
     assert_eq!(count(&engine), 5);
     assert_eq!(engine.unique_lookup(b"StockMovement", b"movement_no", b"M00000001", engine.csn()).unwrap(), None);
-    assert!(engine.unique_lookup(b"Backorder", b"order_no", b"O00000001", engine.csn()).unwrap().is_some());
+    assert_eq!(engine.unique_lookup(b"Backorder", b"order_no", b"O00000001", engine.csn()).unwrap(), None);
     std::fs::remove_file(p).unwrap();
 }
