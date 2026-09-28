@@ -4,7 +4,7 @@ Experimental single-node document store for IO-bound workloads. Its research goa
 
 ## Current state
 
-- Rust prototype: versioned P/U/R keys, WAL with CRC and torn-tail recovery, memtable snapshots, per-block atomic commit, unique-value enforcement and reverse lookup. This is an in-memory index backed by a WAL, **not** a complete LSM: no tile files, compaction, manifest, or general request executor yet.
+- Rust prototype: versioned P/U/R keys, WAL with CRC and torn-tail recovery, memtable snapshots, per-block atomic commit, unique-value enforcement and reverse lookup. A narrowly scoped adapter executes the inventory generator's `cust → take` order-flow template (including stock-decrement and backorder branches); arbitrary request DAGs and operators are **not** supported. This is an in-memory index backed by a WAL, **not** a complete LSM: no tile files, compaction or manifest yet.
 - Python harness: deterministic inventory request generator (SplitMix64, integer Zipf), with a JSONL trace shape.
 - Device calibration: `bench/0a-redo.sh` runs fio and a Rust `O_DIRECT read_at` microbenchmark under a CPU-idle guard. The latest measurements are *reduced-load references*, not clean-idle calibration; see `.scratch/05-engine-v0/evidence/0a-redo/nvme-bench-analysis.md`.
 - Design and open decisions are recorded in `docs/` and `.scratch/`. The proposed request contract is broader than the implemented prototype and is not yet a production API.
