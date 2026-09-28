@@ -1,8 +1,8 @@
 # 06-trace-replay — deterministic inventory JSONL execution
 
-Status: claimed
-Owner: parent agent; isolated worker owns the read-only request adapter at run `d6490691-d85e-404f-aee2-da57c3559c55`.
-Base revision: `d54378e` (2026-09-28).
+Status: done
+Owner: parent agent; read-only adapter worker run `d6490691-d85e-404f-aee2-da57c3559c55` integrated at `48c70ee`.
+Base revision: `d54378e` (2026-09-28); accepted code revision: `24f31df`.
 
 ## Objective and bounds
 
@@ -35,6 +35,8 @@ Fresh reviewer on `cb407f1` returned BLOCK: (P1) 20-line default corpus had no r
 
 Fresh reviewer on `f5f814e` confirmed the five earlier issues resolved and gave OK-with-notes; new P2: the 1 MiB byte cap was enforced during traversal before later lexicographically earlier rows could evict large rows, so a small final top-100 could be falsely rejected. Fixed by checking retained encoded bytes only after final selection; transient retention remains ≤101 × 64 KiB encoded docs. Added regression: 17 large `Z...` rows at low handles are displaced by 100 small `A...` rows at high handles, and the final result succeeds. Targeted `cargo test -p flashdb-engine --test read_requests --offline -q` 5/5, `git diff --check` passed. Final revision and all gates pending.
 
-## Next action
+## Acceptance — 2026-09-28
 
-Reread scoped diff, commit the cap fix, rerun all revision-bound gates and update the active-work pointer. CLI remains experimental and requires a pre-seeded WAL; no layout performance claim before tile/compaction exists. No user decision pending.
+Revision `24f31df`: `cargo test --workspace --offline -q` passed 32 unit + 7 order-flow + 5 read + 3 replay tests (47 total); `cd harness && uv run --with pytest pytest -q` passed 10 tests; `git diff --check` passed; scoped cap diff reread. The independent reviewer gave OK-with-notes for `f5f814e`; its remaining P2 was fixed and caught by the new out-of-order cap regression. Corpus hashes: mixed 20-line `929822594483301f5951e98746c60932d7bfd82408780555a231e9d0a28c5264`; hot 2-line `d803afa5bd8cd459abbadb9e9bd707b491c96c2ccdedf372b7a94930e8758855`. No user decision pending.
+
+**Residual boundaries:** CLI requires an existing independently seeded WAL and is experimental; read bindings are not journalled, so replay onto a previously mutated WAL deduplicates writes but does not reproduce original read observations. Movement scans traverse the entire StockMovement P prefix and cap final top-100 retained encoded bytes; the engine is still WAL+memtable only, not an LSM/tile engine. No layout throughput conclusion follows from this ticket. Next concern: persistence/tile/compaction and then fair layout controls, tracked separately.
