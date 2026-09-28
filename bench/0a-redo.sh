@@ -98,6 +98,15 @@ run_fio 16k-qd32 randread 16384 32 libaio
 run_fio 64k-qd1 randread 65536 1  psync
 run_fio seq    read     1048576 8  libaio
 
+# ---------- Rust 基准（同一空闲窗口内，测量引擎真实访问模式：O_DIRECT pread 页读） ----------
+NB=/home/z/vibe/flashdb/target/release/nvme-bench
+if [ -x "$NB" ]; then
+    for m in qd1 qd8 qd32 qd64; do "$NB" "$BENCH_DIR/f.8g" "$m" > "$EV/nvme-$m.txt" 2>&1; done
+    "$NB" "$BENCH_DIR/f.8g" seq > "$EV/nvme-seq.txt" 2>&1
+else
+    log "nvme-bench binary missing at $NB — skipped"
+fi
+
 # ---------- 5. 判定 ----------
 kill "$SAMPLER_PID" 2>/dev/null; wait "$SAMPLER_PID" 2>/dev/null || true
 max_load=$(awk -F, 'NR>1 && $2+0>m {m=$2+0} END{print m}' "$SAMPLER")
