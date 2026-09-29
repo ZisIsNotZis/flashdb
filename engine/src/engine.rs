@@ -13,7 +13,7 @@
 //! 强制执行本切片未实现，已记录在 ticket 04/03。
 
 use std::collections::HashMap;
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -73,6 +73,18 @@ pub struct Engine {
     /// history lives in `data.wal`. Republishing carries it verbatim into every
     /// new root so a rotated engine's root never stops naming the live suffix.
     segment: Option<SegmentRef>,
+    /// Max CSN present in the active WAL FILE (0 when it holds no records): the
+    /// replay-derived suffix maximum in segment mode, where the engine CSN is
+    /// merged with the manifest checkpoint below the segment floor and may
+    /// legitimately exceed it. The republish guard compares the file against
+    /// this, not against the merged CSN.
+    segment_suffix_csn: u64,
+    /// Set when the live WAL binding could not follow the durable segment flip
+    /// during rotation: the manifest root already names the new segment, so any
+    /// further append through the old binding would be unrecoverable. Every
+    /// mutating operation fails closed until reopen, which recovers from the
+    /// durable root (the never-unlinked old segment is an ignored orphan).
+    wal_detached: bool,
     csn: u64,
     dedup: HashMap<Vec<u8>, u64>,
     max_handle: u64,
@@ -104,6 +116,8 @@ impl Engine {
             dir: parent_dir(wal_path.as_ref()),
             manifest: None,
             segment: None,
+            segment_suffix_csn: 0,
+            wal_detached: false,
             csn: 0,
             dedup: HashMap::new(),
             max_handle: 0,
@@ -210,10 +224,19 @@ impl Engine {
         if !tiles.windows(2).all(|w| w[0].cutoff() < w[1].cutoff()) {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "tile cutoffs overlap or are not strictly increasing"));
         }
-        let (wal, records) = Wal::open_or_recover(wal_path)?;
+        let (wal, records) = match Wal::open_or_recover(wal_path) {
+            Ok(opened) => opened,
+            // A rotated directory no longer has `data.wal`; only `open_discover`
+            // (which follows the manifest's segment reference) can open it.
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                return Err(io::Error::new(io::ErrorKind::NotFound, format!(
+                    "WAL file {} is missing: legacy opens cannot recover a rotated directory - use open_discover (the manifest names the live segment)", wal_path.display())));
+            }
+            Err(e) => return Err(e),
+        };
         for t in &tiles {
             if floor.is_some_and(|f| t.cutoff() <= f) { continue; }
-            if wal_digest(&records, t.cutoff())? != *t.tile.digest() {
+            if wal_digest(&records, t.cutoff(), floor.unwrap_or(0))? != *t.tile.digest() {
                 return Err(io::Error::new(io::ErrorKind::InvalidData, "tile WAL prefix mismatch"));
             }
         }
@@ -245,7 +268,42 @@ impl Engine {
             t.tile.verify_projection(&newest_projection(&covered, lower, t.cutoff()), lower, t.cutoff())?;
             lower = t.cutoff();
         }
-        Ok(Engine { wal, mt, tiles, wal_path: wal_path.to_path_buf(), dir: parent_dir(wal_path), manifest: None, segment: None, csn, dedup, max_handle })
+        Ok(Engine { wal, mt, tiles, wal_path: wal_path.to_path_buf(), dir: parent_dir(wal_path), manifest: None, segment: None, segment_suffix_csn: csn, wal_detached: false, csn, dedup, max_handle })
+    }
+
+    /// The CSN floor below which the active WAL file holds no records: the
+    /// segment start CSN once rotation exists, 0 while the full history is
+    /// retained in `data.wal`.
+    fn wal_floor(&self) -> u64 {
+        self.segment.as_ref().map(|s| s.start_csn).unwrap_or(0)
+    }
+
+    /// Fail closed once a rotation's live-WAL rebinding failed after the
+    /// durable flip: the manifest root already names the new segment, so an
+    /// append through the stale binding would land in a file recovery ignores.
+    /// Reopen recovers from the durable root (the never-unlinked old segment is
+    /// an ignored orphan).
+    fn ensure_attached(&self) -> io::Result<()> {
+        if self.wal_detached {
+            return Err(io::Error::new(io::ErrorKind::Other, "engine WAL binding detached from the durable segment by a failed rotation; reopen to recover"));
+        }
+        Ok(())
+    }
+
+    /// The republish guard: the WAL file being published from must still hold
+    /// exactly the records the serving state was recovered from. Segment mode
+    /// merges the checkpoint frontier below the segment floor into the engine
+    /// CSN, so there the comparison target is the suffix maximum derived from
+    /// the active segment at open (and advanced by each commit), not the merged
+    /// CSN. Any divergence fails closed before a tile can be bound to content
+    /// the engine never served.
+    fn verify_wal_matches_state(&self, records: &[Vec<u8>]) -> io::Result<()> {
+        let wal_max = records.last().map(|r| decode_payload(r).map(|v| v.0)).transpose()?.unwrap_or(0);
+        let expected = if self.segment.is_some() { self.segment_suffix_csn } else { self.csn };
+        if wal_max != expected && self.csn != 0 {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "WAL differs from serving state"));
+        }
+        Ok(())
     }
 
     /// Build one immutable P/U/R tile holding, for the WAL-published versions
@@ -254,6 +312,7 @@ impl Engine {
     /// serving memtable intact; a successful build evicts covered versions only
     /// after the file is synced and verified.
     pub fn build_tile(&mut self, tile_path: impl AsRef<Path>, cutoff: u64) -> io::Result<()> {
+        self.ensure_attached()?;
         if cutoff > self.csn {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "cutoff exceeds CSN"));
         }
@@ -279,13 +338,15 @@ impl Engine {
 
     /// Create-new the tile file, sync it, reopen it and re-check its exact
     /// newest-version-per-logical-key `(previous cutoff, cutoff]` P/U/R
-    /// projection against the retained WAL before any caller may reference it.
+    /// projection against the active WAL file — the retained WAL before
+    /// rotation, the live segment's `(segment start, cutoff]` suffix after it
+    /// (the prefix below the segment floor is already verified state carried by
+    /// the published tiles and the manifest checkpoint) — before any caller may
+    /// reference it.
     fn write_verified_tile(&self, tile_path: &Path, cutoff: u64) -> io::Result<Tile> {
         let (records, _) = wal::replay(&self.wal_path)?;
-        if records.last().map(|r| decode_payload(r).map(|v| v.0)).transpose()? != Some(self.csn) && self.csn != 0 {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "WAL differs from serving state"));
-        }
-        let digest = wal_digest(&records, cutoff)?;
+        self.verify_wal_matches_state(&records)?;
+        let digest = wal_digest(&records, cutoff, self.wal_floor())?;
         let lower = self.tiles.last().map(|t| t.cutoff()).unwrap_or(0);
         let mut expected = Memtable::new();
         for payload in &records {
@@ -318,6 +379,7 @@ impl Engine {
         if self.manifest.as_ref().is_some_and(|m| m.poisoned()) {
             return Err(io::Error::new(io::ErrorKind::Other, "manifest writer poisoned; reopen to recover"));
         }
+        self.ensure_attached()?;
         if cutoff > self.csn {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "cutoff exceeds CSN"));
         }
@@ -353,26 +415,25 @@ impl Engine {
         let mut refs: Vec<TileRef> = self.tiles.iter().map(|t| t.tile_ref()).collect();
         refs.push(tref);
         let checkpoint = Checkpoint { csn: cutoff, handle_watermark: self.max_handle };
-        self.manifest_publish(refs, checkpoint)?;
+        self.manifest_publish(refs, checkpoint, self.segment.clone())?;
         // 4. In-memory flip only after the durable flip.
         self.mt.evict_through(cutoff);
         self.tiles.push(TileHandle { tile, name: name.to_string() });
         Ok(())
     }
 
-    // Shared manifest step of the publication protocol ([`Engine::publish_tile`]
-    // and [`Engine::compact`]): write the inactive page at `seq + 1` carrying the
-    // FULL active tile list, sync the manifest file, sync the parent directory,
-    // then flip the in-memory root. A missing manifest is created, or an
+    // Shared manifest step of the publication protocol ([`Engine::publish_tile`],
+    // [`Engine::compact`] and [`Engine::rotate_wal`]): write the inactive page at
+    // `seq + 1` carrying the FULL active tile list, sync the manifest file, sync
+    // the parent directory, then flip the in-memory root. `segment` is the root's
+    // new segment reference: callers carry the engine's current one verbatim
+    // (`None` until rotation exists — a rotated engine's republished root must
+    // keep naming the live suffix, a legacy engine stays None-encoded), while
+    // rotation installs the fresh one. A missing manifest is created, or an
     // existing empty-root manifest adopted — an engine opened without discovery
     // must never overwrite a root it did not read. Any error poisons the writer
     // until reopen.
-    fn manifest_publish(&mut self, refs: Vec<TileRef>, checkpoint: Checkpoint) -> io::Result<()> {
-        // Every new root carries the engine's current segment reference verbatim
-        // (`None` until rotation exists): a rotated engine's republished root
-        // must keep naming the live suffix, and a legacy engine stays
-        // None-encoded.
-        let segment = self.segment.clone();
+    fn manifest_publish(&mut self, refs: Vec<TileRef>, checkpoint: Checkpoint, segment: Option<SegmentRef>) -> io::Result<()> {
         match &mut self.manifest {
             Some(m) => m.publish(refs, checkpoint, segment)?,
             None => {
@@ -428,10 +489,71 @@ impl Engine {
     /// tiles on disk as unreferenced orphans. Discovery must — and does —
     /// ignore both kinds: unreferenced files are never adopted; they are leaked
     /// until manually removed.
+    /// Rotate the WAL onto a fresh, empty segment once the live segment exceeds
+    /// `max_wal_bytes`. Preconditions: every committed block must already be
+    /// published as a tile (`newest cutoff == csn`) and at least one tile must
+    /// exist — otherwise `Ok(false)`. Protocol mirrors publish: create-new the
+    /// new segment file + dir sync, manifest-publish the same tile list with
+    /// `SegmentRef{new name, start_csn: cutoff}` via the seq+1 flip, and only
+    /// after the durable flip rebind the engine's WAL to the empty segment and
+    /// best-effort unlink the old one (open fds keep it alive; a crash before
+    /// the flip leaves the new file an orphan that discovery ignores).
+    /// Fail-closed: a target-name collision, or any post-flip rebinding failure
+    /// (detached WAL), requires reopen; commits are refused while detached.
+    pub fn rotate_wal(&mut self, max_wal_bytes: u64) -> io::Result<bool> {
+        if self.manifest.as_ref().is_some_and(|m| m.poisoned()) {
+            return Err(io::Error::new(io::ErrorKind::Other, "manifest writer poisoned; reopen to recover"));
+        }
+        self.ensure_attached()?;
+        let Some(newest) = self.tiles.last() else { return Ok(false) };
+        if self.wal.valid_len() <= max_wal_bytes {
+            return Ok(false);
+        }
+        let cutoff = newest.cutoff();
+        if cutoff != self.csn || self.mt.len() != 0 {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput,
+                "rotation requires every committed block published (newest tile cutoff == csn, empty memtable)"));
+        }
+        let name = format!("data-{cutoff}.wal");
+        let path = self.dir.join(&name);
+        let f = OpenOptions::new().read(true).write(true).create_new(true).open(&path)
+            .map_err(|e| if e.kind() == io::ErrorKind::AlreadyExists {
+                io::Error::new(io::ErrorKind::AlreadyExists, format!(
+                    "rotation target {name} already exists (leftover from a failed rotation); remove it or recover via open_discover"))
+            } else { e })?;
+        f.sync_data()?;
+        drop(f);
+        File::open(&self.dir)?.sync_all()?;
+        // The checkpoint is unchanged (same tiles, same csn/watermark); only the
+        // live-segment reference moves to the born-empty file.
+        let refs: Vec<TileRef> = self.tiles.iter().map(|t| t.tile_ref()).collect();
+        let checkpoint = Checkpoint { csn: cutoff, handle_watermark: self.max_handle };
+        let seg = SegmentRef { name: name.clone(), start_csn: cutoff };
+        self.manifest_publish(refs, checkpoint, Some(seg))?;
+        // Durable flip done: rebind to the empty segment, then unlink the old
+        // segment best-effort.
+        let old_path = self.wal_path.clone();
+        let (wal, records) = Wal::open_or_recover(&path)?;
+        if !records.is_empty() {
+            self.wal_detached = true;
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "fresh rotation segment is not empty"));
+        }
+        self.wal = wal;
+        self.wal_path = path;
+        self.segment = Some(SegmentRef { name, start_csn: cutoff });
+        self.segment_suffix_csn = 0;
+        // Pre-rotation block ids die with the old segment, in memory as well:
+        // keeping them would promise a dedup the next reopen will not honor.
+        self.dedup.retain(|_, csn| *csn > cutoff);
+        let _ = fs::remove_file(&old_path);
+        Ok(true)
+    }
+
     pub fn compact(&mut self) -> io::Result<()> {
         if self.manifest.as_ref().is_some_and(|m| m.poisoned()) {
             return Err(io::Error::new(io::ErrorKind::Other, "manifest writer poisoned; reopen to recover"));
         }
+        self.ensure_attached()?;
         if self.tiles.len() < 2 {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "compaction requires at least two active tiles"));
         }
@@ -462,7 +584,7 @@ impl Engine {
         //    number of files carrying `(0, cutoff]` shrinks.
         let tref = TileRef { name: name.clone(), cutoff, digest: *tile.digest() };
         let checkpoint = Checkpoint { csn: cutoff, handle_watermark: self.max_handle };
-        self.manifest_publish(vec![tref], checkpoint)?;
+        self.manifest_publish(vec![tref], checkpoint, self.segment.clone())?;
         // 4. In-memory flip: one tile replaces the whole ordered list; the
         //    memtable is untouched (it only holds versions above `cutoff`).
         let superseded = std::mem::replace(&mut self.tiles, vec![TileHandle { tile, name }]);
@@ -479,19 +601,30 @@ impl Engine {
 
     /// Create-new the compacted tile for the full `(0, cutoff]` union of every
     /// published tile range, sync it, reopen it and re-check its exact
-    /// newest-version-per-logical-key projection against the retained WAL
-    /// before any caller may reference it. Each input tile was itself verified
-    /// against its disjoint WAL range at open/publish, so building from the
-    /// WAL projection IS the multi-tile merge (same codec, same key order,
-    /// newest version per logical key, tombstones retained as newest state) —
-    /// and the verification is `publish`'s extended to the union.
+    /// newest-version-per-logical-key projection against the active WAL file's
+    /// `(segment start, cutoff]` range combined with the already-verified
+    /// tile-carried prefix, before any caller may reference it. Each input tile
+    /// was itself verified against its disjoint WAL range at open/publish, so
+    /// building from the WAL projection IS the multi-tile merge (same codec,
+    /// same key order, newest version per logical key, tombstones retained as
+    /// newest state) — and the verification is `publish`'s extended to the union.
     fn write_compacted_tile(&self, tile_path: &Path, cutoff: u64) -> io::Result<Tile> {
         let (records, _) = wal::replay(&self.wal_path)?;
-        if records.last().map(|r| decode_payload(r).map(|v| v.0)).transpose()? != Some(self.csn) && self.csn != 0 {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "WAL differs from serving state"));
-        }
-        let digest = wal_digest(&records, cutoff)?;
+        self.verify_wal_matches_state(&records)?;
+        let digest = wal_digest(&records, cutoff, self.wal_floor())?;
         let mut expected = Memtable::new();
+        // Segment mode: the retired prefix (0, segment start] survives only in
+        // the already-verified published tiles, so the union projection seeds
+        // from their exact entries before the suffix records are applied. In
+        // full mode the WAL alone already covers every tile range.
+        if self.segment.is_some() {
+            for t in &self.tiles {
+                for entry in t.tile.entries() {
+                    let (key, value) = entry?;
+                    expected.apply(key, value);
+                }
+            }
+        }
         for payload in &records {
             let (csn, _, ops) = decode_payload(payload)?;
             if csn <= cutoff { for op in &ops { apply_op(&mut expected, op, csn); } }
@@ -674,6 +807,7 @@ impl Engine {
 
     /// 原子提交一个块。唯一约束冲突 → `Outcome::Conflict`（未写 WAL，调用方直接报业务错误）。
     pub fn commit_block(&mut self, block_id: &[u8], ops: &[Op]) -> io::Result<Outcome> {
+        self.ensure_attached()?;
         if block_id.is_empty() {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "empty block_id"));
         }
@@ -728,6 +862,10 @@ impl Engine {
             apply_op(&mut self.mt, op, csn);
         }
         self.csn = csn;
+        // The synced record is now the newest content of the active WAL file
+        // (in segment mode too), keeping the republish guard's comparison
+        // target in lockstep with the file.
+        self.segment_suffix_csn = csn;
         self.max_handle = self.max_handle.max(ops.iter().map(op_handle).max().unwrap_or(0));
         self.dedup.insert(block_id.to_vec(), csn);
         Ok(Outcome::Committed { csn })
@@ -761,9 +899,13 @@ fn smallest_disk_head(heads: &[Option<(Vec<u8>, Vec<u8>)>]) -> Option<usize> {
     best
 }
 
-// Bind a tile to the exact WAL prefix which produced it; the WAL remains the only
+// Bind a tile to the exact WAL range which produced it; the WAL remains the only
 // recovery authority. Length delimiters prevent ambiguous concatenation of records.
-fn wal_digest(records: &[Vec<u8>], cutoff: u64) -> io::Result<[u8; 32]> {
+// `floor` is the segment start CSN in segment mode: records below it are retired
+// (their state lives in tiles + manifest checkpoint), so the digest covers only
+// `(floor, cutoff]` and the coverage requirement is relaxed to `cutoff >
+// max(last, floor)` — with floor 0 this is exactly the full-WAL check.
+fn wal_digest(records: &[Vec<u8>], cutoff: u64, floor: u64) -> io::Result<[u8; 32]> {
     let mut hash = Sha256::new();
     let mut last = 0u64;
     for payload in records {
@@ -777,7 +919,7 @@ fn wal_digest(records: &[Vec<u8>], cutoff: u64) -> io::Result<[u8; 32]> {
         }
         last = csn;
     }
-    if cutoff > last { return Err(io::Error::new(io::ErrorKind::InvalidData, "tile cutoff exceeds WAL")); }
+    if cutoff > last.max(floor) { return Err(io::Error::new(io::ErrorKind::InvalidData, "tile cutoff exceeds WAL")); }
     Ok(hash.finalize().into())
 }
 

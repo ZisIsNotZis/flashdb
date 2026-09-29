@@ -388,3 +388,74 @@ fn crc32c(bytes: &[u8]) -> u32 {
     }
     !crc
 }
+
+#[test]
+fn wal_rotation_rebinds_to_fresh_segment_and_drops_pre_rotation_ids() {
+    use flashdb_engine::wal::crc32c;
+    let files = Files::new();
+    let mut e = Engine::create(&files.wal).unwrap();
+    e.commit_block(b"b1", &[doc(1, b"one")]).unwrap();
+    assert_eq!(e.rotate_wal(0).unwrap(), false, "no published tiles");
+    e.commit_block(b"b2", &[doc(2, b"two")]).unwrap();
+    e.publish_tile(&files.dir.join("tile-2.tile"), 2).unwrap();
+    // Unpublished frontier: cutoff(2) != csn(3) refuses with InvalidInput.
+    e.commit_block(b"b3", &[doc(3, b"three")]).unwrap();
+    assert_eq!(e.rotate_wal(0).unwrap_err().kind(), ErrorKind::InvalidInput);
+    // Above-threshold refusal: no rotation even with a fully published state.
+    e.publish_tile(&files.dir.join("tile-3.tile"), 3).unwrap();
+    assert_eq!(e.rotate_wal(u64::MAX).unwrap(), false);
+    assert!(e.committed_block_csn(b"b1").is_some());
+    assert_eq!(e.rotate_wal(0).unwrap(), true);
+    assert!(files.dir.join("data-3.wal").exists(), "new segment named for the cutoff");
+    assert!(!files.wal.exists(), "old segment unlinked after the durable flip");
+    // Pre-rotation block ids are forgotten by design; new commits go to the
+    // new segment and reuse of an old block id commits as a new block.
+    assert_eq!(e.committed_block_csn(b"b1"), None, "pre-rotation ids die with the old segment");
+    assert!(matches!(e.commit_block(b"b1", &[doc(3, b"three")]).unwrap(), Outcome::Committed { csn: 4 }));
+    e.commit_block(b"b4", &[doc(4, b"four")]).unwrap();
+    drop(e);
+    let mut e = Engine::open_discover(&files.dir).unwrap();
+    assert_eq!(e.csn(), 5);
+    assert_eq!(e.next_handle().unwrap(), 5);
+    assert_eq!(e.get(b"E", 1).unwrap(), Some(b"one".to_vec()));
+    assert_eq!(e.get(b"E", 3).unwrap(), Some(b"three".to_vec()));
+    // Rotation chain: a second rotation names the newer cutoff.
+    e.publish_tile(&files.dir.join("tile-5.tile"), 5).unwrap();
+    assert_eq!(e.rotate_wal(0).unwrap(), true);
+    assert!(files.dir.join("data-5.wal").exists());
+    assert!(!files.dir.join("data-3.wal").exists(), "data-3 was the pre-rotation data.wal");
+    // Wrong-segment fail-closed: the manifest names data-5.wal; swapping in a
+    // foreign suffix must be rejected at discovery.
+    let good = fs::read(files.dir.join("data-5.wal")).unwrap();
+    fs::write(files.dir.join("data-5.wal"), b"foreign bytes").unwrap();
+    let err = Engine::open_discover(&files.dir).map(|_| ()).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    // Restore, then legacy opens on a rotated dir fail closed (data.wal is gone).
+    fs::write(files.dir.join("data-5.wal"), &good).unwrap();
+    assert!(Engine::open(&files.wal).is_err());
+    drop(e);
+    let e = Engine::open_discover(&files.dir).unwrap();
+    assert_eq!(e.get(b"E", 4).unwrap(), Some(b"four".to_vec()));
+    // _ = crc32c usage guard if unused
+    let _ = crc32c;
+}
+
+#[test]
+fn rotation_crash_windows_leave_recoverable_state() {
+    let files = Files::new();
+    let mut e = Engine::create(&files.wal).unwrap();
+    e.commit_block(b"b1", &[doc(1, b"a")]).unwrap();
+    e.publish_tile(&files.dir.join("tile-1.tile"), 1).unwrap();
+    e.commit_block(b"b2", &[doc(2, b"b")]).unwrap();
+    e.publish_tile(&files.dir.join("tile-2.tile"), 2).unwrap();
+    // Crash after new-segment creation but before the manifest flip: the empty
+    // data-2.wal is an unreferenced orphan; retry surfaces AlreadyExists (the
+    // leftover must be removed manually, never silently reused).
+    fs::write(files.dir.join("data-2.wal"), b"orphan").unwrap();
+    assert_eq!(e.rotate_wal(0).unwrap_err().kind(), ErrorKind::AlreadyExists);
+    assert!(files.wal.exists(), "old segment untouched by the failed rotation");
+    assert_eq!(e.get(b"E", 2).unwrap(), Some(b"b".to_vec()), "failed rotation changed nothing");
+    fs::remove_file(files.dir.join("data-2.wal")).unwrap();
+    assert_eq!(e.rotate_wal(0).unwrap(), true);
+    assert_eq!(e.get(b"E", 2).unwrap(), Some(b"b".to_vec()));
+}
