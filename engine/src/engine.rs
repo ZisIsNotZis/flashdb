@@ -61,8 +61,10 @@ pub struct Engine {
     mt: Memtable,
     /// Published tiles ordered by strictly increasing cutoff; tile *i* covers
     /// exactly the CSN range `(tiles[i-1].cutoff, tiles[i].cutoff]`, so each CSN
-    /// lives in at most one tier. All versions are retained (WAL + tiles); this
-    /// only bounds what the serving memtable materializes.
+    /// lives in at most one tier. Every tile holds only the NEWEST version per
+    /// logical key within its range (2026-09-29: reads never see historical
+    /// state, so superseded versions are unreadable garbage); the retained WAL
+    /// keeps every version and stays the sole recovery authority.
     tiles: Vec<TileHandle>,
     wal_path: PathBuf,
     dir: PathBuf,
@@ -193,16 +195,20 @@ impl Engine {
         }
         let mut lower = 0u64;
         for t in &tiles {
-            t.tile.verify_projection(&covered, lower, t.cutoff())?;
+            // Tiles hold exactly the newest version per logical key within their
+            // CSN range (same reduction the tile writers apply), so the WAL
+            // projection is reduced the same way before the 1:1 comparison.
+            t.tile.verify_projection(&newest_projection(&covered, lower, t.cutoff()), lower, t.cutoff())?;
             lower = t.cutoff();
         }
         Ok(Engine { wal, mt, tiles, wal_path: wal_path.to_path_buf(), dir: parent_dir(wal_path), manifest: None, csn, dedup, max_handle })
     }
 
-    /// Build one immutable P/U/R tile containing the WAL-published versions in
-    /// `(previous cutoff, cutoff]`. No manifest, checkpoint, or WAL rotation.
-    /// A failed build leaves the serving memtable intact; a successful build
-    /// evicts covered versions only after the file is synced and verified.
+    /// Build one immutable P/U/R tile holding, for the WAL-published versions
+    /// in `(previous cutoff, cutoff]`, only the NEWEST version per logical key.
+    /// No manifest, checkpoint, or WAL rotation. A failed build leaves the
+    /// serving memtable intact; a successful build evicts covered versions only
+    /// after the file is synced and verified.
     pub fn build_tile(&mut self, tile_path: impl AsRef<Path>, cutoff: u64) -> io::Result<()> {
         if cutoff > self.csn {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "cutoff exceeds CSN"));
@@ -220,8 +226,8 @@ impl Engine {
     }
 
     /// Create-new the tile file, sync it, reopen it and re-check its exact
-    /// `(previous cutoff, cutoff]` P/U/R projection against the retained WAL
-    /// before any caller may reference it.
+    /// newest-version-per-logical-key `(previous cutoff, cutoff]` P/U/R
+    /// projection against the retained WAL before any caller may reference it.
     fn write_verified_tile(&self, tile_path: &Path, cutoff: u64) -> io::Result<Tile> {
         let (records, _) = wal::replay(&self.wal_path)?;
         if records.last().map(|r| decode_payload(r).map(|v| v.0)).transpose()? != Some(self.csn) && self.csn != 0 {
@@ -234,10 +240,11 @@ impl Engine {
             let (csn, _, ops) = decode_payload(payload)?;
             if csn <= cutoff && csn > lower { for op in &ops { apply_op(&mut expected, op, csn); } }
         }
-        // The serving memtable holds exactly the versions above `lower`, so
-        // filtering to `<= cutoff` writes precisely the new tile's disjoint range.
-        let tile = Tile::write(tile_path, cutoff, &digest, &self.mt)?;
-        tile.verify_projection(&expected, lower, cutoff)?;
+        // The serving memtable holds exactly the versions above `lower`; both
+        // sides reduce to the newest version per logical key in the disjoint
+        // range, so filtering to `<= cutoff` writes precisely the new tile.
+        let tile = Tile::write(tile_path, cutoff, &digest, &newest_projection(&self.mt, lower, cutoff))?;
+        tile.verify_projection(&newest_projection(&expected, lower, cutoff), lower, cutoff)?;
         Ok(tile)
     }
 
@@ -338,12 +345,15 @@ impl Engine {
     /// protocol, and only after the new root is durable unlink the superseded
     /// tile files.
     ///
-    /// **All versions are retained.** There is no snapshot registry, so the
-    /// corrected retention rule in `docs/engine.md` requires keeping every
-    /// version of every logical key; this compaction's purpose is only reducing
-    /// the per-read file count / rewrite bound ([`manifest::MAX_TILES`] tiles
-    /// collapse to one). The WAL is never rotated or truncated, and the serving
-    /// memtable (exactly the versions above the newest cutoff) is untouched.
+    /// **Only the newest version per logical key survives.** Reads never see
+    /// historical state (2026-09-29, `docs/contracts.md` L-02 resolution), so
+    /// superseded versions are unreadable garbage: the merged tile keeps the
+    /// newest version of every logical key (everything before the trailing
+    /// `~csn`), where a tombstone is itself the newest state and is retained.
+    /// The WAL is never rotated or truncated, and the serving memtable (exactly
+    /// the versions above the newest cutoff) is untouched. Compaction's purpose
+    /// is reducing the per-read file count / rewrite bound
+    /// ([`manifest::MAX_TILES`] tiles collapse to one).
     ///
     /// Refusals: fewer than two active tiles (`InvalidInput` — merging one tile
     /// into a fresh copy buys nothing) or a leftover candidate file with the
@@ -412,11 +422,12 @@ impl Engine {
 
     /// Create-new the compacted tile for the full `(0, cutoff]` union of every
     /// published tile range, sync it, reopen it and re-check its exact
-    /// projection against the retained WAL before any caller may reference it.
-    /// Each input tile was itself verified against its disjoint WAL range at
-    /// open/publish, so writing from the WAL projection IS the multi-tile merge
-    /// (same codec, same key order, all versions including tombstones) — and
-    /// the verification is `publish`'s extended to the union.
+    /// newest-version-per-logical-key projection against the retained WAL
+    /// before any caller may reference it. Each input tile was itself verified
+    /// against its disjoint WAL range at open/publish, so building from the
+    /// WAL projection IS the multi-tile merge (same codec, same key order,
+    /// newest version per logical key, tombstones retained as newest state) —
+    /// and the verification is `publish`'s extended to the union.
     fn write_compacted_tile(&self, tile_path: &Path, cutoff: u64) -> io::Result<Tile> {
         let (records, _) = wal::replay(&self.wal_path)?;
         if records.last().map(|r| decode_payload(r).map(|v| v.0)).transpose()? != Some(self.csn) && self.csn != 0 {
@@ -428,6 +439,7 @@ impl Engine {
             let (csn, _, ops) = decode_payload(payload)?;
             if csn <= cutoff { for op in &ops { apply_op(&mut expected, op, csn); } }
         }
+        let expected = newest_projection(&expected, 0, cutoff);
         let tile = Tile::write(tile_path, cutoff, &digest, &expected)?;
         tile.verify_projection(&expected, 0, cutoff)?;
         Ok(tile)
@@ -461,9 +473,9 @@ impl Engine {
     // K-way merge of the serving memtable and every published tile, all
     // traversed in global key order. Keys encode CSN descending, so each logical
     // key's versions arrive newest-first and the caller's first visible entry
-    // wins; old snapshots therefore reach into older tiles. Tile CSN ranges are
-    // disjoint, so cross-tier equal keys are impossible; the memtable-wins skip
-    // below is defensive only.
+    // wins — the only state reads observe (2026-09-29: no historical reads).
+    // Tile CSN ranges are disjoint, so cross-tier equal keys are impossible;
+    // the memtable-wins skip below is defensive only.
     fn scan_merged(&self, prefix: &[u8], mut visit: impl FnMut(&[u8], &[u8]) -> io::Result<bool>) -> io::Result<()> {
         let mut mem = self.mt.scan_iter(prefix).peekable();
         let mut iters: Vec<_> = self.tiles.iter().map(|t| t.tile.entries()).collect();
@@ -500,7 +512,7 @@ impl Engine {
         Ok(())
     }
 
-    /// 已发布的最新 CSN。新块的快照从这里取。
+    /// 已发布的最新 CSN。读只看最新提交状态（不存在历史读），发布检查亦然。
     pub fn csn(&self) -> u64 {
         self.csn
     }
@@ -516,45 +528,27 @@ impl Engine {
         self.dedup.get(block_id).copied()
     }
 
-    /// 请求标识已用于另一意图（包含旧式未携带意图的 block id）时拒绝重放。
-    /// 当前原型的幂等表保留整个 WAL 生命周期；后续须实现保留期限。
-    pub fn request_intent_conflicts(&self, request_prefix: &[u8], intent_prefix: &[u8]) -> bool {
-        self.dedup.keys().any(|id| id.starts_with(request_prefix) && !id.starts_with(intent_prefix))
-    }
-
-    /// 反向查找：当前指向 `target` 的全部 source 句柄。
-    /// 按 source 取最新 CSN ≤ snapshot；tombstone（空 value）剔除。
-    pub fn reverse_lookup(
-        &self,
-        entity: &[u8],
-        field: &[u8],
-        target: u64,
-        snapshot: u64,
-    ) -> io::Result<Vec<u64>> {
+    /// 反向查找：当前指向 `target` 的全部 source 句柄（最新提交状态，无历史读）。
+    /// tombstone（空 value）剔除。
+    pub fn reverse_lookup(&self, entity: &[u8], field: &[u8], target: u64) -> io::Result<Vec<u64>> {
         check_name(entity)?;
         check_name(field)?;
         let pfx = keys::reverse_prefix(entity, field, target)?;
-        let mut newest: HashMap<u64, (u64, bool)> = HashMap::new();
+        let mut newest: HashMap<u64, bool> = HashMap::new();
         self.scan_merged(&pfx, |key, value| {
-            let Some((_, source, csn)) = keys::decode_reverse(key) else { return Ok(true); };
-            if csn > snapshot { return Ok(true); }
-            let alive = !value.is_empty();
-            match newest.get_mut(&source) {
-                Some(e) if e.0 >= csn => {}
-                _ => {
-                    newest.insert(source, (csn, alive));
-                }
-            }
+            let Some((_, source, _)) = keys::decode_reverse(key) else { return Ok(true); };
+            // 键序内同一 source 按 CSN 降序排列，首个条目即最新状态。
+            newest.entry(source).or_insert(!value.is_empty());
             Ok(true)
         })?;
-        let mut out: Vec<u64> = newest.into_iter().filter(|(_, (_, a))| *a).map(|(s, _)| s).collect();
+        let mut out: Vec<u64> = newest.into_iter().filter(|(_, alive)| *alive).map(|(s, _)| s).collect();
         out.sort();
         Ok(out)
     }
 
-    /// 按已声明唯一字段解析句柄；每个 handle 只采用快照内最新版本。
+    /// 按已声明唯一字段解析句柄（最新提交状态，无历史读）。
     /// 如观察到多个活 owner，则索引已损坏，不能任意选一个。
-    pub fn unique_lookup(&self, entity: &[u8], field: &[u8], value: &[u8], snapshot: u64) -> io::Result<Option<u64>> {
+    pub fn unique_lookup(&self, entity: &[u8], field: &[u8], value: &[u8]) -> io::Result<Option<u64>> {
         let pfx = keys::unique_prefix(entity, field, value)?;
         let mut seen = std::collections::HashSet::new();
         let mut owner = None;
@@ -563,8 +557,10 @@ impl Engine {
                 return Err(io::Error::new(io::ErrorKind::InvalidData, "malformed unique key"));
             }
             let handle = u64::from_be_bytes(key[pfx.len()..pfx.len() + 8].try_into().unwrap());
-            let csn = keys::key_csn(&key).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing CSN"))?;
-            if csn > snapshot || !seen.insert(handle) || val.is_empty() { return Ok(true); }
+            if keys::key_csn(&key).is_none() {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "missing CSN"));
+            }
+            if !seen.insert(handle) || val.is_empty() { return Ok(true); }
             if val != handle.to_be_bytes() {
                 return Err(io::Error::new(io::ErrorKind::InvalidData, "unique value disagrees with handle"));
             }
@@ -576,13 +572,14 @@ impl Engine {
         Ok(owner)
     }
 
-    /// 快照点读：`snapshot` 取块开始时的 [`Engine::csn`]。
-    pub fn get(&self, entity: &[u8], handle: u64, snapshot: u64) -> io::Result<Option<Vec<u8>>> {
+    /// 当前状态点读：只看最新提交版本（2026-09-29：不存在历史读），
+    /// tombstone → 不存在。
+    pub fn get(&self, entity: &[u8], handle: u64) -> io::Result<Option<Vec<u8>>> {
         check_name(entity)?;
         let pfx = keys::primary_prefix(entity, handle)?;
         let mut result = None;
         self.scan_merged(&pfx, |key, value| {
-            if keys::key_csn(key).is_some_and(|csn| csn <= snapshot) {
+            if keys::key_csn(key).is_some() {
                 result = if value.is_empty() { None } else { Some(value.to_vec()) };
                 return Ok(false);
             }
@@ -591,13 +588,12 @@ impl Engine {
         Ok(result)
     }
 
-    /// Visit each live primary document once at a CSN snapshot. The scan walks
-    /// the whole entity prefix (including historical versions); callers must
+    /// Visit each live primary document once at latest committed state (no
+    /// historical reads). The scan walks the whole entity prefix; callers must
     /// bound their returned rows separately when filtering or ordering results.
     pub fn scan_primary(
         &self,
         entity: &[u8],
-        snapshot: u64,
         mut visit: impl FnMut(u64, &[u8]) -> io::Result<()>,
     ) -> io::Result<()> {
         check_name(entity)?;
@@ -605,12 +601,12 @@ impl Engine {
         prefix.truncate(prefix.len() - 8);
         let mut last_handle = None;
         self.scan_merged(&prefix, |key, value| {
-            let (key_entity, handle, csn) = keys::decode_primary(key)
+            let (key_entity, handle, _) = keys::decode_primary(key)
                 .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "malformed primary key"))?;
             if key_entity != entity {
                 return Err(io::Error::new(io::ErrorKind::InvalidData, "primary entity mismatch"));
             }
-            if csn > snapshot || last_handle == Some(handle) { return Ok(true); }
+            if last_handle == Some(handle) { return Ok(true); }
             last_handle = Some(handle);
             if !value.is_empty() {
                 visit(handle, value)?;
@@ -764,6 +760,26 @@ fn apply_op(mt: &mut Memtable, op: &Op, csn: u64) {
             mt.apply(keys::reverse_key(entity, field, *target, *source, csn).unwrap(), Vec::new());
         }
     }
+}
+
+/// Reduce versioned entries to the NEWEST version per logical key within the
+/// CSN range `(lower, cutoff]` (2026-09-29: reads never see historical state,
+/// so superseded versions are unreadable garbage). The logical key is the full
+/// key minus its trailing `~csn`; keys iterate grouped by logical key in
+/// CSN-descending order, so the first in-range version of each logical key
+/// wins. A tombstone (empty value) is itself a newest state and is retained.
+fn newest_projection(mt: &Memtable, lower: u64, cutoff: u64) -> Memtable {
+    let mut out = Memtable::new();
+    let mut last_logical: Option<Vec<u8>> = None;
+    for (key, value) in mt.entries() {
+        let Some(csn) = keys::key_csn(key) else { continue };
+        if csn <= lower || csn > cutoff { continue; }
+        let logical = &key[..key.len() - 8];
+        if last_logical.as_deref() == Some(logical) { continue; }
+        last_logical = Some(logical.to_vec());
+        out.apply(key.to_vec(), value.to_vec());
+    }
+    out
 }
 
 // ---------- WAL payload 编解码（v0 二进制，LE） ----------
@@ -934,7 +950,7 @@ mod tests {
     }
 
     fn get_ok(e: &Engine, entity: &str, handle: u64) -> Option<Vec<u8>> {
-        e.get(entity.as_bytes(), handle, e.csn()).unwrap().map(|b| b.to_vec())
+        e.get(entity.as_bytes(), handle).unwrap().map(|b| b.to_vec())
     }
 
     #[test]
@@ -1003,23 +1019,23 @@ mod tests {
     }
 
     #[test]
-    fn unique_lookup_tracks_snapshot_and_reassignment() {
+    fn unique_lookup_tracks_reassignment_and_deletion() {
         let p = tmp("unique_lookup.wal");
         let mut e = Engine::create(&p).unwrap();
         let field = b"email";
         let value = b"a@x.com";
         let put = |handle| Op::PutUnique { entity: b"Customer".to_vec(), field: field.to_vec(), value: value.to_vec(), handle };
         let del = |handle| Op::DelUnique { entity: b"Customer".to_vec(), field: field.to_vec(), value: value.to_vec(), handle };
-        assert_eq!(e.unique_lookup(b"Customer", field, value, 0).unwrap(), None);
+        assert_eq!(e.unique_lookup(b"Customer", field, value).unwrap(), None);
         e.commit_block(b"one", &[put(1)]).unwrap();
+        assert_eq!(e.unique_lookup(b"Customer", field, value).unwrap(), Some(1));
         e.commit_block(b"transfer", &[del(1), put(2)]).unwrap();
-        assert_eq!(e.unique_lookup(b"Customer", field, value, 1).unwrap(), Some(1));
-        assert_eq!(e.unique_lookup(b"Customer", field, value, 2).unwrap(), Some(2));
+        assert_eq!(e.unique_lookup(b"Customer", field, value).unwrap(), Some(2), "读只看最新提交状态");
         e.commit_block(b"delete", &[del(2)]).unwrap();
-        assert_eq!(e.unique_lookup(b"Customer", field, value, 3).unwrap(), None);
+        assert_eq!(e.unique_lookup(b"Customer", field, value).unwrap(), None);
         drop(e);
         let e = Engine::open(&p).unwrap();
-        assert_eq!(e.unique_lookup(b"Customer", field, value, 2).unwrap(), Some(2));
+        assert_eq!(e.unique_lookup(b"Customer", field, value).unwrap(), None, "恢复后同样只看最新提交状态");
         remove(&p);
     }
 
@@ -1258,15 +1274,13 @@ mod tests {
         };
         e.commit_block(b"r1", &[ref_op(201)]).unwrap();
         e.commit_block(b"r2", &[ref_op(202)]).unwrap();
-        assert_eq!(e.reverse_lookup(b"ServiceTicket", b"order", 101, u64::MAX).unwrap(), vec![201, 202]);
+        assert_eq!(e.reverse_lookup(b"ServiceTicket", b"order", 101).unwrap(), vec![201, 202]);
         // 删除 201 的反向条目 → 202 保留
         e.commit_block(b"r3", &[Op::DelReverse {
             entity: b"ServiceTicket".to_vec(), field: b"order".to_vec(),
             target: 101, source: 201,
         }]).unwrap();
-        assert_eq!(e.reverse_lookup(b"ServiceTicket", b"order", 101, u64::MAX).unwrap(), vec![202]);
-        // 旧快照仍能看到 201
-        assert_eq!(e.reverse_lookup(b"ServiceTicket", b"order", 101, 2).unwrap(), vec![201, 202]);
+        assert_eq!(e.reverse_lookup(b"ServiceTicket", b"order", 101).unwrap(), vec![202]);
         remove(&p);
     }
 
@@ -1294,7 +1308,7 @@ mod tests {
         assert_eq!(e.serving_memtable_entries(), memtable_before, "compaction never touches the memtable");
         drop(e);
         let e = Engine::open_discover(&dir).unwrap();
-        assert_eq!(e.get(b"E", 1, 1).unwrap(), Some(b"v1".to_vec()));
+        assert_eq!(e.get(b"E", 1).unwrap(), Some(b"v2".to_vec()), "合并 tile 只留最新版本，读只看最新状态");
         assert_eq!(e.serving_memtable_entries(), 0);
         drop(e);
         fs::remove_dir_all(&dir).unwrap();

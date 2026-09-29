@@ -24,14 +24,15 @@ fn publish_survives_reopen_via_manifest_and_ignores_unreferenced_tiles() {
     e.commit_block(b"two", &[doc(1, b"newer")]).unwrap();
     e.publish_tile(&files.tile, 1).unwrap();
     assert_eq!(e.serving_memtable_entries(), 1, "only CSN>cutoff versions stay in memory");
-    assert_eq!(e.get(b"E", 1, 2).unwrap(), Some(b"newer".to_vec()));
+    assert_eq!(e.get(b"E", 1).unwrap(), Some(b"newer".to_vec()));
     drop(e);
 
     // Reopen discovers manifest+tiles without any explicit tile argument.
     let mut e = Engine::open_discover(&files.dir).unwrap();
     assert_eq!(e.csn(), 2);
     assert_eq!(e.next_handle().unwrap(), 3);
-    assert_eq!(e.get(b"E", 1, 1).unwrap(), Some(b"covered".to_vec()));
+    assert_eq!(e.get(b"E", 1).unwrap(), Some(b"newer".to_vec()), "latest state wins over the tile's covered version");
+    assert_eq!(e.get(b"E", 2).unwrap(), Some(b"later".to_vec()), "tile one serves the latest state of a handle it covers");
     assert_eq!(e.serving_memtable_entries(), 1, "verified covered prefix not rematerialized");
     // A second tile extends the manifest's ordered list; cutoffs stay strictly
     // increasing (1 -> 2) and the evicted prefix still serves from tile one.
@@ -49,12 +50,13 @@ fn publish_survives_reopen_via_manifest_and_ignores_unreferenced_tiles() {
     fs::write(&leftover, b"half-written candidate").unwrap();
     drop(e);
     let mut e = Engine::open_discover(&files.dir).unwrap();
-    assert_eq!(e.get(b"E", 5, 3).unwrap(), Some(b"five".to_vec()));
+    assert_eq!(e.get(b"E", 5).unwrap(), Some(b"five".to_vec()));
     assert!(e.publish_tile(&leftover, 3).is_err(), "leftover candidate cannot be silently reused");
-    assert_eq!(e.get(b"E", 5, 3).unwrap(), Some(b"five".to_vec()), "failed publish changed nothing");
-    // The discovered two-tile list keeps serving old snapshots after the failed
-    // publish attempt.
-    assert_eq!(e.get(b"E", 1, 1).unwrap(), Some(b"covered".to_vec()));
+    assert_eq!(e.get(b"E", 5).unwrap(), Some(b"five".to_vec()), "failed publish changed nothing");
+    // The discovered two-tile list keeps serving latest committed state after
+    // the failed publish attempt, across both tiles and the memtable.
+    assert_eq!(e.get(b"E", 1).unwrap(), Some(b"newer".to_vec()));
+    assert_eq!(e.get(b"E", 2).unwrap(), Some(b"later".to_vec()));
     assert_eq!(e.serving_memtable_entries(), 1, "only the CSN-3 version stays in memory");
 }
 
@@ -75,7 +77,7 @@ fn torn_or_corrupt_manifest_fails_closed_and_wal_only_open_still_works() {
     let mut e = Engine::open_discover(&files.dir).unwrap();
     assert_eq!(e.csn(), 1);
     assert_eq!(e.serving_memtable_entries(), 1, "no tile root: full WAL replay serves everything");
-    assert_eq!(e.get(b"E", 1, 1).unwrap(), Some(b"covered".to_vec()));
+    assert_eq!(e.get(b"E", 1).unwrap(), Some(b"covered".to_vec()));
     drop(e);
     fs::write(&manifest, &pristine).unwrap();
 
@@ -88,7 +90,7 @@ fn torn_or_corrupt_manifest_fails_closed_and_wal_only_open_still_works() {
     let err = Engine::open_discover(&files.dir).map(|_| ()).unwrap_err();
     assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     let e = Engine::open(&files.wal).unwrap();
-    assert_eq!(e.get(b"E", 1, 1).unwrap(), Some(b"covered".to_vec()));
+    assert_eq!(e.get(b"E", 1).unwrap(), Some(b"covered".to_vec()));
 }
 
 #[test]
@@ -118,7 +120,7 @@ fn adoption_refuses_manifest_with_active_tile_and_accepts_empty_root() {
     e.publish_tile(&other.tile, 1).unwrap();
     drop(e);
     let e = Engine::open_discover(&other.dir).unwrap();
-    assert_eq!(e.get(b"E", 1, 1).unwrap(), Some(b"x".to_vec()));
+    assert_eq!(e.get(b"E", 1).unwrap(), Some(b"x".to_vec()));
 }
 
 #[test]
@@ -162,5 +164,5 @@ fn manifest_durable_but_engine_crashed_before_flip_recovers_new_root() {
     assert_eq!(e.committed_block_csn(b"one"), Some(1));
     assert_eq!(e.commit_block(b"one", &[doc(9, b"ignored")]).unwrap(), Outcome::AlreadyCommitted { csn: 1 });
     assert_eq!(e.serving_memtable_entries(), 0);
-    assert_eq!(e.get(b"E", 1, 1).unwrap(), Some(b"covered".to_vec()));
+    assert_eq!(e.get(b"E", 1).unwrap(), Some(b"covered".to_vec()));
 }

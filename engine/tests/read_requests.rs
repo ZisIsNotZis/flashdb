@@ -70,7 +70,7 @@ fn generator_point_reads_return_documents_or_empty_without_commits_and_survive_r
 }
 
 #[test]
-fn movement_scan_uses_snapshot_primary_versions_tombstones_and_ordered_top_100() {
+fn movement_scan_reads_latest_state_tombstones_and_ordered_top_100() {
     let p = path();
     let mut e = Engine::create(&p).unwrap();
     let req: Value = serde_json::from_str(MOVEMENTS).unwrap();
@@ -81,21 +81,14 @@ fn movement_scan_uses_snapshot_primary_versions_tombstones_and_ordered_top_100()
             put("StockMovement", handle, &json!({"order_no":"O00000007", "movement_no":format!("M{n:03}"), "delta":-1})),
         ]).unwrap();
     }
-    let before = e.csn();
     e.commit_block(b"update", &[put("StockMovement", 1, &json!({"order_no":"O00000007", "movement_no":"Mzzz", "delta":-2}))]).unwrap();
     e.commit_block(b"deleted", &[Op::DelDoc { entity:b"StockMovement".to_vec(), handle: 2 }]).unwrap();
     e.commit_block(b"other-order", &[put("StockMovement", 200, &json!({"order_no":"O00000008", "movement_no":"M000"}))]).unwrap();
     e.commit_block(b"other-entity", &[put("Stock", 201, &json!({"sku":"S004353", "loc":"L005"}))]).unwrap();
-    let mut old = Vec::new();
-    e.scan_primary(b"StockMovement", before, |handle, bytes| {
-        old.push((handle, serde_json::from_slice::<Value>(bytes).unwrap()));
-        Ok(())
-    }).unwrap();
-    assert_eq!(old.len(), 105);
-    assert_eq!(old.iter().find(|(h, _)| *h == 1).unwrap().1["movement_no"], "M000");
-    assert!(old.iter().any(|(h, _)| *h == 2));
+    // The scan sees only latest committed state: the update counts once, the
+    // tombstoned movement is hidden, the other order/entity remain visible.
     let mut current = Vec::new();
-    e.scan_primary(b"StockMovement", e.csn(), |handle, _| { current.push(handle); Ok(()) }).unwrap();
+    e.scan_primary(b"StockMovement", |handle, _| { current.push(handle); Ok(()) }).unwrap();
     assert_eq!(current.len(), 105, "update counts once, tombstone hides one, other order remains");
     assert!(!current.contains(&2));
     let csn = e.csn();

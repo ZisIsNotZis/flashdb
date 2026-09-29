@@ -35,7 +35,7 @@ fn request() -> Value {
     })
 }
 fn get(engine: &Engine, entity: &str, handle: u64) -> Value {
-    serde_json::from_slice(&engine.get(entity.as_bytes(), handle, engine.csn()).unwrap().unwrap()).unwrap()
+    serde_json::from_slice(&engine.get(entity.as_bytes(), handle).unwrap().unwrap()).unwrap()
 }
 fn count(engine: &Engine) -> i64 { get(engine, "Stock", 10)["on_hand"].as_i64().unwrap() }
 
@@ -62,7 +62,7 @@ fn actual_python_generator_fixture_executes_through_engine() {
     assert_eq!(execute_order_flow(&mut engine, &req).unwrap()["take"].status, "ok");
     assert_eq!(get(&engine, "Stock", 10)["on_hand"], 1);
     let order_no = req["params"]["order_no"].as_str().unwrap();
-    assert!(engine.unique_lookup(b"Order", b"order_no", order_no.as_bytes(), engine.csn()).unwrap().is_some());
+    assert!(engine.unique_lookup(b"Order", b"order_no", order_no.as_bytes()).unwrap().is_some());
     drop(engine);
     let engine = Engine::open(&p).unwrap();
     assert_eq!(get(&engine, "Stock", 10)["on_hand"], 1);
@@ -80,15 +80,15 @@ fn generator_order_flow_atomic_success_dedup_and_reopen() {
     assert_eq!(out["take"].status, "ok");
     assert_eq!(engine.csn(), 2, "one WAL commit for all seven P/U/R ops");
     assert_eq!(count(&engine), 5);
-    let movement = engine.unique_lookup(b"StockMovement", b"movement_no", b"M00000001", engine.csn()).unwrap().unwrap();
-    let order = engine.unique_lookup(b"Order", b"order_no", b"O00000001", engine.csn()).unwrap().unwrap();
+    let movement = engine.unique_lookup(b"StockMovement", b"movement_no", b"M00000001").unwrap().unwrap();
+    let order = engine.unique_lookup(b"Order", b"order_no", b"O00000001").unwrap().unwrap();
     assert_ne!(movement, order);
     assert_eq!(get(&engine, "StockMovement", movement)["delta"], -3);
     assert_eq!(get(&engine, "StockMovement", movement)["stock"], 10);
     assert_eq!(get(&engine, "Order", order)["buyer"], 20);
-    assert_eq!(engine.reverse_lookup(b"Order", b"buyer", 20, engine.csn()).unwrap(), vec![order]);
-    assert_eq!(engine.reverse_lookup(b"StockMovement", b"stock", 10, engine.csn()).unwrap(), vec![movement]);
-    assert_eq!(engine.unique_lookup(b"Backorder", b"order_no", b"O00000001", engine.csn()).unwrap(), None);
+    assert_eq!(engine.reverse_lookup(b"Order", b"buyer", 20).unwrap(), vec![order]);
+    assert_eq!(engine.reverse_lookup(b"StockMovement", b"stock", 10).unwrap(), vec![movement]);
+    assert_eq!(engine.unique_lookup(b"Backorder", b"order_no", b"O00000001").unwrap(), None);
     assert_eq!(execute_order_flow(&mut engine, &request).unwrap()["take"].csn, Some(2));
     assert_eq!(engine.csn(), 2);
     drop(engine);
@@ -101,7 +101,11 @@ fn generator_order_flow_atomic_success_dedup_and_reopen() {
 }
 
 #[test]
-fn same_id_different_payload_must_not_acknowledge_old_commit() {
+fn same_id_different_payload_executes_as_new_request_business_uniqueness_guards() {
+    // 2026-09-29: request-id dedup is an internal detail, never a guarantee.
+    // A reused request id with a different payload executes as a NEW request;
+    // idempotency comes from business uniqueness — the same order_no fails
+    // unique_violation (AlreadyExists), a genuinely new order_no commits.
     let p = path();
     let mut engine = Engine::create(&p).unwrap();
     fixture(&mut engine, 8);
@@ -109,11 +113,22 @@ fn same_id_different_payload_must_not_acknowledge_old_commit() {
     assert_eq!(execute_order_flow(&mut engine, &req).unwrap()["take"].status, "ok");
     let mut changed = req;
     changed["params"]["qty"] = json!(4);
-    assert!(execute_order_flow(&mut engine, &changed).is_err(), "same id but different intent must be rejected");
+    let err = execute_order_flow(&mut engine, &changed).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists, "same order_no → unique_violation, not an intent check");
+    assert_eq!(engine.csn(), 2, "the conflicting new request committed nothing");
+    // A genuinely different intent (new business key) runs as a new request.
+    changed["params"]["order_no"] = json!("O00000002");
+    changed["blocks"]["take"]["ops"][1]["put"]["StockMovement"]["movement_no"] = json!("M00000002");
+    let out = execute_order_flow(&mut engine, &changed).unwrap();
+    assert_eq!(out["take"].status, "ok");
+    assert_eq!(engine.csn(), 3);
+    assert_eq!(count(&engine), 1, "8 - 3 - 4");
     drop(engine);
     let mut reopened = Engine::open(&p).unwrap();
-    assert!(execute_order_flow(&mut reopened, &changed).is_err(), "recovery must preserve intent check");
-    assert_eq!(reopened.csn(), 2);
+    assert_eq!(count(&reopened), 1);
+    // Internal block-id dedup still replays an identical payload's recorded CSN.
+    assert_eq!(execute_order_flow(&mut reopened, &changed).unwrap()["take"].csn, Some(3));
+    assert_eq!(reopened.csn(), 3);
     std::fs::remove_file(p).unwrap();
 }
 
@@ -128,9 +143,9 @@ fn insufficient_stock_only_backorder_and_replay() {
     assert_eq!(out["take/else"].status, "ok");
     assert_eq!(engine.csn(), 2);
     assert_eq!(count(&engine), 2);
-    assert_eq!(engine.unique_lookup(b"Order", b"order_no", b"O00000001", engine.csn()).unwrap(), None);
-    assert_eq!(engine.unique_lookup(b"StockMovement", b"movement_no", b"M00000001", engine.csn()).unwrap(), None);
-    let handle = engine.unique_lookup(b"Backorder", b"order_no", b"O00000001", engine.csn()).unwrap().unwrap();
+    assert_eq!(engine.unique_lookup(b"Order", b"order_no", b"O00000001").unwrap(), None);
+    assert_eq!(engine.unique_lookup(b"StockMovement", b"movement_no", b"M00000001").unwrap(), None);
+    let handle = engine.unique_lookup(b"Backorder", b"order_no", b"O00000001").unwrap().unwrap();
     assert_eq!(get(&engine, "Backorder", handle)["qty"], 3);
     drop(engine);
     let mut engine = Engine::open(&p).unwrap();
@@ -171,7 +186,7 @@ fn order_and_backorder_numbers_are_exclusive_across_requests_and_reopen() {
     let err = execute_order_flow(&mut engine, &second).unwrap_err();
     assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
     assert_eq!(engine.csn(), 2);
-    assert_eq!(engine.unique_lookup(b"Backorder", b"order_no", b"O00000001", engine.csn()).unwrap(), None);
+    assert_eq!(engine.unique_lookup(b"Backorder", b"order_no", b"O00000001").unwrap(), None);
     drop(engine);
     let mut engine = Engine::open(&p).unwrap();
     assert_eq!(execute_order_flow(&mut engine, &second).unwrap_err().kind(), std::io::ErrorKind::AlreadyExists);
@@ -186,7 +201,7 @@ fn order_and_backorder_numbers_are_exclusive_across_requests_and_reopen() {
         doc: serde_json::to_vec(&json!({"sku":"S000001","loc":"L000","on_hand":10})).unwrap() }]).unwrap();
     second["params"]["qty"] = json!(1);
     assert_eq!(execute_order_flow(&mut engine, &second).unwrap_err().kind(), std::io::ErrorKind::AlreadyExists);
-    assert_eq!(engine.unique_lookup(b"Order", b"order_no", b"O00000001", engine.csn()).unwrap(), None);
+    assert_eq!(engine.unique_lookup(b"Order", b"order_no", b"O00000001").unwrap(), None);
     drop(engine);
     let mut engine = Engine::open(&p).unwrap();
     assert_eq!(execute_order_flow(&mut engine, &second).unwrap_err().kind(), std::io::ErrorKind::AlreadyExists);
@@ -216,8 +231,8 @@ fn malformed_or_conflicting_request_cannot_partially_write() {
     assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
     assert_eq!(engine.csn(), 2);
     assert_eq!(count(&engine), 5);
-    assert_eq!(engine.unique_lookup(b"StockMovement", b"movement_no", b"M00000001", engine.csn()).unwrap(), Some(50));
-    assert_eq!(engine.get(b"StockMovement", 50, engine.csn()).unwrap(), None, "no movement document was published");
-    assert_eq!(engine.unique_lookup(b"Backorder", b"order_no", b"O00000001", engine.csn()).unwrap(), None);
+    assert_eq!(engine.unique_lookup(b"StockMovement", b"movement_no", b"M00000001").unwrap(), Some(50));
+    assert_eq!(engine.get(b"StockMovement", 50).unwrap(), None, "no movement document was published");
+    assert_eq!(engine.unique_lookup(b"Backorder", b"order_no", b"O00000001").unwrap(), None);
     std::fs::remove_file(p).unwrap();
 }

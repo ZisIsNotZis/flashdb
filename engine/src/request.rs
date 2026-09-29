@@ -198,9 +198,8 @@ fn stock_key(sku: &str, loc: &str) -> Vec<u8> {
 }
 
 fn lookup(engine: &Engine, catalog: &Catalog, key: &[u8]) -> io::Result<Option<(u64, Value)>> {
-    let snapshot = engine.csn();
-    let Some(handle) = engine.unique_lookup(catalog.entity.as_bytes(), catalog.unique.as_bytes(), key, snapshot)? else { return Ok(None) };
-    let doc = engine.get(catalog.entity.as_bytes(), handle, snapshot)?
+    let Some(handle) = engine.unique_lookup(catalog.entity.as_bytes(), catalog.unique.as_bytes(), key)? else { return Ok(None) };
+    let doc = engine.get(catalog.entity.as_bytes(), handle)?
         .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "dangling unique index"))?;
     let row: Value = serde_json::from_slice(&doc).map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?;
     Ok(Some((handle, row)))
@@ -278,7 +277,8 @@ fn validate_read(req: &Value) -> io::Result<ReadKind> {
 }
 
 /// Dispatch only the four inventory templates emitted by the v0 generator.
-/// Read blocks observe one current CSN and never publish or journal results.
+/// Read blocks observe latest committed state (no historical reads) and never
+/// publish or journal results.
 /// Movement scans traverse the P prefix (not a unique order_no index), retain
 /// only the first 100 matching rows ordered by (movement_no, handle), and may
 /// still cost a full entity scan. No concurrent isolation or read replay claim.
@@ -288,7 +288,6 @@ pub fn execute_request(engine: &mut Engine, req: &Value) -> io::Result<RequestRe
         return execute_order_flow(engine, req);
     }
     let kind = validate_read(req)?;
-    let snapshot = engine.csn();
     let row = match kind {
         ReadKind::Stock => {
             let where_ = &req["blocks"]["q"]["get"]["Stock"]["where"];
@@ -314,7 +313,7 @@ pub fn execute_request(engine: &mut Engine, req: &Value) -> io::Result<RequestRe
             let order_no = req["blocks"]["q"]["find"]["StockMovement"]["where"]["order_no"].as_str().unwrap();
             let mut rows = BTreeMap::new();
             let mut retained_bytes = 0usize;
-            engine.scan_primary(MOVEMENT.entity.as_bytes(), snapshot, |handle, doc| {
+            engine.scan_primary(MOVEMENT.entity.as_bytes(), |handle, doc| {
                 if doc.len() > MAX_MOVEMENT_DOC_BYTES {
                     return Err(io::Error::new(ErrorKind::InvalidData, "movement document exceeds scan byte cap"));
                 }
@@ -379,17 +378,16 @@ fn publish(engine: &mut Engine, id: &[u8], ops: &[Op]) -> io::Result<BlockResult
 ///
 /// Failed reads are not durable outcomes; clients needing exact original read
 /// bindings across retries must wait for the later general request journal.
-/// The engine's dedup has no expiry; this adapter persists the complete
-/// canonical request payload in its write block id to reject changed intent.
+/// Request-id dedup is an internal detail, not a guarantee (2026-09-29): the
+/// canonical request payload stays embedded in the write block id, so an
+/// identical request replays its recorded CSN while a reused request id with a
+/// different payload executes as a NEW request — idempotency is enforced by
+/// business uniqueness (the engine acks only after fsync), never by the id.
 /// A unique publish conflict leaves the write set unapplied and returns
 /// AlreadyExists, never a backorder. Only timing contention may be retried.
 pub fn execute_order_flow(engine: &mut Engine, req: &Value) -> io::Result<RequestResult> {
     let has_read_fallback = validate(req)?;
-    let id = req["id"].as_str().unwrap();
     let intent = intent_prefix(req)?;
-    if engine.request_intent_conflicts(&request_prefix(id), &intent) {
-        return Err(invalid("request id reused with different payload"));
-    }
     let params = &req["params"];
     let cust = &req["blocks"]["cust"];
     let mut results = BTreeMap::new();
@@ -433,7 +431,7 @@ pub fn execute_order_flow(engine: &mut Engine, req: &Value) -> io::Result<Reques
     // with publication in this prototype.
     let order_no = text(&params["order_no"], "order_no")?;
     for catalog in [&ORDER, &BACKORDER] {
-        if engine.unique_lookup(catalog.entity.as_bytes(), catalog.unique.as_bytes(), order_no.as_bytes(), engine.csn())?.is_some() {
+        if engine.unique_lookup(catalog.entity.as_bytes(), catalog.unique.as_bytes(), order_no.as_bytes())?.is_some() {
             return Err(io::Error::new(ErrorKind::AlreadyExists, "order number already used"));
         }
     }

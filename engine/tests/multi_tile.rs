@@ -1,5 +1,5 @@
 //! Multi-tile engine: an ordered list of published tiles (strictly increasing
-//! cutoffs), cross-tier snapshot reads spanning tiles, and the explicit
+//! cutoffs), cross-tier latest-state reads spanning tiles, and the explicit
 //! [`Engine::maybe_checkpoint`] trigger. The WAL stays the sole recovery
 //! authority and is never rotated or truncated here.
 
@@ -24,37 +24,21 @@ fn del_doc(h: u64) -> Op { Op::DelDoc { entity: b"E".to_vec(), handle: h } }
 fn unique(h: u64) -> Op { Op::PutUnique { entity: b"E".to_vec(), field: b"u".to_vec(), value: b"v".to_vec(), handle: h } }
 fn del_unique(h: u64) -> Op { Op::DelUnique { entity: b"E".to_vec(), field: b"u".to_vec(), value: b"v".to_vec(), handle: h } }
 fn reverse(source: u64) -> Op { Op::PutReverse { entity: b"E".to_vec(), field: b"r".to_vec(), target: 10, source } }
-fn scan(e: &Engine, snapshot: u64) -> Vec<(u64, Vec<u8>)> {
+fn scan(e: &Engine) -> Vec<(u64, Vec<u8>)> {
     let mut docs = Vec::new();
-    e.scan_primary(b"E", snapshot, |h, bytes| { docs.push((h, bytes.to_vec())); Ok(()) }).unwrap();
+    e.scan_primary(b"E", |h, bytes| { docs.push((h, bytes.to_vec())); Ok(()) }).unwrap();
     docs
 }
-fn assert_all_snapshots(e: &Engine) {
-    // The version of P/E/1 and P/E/2 visible at each snapshot lives in a
-    // different tier: csn 1-2 in tile one, csn 3-4 in tile two, csn 5+ in the
-    // serving memtable.
-    let doc1 = [Some("v1"), Some("v2"), Some("v2"), Some("v4"), Some("v4")];
-    let doc2 = [None, Some("keep"), None, None, None];
-    for (i, snapshot) in [1u64, 2, 3, 4, 5].iter().enumerate() {
-        let s = *snapshot;
-        assert_eq!(e.get(b"E", 1, s).unwrap(), doc1[i].map(|v| v.as_bytes().to_vec()), "P/E/1 at snapshot {s}");
-        assert_eq!(e.get(b"E", 2, s).unwrap(), doc2[i].map(|v| v.as_bytes().to_vec()), "P/E/2 at snapshot {s}");
-        assert_eq!(e.get(b"E", 3, s).unwrap(), (s == 5).then(|| b"live".to_vec()), "P/E/3 at snapshot {s}");
-        // Publish-time uniqueness semantics are unchanged across tiers.
-        assert_eq!(e.unique_lookup(b"E", b"u", b"v", s).unwrap(),
-            match s { 1 | 2 => Some(1), 3 | 4 => Some(2), _ => Some(3) }, "U at snapshot {s}");
-        assert_eq!(e.reverse_lookup(b"E", b"r", 10, s).unwrap(),
-            match s { 1 | 2 => vec![21], 3 | 4 => vec![21, 22], _ => vec![21, 22, 23] }, "R at snapshot {s}");
-        assert_eq!(scan(e, s), {
-            let rows: Vec<(u64, Vec<u8>)> = match s {
-                1 => vec![(1, b"v1".to_vec())],
-                2 => vec![(1, b"v2".to_vec()), (2, b"keep".to_vec())],
-                3 | 4 => vec![(1, e.get(b"E", 1, s).unwrap().unwrap())],
-                _ => vec![(1, b"v4".to_vec()), (3, b"live".to_vec())],
-            };
-            rows
-        }, "scan at snapshot {s}");
-    }
+fn assert_current_state(e: &Engine, doc3: &[u8]) {
+    // Reads see only latest committed state (2026-09-29), across all tiers:
+    // tile one covers csn 1-2, tile two csn 3-4, the serving memtable csn 5+.
+    // P/E/1 is v4, P/E/2 deleted (tombstone), P/E/3 is whatever was written last.
+    assert_eq!(e.get(b"E", 1).unwrap(), Some(b"v4".to_vec()), "P/E/1 latest");
+    assert_eq!(e.get(b"E", 2).unwrap(), None, "P/E/2 tombstoned");
+    assert_eq!(e.get(b"E", 3).unwrap(), Some(doc3.to_vec()), "P/E/3 latest");
+    assert_eq!(e.unique_lookup(b"E", b"u", b"v").unwrap(), Some(3), "U latest");
+    assert_eq!(e.reverse_lookup(b"E", b"r", 10).unwrap(), vec![21, 22, 23], "R latest");
+    assert_eq!(scan(e), vec![(1, b"v4".to_vec()), (3, doc3.to_vec())], "scan at latest");
 }
 
 #[test]
@@ -62,7 +46,7 @@ fn multi_tile_publish_cross_tier_reads_and_checkpointed_reopen() {
     let files = Files::new();
     let mut e = Engine::create(&files.wal).unwrap();
     // Tile one covers CSN 1-2, tile two covers CSN 3-4, the serving memtable
-    // holds CSN 5+. Every version is retained (WAL + tiles).
+    // holds CSN 5+. The WAL retains every version; reads see latest state only.
     e.commit_block(b"b1", &[doc(1, b"v1"), unique(1), reverse(21)]).unwrap();
     e.commit_block(b"b2", &[doc(2, b"keep"), doc(1, b"v2")]).unwrap();
     e.publish_tile(&files.dir.join("tile-2.tile"), 2).unwrap();
@@ -72,11 +56,11 @@ fn multi_tile_publish_cross_tier_reads_and_checkpointed_reopen() {
     e.publish_tile(&files.dir.join("tile-4.tile"), 4).unwrap();
     assert_eq!(e.serving_memtable_entries(), 0);
     // unique(2) still owns "v"; a same-block release+take is the established
-    // transfer shape and is what makes U@5 resolve to handle 3.
+    // transfer shape and is what makes U resolve to handle 3.
     e.commit_block(b"b5", &[del_unique(2), unique(3), doc(3, b"live"), reverse(23)]).unwrap();
     assert_eq!(e.csn(), 5);
     assert_eq!(e.serving_memtable_entries(), 4, "only CSN>4 versions stay in memory");
-    assert_all_snapshots(&e);
+    assert_current_state(&e, b"live");
     assert!(matches!(e.commit_block(b"b6", &[unique(4)]).unwrap(), Outcome::Conflict(_)),
         "publish-time uniqueness consults all tiers");
 
@@ -84,7 +68,7 @@ fn multi_tile_publish_cross_tier_reads_and_checkpointed_reopen() {
     let mut e = Engine::open_discover(&files.dir).unwrap();
     assert_eq!(e.csn(), 5);
     assert_eq!(e.serving_memtable_entries(), 4, "verified tile ranges are not rematerialized");
-    assert_all_snapshots(&e);
+    assert_current_state(&e, b"live");
     // Dedup ids and the handle watermark still come from the retained WAL, not
     // from any tile or manifest checkpoint.
     assert_eq!(e.committed_block_csn(b"b1"), Some(1));
@@ -95,10 +79,10 @@ fn multi_tile_publish_cross_tier_reads_and_checkpointed_reopen() {
     // ordered list past both discovered tiles.
     e.publish_tile(&files.dir.join("tile-5.tile"), 5).unwrap();
     assert_eq!(e.serving_memtable_entries(), 0);
-    assert_eq!(e.get(b"E", 3, 5).unwrap(), Some(b"live".to_vec()));
+    assert_eq!(e.get(b"E", 3).unwrap(), Some(b"live".to_vec()));
     drop(e);
     let e = Engine::open_discover(&files.dir).unwrap();
-    assert_all_snapshots(&e);
+    assert_current_state(&e, b"live");
     assert_eq!(e.serving_memtable_entries(), 0);
 }
 
@@ -117,7 +101,7 @@ fn maybe_checkpoint_triggers_only_past_threshold_and_advances_root() {
     assert_eq!(e.serving_memtable_entries(), 0, "checkpoint evicts everything through the current CSN");
     drop(e);
     let mut e = Engine::open_discover(&files.dir).unwrap();
-    assert_eq!(e.get(b"E", 1, 1).unwrap(), Some(b"a".to_vec()));
+    assert_eq!(e.get(b"E", 1).unwrap(), Some(b"a".to_vec()));
     assert_eq!(e.serving_memtable_entries(), 0, "the checkpointed tile is referenced by the advanced root");
 
     // The WAL is never rotated, so valid_len still exceeds the threshold and
@@ -133,8 +117,8 @@ fn maybe_checkpoint_triggers_only_past_threshold_and_advances_root() {
     assert!(files.dir.join(format!("tile-{}.tile", e.csn())).exists());
     drop(e);
     let e = Engine::open_discover(&files.dir).unwrap();
-    assert_eq!(e.get(b"E", 1, 1).unwrap(), Some(b"a".to_vec()), "old snapshot still served from tile one");
-    assert_eq!(e.get(b"E", 2, 2).unwrap(), Some(b"b".to_vec()));
+    assert_eq!(e.get(b"E", 1).unwrap(), Some(b"a".to_vec()), "handle 1 still served from tile one");
+    assert_eq!(e.get(b"E", 2).unwrap(), Some(b"b".to_vec()));
     assert_eq!(e.serving_memtable_entries(), 0);
 }
 
@@ -166,7 +150,7 @@ fn compaction_name_owned_by_live_tile_fails_closed_without_hint_to_delete() {
     assert!(err.to_string().contains("live published tile"), "{err}");
     assert!(err.to_string().contains("cannot proceed"), "error must not tell the user to remove a live tile: {err}");
     assert!(files.dir.join("compact-2.tile").exists(), "live tile untouched");
-    assert_eq!(e.get(b"E", 1, 1).unwrap(), Some(b"a".to_vec()));
+    assert_eq!(e.get(b"E", 1).unwrap(), Some(b"a".to_vec()));
 }
 
 #[test]
@@ -186,8 +170,8 @@ fn manifest_refuses_more_than_max_tiles() {
     let e = Engine::open_discover(&files.dir).unwrap();
     assert_eq!(e.csn(), 9);
     assert_eq!(e.serving_memtable_entries(), 1, "all eight tiles re-verified against the WAL at open");
-    assert_eq!(e.get(b"E", 1, 1).unwrap(), Some(b"d".to_vec()));
-    assert_eq!(e.get(b"E", 8, 8).unwrap(), Some(b"d".to_vec()));
+    assert_eq!(e.get(b"E", 1).unwrap(), Some(b"d".to_vec()));
+    assert_eq!(e.get(b"E", 8).unwrap(), Some(b"d".to_vec()));
 }
 
 #[test]
@@ -241,7 +225,7 @@ fn overlapping_or_out_of_order_cutoffs_are_rejected() {
 }
 
 #[test]
-fn compact_merges_tiles_into_one_and_preserves_every_snapshot() {
+fn compact_merges_tiles_into_one_and_serves_latest_state() {
     let files = Files::new();
     let mut e = Engine::create(&files.wal).unwrap();
     // Tile one covers CSN 1-2, tile two CSN 3-4, the serving memtable CSN 5.
@@ -252,7 +236,7 @@ fn compact_merges_tiles_into_one_and_preserves_every_snapshot() {
     e.commit_block(b"b4", &[doc(1, b"v4")]).unwrap();
     e.publish_tile(&files.dir.join("tile-4.tile"), 4).unwrap();
     e.commit_block(b"b5", &[del_unique(2), unique(3), doc(3, b"live"), reverse(23)]).unwrap();
-    assert_all_snapshots(&e);
+    assert_current_state(&e, b"live");
     let memtable_before = e.serving_memtable_entries();
     assert_eq!(memtable_before, 4);
     // Simulate the crash window later: keep the exact bytes of one superseded
@@ -264,7 +248,7 @@ fn compact_merges_tiles_into_one_and_preserves_every_snapshot() {
     assert!(!files.dir.join("tile-2.tile").exists(), "superseded tiles are unlinked only after the durable flip");
     assert!(!files.dir.join("tile-4.tile").exists());
     assert!(files.dir.join("compact-4.tile").exists(), "the merged tile uses the engine-chosen name");
-    assert_all_snapshots(&e);
+    assert_current_state(&e, b"live");
 
     // Crash between flip and unlink: tile-2.tile survives on disk as an
     // unreferenced orphan. Discovery must ignore it (never adopt) and keep
@@ -274,7 +258,7 @@ fn compact_merges_tiles_into_one_and_preserves_every_snapshot() {
     let mut e = Engine::open_discover(&files.dir).unwrap();
     assert_eq!(e.csn(), 5);
     assert_eq!(e.serving_memtable_entries(), 4);
-    assert_all_snapshots(&e);
+    assert_current_state(&e, b"live");
     // Dedup ids and the handle watermark still come from the retained WAL.
     assert_eq!(e.committed_block_csn(b"b1"), Some(1));
     assert_eq!(e.commit_block(b"b1", &[doc(99, b"ignored")]).unwrap(), Outcome::AlreadyCommitted { csn: 1 });
@@ -291,14 +275,12 @@ fn compact_merges_tiles_into_one_and_preserves_every_snapshot() {
     assert!(!files.dir.join("compact-4.tile").exists());
     assert!(!files.dir.join("tile-6.tile").exists());
     assert!(files.dir.join("compact-6.tile").exists());
-    for s in 1..=6u64 {
-        assert_eq!(e.get(b"E", 1, s).unwrap(), match s { 1 => Some(b"v1".to_vec()), 2 | 3 => Some(b"v2".to_vec()), _ => Some(b"v4".to_vec()) }, "P/E/1 at snapshot {s}");
-        assert_eq!(e.get(b"E", 3, s).unwrap(), match s { 5 => Some(b"live".to_vec()), 6 => Some(b"live2".to_vec()), _ => None }, "P/E/3 at snapshot {s}");
-    }
+    assert_eq!(e.get(b"E", 1).unwrap(), Some(b"v4".to_vec()));
+    assert_eq!(e.get(b"E", 3).unwrap(), Some(b"live2".to_vec()));
     drop(e);
     let e = Engine::open_discover(&files.dir).unwrap();
-    assert_all_snapshots(&e);
-    assert_eq!(e.get(b"E", 3, 6).unwrap(), Some(b"live2".to_vec()));
+    assert_current_state(&e, b"live2");
+    assert_eq!(e.get(b"E", 3).unwrap(), Some(b"live2".to_vec()));
     assert_eq!(e.serving_memtable_entries(), 0);
     // The orphan from the crash window is still ignored after everything.
     assert!(files.dir.join("tile-2.tile").exists());
@@ -321,7 +303,7 @@ fn compact_refuses_under_two_tiles_and_leftover_candidates() {
     let candidate = files.dir.join("compact-2.tile");
     fs::write(&candidate, b"stale compaction candidate").unwrap();
     assert_eq!(e.compact().unwrap_err().kind(), ErrorKind::AlreadyExists);
-    assert_eq!(e.get(b"E", 1, 1).unwrap(), Some(b"a".to_vec()), "refused compaction changed nothing");
+    assert_eq!(e.get(b"E", 1).unwrap(), Some(b"b".to_vec()), "refused compaction changed nothing");
     assert_eq!(e.serving_memtable_entries(), 1);
     assert!(files.dir.join("tile-1.tile").exists(), "superseded tiles stay referenced until a successful compact");
 
@@ -329,10 +311,8 @@ fn compact_refuses_under_two_tiles_and_leftover_candidates() {
     e.compact().unwrap();
     assert!(!files.dir.join("tile-1.tile").exists());
     assert!(!files.dir.join("tile-2.tile").exists());
-    for s in 1..=3u64 {
-        assert_eq!(e.get(b"E", 1, s).unwrap(), (s == 1).then(|| b"a".to_vec()).or(Some(b"b".to_vec())));
-        assert_eq!(e.get(b"E", 2, s).unwrap(), (s == 3).then(|| b"c".to_vec()));
-    }
+    assert_eq!(e.get(b"E", 1).unwrap(), Some(b"b".to_vec()), "newest version survives compaction");
+    assert_eq!(e.get(b"E", 2).unwrap(), Some(b"c".to_vec()));
 }
 
 #[test]
@@ -357,10 +337,47 @@ fn compact_releases_the_max_tiles_bound() {
     assert_eq!(e.serving_memtable_entries(), 0);
     drop(e);
     let e = Engine::open_discover(&files.dir).unwrap();
-    assert_eq!(e.get(b"E", 1, 1).unwrap(), Some(b"d".to_vec()));
-    assert_eq!(e.get(b"E", 8, 8).unwrap(), Some(b"d".to_vec()));
-    assert_eq!(e.get(b"E", 9, 9).unwrap(), Some(b"d".to_vec()));
+    assert_eq!(e.get(b"E", 1).unwrap(), Some(b"d".to_vec()));
+    assert_eq!(e.get(b"E", 8).unwrap(), Some(b"d".to_vec()));
+    assert_eq!(e.get(b"E", 9).unwrap(), Some(b"d".to_vec()));
     assert_eq!(e.serving_memtable_entries(), 0);
+}
+
+#[test]
+fn tiles_and_compaction_keep_only_the_newest_version_per_logical_key() {
+    let files = Files::new();
+    let mut e = Engine::create(&files.wal).unwrap();
+    // Two versions of one logical key inside ONE published range: the tile
+    // keeps only the newest; the superseded v1 is unreadable garbage
+    // (2026-09-29: reads never see historical state).
+    e.commit_block(b"b1", &[doc(1, b"v1")]).unwrap();
+    e.commit_block(b"b2", &[doc(1, b"v2"), doc(2, b"keep")]).unwrap();
+    e.publish_tile(&files.dir.join("tile-2.tile"), 2).unwrap();
+    assert_eq!(tile_entry_count(&files.dir.join("tile-2.tile")), 2, "superseded v1 dropped; newest doc1 + doc2 remain");
+    assert_eq!(e.get(b"E", 1).unwrap(), Some(b"v2".to_vec()));
+    // A delete is itself a newest state and is retained through compaction.
+    e.commit_block(b"b3", &[del_doc(1)]).unwrap();
+    e.commit_block(b"b4", &[doc(3, b"live")]).unwrap();
+    e.publish_tile(&files.dir.join("tile-4.tile"), 4).unwrap();
+    e.compact().unwrap();
+    assert_eq!(tile_entry_count(&files.dir.join("compact-4.tile")), 3,
+        "merged tile: tombstone for doc1 (newest state), keep, live — nothing else");
+    assert_eq!(e.get(b"E", 1).unwrap(), None, "tombstone is the newest state");
+    assert_eq!(e.get(b"E", 2).unwrap(), Some(b"keep".to_vec()));
+    assert_eq!(e.get(b"E", 3).unwrap(), Some(b"live".to_vec()));
+    assert_eq!(scan(&e), vec![(2, b"keep".to_vec()), (3, b"live".to_vec())]);
+    drop(e);
+    let e = Engine::open_discover(&files.dir).unwrap();
+    assert_eq!(e.get(b"E", 1).unwrap(), None);
+    assert_eq!(e.get(b"E", 2).unwrap(), Some(b"keep".to_vec()));
+    assert_eq!(e.get(b"E", 3).unwrap(), Some(b"live".to_vec()));
+    assert_eq!(e.serving_memtable_entries(), 0, "merged tile verified against the reduced WAL projection at open");
+}
+
+fn tile_entry_count(path: &PathBuf) -> u64 {
+    // Tile header: magic(8) cutoff(8) wal-digest(32) count(8) ...
+    let bytes = fs::read(path).unwrap();
+    u64::from_le_bytes(bytes[48..56].try_into().unwrap())
 }
 
 fn crc32c(bytes: &[u8]) -> u32 {
