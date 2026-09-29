@@ -52,4 +52,4 @@ Fresh reviewer on `bcd29e8` (resumed after timeout, source-read based) returned 
 
 ## Next action
 
-Manifest slice frozen. Remaining author-owned choices (snapshot lease/expiry, L-02 dedup retention) gate only version dropping and WAL retirement, not the next mechanism slice: multiple tiles + automatic checkpoint trigger, then compaction. No user decision pending.
+Manifest slice frozen. Worker `538428a9-14c7-4d3a-893f-355f1352e95e` (isolated, from `721d7b7`) implements multi-tile manifest payload (ordered, strictly increasing cutoffs, MAX_TILES cap) with cross-tile newest-visible merge, `maybe_checkpoint(max_wal_bytes)` automatic publish trigger, and per-tile WAL-projection verification at discovery. Parent next: independent review of worker commit, integrate, then compaction slice. Snapshot lease/expiry and L-02 dedup retention remain author-owned gates for version dropping / WAL retirement only.
