@@ -109,11 +109,21 @@ impl Engine {
     }
 
     /// Explicit prototype recovery: a missing, corrupt or WAL-mismatched tile fails
-    /// closed. To rebuild from retained WAL, explicitly call `open` instead.
+    /// closed. To rebuild from retained WAL, explicitly call `open` instead. The
+    /// tile path must satisfy the same plain-filename rules as `publish_tile`, so
+    /// a legacy-opened engine can never adopt a name that a later `publish_tile`
+    /// could reference but `open_discover` could never resolve.
     pub fn open_with_tile(wal_path: impl AsRef<Path>, tile_path: impl AsRef<Path>) -> io::Result<Engine> {
         let tile_path = tile_path.as_ref();
+        let name = match tile_path.file_name().and_then(|n| n.to_str()) {
+            Some(n) => n.to_string(),
+            None => return Err(io::Error::new(io::ErrorKind::InvalidInput, "tile path must be a plain filename inside the engine directory")),
+        };
+        if !manifest::valid_tile_name(&name)
+            || parent_dir(tile_path) != parent_dir(wal_path.as_ref()) {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "tile path must be a plain filename inside the engine directory"));
+        }
         let tile = Tile::open(tile_path)?;
-        let name = tile_path.file_name().and_then(|n| n.to_str()).unwrap_or_default().to_string();
         Self::open_impl(wal_path.as_ref(), vec![TileHandle { tile, name }])
     }
 

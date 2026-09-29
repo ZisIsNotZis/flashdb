@@ -70,9 +70,10 @@ fn header(cutoff: u64, digest: &[u8; 32], count: u64, size: u64) -> [u8; HEADER]
 }
 
 // Positional reads never expose borrowed file-backed bytes. Truncation and
-// corruption yield io::Error, never SIGBUS/panic. The multi-tile merge
-// pre-advances every published tile, so corruption anywhere in a tile fails
-// every read closed (stronger than the earlier single-tile qualification).
+// corruption yield io::Error, never SIGBUS/panic. Open verifies every stored
+// record; at read time the multi-tile merge pre-advances every published tile
+// so corruption reached by any read fails closed - though a read that stops
+// before a corrupt record still does not detect it (no eager whole-file recheck).
 fn read_exact_at(file: &File, mut bytes: &mut [u8], mut offset: u64) -> io::Result<()> {
     while !bytes.is_empty() {
         match file.read_at(bytes, offset) {
