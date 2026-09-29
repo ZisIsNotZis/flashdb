@@ -370,6 +370,13 @@ impl Engine {
         }
         let cutoff = self.tiles.last().unwrap().cutoff();
         let path = self.dir.join(format!("compact-{cutoff}.tile"));
+        let name = format!("compact-{cutoff}.tile");
+        if self.tiles.iter().any(|t| t.name == name) {
+            // A LIVE published tile owns this name; deleting it per a generic
+            // "remove the leftover" hint would brick discovery after restart.
+            return Err(io::Error::new(io::ErrorKind::AlreadyExists,
+                format!("compaction candidate {name} is a live published tile; compaction cannot proceed under this name")));
+        }
         // 1. Build + verify the merged tile against the full retained WAL union
         //    projection, exactly as publish verifies a single tile's range.
         let tile = match self.write_compacted_tile(&path, cutoff) {
@@ -386,7 +393,6 @@ impl Engine {
         // 3. Manifest protocol: the new root lists exactly one tile. The cutoff
         //    (and therefore the checkpoint frontier) is unchanged; only the
         //    number of files carrying `(0, cutoff]` shrinks.
-        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default().to_string();
         let tref = TileRef { name: name.clone(), cutoff, digest: *tile.digest() };
         let checkpoint = Checkpoint { csn: cutoff, handle_watermark: self.max_handle };
         self.manifest_publish(vec![tref], checkpoint)?;

@@ -152,6 +152,24 @@ fn checkpoint_name_collision_fails_closed_without_side_effects() {
 }
 
 #[test]
+fn compaction_name_owned_by_live_tile_fails_closed_without_hint_to_delete() {
+    let files = Files::new();
+    let mut e = Engine::create(&files.wal).unwrap();
+    // Publish a tile whose name collides with the deterministic compaction
+    // candidate for the next cutoff; the live tile must never be deletable.
+    e.commit_block(b"b1", &[doc(1, b"a")]).unwrap();
+    e.publish_tile(&files.dir.join("compact-2.tile"), 1).unwrap();
+    e.commit_block(b"b2", &[doc(2, b"b")]).unwrap();
+    e.publish_tile(&files.dir.join("tile-2.tile"), 2).unwrap();
+    let err = e.compact().unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::AlreadyExists);
+    assert!(err.to_string().contains("live published tile"), "{err}");
+    assert!(err.to_string().contains("cannot proceed"), "error must not tell the user to remove a live tile: {err}");
+    assert!(files.dir.join("compact-2.tile").exists(), "live tile untouched");
+    assert_eq!(e.get(b"E", 1, 1).unwrap(), Some(b"a".to_vec()));
+}
+
+#[test]
 fn manifest_refuses_more_than_max_tiles() {
     let files = Files::new();
     let mut e = Engine::create(&files.wal).unwrap();
