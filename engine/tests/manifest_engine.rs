@@ -27,15 +27,17 @@ fn publish_survives_reopen_via_manifest_and_ignores_unreferenced_tiles() {
     assert_eq!(e.get(b"E", 1, 2).unwrap(), Some(b"newer".to_vec()));
     drop(e);
 
-    // Reopen discovers manifest+tile without any explicit tile argument.
+    // Reopen discovers manifest+tiles without any explicit tile argument.
     let mut e = Engine::open_discover(&files.dir).unwrap();
     assert_eq!(e.csn(), 2);
     assert_eq!(e.next_handle().unwrap(), 3);
     assert_eq!(e.get(b"E", 1, 1).unwrap(), Some(b"covered".to_vec()));
     assert_eq!(e.serving_memtable_entries(), 1, "verified covered prefix not rematerialized");
-    // A second tile is refused in this slice.
+    // A second tile extends the manifest's ordered list; cutoffs stay strictly
+    // increasing (1 -> 2) and the evicted prefix still serves from tile one.
     let second = files.dir.join("second.tile");
-    assert_eq!(e.publish_tile(&second, 2).unwrap_err().kind(), std::io::ErrorKind::InvalidInput);
+    e.publish_tile(&second, 2).unwrap();
+    assert_eq!(e.serving_memtable_entries(), 0, "the CSN-2 version joined tile two");
     // New writes still commit over the published state.
     assert!(matches!(e.commit_block(b"three", &[doc(5, b"five")]).unwrap(), Outcome::Committed { csn: 3 }));
     drop(e);
@@ -50,6 +52,10 @@ fn publish_survives_reopen_via_manifest_and_ignores_unreferenced_tiles() {
     assert_eq!(e.get(b"E", 5, 3).unwrap(), Some(b"five".to_vec()));
     assert!(e.publish_tile(&leftover, 3).is_err(), "leftover candidate cannot be silently reused");
     assert_eq!(e.get(b"E", 5, 3).unwrap(), Some(b"five".to_vec()), "failed publish changed nothing");
+    // The discovered two-tile list keeps serving old snapshots after the failed
+    // publish attempt.
+    assert_eq!(e.get(b"E", 1, 1).unwrap(), Some(b"covered".to_vec()));
+    assert_eq!(e.serving_memtable_entries(), 1, "only the CSN-3 version stays in memory");
 }
 
 #[test]

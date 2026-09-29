@@ -59,7 +59,11 @@ pub enum Outcome {
 pub struct Engine {
     wal: Wal,
     mt: Memtable,
-    tile: Option<Tile>,
+    /// Published tiles ordered by strictly increasing cutoff; tile *i* covers
+    /// exactly the CSN range `(tiles[i-1].cutoff, tiles[i].cutoff]`, so each CSN
+    /// lives in at most one tier. All versions are retained (WAL + tiles); this
+    /// only bounds what the serving memtable materializes.
+    tiles: Vec<TileHandle>,
     wal_path: PathBuf,
     dir: PathBuf,
     manifest: Option<Manifest>,
@@ -68,13 +72,28 @@ pub struct Engine {
     max_handle: u64,
 }
 
+/// An open tile plus the plain filename under which the manifest references it
+/// (explicit path, discovery, or an engine-chosen checkpoint name).
+struct TileHandle {
+    tile: Tile,
+    name: String,
+}
+
+impl TileHandle {
+    fn cutoff(&self) -> u64 { self.tile.cutoff() }
+
+    fn tile_ref(&self) -> TileRef {
+        TileRef { name: self.name.clone(), cutoff: self.tile.cutoff(), digest: *self.tile.digest() }
+    }
+}
+
 impl Engine {
     /// 新建（空库）。
     pub fn create(wal_path: impl AsRef<Path>) -> io::Result<Engine> {
         Ok(Engine {
             wal: Wal::create(&wal_path)?,
             mt: Memtable::new(),
-            tile: None,
+            tiles: Vec::new(),
             wal_path: wal_path.as_ref().to_path_buf(),
             dir: parent_dir(wal_path.as_ref()),
             manifest: None,
@@ -86,38 +105,42 @@ impl Engine {
 
     /// Recover wholly from WAL; does not automatically discover tile candidates.
     pub fn open(wal_path: impl AsRef<Path>) -> io::Result<Engine> {
-        Self::open_impl(wal_path.as_ref(), None)
+        Self::open_impl(wal_path.as_ref(), Vec::new())
     }
 
     /// Explicit prototype recovery: a missing, corrupt or WAL-mismatched tile fails
     /// closed. To rebuild from retained WAL, explicitly call `open` instead.
     pub fn open_with_tile(wal_path: impl AsRef<Path>, tile_path: impl AsRef<Path>) -> io::Result<Engine> {
-        Self::open_impl(wal_path.as_ref(), Some(Tile::open(tile_path.as_ref())?))
+        let tile_path = tile_path.as_ref();
+        let tile = Tile::open(tile_path)?;
+        let name = tile_path.file_name().and_then(|n| n.to_str()).unwrap_or_default().to_string();
+        Self::open_impl(wal_path.as_ref(), vec![TileHandle { tile, name }])
     }
 
     /// Durable-root recovery: select the highest valid manifest page in `dir`, open
-    /// and verify the referenced tile against the retained WAL exactly as
-    /// `open_with_tile` does, and simply ignore unreferenced tile files (they are
-    /// never candidates; fail-closed, no adoption). Conventional layout:
-    /// `<dir>/data.wal`, `<dir>/manifest`, tiles referenced by plain filename.
-    /// A missing manifest file is the empty initial state (no tile); full WAL
-    /// replay still happens, so open time and RAM stay unbounded in this slice.
+    /// and verify every referenced tile against the retained WAL exactly as
+    /// `open_with_tile` does (cutoff ordering included), and simply ignore
+    /// unreferenced tile files (they are never candidates; fail-closed, no
+    /// adoption). Conventional layout: `<dir>/data.wal`, `<dir>/manifest`, tiles
+    /// referenced by plain filename. A missing manifest file is the empty initial
+    /// state (no tiles); full WAL replay still happens, so open time and RAM stay
+    /// unbounded in this slice.
     pub fn open_discover(dir: impl AsRef<Path>) -> io::Result<Engine> {
         let dir = dir.as_ref();
         let manifest = Manifest::open(&dir.join(manifest::MANIFEST_NAME))?;
-        let tile = match manifest.as_ref().and_then(|m| m.root().tile.as_ref()) {
-            Some(t) => {
+        let mut tiles = Vec::new();
+        if let Some(m) = manifest.as_ref() {
+            for t in &m.root().tiles {
                 // The root's binding must match the tile's own header, not just
                 // its name: a swapped or stale filename must not be adopted.
                 let opened = Tile::open(dir.join(&t.name).as_path())?;
                 if opened.cutoff() != t.cutoff || opened.digest() != &t.digest {
                     return Err(io::Error::new(io::ErrorKind::InvalidData, "manifest tile reference disagrees with tile header"));
                 }
-                Some(opened)
+                tiles.push(TileHandle { tile: opened, name: t.name.clone() });
             }
-            None => None,
-        };
-        let mut e = Self::open_impl(&dir.join(manifest::WAL_NAME), tile)?;
+        }
+        let mut e = Self::open_impl(&dir.join(manifest::WAL_NAME), tiles)?;
         if let Some(m) = &manifest {
             // While the WAL is fully retained these can only fire on divergence;
             // after WAL retirement the watermark check must become a max() merge
@@ -134,10 +157,13 @@ impl Engine {
         Ok(e)
     }
 
-    fn open_impl(wal_path: &Path, tile: Option<Tile>) -> io::Result<Engine> {
+    fn open_impl(wal_path: &Path, tiles: Vec<TileHandle>) -> io::Result<Engine> {
+        if !tiles.windows(2).all(|w| w[0].cutoff() < w[1].cutoff()) {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "tile cutoffs overlap or are not strictly increasing"));
+        }
         let (wal, records) = Wal::open_or_recover(wal_path)?;
-        if let Some(t) = &tile {
-            if wal_digest(&records, t.cutoff())? != *t.digest() {
+        for t in &tiles {
+            if wal_digest(&records, t.cutoff())? != *t.tile.digest() {
                 return Err(io::Error::new(io::ErrorKind::InvalidData, "tile WAL prefix mismatch"));
             }
         }
@@ -146,71 +172,91 @@ impl Engine {
         let mut csn = 0u64;
         let mut dedup = HashMap::new();
         let mut max_handle = 0;
+        let covered_through = tiles.last().map(|t| t.cutoff()).unwrap_or(0);
         for payload in &records {
             let (rec_csn, block_id, ops) = decode_payload(payload)?;
             max_handle = max_handle.max(ops.iter().map(op_handle).max().unwrap_or(0));
-            let destination = if tile.as_ref().is_some_and(|t| rec_csn <= t.cutoff()) { &mut covered } else { &mut mt };
+            let destination = if rec_csn <= covered_through { &mut covered } else { &mut mt };
             for op in &ops { apply_op(destination, op, rec_csn); }
             csn = csn.max(rec_csn);
             dedup.insert(block_id, rec_csn);
         }
-        if let Some(t) = &tile { t.verify_projection(&covered, t.cutoff())?; }
-        Ok(Engine { wal, mt, tile, wal_path: wal_path.to_path_buf(), dir: parent_dir(wal_path), manifest: None, csn, dedup, max_handle })
+        let mut lower = 0u64;
+        for t in &tiles {
+            t.tile.verify_projection(&covered, lower, t.cutoff())?;
+            lower = t.cutoff();
+        }
+        Ok(Engine { wal, mt, tiles, wal_path: wal_path.to_path_buf(), dir: parent_dir(wal_path), manifest: None, csn, dedup, max_handle })
     }
 
-    /// Build one immutable P/U/R tile containing *all* WAL-published versions at or
-    /// before cutoff. No automatic discovery, checkpoint, manifest or WAL rotation.
-    /// A failed build leaves the serving memtable intact; a successful build evicts
-    /// covered versions only after the file is synced and verified.
+    /// Build one immutable P/U/R tile containing the WAL-published versions in
+    /// `(previous cutoff, cutoff]`. No manifest, checkpoint, or WAL rotation.
+    /// A failed build leaves the serving memtable intact; a successful build
+    /// evicts covered versions only after the file is synced and verified.
     pub fn build_tile(&mut self, tile_path: impl AsRef<Path>, cutoff: u64) -> io::Result<()> {
-        if self.tile.is_some() || cutoff > self.csn {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "tile already active or cutoff exceeds CSN"));
+        if cutoff > self.csn {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "cutoff exceeds CSN"));
+        }
+        if self.tiles.last().is_some_and(|t| t.cutoff() >= cutoff) {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "tile cutoff must be strictly above the newest active tile cutoff"));
         }
         let tile = self.write_verified_tile(tile_path.as_ref(), cutoff)?;
         self.mt.evict_through(cutoff);
-        self.tile = Some(tile);
+        self.tiles.push(TileHandle {
+            tile,
+            name: tile_path.as_ref().file_name().and_then(|n| n.to_str()).unwrap_or_default().to_string(),
+        });
         Ok(())
     }
 
-    /// Create-new the tile file, sync it, reopen it and re-check its full P/U/R
-    /// projection against the retained WAL before any caller may reference it.
+    /// Create-new the tile file, sync it, reopen it and re-check its exact
+    /// `(previous cutoff, cutoff]` P/U/R projection against the retained WAL
+    /// before any caller may reference it.
     fn write_verified_tile(&self, tile_path: &Path, cutoff: u64) -> io::Result<Tile> {
         let (records, _) = wal::replay(&self.wal_path)?;
         if records.last().map(|r| decode_payload(r).map(|v| v.0)).transpose()? != Some(self.csn) && self.csn != 0 {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "WAL differs from serving state"));
         }
         let digest = wal_digest(&records, cutoff)?;
+        let lower = self.tiles.last().map(|t| t.cutoff()).unwrap_or(0);
         let mut expected = Memtable::new();
         for payload in &records {
             let (csn, _, ops) = decode_payload(payload)?;
-            if csn <= cutoff { for op in &ops { apply_op(&mut expected, op, csn); } }
+            if csn <= cutoff && csn > lower { for op in &ops { apply_op(&mut expected, op, csn); } }
         }
+        // The serving memtable holds exactly the versions above `lower`, so
+        // filtering to `<= cutoff` writes precisely the new tile's disjoint range.
         let tile = Tile::write(tile_path, cutoff, &digest, &self.mt)?;
-        tile.verify_projection(&expected, cutoff)?;
+        tile.verify_projection(&expected, lower, cutoff)?;
         Ok(tile)
     }
 
-    /// Durable publication of one tile: build the existing verified tile exactly
-    /// as [`Engine::build_tile`], make the tile's directory entry durable, then
-    /// run the manifest protocol — write the inactive page at seq+1, sync the
-    /// manifest file, sync the parent directory, flip the in-memory root — and
-    /// only then evict tile-covered memtable versions. Strict limits: at most
-    /// ONE active tile in this slice (a second `publish_tile` is refused), the
-    /// tile path must be a plain not-yet-existing filename inside the engine
-    /// directory (the manifest stores the name, never a path), and any manifest
-    /// I/O error poisons the writer until reopen selects the highest valid page.
-    /// A failed publish leaves the tile file on disk unreferenced (ignored by
+    /// Durable publication of one tile: build the verified tile exactly as
+    /// [`Engine::build_tile`], make the tile's directory entry durable, then
+    /// run the manifest protocol — write the inactive page at seq+1 with the
+    /// full active tile list plus the new tile, sync the manifest file, sync
+    /// the parent directory, flip the in-memory root — and only then evict
+    /// tile-covered memtable versions. Rules: tile cutoffs must be strictly
+    /// increasing (no CSN overlap with the newest active tile), at most
+    /// [`manifest::MAX_TILES`] active tiles, the tile path must be a plain
+    /// not-yet-existing filename inside the engine directory (the manifest
+    /// stores the name, never a path), and any manifest I/O error poisons the
+    /// writer until reopen selects the highest valid page. A failed publish
+    /// leaves the tile file on disk unreferenced (ignored by
     /// [`Engine::open_discover`]); republishing over it surfaces a clear
     /// `AlreadyExists` error instead of silently reusing the leftover file.
     pub fn publish_tile(&mut self, tile_path: impl AsRef<Path>, cutoff: u64) -> io::Result<()> {
         if self.manifest.as_ref().is_some_and(|m| m.poisoned()) {
             return Err(io::Error::new(io::ErrorKind::Other, "manifest writer poisoned; reopen to recover"));
         }
-        if self.tile.is_some() {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "tile already active; at most one tile in this slice"));
-        }
         if cutoff > self.csn {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "cutoff exceeds CSN"));
+        }
+        if self.tiles.last().is_some_and(|t| t.cutoff() >= cutoff) {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "tile cutoff must be strictly above the newest active tile cutoff"));
+        }
+        if self.tiles.len() >= manifest::MAX_TILES {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "active tile list is full; no compaction exists in this slice"));
         }
         let tile_path = tile_path.as_ref();
         let name = match tile_path.file_name().and_then(|n| n.to_str()) {
@@ -232,11 +278,14 @@ impl Engine {
         // 2. The tile's own directory entry must be durable before the manifest
         //    can reference it (checkpoint publication ordering).
         File::open(&self.dir)?.sync_all()?;
-        // 3. Manifest protocol; any error poisons the writer until reopen.
+        // 3. Manifest protocol; any error poisons the writer until reopen. The
+        //    page always carries the full ordered active list plus the new tile.
         let tref = TileRef { name: name.to_string(), cutoff, digest: *tile.digest() };
+        let mut refs: Vec<TileRef> = self.tiles.iter().map(|t| t.tile_ref()).collect();
+        refs.push(tref);
         let checkpoint = Checkpoint { csn: cutoff, handle_watermark: self.max_handle };
         match &mut self.manifest {
-            Some(m) => m.publish(tref, checkpoint)?,
+            Some(m) => m.publish(refs, checkpoint)?,
             None => {
                 let path = self.dir.join(manifest::MANIFEST_NAME);
                 let mut m = match Manifest::create(&path) {
@@ -245,48 +294,85 @@ impl Engine {
                         // An engine opened without discovery must never overwrite
                         // a root it did not read; adopt or refuse, never clobber.
                         match Manifest::open(&path)? {
-                            Some(m) if m.root().tile.is_none() => m,
+                            Some(m) if m.root().tiles.is_empty() => m,
                             _ => return Err(io::Error::new(io::ErrorKind::InvalidData,
-                                "manifest already exists with an active tile; use open_discover to adopt it before publishing")),
+                                "manifest already exists with active tiles; use open_discover to adopt them before publishing")),
                         }
                     }
                     Err(e) => return Err(e),
                 };
-                m.publish(tref, checkpoint)?;
+                m.publish(refs, checkpoint)?;
                 self.manifest = Some(m);
             }
         }
         // 4. In-memory flip only after the durable flip.
         self.mt.evict_through(cutoff);
-        self.tile = Some(tile);
+        self.tiles.push(TileHandle { tile, name: name.to_string() });
         Ok(())
+    }
+
+    /// Automatic checkpoint trigger. When the retained WAL's valid length
+    /// exceeds `max_wal_bytes`, publish a new tile covering everything through
+    /// the current CSN under an engine-chosen unused plain filename
+    /// (`tile-<cutoff>.tile`); an existing file of that name is refused as
+    /// `InvalidInput` rather than silently renamed. The WAL itself is never
+    /// rotated or truncated in this slice. `Ok(false)` = below threshold (no
+    /// checkpoint); callers invoke this explicitly — there is no background
+    /// thread.
+    pub fn maybe_checkpoint(&mut self, max_wal_bytes: u64) -> io::Result<bool> {
+        if self.csn == 0 || self.wal.valid_len() <= max_wal_bytes {
+            return Ok(false);
+        }
+        let path = self.dir.join(format!("tile-{}.tile", self.csn));
+        if path.try_exists()? {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput,
+                format!("checkpoint tile name {} already exists; remove it or publish manually to another name", path.display())));
+        }
+        self.publish_tile(&path, self.csn)?;
+        Ok(true)
     }
 
     /// Prototype inspection hook: proves tile-covered versions are no longer served
     /// from the memtable (not a bound on WAL recovery or total RAM).
     pub fn serving_memtable_entries(&self) -> usize { self.mt.len() }
 
-    // Sequential, checksum-verified traversal. No index or bounded-I/O point read.
-    // A failed read aborts before callers can publish a block based on partial state.
+    // K-way merge of the serving memtable and every published tile, all
+    // traversed in global key order. Keys encode CSN descending, so each logical
+    // key's versions arrive newest-first and the caller's first visible entry
+    // wins; old snapshots therefore reach into older tiles. Tile CSN ranges are
+    // disjoint, so cross-tier equal keys are impossible; the memtable-wins skip
+    // below is defensive only.
     fn scan_merged(&self, prefix: &[u8], mut visit: impl FnMut(&[u8], &[u8]) -> io::Result<bool>) -> io::Result<()> {
         let mut mem = self.mt.scan_iter(prefix).peekable();
-        let mut disk = self.tile.iter().flat_map(|tile| tile.entries());
-        let mut next_disk = next_matching(&mut disk, prefix)?;
-        while mem.peek().is_some() || next_disk.is_some() {
-            let use_mem = match (mem.peek(), next_disk.as_ref()) {
-                (Some((mk, _)), Some((dk, _))) => mk <= &dk.as_slice(),
+        let mut iters: Vec<_> = self.tiles.iter().map(|t| t.tile.entries()).collect();
+        let mut heads: Vec<Option<(Vec<u8>, Vec<u8>)>> = Vec::with_capacity(iters.len());
+        for iter in iters.iter_mut() {
+            heads.push(next_matching(iter, prefix)?);
+        }
+        loop {
+            if mem.peek().is_none() && heads.iter().all(Option::is_none) { break; }
+            let disk = smallest_disk_head(&heads);
+            let use_mem = match (mem.peek(), disk) {
+                (Some((mk, _)), Some(i)) => {
+                    let head = heads[i].as_ref().unwrap();
+                    *mk <= head.0.as_slice()
+                }
                 (Some(_), None) => true,
-                _ => false,
+                (None, _) => false,
             };
             if use_mem {
                 let (key, value) = mem.next().unwrap();
-                let equal = next_disk.as_ref().is_some_and(|(dk, _)| key == dk);
+                if let Some(i) = disk {
+                    if heads[i].as_ref().is_some_and(|(k, _)| k.as_slice() == key) {
+                        heads[i] = next_matching(&mut iters[i], prefix)?;
+                    }
+                }
                 if !visit(key, value)? { return Ok(()); }
-                if equal { next_disk = next_matching(&mut disk, prefix)?; }
             } else {
-                let (key, value) = next_disk.take().unwrap();
+                let i = disk.unwrap();
+                let (key, value) = heads[i].take().unwrap();
+                heads[i] = next_matching(&mut iters[i], prefix)?;
                 if !visit(&key, &value)? { return Ok(()); }
-                next_disk = next_matching(&mut disk, prefix)?;
             }
         }
         Ok(())
@@ -482,6 +568,22 @@ fn next_matching(
         if key.starts_with(prefix) { return Ok(Some((key, value))); }
     }
     Ok(None)
+}
+
+// Index of the smallest pending tile head, if any; linear over at most
+// manifest::MAX_TILES heads.
+fn smallest_disk_head(heads: &[Option<(Vec<u8>, Vec<u8>)>]) -> Option<usize> {
+    let mut best: Option<usize> = None;
+    for (i, head) in heads.iter().enumerate() {
+        if let Some((key, _)) = head {
+            let better = match best {
+                None => true,
+                Some(b) => key.as_slice() < heads[b].as_ref().unwrap().0.as_slice(),
+            };
+            if better { best = Some(i); }
+        }
+    }
+    best
 }
 
 // Bind a tile to the exact WAL prefix which produced it; the WAL remains the only

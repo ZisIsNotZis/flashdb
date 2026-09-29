@@ -1,13 +1,15 @@
-//! Minimal durable A/B manifest root for published tiles. This slice records **at
-//! most one** active tile; it never retires or truncates the WAL, and the dedup
-//! map stays derivable by full replay of the retained WAL.
+//! Minimal durable A/B manifest root for published tiles. The root records an
+//! **ordered list of active tiles** (ascending, strictly increasing cutoffs, so
+//! their CSN ranges never overlap) bounded by [`MAX_TILES`] so the list always
+//! fits one page; it never retires or truncates the WAL, and the dedup map stays
+//! derivable by full replay of the retained WAL.
 //!
 //! File layout: exactly two fixed [`PAGE`] (4 KiB) slots, each
 //! `[seq u64 LE][crc32c(payload) u32 LE][payload]` with a fixed 4092-byte payload
-//! (unused tail zero-filled and covered by the CRC). The payload holds the ordered
-//! list of active tile filenames (here: 0 or 1 entry: filename + cutoff + WAL
-//! digest) plus this slice's checkpoint: the CSN frontier the tile makes durable
-//! (= the tile cutoff) and the handle high-water mark at publication.
+//! (unused tail zero-filled and covered by the CRC). The payload holds the
+//! ordered list of active tile filenames (filename + cutoff + WAL digest each)
+//! plus the checkpoint: the CSN frontier the newest tile makes durable (= the
+//! newest tile cutoff) and the handle high-water mark at publication.
 //!
 //! Publication protocol (SS-26 discipline): write the *inactive* slot at
 //! `root.seq + 1` → `fdatasync` the manifest file → `fsync` the parent directory →
@@ -44,6 +46,13 @@ const HEADER: usize = 12; // seq u64 LE + crc32c u32 LE
 const PAYLOAD: usize = PAGE - HEADER;
 const MAX_NAME: usize = 255;
 
+/// Small active-tile bound: [`MAX_TILES`] entries of at most
+/// 4 + [`MAX_NAME`] + 8 + 32 bytes each always fit one payload with the count
+/// and checkpoint fields to spare, so the bound is about the one-page invariant,
+/// not an arbitrary engine limit. A publish beyond it is refused as
+/// `InvalidInput`; a CRC-valid page claiming more is corruption (fail closed).
+pub(crate) const MAX_TILES: usize = 8;
+
 fn invalid(message: &'static str) -> io::Error { io::Error::new(ErrorKind::InvalidData, message) }
 
 /// One active tile referenced by a manifest page: a plain filename inside the
@@ -67,8 +76,14 @@ pub(crate) struct Checkpoint {
 #[derive(Clone, Debug)]
 pub(crate) struct Root {
     pub(crate) seq: u64,
-    pub(crate) tile: Option<TileRef>,
+    /// Active tiles ordered by strictly increasing cutoff (non-overlapping CSN
+    /// ranges). Empty only in the initial seq-0 root.
+    pub(crate) tiles: Vec<TileRef>,
     pub(crate) checkpoint: Checkpoint,
+}
+
+fn cutoffs_strictly_increasing(tiles: &[TileRef]) -> bool {
+    tiles.windows(2).all(|w| w[0].cutoff < w[1].cutoff)
 }
 
 /// Names a manifest entry may never take: they would collide with the manifest
@@ -83,22 +98,30 @@ pub(crate) fn valid_tile_name(name: &str) -> bool {
 fn encode_root(root: &Root) -> io::Result<[u8; PAYLOAD]> {
     let mut p = [0u8; PAYLOAD];
     let mut i = 0;
-    match &root.tile {
-        None => {
-            if root.seq != 0 {
-                return Err(invalid("empty manifest requires seq 0"));
-            }
-            i = 4; // tile_count = 0, rest zeroed
+    if root.tiles.is_empty() {
+        if root.seq != 0 {
+            return Err(invalid("empty manifest requires seq 0"));
         }
-        Some(t) => {
+        i = 4; // tile_count = 0, rest zeroed
+    } else {
+        if root.tiles.len() > MAX_TILES {
+            return Err(invalid("manifest tile list exceeds one page"));
+        }
+        if !cutoffs_strictly_increasing(&root.tiles) {
+            return Err(invalid("manifest tile cutoffs overlap or are not strictly increasing"));
+        }
+        p[..4].copy_from_slice(&(root.tiles.len() as u32).to_le_bytes());
+        i = 4;
+        for t in &root.tiles {
             let name = t.name.as_bytes();
             if !valid_tile_name(&t.name) {
                 return Err(invalid("tile name is not a plain directory-local file"));
             }
-            p[..4].copy_from_slice(&1u32.to_le_bytes());
-            p[4..8].copy_from_slice(&(name.len() as u32).to_le_bytes());
-            p[8..8 + name.len()].copy_from_slice(name);
-            i = 8 + name.len();
+            // MAX_TILES * (4 + MAX_NAME + 8 + 32) + 20 stays far below PAYLOAD,
+            // so these fixed-size writes cannot run past the page.
+            p[i..i + 4].copy_from_slice(&(name.len() as u32).to_le_bytes());
+            p[i + 4..i + 4 + name.len()].copy_from_slice(name);
+            i += 4 + name.len();
             p[i..i + 8].copy_from_slice(&t.cutoff.to_le_bytes());
             i += 8;
             p[i..i + 32].copy_from_slice(&t.digest);
@@ -139,12 +162,13 @@ impl<'a> Cur<'a> {
 /// CRC-valid but structurally impossible payloads are corruption, not fallback.
 fn decode_payload(seq: u64, payload: &[u8]) -> io::Result<Root> {
     let mut c = Cur { b: payload, i: 0 };
-    let tile = match c.u32()? {
-        0 => {
-            if seq != 0 { return Err(invalid("manifest lists zero tiles at nonzero seq")); }
-            None
-        }
-        1 => {
+    let count = c.u32()? as usize;
+    let mut tiles = Vec::new();
+    if count == 0 {
+        if seq != 0 { return Err(invalid("manifest lists zero tiles at nonzero seq")); }
+    } else {
+        if count > MAX_TILES { return Err(invalid("manifest lists more tiles than fit in one page")); }
+        for _ in 0..count {
             let n = c.u32()? as usize;
             if !(1..=MAX_NAME).contains(&n) { return Err(invalid("manifest tile name length out of bounds")); }
             let name = std::str::from_utf8(c.take(n)?)
@@ -154,18 +178,20 @@ fn decode_payload(seq: u64, payload: &[u8]) -> io::Result<Root> {
             }
             let cutoff = c.u64()?;
             let digest = c.take(32)?.try_into().unwrap();
-            Some(TileRef { name: name.to_string(), cutoff, digest })
+            tiles.push(TileRef { name: name.to_string(), cutoff, digest });
         }
-        _ => return Err(invalid("manifest lists more than one tile")),
-    };
+        if !cutoffs_strictly_increasing(&tiles) {
+            return Err(invalid("manifest tile cutoffs overlap or are not strictly increasing"));
+        }
+    }
     let checkpoint = Checkpoint { csn: c.u64()?, handle_watermark: c.u64()? };
-    if tile.as_ref().is_some_and(|t| checkpoint.csn != t.cutoff) {
-        return Err(invalid("manifest checkpoint CSN disagrees with tile cutoff"));
+    if tiles.last().is_some_and(|t| checkpoint.csn != t.cutoff) {
+        return Err(invalid("manifest checkpoint CSN disagrees with newest tile cutoff"));
     }
     if payload[c.i..].iter().any(|&b| b != 0) {
         return Err(invalid("manifest payload has unparsed trailing bytes"));
     }
-    Ok(Root { seq, tile, checkpoint })
+    Ok(Root { seq, tiles, checkpoint })
 }
 
 /// `Ok(None)` marks a torn/absent page that A/B selection may skip; an `Err`
@@ -248,7 +274,7 @@ impl Manifest {
     /// file, sync parent directory.
     pub(crate) fn create(path: &Path) -> io::Result<Manifest> {
         let file = OpenOptions::new().read(true).write(true).create_new(true).open(path)?;
-        let initial = Root { seq: 0, tile: None, checkpoint: Checkpoint { csn: 0, handle_watermark: 0 } };
+        let initial = Root { seq: 0, tiles: Vec::new(), checkpoint: Checkpoint { csn: 0, handle_watermark: 0 } };
         file.write_all_at(&encode_page(0, &initial)?, 0)?;
         file.sync_data()?;
         File::open(Self::parent(path))?.sync_all()?;
@@ -267,19 +293,30 @@ impl Manifest {
     pub(crate) fn poisoned(&self) -> bool { self.poisoned }
 
     /// Write the inactive slot at `root.seq + 1`, sync the file, sync the parent
-    /// directory, then flip the in-memory root. Any error poisons this writer.
-    pub(crate) fn publish(&mut self, tile: TileRef, checkpoint: Checkpoint) -> io::Result<()> {
+    /// directory, then flip the in-memory root. `tiles` replaces the full active
+    /// list; structural problems in it fail before any I/O. Any error poisons
+    /// this writer.
+    pub(crate) fn publish(&mut self, tiles: Vec<TileRef>, checkpoint: Checkpoint) -> io::Result<()> {
         if self.poisoned {
             return Err(io::Error::new(io::ErrorKind::Other, "manifest writer poisoned; reopen to recover"));
         }
-        let result = self.publish_inner(tile, checkpoint);
+        let result = self.publish_inner(tiles, checkpoint);
         if result.is_err() { self.poisoned = true; }
         result
     }
 
-    fn publish_inner(&mut self, tile: TileRef, checkpoint: Checkpoint) -> io::Result<()> {
+    fn publish_inner(&mut self, tiles: Vec<TileRef>, checkpoint: Checkpoint) -> io::Result<()> {
         let seq = self.root.seq.checked_add(1).ok_or_else(|| invalid("manifest seq exhausted"))?;
-        let root = Root { seq, tile: Some(tile), checkpoint };
+        if tiles.is_empty() || tiles.len() > MAX_TILES {
+            return Err(invalid("publish requires one to MAX_TILES active tiles"));
+        }
+        if !cutoffs_strictly_increasing(&tiles) {
+            return Err(invalid("manifest tile cutoffs overlap or are not strictly increasing"));
+        }
+        if checkpoint.csn != tiles.last().unwrap().cutoff {
+            return Err(invalid("manifest checkpoint CSN disagrees with newest tile cutoff"));
+        }
+        let root = Root { seq, tiles, checkpoint };
         let page = encode_page(seq, &root)?;
         let slot = 1 - self.slot;
         #[cfg(test)]
@@ -321,29 +358,32 @@ mod tests {
     fn root_of(m: &Option<Manifest>) -> &Root { &m.as_ref().unwrap().root() }
 
     #[test]
-    fn page_roundtrips_tile_and_checkpoint() {
-        let root = Root { seq: 9, tile: Some(tile("data.tile", 42)), checkpoint: Checkpoint { csn: 42, handle_watermark: 43 } };
+    fn page_roundtrips_tiles_and_checkpoint() {
+        let root = Root { seq: 9, tiles: vec![tile("a.tile", 40), tile("b.tile", 42)], checkpoint: Checkpoint { csn: 42, handle_watermark: 43 } };
         let page = encode_page(9, &root).unwrap();
         let decoded = decode_page(&page).unwrap().unwrap();
         assert_eq!(decoded.seq, 9);
-        assert_eq!(decoded.tile.as_ref().unwrap().name, "data.tile");
-        assert_eq!(decoded.tile.as_ref().unwrap().cutoff, 42);
-        assert_eq!(decoded.tile.as_ref().unwrap().digest, [7u8; 32]);
+        assert_eq!(decoded.tiles.len(), 2);
+        assert_eq!(decoded.tiles[0].name, "a.tile");
+        assert_eq!(decoded.tiles[0].cutoff, 40);
+        assert_eq!(decoded.tiles[0].digest, [7u8; 32]);
+        assert_eq!(decoded.tiles[1].name, "b.tile");
+        assert_eq!(decoded.tiles[1].cutoff, 42);
         assert_eq!(decoded.checkpoint, Checkpoint { csn: 42, handle_watermark: 43 });
     }
 
     #[test]
     fn crc_torn_page_is_invalid_but_impossible_payload_is_corruption() {
-        let root = Root { seq: 1, tile: Some(tile("t.tile", 1)), checkpoint: Checkpoint { csn: 1, handle_watermark: 1 } };
+        let root = Root { seq: 1, tiles: vec![tile("t.tile", 1)], checkpoint: Checkpoint { csn: 1, handle_watermark: 1 } };
         let mut page = encode_page(1, &root).unwrap();
         page[20] ^= 0x80; // flip a payload byte under the CRC
         assert!(decode_page(&page).unwrap().is_none(), "CRC mismatch must be an invalid page, not corruption");
         page[8] ^= 0x80; // now the stored CRC itself disagrees
         assert!(decode_page(&page).unwrap().is_none());
 
-        // CRC-valid garbage: two tiles, zero tiles at nonzero seq, junk tail.
+        // CRC-valid garbage: too many tiles, zero tiles at nonzero seq, junk tail.
         let mut p = [0u8; PAYLOAD];
-        p[..4].copy_from_slice(&2u32.to_le_bytes());
+        p[..4].copy_from_slice(&((MAX_TILES + 1) as u32).to_le_bytes());
         assert_eq!(decode_payload(1, &p).unwrap_err().kind(), ErrorKind::InvalidData);
         let mut p = [0u8; PAYLOAD];
         assert_eq!(decode_payload(1, &p).unwrap_err().to_string(), "manifest lists zero tiles at nonzero seq");
@@ -355,6 +395,36 @@ mod tests {
         p[4..8].copy_from_slice(&5u32.to_le_bytes());
         p[8..13].copy_from_slice(b"a/b\0c");
         assert_eq!(decode_payload(1, &p).unwrap_err().kind(), ErrorKind::InvalidData);
+
+        // CRC-valid but structurally impossible tile lists are corruption:
+        // decreasing/equal cutoffs, or a checkpoint that is not the newest
+        // cutoff. encode_root refuses to produce these, so the payloads are
+        // hand-assembled the way only corruption could write them.
+        let entry = |name: &[u8], cutoff: u64| {
+            let mut e = Vec::new();
+            e.extend_from_slice(&(name.len() as u32).to_le_bytes());
+            e.extend_from_slice(name);
+            e.extend_from_slice(&cutoff.to_le_bytes());
+            e.extend_from_slice(&[7u8; 32]);
+            e
+        };
+        let hand_built = |entries: &[(Vec<u8>, u64)], checkpoint: (u64, u64)| {
+            let mut p = [0u8; PAYLOAD];
+            p[..4].copy_from_slice(&(entries.len() as u32).to_le_bytes());
+            let mut i = 4;
+            for (name, cutoff) in entries {
+                let e = entry(name, *cutoff);
+                p[i..i + e.len()].copy_from_slice(&e);
+                i += e.len();
+            }
+            p[i..i + 8].copy_from_slice(&checkpoint.0.to_le_bytes());
+            p[i + 8..i + 16].copy_from_slice(&checkpoint.1.to_le_bytes());
+            p
+        };
+        assert_eq!(decode_payload(3, &hand_built(&[(b"b.tile".to_vec(), 3), (b"a.tile".to_vec(), 3)], (3, 3))).unwrap_err().kind(), ErrorKind::InvalidData);
+        assert_eq!(decode_payload(3, &hand_built(&[(b"b.tile".to_vec(), 3), (b"a.tile".to_vec(), 2)], (2, 3))).unwrap_err().kind(), ErrorKind::InvalidData);
+        assert_eq!(decode_payload(3, &hand_built(&[(b"a.tile".to_vec(), 2), (b"b.tile".to_vec(), 3)], (2, 3))).unwrap_err().to_string(),
+            "manifest checkpoint CSN disagrees with newest tile cutoff");
     }
 
     #[test]
@@ -376,11 +446,11 @@ mod tests {
         let path = dir.join(MANIFEST_NAME);
         let m = Manifest::create(&path).unwrap();
         assert_eq!(m.root().seq, 0);
-        assert!(m.root().tile.is_none());
+        assert!(m.root().tiles.is_empty());
         assert_eq!(fs::metadata(&path).unwrap().len(), PAGE as u64);
         let reopened = Manifest::open(&path).unwrap().unwrap();
         assert_eq!(reopened.root().seq, 0);
-        assert!(reopened.root().tile.is_none());
+        assert!(reopened.root().tiles.is_empty());
     }
 
     #[test]
@@ -388,21 +458,25 @@ mod tests {
         let dir = tmp_dir("page-selection");
         let path = dir.join(MANIFEST_NAME);
         let mut m = Manifest::create(&path).unwrap();
-        m.publish(tile("one.tile", 1), Checkpoint { csn: 1, handle_watermark: 2 }).unwrap();
-        m.publish(tile("two.tile", 2), Checkpoint { csn: 2, handle_watermark: 3 }).unwrap();
+        m.publish(vec![tile("one.tile", 1)], Checkpoint { csn: 1, handle_watermark: 2 }).unwrap();
+        // The seq-2 root carries a two-tile list: each publish replaces the full
+        // active list, so an A/B fallback must restore a list, not one entry.
+        m.publish(vec![tile("one.tile", 1), tile("two.tile", 2)], Checkpoint { csn: 2, handle_watermark: 3 }).unwrap();
         drop(m);
         assert_eq!(root_of(&Manifest::open(&path).unwrap()).seq, 2);
 
         // Torn newest-slot tail: publish seq1 -> slot B, seq2 -> slot A. The
         // appended garbage truncates slot B's readable bytes, but slot A still
-        // holds the valid seq-2 page, so it remains the selected root.
+        // holds the valid seq-2 page with its full tile list, so it remains the
+        // selected root.
         let f = fs::OpenOptions::new().write(true).open(&path).unwrap();
         f.set_len(PAGE as u64 + 100).unwrap();
         drop(f);
         let opened = Manifest::open(&path).unwrap();
         let selected = root_of(&opened);
         assert_eq!(selected.seq, 2);
-        assert_eq!(selected.tile.as_ref().unwrap().name, "two.tile");
+        assert_eq!(selected.tiles.len(), 2, "fallback restores the full previous tile list");
+        assert_eq!(selected.tiles[1].name, "two.tile");
 
         // Full-length file with a zero-filled (CRC-invalid) slot B keeps slot A.
         let mut bytes = fs::read(&path).unwrap();
@@ -419,7 +493,7 @@ mod tests {
         let opened = Manifest::open(&path).unwrap();
         let selected = root_of(&opened);
         assert_eq!(selected.seq, 1);
-        assert_eq!(selected.tile.as_ref().unwrap().name, "one.tile");
+        assert_eq!(selected.tiles[0].name, "one.tile");
 
         // Both pages invalid (CRC), or structurally impossible files, fail closed.
         let mut bytes = fs::read(&path).unwrap();
@@ -439,8 +513,8 @@ mod tests {
     fn equal_seq_pages_fail_closed() {
         let dir = tmp_dir("equal-seq");
         let path = dir.join(MANIFEST_NAME);
-        let a = Root { seq: 1, tile: Some(tile("a.tile", 1)), checkpoint: Checkpoint { csn: 1, handle_watermark: 1 } };
-        let b = Root { seq: 1, tile: Some(tile("b.tile", 1)), checkpoint: Checkpoint { csn: 1, handle_watermark: 1 } };
+        let a = Root { seq: 1, tiles: vec![tile("a.tile", 1)], checkpoint: Checkpoint { csn: 1, handle_watermark: 1 } };
+        let b = Root { seq: 1, tiles: vec![tile("b.tile", 1)], checkpoint: Checkpoint { csn: 1, handle_watermark: 1 } };
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&encode_page(1, &a).unwrap());
         bytes.extend_from_slice(&encode_page(1, &b).unwrap());
@@ -453,16 +527,16 @@ mod tests {
         let dir = tmp_dir("poison");
         let path = dir.join(MANIFEST_NAME);
         let mut m = Manifest::create(&path).unwrap();
-        m.publish(tile("one.tile", 1), Checkpoint { csn: 1, handle_watermark: 2 }).unwrap();
+        m.publish(vec![tile("one.tile", 1)], Checkpoint { csn: 1, handle_watermark: 2 }).unwrap();
         assert_eq!(m.root().seq, 1);
         assert_eq!(fs::metadata(&path).unwrap().len(), 2 * PAGE as u64);
 
         m.inject_page_write_error = true;
-        let err = m.publish(tile("two.tile", 2), Checkpoint { csn: 2, handle_watermark: 3 }).unwrap_err();
+        let err = m.publish(vec![tile("two.tile", 2)], Checkpoint { csn: 2, handle_watermark: 3 }).unwrap_err();
         assert!(err.to_string().contains("injected manifest page write failure"));
         assert!(m.poisoned());
         m.inject_page_write_error = false;
-        assert_eq!(m.publish(tile("two.tile", 2), Checkpoint { csn: 2, handle_watermark: 3 }).unwrap_err().to_string(),
+        assert_eq!(m.publish(vec![tile("two.tile", 2)], Checkpoint { csn: 2, handle_watermark: 3 }).unwrap_err().to_string(),
             "manifest writer poisoned; reopen to recover");
         drop(m);
 
@@ -470,13 +544,13 @@ mod tests {
         // the newer slot torn but the root intact.
         let mut m = Manifest::open(&path).unwrap().unwrap();
         assert_eq!(m.root().seq, 1);
-        m.publish(tile("two.tile", 2), Checkpoint { csn: 2, handle_watermark: 3 }).unwrap();
+        m.publish(vec![tile("two.tile", 2)], Checkpoint { csn: 2, handle_watermark: 3 }).unwrap();
         assert_eq!(m.root().seq, 2);
         drop(m);
 
         let mut m = Manifest::open(&path).unwrap().unwrap();
         m.inject_sync_error = true;
-        assert!(m.publish(tile("three.tile", 3), Checkpoint { csn: 3, handle_watermark: 4 }).is_err());
+        assert!(m.publish(vec![tile("three.tile", 3)], Checkpoint { csn: 3, handle_watermark: 4 }).is_err());
         assert!(m.poisoned());
         drop(m);
         // The page write landed even though its sync failed; reopen takes the
@@ -485,6 +559,24 @@ mod tests {
         let opened = Manifest::open(&path).unwrap();
         let selected = root_of(&opened);
         assert_eq!(selected.seq, 3);
-        assert_eq!(selected.tile.as_ref().unwrap().name, "three.tile");
+        assert_eq!(selected.tiles[0].name, "three.tile");
+    }
+
+    #[test]
+    fn publish_refuses_structurally_invalid_tile_lists_before_any_io() {
+        // Each case needs a fresh manifest: a refused publish poisons the
+        // writer even though nothing was ever written (root stays at seq 0).
+        let case = |name: &str, tiles: Vec<TileRef>, checkpoint: Checkpoint| {
+            let path = tmp_dir(name).join(MANIFEST_NAME);
+            let mut m = Manifest::create(&path).unwrap();
+            assert_eq!(m.publish(tiles, checkpoint).unwrap_err().kind(), ErrorKind::InvalidData);
+            assert_eq!(m.root().seq, 0);
+            assert_eq!(fs::metadata(&path).unwrap().len(), PAGE as u64);
+        };
+        case("refuse-empty", Vec::new(), Checkpoint { csn: 0, handle_watermark: 0 });
+        case("refuse-cutoff", vec![tile("a.tile", 5)], Checkpoint { csn: 4, handle_watermark: 0 });
+        case("refuse-order", vec![tile("b.tile", 6), tile("a.tile", 5)], Checkpoint { csn: 6, handle_watermark: 0 });
+        case("refuse-overlap", vec![tile("a.tile", 5), tile("b.tile", 5)], Checkpoint { csn: 5, handle_watermark: 0 });
+        case("refuse-too-many", (0..MAX_TILES as u64 + 1).map(|i| tile(&format!("t{i}.tile"), i + 1)).collect::<Vec<_>>(), Checkpoint { csn: MAX_TILES as u64 + 1, handle_watermark: 0 });
     }
 }

@@ -295,10 +295,13 @@ fn point_read_checks_traversed_records_not_unrelated_later_entries() {
     let second_key = u32::from_le_bytes(bytes[second..second + 4].try_into().unwrap()) as usize;
     bytes[second + 12 + second_key] ^= 1;
     fs::write(&files.tile, bytes).unwrap();
-    assert_eq!(e.get(b"E", 1, 1).unwrap(), Some(b"first".to_vec()),
-        "point lookup need not verify an unrelated later record");
-    assert_eq!(e.get(b"E", 2, 1).unwrap_err().kind(), ErrorKind::InvalidData,
-        "a traversed corrupt record must fail without process crash");
+    // Multi-tile merge pre-advances every tile to its first matching key, so a
+    // corrupted record anywhere in a published tile fails every read closed:
+    // the weaker single-tile qualification (only traversed records checked)
+    // was intentionally dropped during the multi-tile integration.
+    assert_eq!(e.get(b"E", 1, 1).unwrap_err().kind(), ErrorKind::InvalidData,
+        "any tile corruption fails closed without process crash");
+    assert_eq!(e.get(b"E", 2, 1).unwrap_err().kind(), ErrorKind::InvalidData);
 }
 
 #[test]

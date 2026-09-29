@@ -70,8 +70,9 @@ fn header(cutoff: u64, digest: &[u8; 32], count: u64, size: u64) -> [u8; HEADER]
 }
 
 // Positional reads never expose borrowed file-backed bytes. Truncation and
-// corruption of a record actually traversed yield io::Error, not SIGBUS/panic;
-// an early point lookup does not revalidate unrelated later records.
+// corruption yield io::Error, never SIGBUS/panic. The multi-tile merge
+// pre-advances every published tile, so corruption anywhere in a tile fails
+// every read closed (stronger than the earlier single-tile qualification).
 fn read_exact_at(file: &File, mut bytes: &mut [u8], mut offset: u64) -> io::Result<()> {
     while !bytes.is_empty() {
         match file.read_at(bytes, offset) {
@@ -199,9 +200,16 @@ impl Tile {
         Entries { tile: self, pos: HEADER as u64, left: self.count, checked: false, done: false }
     }
 
-    pub(crate) fn verify_projection(&self, expected: &Memtable, cutoff: u64) -> io::Result<()> {
+    /// Exact comparison against the WAL projection in the CSN range
+    /// `(lower, cutoff]`: every expected entry must match a tile entry in key
+    /// order, and any leftover tile entry is an error. Tile ranges are disjoint
+    /// (`lower` is the previous tile's cutoff, 0 for the oldest), so a tile
+    /// holding another range's versions fails closed here.
+    pub(crate) fn verify_projection(&self, expected: &Memtable, lower: u64, cutoff: u64) -> io::Result<()> {
         let mut actual = self.entries();
-        for (key, value) in expected.entries().filter(|(key, _)| keys::key_csn(key).is_some_and(|csn| csn <= cutoff)) {
+        for (key, value) in expected.entries().filter(|(key, _)| {
+            keys::key_csn(key).is_some_and(|csn| csn > lower && csn <= cutoff)
+        }) {
             let (got_key, got_value) = actual.next().ok_or_else(|| invalid("tile missing WAL entry"))??;
             if got_key != key || got_value != value { return Err(invalid("tile entry disagrees with WAL")); }
         }
