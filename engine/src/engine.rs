@@ -13,12 +13,14 @@
 //! 强制执行本切片未实现，已记录在 ticket 04/03。
 
 use std::collections::HashMap;
+use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 
 use crate::keys::{self, check_name};
+use crate::manifest::{self, Checkpoint, Manifest, TileRef};
 use crate::memtable::Memtable;
 use crate::tile::Tile;
 use crate::wal::{self, Wal};
@@ -59,6 +61,8 @@ pub struct Engine {
     mt: Memtable,
     tile: Option<Tile>,
     wal_path: PathBuf,
+    dir: PathBuf,
+    manifest: Option<Manifest>,
     csn: u64,
     dedup: HashMap<Vec<u8>, u64>,
     max_handle: u64,
@@ -72,6 +76,8 @@ impl Engine {
             mt: Memtable::new(),
             tile: None,
             wal_path: wal_path.as_ref().to_path_buf(),
+            dir: parent_dir(wal_path.as_ref()),
+            manifest: None,
             csn: 0,
             dedup: HashMap::new(),
             max_handle: 0,
@@ -87,6 +93,34 @@ impl Engine {
     /// closed. To rebuild from retained WAL, explicitly call `open` instead.
     pub fn open_with_tile(wal_path: impl AsRef<Path>, tile_path: impl AsRef<Path>) -> io::Result<Engine> {
         Self::open_impl(wal_path.as_ref(), Some(Tile::open(tile_path.as_ref())?))
+    }
+
+    /// Durable-root recovery: select the highest valid manifest page in `dir`, open
+    /// and verify the referenced tile against the retained WAL exactly as
+    /// `open_with_tile` does, and simply ignore unreferenced tile files (they are
+    /// never candidates; fail-closed, no adoption). Conventional layout:
+    /// `<dir>/data.wal`, `<dir>/manifest`, tiles referenced by plain filename.
+    /// A missing manifest file is the empty initial state (no tile); full WAL
+    /// replay still happens, so open time and RAM stay unbounded in this slice.
+    pub fn open_discover(dir: impl AsRef<Path>) -> io::Result<Engine> {
+        let dir = dir.as_ref();
+        let manifest = Manifest::open(&dir.join(manifest::MANIFEST_NAME))?;
+        let tile = match manifest.as_ref().and_then(|m| m.root().tile.as_ref()) {
+            Some(t) => Some(Tile::open(dir.join(&t.name).as_path())?),
+            None => None,
+        };
+        let mut e = Self::open_impl(&dir.join(manifest::WAL_NAME), tile)?;
+        if let Some(m) = &manifest {
+            let cp = m.root().checkpoint;
+            if cp.csn > e.csn {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "manifest checkpoint CSN is ahead of the retained WAL"));
+            }
+            if cp.handle_watermark > e.max_handle {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "manifest handle watermark is ahead of the retained WAL"));
+            }
+        }
+        e.manifest = manifest;
+        Ok(e)
     }
 
     fn open_impl(wal_path: &Path, tile: Option<Tile>) -> io::Result<Engine> {
@@ -110,7 +144,7 @@ impl Engine {
             dedup.insert(block_id, rec_csn);
         }
         if let Some(t) = &tile { t.verify_projection(&covered, t.cutoff())?; }
-        Ok(Engine { wal, mt, tile, wal_path: wal_path.to_path_buf(), csn, dedup, max_handle })
+        Ok(Engine { wal, mt, tile, wal_path: wal_path.to_path_buf(), dir: parent_dir(wal_path), manifest: None, csn, dedup, max_handle })
     }
 
     /// Build one immutable P/U/R tile containing *all* WAL-published versions at or
@@ -121,6 +155,15 @@ impl Engine {
         if self.tile.is_some() || cutoff > self.csn {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "tile already active or cutoff exceeds CSN"));
         }
+        let tile = self.write_verified_tile(tile_path.as_ref(), cutoff)?;
+        self.mt.evict_through(cutoff);
+        self.tile = Some(tile);
+        Ok(())
+    }
+
+    /// Create-new the tile file, sync it, reopen it and re-check its full P/U/R
+    /// projection against the retained WAL before any caller may reference it.
+    fn write_verified_tile(&self, tile_path: &Path, cutoff: u64) -> io::Result<Tile> {
         let (records, _) = wal::replay(&self.wal_path)?;
         if records.last().map(|r| decode_payload(r).map(|v| v.0)).transpose()? != Some(self.csn) && self.csn != 0 {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "WAL differs from serving state"));
@@ -131,8 +174,78 @@ impl Engine {
             let (csn, _, ops) = decode_payload(payload)?;
             if csn <= cutoff { for op in &ops { apply_op(&mut expected, op, csn); } }
         }
-        let tile = Tile::write(tile_path.as_ref(), cutoff, &digest, &self.mt)?;
+        let tile = Tile::write(tile_path, cutoff, &digest, &self.mt)?;
         tile.verify_projection(&expected, cutoff)?;
+        Ok(tile)
+    }
+
+    /// Durable publication of one tile: build the existing verified tile exactly
+    /// as [`Engine::build_tile`], make the tile's directory entry durable, then
+    /// run the manifest protocol — write the inactive page at seq+1, sync the
+    /// manifest file, sync the parent directory, flip the in-memory root — and
+    /// only then evict tile-covered memtable versions. Strict limits: at most
+    /// ONE active tile in this slice (a second `publish_tile` is refused), the
+    /// tile path must be a plain not-yet-existing filename inside the engine
+    /// directory (the manifest stores the name, never a path), and any manifest
+    /// I/O error poisons the writer until reopen selects the highest valid page.
+    /// A failed publish leaves the tile file on disk unreferenced (ignored by
+    /// [`Engine::open_discover`]); republishing over it surfaces a clear
+    /// `AlreadyExists` error instead of silently reusing the leftover file.
+    pub fn publish_tile(&mut self, tile_path: impl AsRef<Path>, cutoff: u64) -> io::Result<()> {
+        if self.manifest.as_ref().is_some_and(|m| m.poisoned()) {
+            return Err(io::Error::new(io::ErrorKind::Other, "manifest writer poisoned; reopen to recover"));
+        }
+        if self.tile.is_some() {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "tile already active; at most one tile in this slice"));
+        }
+        if cutoff > self.csn {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "cutoff exceeds CSN"));
+        }
+        let tile_path = tile_path.as_ref();
+        let name = match tile_path.file_name().and_then(|n| n.to_str()) {
+            Some(n) => n,
+            None => return Err(io::Error::new(io::ErrorKind::InvalidInput, "tile path must be a plain filename inside the engine directory")),
+        };
+        if !manifest::valid_tile_name(name) || parent_dir(tile_path) != self.dir {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "tile path must be a plain filename inside the engine directory"));
+        }
+        // 1. Build + verify the tile file without touching serving state.
+        let tile = match self.write_verified_tile(tile_path, cutoff) {
+            Ok(t) => t,
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                return Err(io::Error::new(io::ErrorKind::AlreadyExists, format!(
+                    "tile candidate already exists and is unreferenced by the manifest (leftover from a failed publish or crash after tile sync); remove {} or publish to another name", tile_path.display())));
+            }
+            Err(e) => return Err(e),
+        };
+        // 2. The tile's own directory entry must be durable before the manifest
+        //    can reference it (checkpoint publication ordering).
+        File::open(&self.dir)?.sync_all()?;
+        // 3. Manifest protocol; any error poisons the writer until reopen.
+        let tref = TileRef { name: name.to_string(), cutoff, digest: *tile.digest() };
+        let checkpoint = Checkpoint { csn: cutoff, handle_watermark: self.max_handle };
+        match &mut self.manifest {
+            Some(m) => m.publish(tref, checkpoint)?,
+            None => {
+                let path = self.dir.join(manifest::MANIFEST_NAME);
+                let mut m = match Manifest::create(&path) {
+                    Ok(m) => m,
+                    Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                        // An engine opened without discovery must never overwrite
+                        // a root it did not read; adopt or refuse, never clobber.
+                        match Manifest::open(&path)? {
+                            Some(m) if m.root().tile.is_none() => m,
+                            _ => return Err(io::Error::new(io::ErrorKind::InvalidData,
+                                "manifest already exists with an active tile; use open_discover to adopt it before publishing")),
+                        }
+                    }
+                    Err(e) => return Err(e),
+                };
+                m.publish(tref, checkpoint)?;
+                self.manifest = Some(m);
+            }
+        }
+        // 4. In-memory flip only after the durable flip.
         self.mt.evict_through(cutoff);
         self.tile = Some(tile);
         Ok(())
@@ -378,6 +491,11 @@ fn wal_digest(records: &[Vec<u8>], cutoff: u64) -> io::Result<[u8; 32]> {
     }
     if cutoff > last { return Err(io::Error::new(io::ErrorKind::InvalidData, "tile cutoff exceeds WAL")); }
     Ok(hash.finalize().into())
+}
+
+// Directory a manifest or tile name resolves against; empty parents mean ".".
+fn parent_dir(path: &Path) -> PathBuf {
+    path.parent().filter(|p| !p.as_os_str().is_empty()).map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from("."))
 }
 
 // ---------- op → memtable ----------
