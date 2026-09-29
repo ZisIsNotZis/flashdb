@@ -222,6 +222,129 @@ fn overlapping_or_out_of_order_cutoffs_are_rejected() {
     assert_eq!(Engine::open(&files.wal).unwrap().csn(), 2);
 }
 
+#[test]
+fn compact_merges_tiles_into_one_and_preserves_every_snapshot() {
+    let files = Files::new();
+    let mut e = Engine::create(&files.wal).unwrap();
+    // Tile one covers CSN 1-2, tile two CSN 3-4, the serving memtable CSN 5.
+    e.commit_block(b"b1", &[doc(1, b"v1"), unique(1), reverse(21)]).unwrap();
+    e.commit_block(b"b2", &[doc(2, b"keep"), doc(1, b"v2")]).unwrap();
+    e.publish_tile(&files.dir.join("tile-2.tile"), 2).unwrap();
+    e.commit_block(b"b3", &[del_doc(2), del_unique(1), unique(2), reverse(22)]).unwrap();
+    e.commit_block(b"b4", &[doc(1, b"v4")]).unwrap();
+    e.publish_tile(&files.dir.join("tile-4.tile"), 4).unwrap();
+    e.commit_block(b"b5", &[del_unique(2), unique(3), doc(3, b"live"), reverse(23)]).unwrap();
+    assert_all_snapshots(&e);
+    let memtable_before = e.serving_memtable_entries();
+    assert_eq!(memtable_before, 4);
+    // Simulate the crash window later: keep the exact bytes of one superseded
+    // tile so it can be restored as a crash-before-unlink orphan afterwards.
+    let orphan_bytes = fs::read(files.dir.join("tile-2.tile")).unwrap();
+
+    e.compact().unwrap();
+    assert_eq!(e.serving_memtable_entries(), memtable_before, "compaction never touches the memtable");
+    assert!(!files.dir.join("tile-2.tile").exists(), "superseded tiles are unlinked only after the durable flip");
+    assert!(!files.dir.join("tile-4.tile").exists());
+    assert!(files.dir.join("compact-4.tile").exists(), "the merged tile uses the engine-chosen name");
+    assert_all_snapshots(&e);
+
+    // Crash between flip and unlink: tile-2.tile survives on disk as an
+    // unreferenced orphan. Discovery must ignore it (never adopt) and keep
+    // serving everything from the single compacted tile.
+    fs::write(files.dir.join("tile-2.tile"), &orphan_bytes).unwrap();
+    drop(e);
+    let mut e = Engine::open_discover(&files.dir).unwrap();
+    assert_eq!(e.csn(), 5);
+    assert_eq!(e.serving_memtable_entries(), 4);
+    assert_all_snapshots(&e);
+    // Dedup ids and the handle watermark still come from the retained WAL.
+    assert_eq!(e.committed_block_csn(b"b1"), Some(1));
+    assert_eq!(e.commit_block(b"b1", &[doc(99, b"ignored")]).unwrap(), Outcome::AlreadyCommitted { csn: 1 });
+    assert_eq!(e.next_handle().unwrap(), 24);
+
+    // One tile left: further compaction is refused...
+    assert_eq!(e.compact().unwrap_err().kind(), ErrorKind::InvalidInput);
+    // ...but publishing continues the ordered list past the merged tile, and a
+    // second compaction collapses the chain again.
+    e.commit_block(b"b6", &[doc(3, b"live2")]).unwrap();
+    e.publish_tile(&files.dir.join("tile-6.tile"), 6).unwrap();
+    assert_eq!(e.serving_memtable_entries(), 0);
+    e.compact().unwrap();
+    assert!(!files.dir.join("compact-4.tile").exists());
+    assert!(!files.dir.join("tile-6.tile").exists());
+    assert!(files.dir.join("compact-6.tile").exists());
+    for s in 1..=6u64 {
+        assert_eq!(e.get(b"E", 1, s).unwrap(), match s { 1 => Some(b"v1".to_vec()), 2 | 3 => Some(b"v2".to_vec()), _ => Some(b"v4".to_vec()) }, "P/E/1 at snapshot {s}");
+        assert_eq!(e.get(b"E", 3, s).unwrap(), match s { 5 => Some(b"live".to_vec()), 6 => Some(b"live2".to_vec()), _ => None }, "P/E/3 at snapshot {s}");
+    }
+    drop(e);
+    let e = Engine::open_discover(&files.dir).unwrap();
+    assert_all_snapshots(&e);
+    assert_eq!(e.get(b"E", 3, 6).unwrap(), Some(b"live2".to_vec()));
+    assert_eq!(e.serving_memtable_entries(), 0);
+    // The orphan from the crash window is still ignored after everything.
+    assert!(files.dir.join("tile-2.tile").exists());
+}
+
+#[test]
+fn compact_refuses_under_two_tiles_and_leftover_candidates() {
+    let files = Files::new();
+    let mut e = Engine::create(&files.wal).unwrap();
+    assert_eq!(e.compact().unwrap_err().kind(), ErrorKind::InvalidInput, "zero active tiles");
+    e.commit_block(b"b1", &[doc(1, b"a")]).unwrap();
+    e.commit_block(b"b2", &[doc(1, b"b")]).unwrap();
+    e.publish_tile(&files.dir.join("tile-1.tile"), 1).unwrap();
+    assert_eq!(e.compact().unwrap_err().kind(), ErrorKind::InvalidInput, "one active tile");
+    e.commit_block(b"b3", &[doc(2, b"c")]).unwrap();
+    e.publish_tile(&files.dir.join("tile-2.tile"), 2).unwrap();
+
+    // A leftover candidate (crash after tile sync, before manifest flip) with
+    // the engine-chosen name fails closed and changes nothing.
+    let candidate = files.dir.join("compact-2.tile");
+    fs::write(&candidate, b"stale compaction candidate").unwrap();
+    assert_eq!(e.compact().unwrap_err().kind(), ErrorKind::AlreadyExists);
+    assert_eq!(e.get(b"E", 1, 1).unwrap(), Some(b"a".to_vec()), "refused compaction changed nothing");
+    assert_eq!(e.serving_memtable_entries(), 1);
+    assert!(files.dir.join("tile-1.tile").exists(), "superseded tiles stay referenced until a successful compact");
+
+    fs::remove_file(&candidate).unwrap();
+    e.compact().unwrap();
+    assert!(!files.dir.join("tile-1.tile").exists());
+    assert!(!files.dir.join("tile-2.tile").exists());
+    for s in 1..=3u64 {
+        assert_eq!(e.get(b"E", 1, s).unwrap(), (s == 1).then(|| b"a".to_vec()).or(Some(b"b".to_vec())));
+        assert_eq!(e.get(b"E", 2, s).unwrap(), (s == 3).then(|| b"c".to_vec()));
+    }
+}
+
+#[test]
+fn compact_releases_the_max_tiles_bound() {
+    let files = Files::new();
+    let mut e = Engine::create(&files.wal).unwrap();
+    // Fill the manifest page: eight tiles is manifest::MAX_TILES.
+    for i in 1..=8u64 {
+        e.commit_block(&format!("b{i}").into_bytes(), &[doc(i, b"d")]).unwrap();
+        e.publish_tile(&files.dir.join(format!("tile-{i}.tile")), i).unwrap();
+    }
+    e.commit_block(b"b9", &[doc(9, b"d")]).unwrap();
+    assert_eq!(e.publish_tile(&files.dir.join("tile-9.tile"), 9).unwrap_err().kind(), ErrorKind::InvalidInput);
+    assert_eq!(e.serving_memtable_entries(), 1, "refused publish left the memtable serving");
+    e.compact().unwrap();
+    assert!(files.dir.join("compact-8.tile").exists());
+    assert!(!files.dir.join("tile-1.tile").exists());
+    assert!(!files.dir.join("tile-8.tile").exists());
+    assert_eq!(e.serving_memtable_entries(), 1, "compaction still never touches the memtable");
+    // The freed page slot accepts new tiles again.
+    e.publish_tile(&files.dir.join("tile-9.tile"), 9).unwrap();
+    assert_eq!(e.serving_memtable_entries(), 0);
+    drop(e);
+    let e = Engine::open_discover(&files.dir).unwrap();
+    assert_eq!(e.get(b"E", 1, 1).unwrap(), Some(b"d".to_vec()));
+    assert_eq!(e.get(b"E", 8, 8).unwrap(), Some(b"d".to_vec()));
+    assert_eq!(e.get(b"E", 9, 9).unwrap(), Some(b"d".to_vec()));
+    assert_eq!(e.serving_memtable_entries(), 0);
+}
+
 fn crc32c(bytes: &[u8]) -> u32 {
     let mut crc = !0u32;
     for &byte in bytes {

@@ -13,7 +13,7 @@
 //! 强制执行本切片未实现，已记录在 ticket 04/03。
 
 use std::collections::HashMap;
-use std::fs::File;
+use std::fs::{self, File};
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -294,6 +294,21 @@ impl Engine {
         let mut refs: Vec<TileRef> = self.tiles.iter().map(|t| t.tile_ref()).collect();
         refs.push(tref);
         let checkpoint = Checkpoint { csn: cutoff, handle_watermark: self.max_handle };
+        self.manifest_publish(refs, checkpoint)?;
+        // 4. In-memory flip only after the durable flip.
+        self.mt.evict_through(cutoff);
+        self.tiles.push(TileHandle { tile, name: name.to_string() });
+        Ok(())
+    }
+
+    // Shared manifest step of the publication protocol ([`Engine::publish_tile`]
+    // and [`Engine::compact`]): write the inactive page at `seq + 1` carrying the
+    // FULL active tile list, sync the manifest file, sync the parent directory,
+    // then flip the in-memory root. A missing manifest is created, or an
+    // existing empty-root manifest adopted — an engine opened without discovery
+    // must never overwrite a root it did not read. Any error poisons the writer
+    // until reopen.
+    fn manifest_publish(&mut self, refs: Vec<TileRef>, checkpoint: Checkpoint) -> io::Result<()> {
         match &mut self.manifest {
             Some(m) => m.publish(refs, checkpoint)?,
             None => {
@@ -315,10 +330,101 @@ impl Engine {
                 self.manifest = Some(m);
             }
         }
-        // 4. In-memory flip only after the durable flip.
-        self.mt.evict_through(cutoff);
-        self.tiles.push(TileHandle { tile, name: name.to_string() });
         Ok(())
+    }
+
+    /// Merge every published tile into ONE new whole tile file covering the full
+    /// `(0, newest tile cutoff]` CSN range, publish it through the manifest
+    /// protocol, and only after the new root is durable unlink the superseded
+    /// tile files.
+    ///
+    /// **All versions are retained.** There is no snapshot registry, so the
+    /// corrected retention rule in `docs/engine.md` requires keeping every
+    /// version of every logical key; this compaction's purpose is only reducing
+    /// the per-read file count / rewrite bound ([`manifest::MAX_TILES`] tiles
+    /// collapse to one). The WAL is never rotated or truncated, and the serving
+    /// memtable (exactly the versions above the newest cutoff) is untouched.
+    ///
+    /// Refusals: fewer than two active tiles (`InvalidInput` — merging one tile
+    /// into a fresh copy buys nothing) or a leftover candidate file with the
+    /// engine-chosen name `compact-<cutoff>.tile` inside the engine directory
+    /// (`AlreadyExists`, mirroring `publish_tile`'s leftover handling — cutoffs
+    /// strictly increase across compactions because compaction requires at
+    /// least two tiles, so live names never collide). Reads are unavailable for
+    /// the duration: single-writer `&mut self`.
+    ///
+    /// Ordering is `publish_tile`'s: create-new + sync + verify the merged tile
+    /// against the retained WAL, sync the directory entry, manifest
+    /// write-inactive-page(seq+1) → sync file → sync dir → flip. A crash before
+    /// the flip leaves the merged file an unreferenced orphan; a crash (or
+    /// unlink failure) between the flip and the unlinks leaves the superseded
+    /// tiles on disk as unreferenced orphans. Discovery must — and does —
+    /// ignore both kinds: unreferenced files are never adopted; they are leaked
+    /// until manually removed.
+    pub fn compact(&mut self) -> io::Result<()> {
+        if self.manifest.as_ref().is_some_and(|m| m.poisoned()) {
+            return Err(io::Error::new(io::ErrorKind::Other, "manifest writer poisoned; reopen to recover"));
+        }
+        if self.tiles.len() < 2 {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "compaction requires at least two active tiles"));
+        }
+        let cutoff = self.tiles.last().unwrap().cutoff();
+        let path = self.dir.join(format!("compact-{cutoff}.tile"));
+        // 1. Build + verify the merged tile against the full retained WAL union
+        //    projection, exactly as publish verifies a single tile's range.
+        let tile = match self.write_compacted_tile(&path, cutoff) {
+            Ok(t) => t,
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                return Err(io::Error::new(io::ErrorKind::AlreadyExists, format!(
+                    "compaction candidate already exists and is unreferenced by the manifest (leftover from a failed compaction or crash after tile sync); remove {} and retry", path.display())));
+            }
+            Err(e) => return Err(e),
+        };
+        // 2. The tile's own directory entry must be durable before the manifest
+        //    can reference it (checkpoint publication ordering).
+        File::open(&self.dir)?.sync_all()?;
+        // 3. Manifest protocol: the new root lists exactly one tile. The cutoff
+        //    (and therefore the checkpoint frontier) is unchanged; only the
+        //    number of files carrying `(0, cutoff]` shrinks.
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default().to_string();
+        let tref = TileRef { name: name.clone(), cutoff, digest: *tile.digest() };
+        let checkpoint = Checkpoint { csn: cutoff, handle_watermark: self.max_handle };
+        self.manifest_publish(vec![tref], checkpoint)?;
+        // 4. In-memory flip: one tile replaces the whole ordered list; the
+        //    memtable is untouched (it only holds versions above `cutoff`).
+        let superseded = std::mem::replace(&mut self.tiles, vec![TileHandle { tile, name }]);
+        // 5. Only now drop the superseded files. Unlink after the durable flip
+        //    is safe: open fds keep working (POSIX) and the new root no longer
+        //    references them. Failures here are best-effort ignored — the
+        //    compaction is already durably committed and a leftover file is a
+        //    harmless orphan that discovery ignores and never adopts.
+        for old in &superseded {
+            let _ = fs::remove_file(self.dir.join(&old.name));
+        }
+        Ok(())
+    }
+
+    /// Create-new the compacted tile for the full `(0, cutoff]` union of every
+    /// published tile range, sync it, reopen it and re-check its exact
+    /// projection against the retained WAL before any caller may reference it.
+    /// Each input tile was itself verified against its disjoint WAL range at
+    /// open/publish, so writing from the WAL projection IS the multi-tile merge
+    /// (same codec, same key order, all versions including tombstones) — and
+    /// the verification is `publish`'s extended to the union.
+    fn write_compacted_tile(&self, tile_path: &Path, cutoff: u64) -> io::Result<Tile> {
+        let (records, _) = wal::replay(&self.wal_path)?;
+        if records.last().map(|r| decode_payload(r).map(|v| v.0)).transpose()? != Some(self.csn) && self.csn != 0 {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "WAL differs from serving state"));
+        }
+        let digest = wal_digest(&records, cutoff)?;
+        let mut expected = Memtable::new();
+        for payload in &records {
+            let (csn, _, ops) = decode_payload(payload)?;
+            if csn <= cutoff { for op in &ops { apply_op(&mut expected, op, csn); } }
+        }
+        let tile = Tile::write(tile_path, cutoff, &digest, &expected)?;
+        tile.verify_projection(&expected, 0, cutoff)?;
+        Ok(tile)
     }
 
     /// Automatic checkpoint trigger. When the retained WAL's valid length
@@ -815,6 +921,12 @@ mod tests {
         d.join(name)
     }
 
+    fn tmp_dir(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("flashdb-engine-dir-{}-{name}", process::id()));
+        fs::create_dir_all(&d).unwrap();
+        d
+    }
+
     fn get_ok(e: &Engine, entity: &str, handle: u64) -> Option<Vec<u8>> {
         e.get(entity.as_bytes(), handle, e.csn()).unwrap().map(|b| b.to_vec())
     }
@@ -1150,6 +1262,55 @@ mod tests {
         // 旧快照仍能看到 201
         assert_eq!(e.reverse_lookup(b"ServiceTicket", b"order", 101, 2).unwrap(), vec![201, 202]);
         remove(&p);
+    }
+
+    #[test]
+    fn compact_publishes_one_tile_root_and_advances_manifest_seq() {
+        // Path 1: an existing manifest chain advances its seq and lists exactly
+        // one tile after compaction.
+        let dir = tmp_dir("compact-seq");
+        let mut e = Engine::create(&dir.join("data.wal")).unwrap();
+        let put = |h: u64, v: &[u8]| Op::PutDoc { entity: b"E".to_vec(), handle: h, doc: v.to_vec() };
+        e.commit_block(b"b1", &[put(1, b"v1")]).unwrap();
+        e.commit_block(b"b2", &[put(1, b"v2")]).unwrap();
+        e.publish_tile(&dir.join("t1.tile"), 1).unwrap();
+        e.publish_tile(&dir.join("t2.tile"), 2).unwrap();
+        let seq_before = e.manifest.as_ref().unwrap().root().seq;
+        assert_eq!(seq_before, 2);
+        let memtable_before = e.serving_memtable_entries();
+        e.compact().unwrap();
+        let root = e.manifest.as_ref().unwrap().root();
+        assert_eq!(root.seq, seq_before + 1, "compaction follows the manifest publication protocol");
+        assert_eq!(root.tiles.len(), 1, "the compacted root lists exactly one tile");
+        assert_eq!(root.tiles[0].name, "compact-2.tile");
+        assert_eq!(root.tiles[0].cutoff, 2);
+        assert_eq!(root.checkpoint.csn, 2);
+        assert_eq!(e.serving_memtable_entries(), memtable_before, "compaction never touches the memtable");
+        drop(e);
+        let e = Engine::open_discover(&dir).unwrap();
+        assert_eq!(e.get(b"E", 1, 1).unwrap(), Some(b"v1".to_vec()));
+        assert_eq!(e.serving_memtable_entries(), 0);
+        drop(e);
+        fs::remove_dir_all(&dir).unwrap();
+
+        // Path 2: tiles built without any manifest get one created at seq 1 by
+        // the first compaction.
+        let dir = tmp_dir("compact-seed-nomanifest");
+        let mut e = Engine::create(&dir.join("data.wal")).unwrap();
+        e.commit_block(b"b1", &[put(1, b"v1")]).unwrap();
+        e.commit_block(b"b2", &[put(1, b"v2")]).unwrap();
+        e.build_tile(&dir.join("t1.tile"), 1).unwrap();
+        e.build_tile(&dir.join("t2.tile"), 2).unwrap();
+        assert!(e.manifest.is_none(), "build_tile alone never creates a manifest");
+        e.compact().unwrap();
+        let root = e.manifest.as_ref().unwrap().root();
+        assert_eq!(root.seq, 1);
+        assert_eq!(root.tiles.len(), 1);
+        assert_eq!(root.tiles[0].name, "compact-2.tile");
+        // One tile remains: further compaction is refused as InvalidInput.
+        assert_eq!(e.compact().unwrap_err().kind(), io::ErrorKind::InvalidInput);
+        drop(e);
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     fn remove(p: &Path) {
