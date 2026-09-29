@@ -159,6 +159,9 @@ fn decode_payload(seq: u64, payload: &[u8]) -> io::Result<Root> {
         _ => return Err(invalid("manifest lists more than one tile")),
     };
     let checkpoint = Checkpoint { csn: c.u64()?, handle_watermark: c.u64()? };
+    if tile.as_ref().is_some_and(|t| checkpoint.csn != t.cutoff) {
+        return Err(invalid("manifest checkpoint CSN disagrees with tile cutoff"));
+    }
     if payload[c.i..].iter().any(|&b| b != 0) {
         return Err(invalid("manifest payload has unparsed trailing bytes"));
     }
@@ -206,7 +209,10 @@ impl Manifest {
             Err(e) => return Err(e),
         };
         let len = file.metadata()?.len();
-        if len < PAGE as u64 { return Err(invalid("manifest file shorter than one page")); }
+        if len < PAGE as u64 {
+            return Err(io::Error::new(io::ErrorKind::InvalidData,
+                "manifest file shorter than one page (a torn Manifest::create); the file is not recoverable in place - move it aside and republish the tile"));
+        }
         if len > 2 * PAGE as u64 { return Err(invalid("manifest file larger than two pages")); }
         let mut raw = [0u8; PAGE];
         file.read_exact_at(&mut raw, 0)?;

@@ -106,11 +106,22 @@ impl Engine {
         let dir = dir.as_ref();
         let manifest = Manifest::open(&dir.join(manifest::MANIFEST_NAME))?;
         let tile = match manifest.as_ref().and_then(|m| m.root().tile.as_ref()) {
-            Some(t) => Some(Tile::open(dir.join(&t.name).as_path())?),
+            Some(t) => {
+                // The root's binding must match the tile's own header, not just
+                // its name: a swapped or stale filename must not be adopted.
+                let opened = Tile::open(dir.join(&t.name).as_path())?;
+                if opened.cutoff() != t.cutoff || opened.digest() != &t.digest {
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, "manifest tile reference disagrees with tile header"));
+                }
+                Some(opened)
+            }
             None => None,
         };
         let mut e = Self::open_impl(&dir.join(manifest::WAL_NAME), tile)?;
         if let Some(m) = &manifest {
+            // While the WAL is fully retained these can only fire on divergence;
+            // after WAL retirement the watermark check must become a max() merge
+            // against the checkpointed watermark rather than replay-derived state.
             let cp = m.root().checkpoint;
             if cp.csn > e.csn {
                 return Err(io::Error::new(io::ErrorKind::InvalidData, "manifest checkpoint CSN is ahead of the retained WAL"));

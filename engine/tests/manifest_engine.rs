@@ -1,4 +1,5 @@
 use flashdb_engine::engine::{Engine, Op, Outcome};
+use flashdb_engine::wal::crc32c;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -82,6 +83,64 @@ fn torn_or_corrupt_manifest_fails_closed_and_wal_only_open_still_works() {
     assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     let e = Engine::open(&files.wal).unwrap();
     assert_eq!(e.get(b"E", 1, 1).unwrap(), Some(b"covered".to_vec()));
+}
+
+#[test]
+fn adoption_refuses_manifest_with_active_tile_and_accepts_empty_root() {
+    let files = Files::new();
+    let mut e = Engine::create(&files.wal).unwrap();
+    e.commit_block(b"one", &[doc(1, b"covered")]).unwrap();
+    e.publish_tile(&files.tile, 1).unwrap();
+    drop(e);
+    // An engine opened WITHOUT discovery must not clobber the existing root.
+    let mut plain = Engine::open(&files.wal).unwrap();
+    assert_eq!(plain.publish_tile(&files.dir.join("again.tile"), 1).map(|_| ()).unwrap_err().kind(),
+        std::io::ErrorKind::InvalidData);
+    drop(plain);
+    assert!(Engine::open_discover(&files.dir).is_ok(), "refused publish left the root intact");
+
+    // Empty seq-0 root (e.g. torn first publish) can be adopted.
+    let other = Files::new();
+    let mut e = Engine::create(&other.wal).unwrap();
+    e.commit_block(b"one", &[doc(1, b"x")]).unwrap();
+    // Fabricate an empty-root manifest exactly as Manifest::create would.
+    let mut page = vec![0u8; 4096];
+    page[..8].copy_from_slice(&0u64.to_le_bytes());
+    let crc = crc32c(&page[12..]);
+    page[8..12].copy_from_slice(&crc.to_le_bytes());
+    fs::write(other.dir.join("manifest"), &page).unwrap();
+    e.publish_tile(&other.tile, 1).unwrap();
+    drop(e);
+    let e = Engine::open_discover(&other.dir).unwrap();
+    assert_eq!(e.get(b"E", 1, 1).unwrap(), Some(b"x".to_vec()));
+}
+
+#[test]
+fn manifest_tile_reference_disagreeing_with_tile_header_fails_closed() {
+    let files = Files::new();
+    let mut e = Engine::create(&files.wal).unwrap();
+    e.commit_block(b"one", &[doc(1, b"covered")]).unwrap();
+    e.publish_tile(&files.tile, 1).unwrap();
+    drop(e);
+    // Swap the recorded cutoff without touching the tile or WAL digest path.
+    let mut bytes = fs::read(&files.dir.join("manifest")).unwrap();
+    let seq1_slot = 4096; // single publish -> active root in slot B
+    bytes[seq1_slot + 12 + 4 + 4 + 9] ^= 0x01; // first cutoff byte inside payload
+    // Recompute the page CRC so only the root/header disagreement is exercised.
+    let payload = &bytes[seq1_slot + 12..seq1_slot + 4096];
+    let crc = crc32c(payload);
+    bytes[seq1_slot + 8..seq1_slot + 12].copy_from_slice(&crc.to_le_bytes());
+    fs::write(files.dir.join("manifest"), &bytes).unwrap();
+    let err = Engine::open_discover(&files.dir).map(|_| ()).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+}
+
+#[test]
+fn torn_manifest_create_is_reported_with_remediation_hint() {
+    let files = Files::new();
+    fs::write(files.dir.join("manifest"), b"short").unwrap();
+    let err = Engine::open_discover(&files.dir).map(|_| ()).unwrap_err();
+    assert!(err.to_string().contains("move it aside"));
 }
 
 #[test]
