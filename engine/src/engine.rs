@@ -213,6 +213,14 @@ impl Engine {
         if cutoff > self.csn {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "cutoff exceeds CSN"));
         }
+        // The same plain-filename rules as publish_tile: an engine-built tile
+        // must be adoptable by the manifest and unlinkable by compaction without
+        // ambiguity.
+        let tile_path = tile_path.as_ref();
+        match tile_path.file_name().and_then(|n| n.to_str()) {
+            Some(n) if manifest::valid_tile_name(n) && parent_dir(tile_path) == self.dir => {}
+            _ => return Err(io::Error::new(io::ErrorKind::InvalidInput, "tile path must be a plain filename inside the engine directory")),
+        }
         if self.tiles.last().is_some_and(|t| t.cutoff() >= cutoff) {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "tile cutoff must be strictly above the newest active tile cutoff"));
         }
