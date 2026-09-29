@@ -70,6 +70,10 @@ Worker `6c3e732f-35b4-41dd-a26f-3ea17a812d7b` timed out pre-commit; patch recove
 
 ## Next action
 
+## WAL rotation slice — 2026-09-29, in progress (split)
+
+Rotation is too large for one fresh 20-minute worker: run `8e8fcef5-505d-4179-8351-3775555c6c23` produced a manifest-only partial (committed as WIP `bcd5d31`); run `2a57912a-5d2f-4156-bf8a-2b95232e9577` produced an empty patch. Split now: worker `2e0111eb-3df3-4356-89e3-ca79085c6088` does ONLY segment-aware recovery (fix broken call sites with None, open_discover opens manifest-named segment, suffix-only replay, pre-rotation-records fail-closed, checkpoint CSN/handle respected, hand-crafted suffix test). A follow-up worker will add rotate_wal itself. Design (binding): rotation creates a NEW segment file (never truncate the current one), manifest flip publishes SegmentRef{current segment, start_csn=cutoff}, old segment unlinked only after durable flip, orphans ignored; dedup ids at/below start_csn are dead by design.
+
 ## Next action
 
 Mechanism closed loop; latest-only slice accepted at `315b49e`. WAL rotation is now unblocked by both author decisions (no historical versions to preserve, no durable dedup to persist). Next slice: WAL segment rotation + recovery replaying only the suffix above the newest tile cutoff (dedup ids above the cutoff come from the retained suffix; ids at/below are dead by design), with fault injection at every segment boundary. Then the 200 GB / 8 GB cgroup experiment becomes the next milestone. for the disk path is now: WAL (poison + fail-closed corruption) → verified tiles → durable A/B manifest → multi-tile reads → maybe_checkpoint → compaction, all with WAL retained. Next slices: multiple sequential compactions lifecycle hardening, then the author-owned boundary pair (snapshot lease/expiry + L-02 dedup retention) which gates version dropping and WAL rotation — bring a concrete proposal to the author before implementing either. No user decision pending until that proposal is ready.
