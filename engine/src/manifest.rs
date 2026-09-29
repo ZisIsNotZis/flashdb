@@ -1,8 +1,19 @@
 //! Minimal durable A/B manifest root for published tiles. The root records an
 //! **ordered list of active tiles** (ascending, strictly increasing cutoffs, so
 //! their CSN ranges never overlap) bounded by [`MAX_TILES`] so the list always
-//! fits one page; it never retires or truncates the WAL, and the dedup map stays
-//! derivable by full replay of the retained WAL.
+//! fits one page, plus the **current WAL segment** reference once rotation has
+//! happened: records at or below the segment's start CSN are disposable (a
+//! published tile covers them), so the named segment file holds only the live
+//! suffix and the root must name it — otherwise recovery could not find the
+//! post-rotation WAL at all.
+//!
+//! File layout: exactly two fixed [`PAGE`] (4 KiB) slots, each
+//! `[seq u64 LE][crc32c(payload) u32 LE][payload]` with a fixed 4092-byte payload
+//! (unused tail zero-filled and covered by the CRC). The payload holds the
+//! ordered list of active tile filenames (filename + cutoff + WAL digest each),
+//! the checkpoint (the CSN frontier the newest tile makes durable = the newest
+//! tile cutoff, plus the handle high-water mark at publication), and the segment
+//! reference (plain filename + start CSN) when the WAL has been rotated.
 //!
 //! File layout: exactly two fixed [`PAGE`] (4 KiB) slots, each
 //! `[seq u64 LE][crc32c(payload) u32 LE][payload]` with a fixed 4092-byte payload
@@ -73,6 +84,19 @@ pub(crate) struct Checkpoint {
     pub(crate) handle_watermark: u64,
 }
 
+/// The engine's current WAL segment once rotation exists: a plain filename in
+/// the engine directory and the CSN cutoff at which it started. Every record in
+/// the named file must have a CSN strictly above `start_csn` (records at or
+/// below it are dead by design — a published tile covers them); recovery fail-
+/// closes on any record violating that, so a stale or foreign segment cannot be
+/// mistaken for the live suffix. `None` = the WAL was never rotated and the
+/// whole history lives in the conventional `data.wal`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SegmentRef {
+    pub(crate) name: String,
+    pub(crate) start_csn: u64,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct Root {
     pub(crate) seq: u64,
@@ -80,6 +104,8 @@ pub(crate) struct Root {
     /// ranges). Empty only in the initial seq-0 root.
     pub(crate) tiles: Vec<TileRef>,
     pub(crate) checkpoint: Checkpoint,
+    /// Current WAL segment once rotation has happened; `None` before it.
+    pub(crate) segment: Option<SegmentRef>,
 }
 
 fn cutoffs_strictly_increasing(tiles: &[TileRef]) -> bool {
@@ -130,6 +156,21 @@ fn encode_root(root: &Root) -> io::Result<[u8; PAYLOAD]> {
     }
     p[i..i + 8].copy_from_slice(&root.checkpoint.csn.to_le_bytes());
     p[i + 8..i + 16].copy_from_slice(&root.checkpoint.handle_watermark.to_le_bytes());
+    i += 16;
+    match &root.segment {
+        None => p[i..i + 4].copy_from_slice(&0u32.to_le_bytes()), // name_len 0 = no segment
+        Some(s) => {
+            if !valid_tile_name(&s.name) {
+                return Err(invalid("segment name is not a plain directory-local file"));
+            }
+            let name = s.name.as_bytes();
+            p[i..i + 4].copy_from_slice(&(name.len() as u32).to_le_bytes());
+            i += 4;
+            p[i..i + name.len()].copy_from_slice(name);
+            i += name.len();
+            p[i..i + 8].copy_from_slice(&s.start_csn.to_le_bytes());
+        }
+    }
     Ok(p)
 }
 
@@ -188,10 +229,27 @@ fn decode_payload(seq: u64, payload: &[u8]) -> io::Result<Root> {
     if tiles.last().is_some_and(|t| checkpoint.csn != t.cutoff) {
         return Err(invalid("manifest checkpoint CSN disagrees with newest tile cutoff"));
     }
+    let segment = {
+        let n = c.u32()? as usize;
+        if n == 0 {
+            None
+        } else {
+            if !(1..=MAX_NAME).contains(&n) { return Err(invalid("manifest segment name length out of bounds")); }
+            let name = std::str::from_utf8(c.take(n)?)
+                .map_err(|_| invalid("manifest segment name is not UTF-8"))?;
+            if !valid_tile_name(name) {
+                return Err(invalid("manifest segment name is not a plain directory-local file"));
+            }
+            Some(SegmentRef { name: name.to_string(), start_csn: c.u64()? })
+        }
+    };
+    if tiles.is_empty() && segment.is_some() {
+        return Err(invalid("empty manifest cannot reference a WAL segment"));
+    }
     if payload[c.i..].iter().any(|&b| b != 0) {
         return Err(invalid("manifest payload has unparsed trailing bytes"));
     }
-    Ok(Root { seq, tiles, checkpoint })
+    Ok(Root { seq, tiles, checkpoint, segment })
 }
 
 /// `Ok(None)` marks a torn/absent page that A/B selection may skip; an `Err`
@@ -274,7 +332,7 @@ impl Manifest {
     /// file, sync parent directory.
     pub(crate) fn create(path: &Path) -> io::Result<Manifest> {
         let file = OpenOptions::new().read(true).write(true).create_new(true).open(path)?;
-        let initial = Root { seq: 0, tiles: Vec::new(), checkpoint: Checkpoint { csn: 0, handle_watermark: 0 } };
+        let initial = Root { seq: 0, tiles: Vec::new(), checkpoint: Checkpoint { csn: 0, handle_watermark: 0 }, segment: None };
         file.write_all_at(&encode_page(0, &initial)?, 0)?;
         file.sync_data()?;
         File::open(Self::parent(path))?.sync_all()?;
@@ -294,18 +352,18 @@ impl Manifest {
 
     /// Write the inactive slot at `root.seq + 1`, sync the file, sync the parent
     /// directory, then flip the in-memory root. `tiles` replaces the full active
-    /// list; structural problems in it fail before any I/O. Any error poisons
-    /// this writer.
-    pub(crate) fn publish(&mut self, tiles: Vec<TileRef>, checkpoint: Checkpoint) -> io::Result<()> {
+    /// list and `segment` the full segment reference; structural problems in
+    /// them fail before any I/O. Any error poisons this writer.
+    pub(crate) fn publish(&mut self, tiles: Vec<TileRef>, checkpoint: Checkpoint, segment: Option<SegmentRef>) -> io::Result<()> {
         if self.poisoned {
             return Err(io::Error::new(io::ErrorKind::Other, "manifest writer poisoned; reopen to recover"));
         }
-        let result = self.publish_inner(tiles, checkpoint);
+        let result = self.publish_inner(tiles, checkpoint, segment);
         if result.is_err() { self.poisoned = true; }
         result
     }
 
-    fn publish_inner(&mut self, tiles: Vec<TileRef>, checkpoint: Checkpoint) -> io::Result<()> {
+    fn publish_inner(&mut self, tiles: Vec<TileRef>, checkpoint: Checkpoint, segment: Option<SegmentRef>) -> io::Result<()> {
         let seq = self.root.seq.checked_add(1).ok_or_else(|| invalid("manifest seq exhausted"))?;
         if tiles.is_empty() || tiles.len() > MAX_TILES {
             return Err(invalid("publish requires one to MAX_TILES active tiles"));
@@ -316,7 +374,7 @@ impl Manifest {
         if checkpoint.csn != tiles.last().unwrap().cutoff {
             return Err(invalid("manifest checkpoint CSN disagrees with newest tile cutoff"));
         }
-        let root = Root { seq, tiles, checkpoint };
+        let root = Root { seq, tiles, checkpoint, segment };
         let page = encode_page(seq, &root)?;
         let slot = 1 - self.slot;
         #[cfg(test)]
@@ -359,7 +417,7 @@ mod tests {
 
     #[test]
     fn page_roundtrips_tiles_and_checkpoint() {
-        let root = Root { seq: 9, tiles: vec![tile("a.tile", 40), tile("b.tile", 42)], checkpoint: Checkpoint { csn: 42, handle_watermark: 43 } };
+        let root = Root { seq: 9, tiles: vec![tile("a.tile", 40), tile("b.tile", 42)], checkpoint: Checkpoint { csn: 42, handle_watermark: 43 }, segment: None };
         let page = encode_page(9, &root).unwrap();
         let decoded = decode_page(&page).unwrap().unwrap();
         assert_eq!(decoded.seq, 9);
@@ -374,7 +432,7 @@ mod tests {
 
     #[test]
     fn crc_torn_page_is_invalid_but_impossible_payload_is_corruption() {
-        let root = Root { seq: 1, tiles: vec![tile("t.tile", 1)], checkpoint: Checkpoint { csn: 1, handle_watermark: 1 } };
+        let root = Root { seq: 1, tiles: vec![tile("t.tile", 1)], checkpoint: Checkpoint { csn: 1, handle_watermark: 1 }, segment: None };
         let mut page = encode_page(1, &root).unwrap();
         page[20] ^= 0x80; // flip a payload byte under the CRC
         assert!(decode_page(&page).unwrap().is_none(), "CRC mismatch must be an invalid page, not corruption");
@@ -428,6 +486,71 @@ mod tests {
     }
 
     #[test]
+    fn segment_roundtrips_and_structural_corruption_fails_closed() {
+        let seg = |name: &str, start: u64| SegmentRef { name: name.to_string(), start_csn: start };
+        let root = Root {
+            seq: 7,
+            tiles: vec![tile("t.tile", 4)],
+            checkpoint: Checkpoint { csn: 4, handle_watermark: 9 },
+            segment: Some(seg("data-4.wal", 4)),
+        };
+        let decoded = decode_page(&encode_page(7, &root).unwrap()).unwrap().unwrap();
+        assert_eq!(decoded.segment.as_ref().unwrap(), &seg("data-4.wal", 4));
+        // A root without rotation decodes with no segment reference.
+        let plain = Root { segment: None, ..root.clone() };
+        let decoded = decode_page(&encode_page(7, &plain).unwrap()).unwrap().unwrap();
+        assert!(decoded.segment.is_none());
+
+        // The encoder refuses segment names colliding with the manifest or the
+        // conventional WAL filename (same rules as tile names).
+        let mut bad = root.clone();
+        bad.segment = Some(seg(MANIFEST_NAME, 4));
+        assert!(encode_page(7, &bad).is_err());
+        bad.segment = Some(seg(WAL_NAME, 4));
+        assert!(encode_page(7, &bad).is_err());
+
+        // Hand-built CRC-valid payloads that only corruption could produce:
+        // an empty root referencing a segment, an out-of-bounds segment name
+        // length, and a non-plain segment name.
+        let with_segment = |tail: &[u8]| {
+            let mut p = [0u8; PAYLOAD];
+            p[20..20 + tail.len()].copy_from_slice(tail);
+            p
+        };
+        // Empty root: count/checkpoint are zero, so the segment fields start at 20.
+        let p = with_segment(&{
+            let mut t = 4u32.to_le_bytes().to_vec();
+            t.extend_from_slice(b"data");
+            t.extend_from_slice(&0u64.to_le_bytes());
+            t
+        });
+        assert_eq!(decode_payload(0, &p).unwrap_err().to_string(), "empty manifest cannot reference a WAL segment");
+        // One-tile root: tile entry ends at 54, checkpoint at 54..70, segment
+        // fields follow at 70.
+        let one_tile_seg = |tail: &[u8]| {
+            let mut p = [0u8; PAYLOAD];
+            p[..4].copy_from_slice(&1u32.to_le_bytes());
+            p[4..8].copy_from_slice(&6u32.to_le_bytes());
+            p[8..14].copy_from_slice(b"t.tile");
+            p[14..22].copy_from_slice(&4u64.to_le_bytes());
+            p[22..54].copy_from_slice(&[7u8; 32]);
+            p[54..62].copy_from_slice(&4u64.to_le_bytes());
+            p[62..70].copy_from_slice(&9u64.to_le_bytes());
+            p[70..70 + tail.len()].copy_from_slice(tail);
+            p
+        };
+        let p = one_tile_seg(&((MAX_NAME as u32 + 1).to_le_bytes()));
+        assert_eq!(decode_payload(7, &p).unwrap_err().to_string(), "manifest segment name length out of bounds");
+        let p = one_tile_seg(&{
+            let mut t = 4u32.to_le_bytes().to_vec();
+            t.extend_from_slice(b"a/b\0c");
+            t.extend_from_slice(&4u64.to_le_bytes());
+            t
+        });
+        assert_eq!(decode_payload(7, &p).unwrap_err().to_string(), "manifest segment name is not a plain directory-local file");
+    }
+
+    #[test]
     fn valid_tile_name_bounds() {
         assert!(valid_tile_name("data.tile"));
         assert!(!valid_tile_name(""));
@@ -458,10 +581,10 @@ mod tests {
         let dir = tmp_dir("page-selection");
         let path = dir.join(MANIFEST_NAME);
         let mut m = Manifest::create(&path).unwrap();
-        m.publish(vec![tile("one.tile", 1)], Checkpoint { csn: 1, handle_watermark: 2 }).unwrap();
+        m.publish(vec![tile("one.tile", 1)], Checkpoint { csn: 1, handle_watermark: 2 }, None).unwrap();
         // The seq-2 root carries a two-tile list: each publish replaces the full
         // active list, so an A/B fallback must restore a list, not one entry.
-        m.publish(vec![tile("one.tile", 1), tile("two.tile", 2)], Checkpoint { csn: 2, handle_watermark: 3 }).unwrap();
+        m.publish(vec![tile("one.tile", 1), tile("two.tile", 2)], Checkpoint { csn: 2, handle_watermark: 3 }, None).unwrap();
         drop(m);
         assert_eq!(root_of(&Manifest::open(&path).unwrap()).seq, 2);
 
@@ -513,8 +636,8 @@ mod tests {
     fn equal_seq_pages_fail_closed() {
         let dir = tmp_dir("equal-seq");
         let path = dir.join(MANIFEST_NAME);
-        let a = Root { seq: 1, tiles: vec![tile("a.tile", 1)], checkpoint: Checkpoint { csn: 1, handle_watermark: 1 } };
-        let b = Root { seq: 1, tiles: vec![tile("b.tile", 1)], checkpoint: Checkpoint { csn: 1, handle_watermark: 1 } };
+        let a = Root { seq: 1, tiles: vec![tile("a.tile", 1)], checkpoint: Checkpoint { csn: 1, handle_watermark: 1 }, segment: None };
+        let b = Root { seq: 1, tiles: vec![tile("b.tile", 1)], checkpoint: Checkpoint { csn: 1, handle_watermark: 1 }, segment: None };
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&encode_page(1, &a).unwrap());
         bytes.extend_from_slice(&encode_page(1, &b).unwrap());
@@ -527,16 +650,16 @@ mod tests {
         let dir = tmp_dir("poison");
         let path = dir.join(MANIFEST_NAME);
         let mut m = Manifest::create(&path).unwrap();
-        m.publish(vec![tile("one.tile", 1)], Checkpoint { csn: 1, handle_watermark: 2 }).unwrap();
+        m.publish(vec![tile("one.tile", 1)], Checkpoint { csn: 1, handle_watermark: 2 }, None).unwrap();
         assert_eq!(m.root().seq, 1);
         assert_eq!(fs::metadata(&path).unwrap().len(), 2 * PAGE as u64);
 
         m.inject_page_write_error = true;
-        let err = m.publish(vec![tile("two.tile", 2)], Checkpoint { csn: 2, handle_watermark: 3 }).unwrap_err();
+        let err = m.publish(vec![tile("two.tile", 2)], Checkpoint { csn: 2, handle_watermark: 3 }, None).unwrap_err();
         assert!(err.to_string().contains("injected manifest page write failure"));
         assert!(m.poisoned());
         m.inject_page_write_error = false;
-        assert_eq!(m.publish(vec![tile("two.tile", 2)], Checkpoint { csn: 2, handle_watermark: 3 }).unwrap_err().to_string(),
+        assert_eq!(m.publish(vec![tile("two.tile", 2)], Checkpoint { csn: 2, handle_watermark: 3 }, None).unwrap_err().to_string(),
             "manifest writer poisoned; reopen to recover");
         drop(m);
 
@@ -544,13 +667,13 @@ mod tests {
         // the newer slot torn but the root intact.
         let mut m = Manifest::open(&path).unwrap().unwrap();
         assert_eq!(m.root().seq, 1);
-        m.publish(vec![tile("two.tile", 2)], Checkpoint { csn: 2, handle_watermark: 3 }).unwrap();
+        m.publish(vec![tile("two.tile", 2)], Checkpoint { csn: 2, handle_watermark: 3 }, None).unwrap();
         assert_eq!(m.root().seq, 2);
         drop(m);
 
         let mut m = Manifest::open(&path).unwrap().unwrap();
         m.inject_sync_error = true;
-        assert!(m.publish(vec![tile("three.tile", 3)], Checkpoint { csn: 3, handle_watermark: 4 }).is_err());
+        assert!(m.publish(vec![tile("three.tile", 3)], Checkpoint { csn: 3, handle_watermark: 4 }, None).is_err());
         assert!(m.poisoned());
         drop(m);
         // The page write landed even though its sync failed; reopen takes the
@@ -569,7 +692,7 @@ mod tests {
         let case = |name: &str, tiles: Vec<TileRef>, checkpoint: Checkpoint| {
             let path = tmp_dir(name).join(MANIFEST_NAME);
             let mut m = Manifest::create(&path).unwrap();
-            assert_eq!(m.publish(tiles, checkpoint).unwrap_err().kind(), ErrorKind::InvalidData);
+            assert_eq!(m.publish(tiles, checkpoint, None).unwrap_err().kind(), ErrorKind::InvalidData);
             assert_eq!(m.root().seq, 0);
             assert_eq!(fs::metadata(&path).unwrap().len(), PAGE as u64);
         };
