@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 use sha2::{Digest, Sha256};
 
 use crate::keys::{self, check_name};
-use crate::manifest::{self, Checkpoint, Manifest, TileRef};
+use crate::manifest::{self, Checkpoint, Manifest, SegmentRef, TileRef};
 use crate::memtable::Memtable;
 use crate::tile::Tile;
 use crate::wal::{self, Wal};
@@ -69,6 +69,10 @@ pub struct Engine {
     wal_path: PathBuf,
     dir: PathBuf,
     manifest: Option<Manifest>,
+    /// Current WAL segment per the manifest root; `None` while the whole
+    /// history lives in `data.wal`. Republishing carries it verbatim into every
+    /// new root so a rotated engine's root never stops naming the live suffix.
+    segment: Option<SegmentRef>,
     csn: u64,
     dedup: HashMap<Vec<u8>, u64>,
     max_handle: u64,
@@ -99,6 +103,7 @@ impl Engine {
             wal_path: wal_path.as_ref().to_path_buf(),
             dir: parent_dir(wal_path.as_ref()),
             manifest: None,
+            segment: None,
             csn: 0,
             dedup: HashMap::new(),
             max_handle: 0,
@@ -107,7 +112,7 @@ impl Engine {
 
     /// Recover wholly from WAL; does not automatically discover tile candidates.
     pub fn open(wal_path: impl AsRef<Path>) -> io::Result<Engine> {
-        Self::open_impl(wal_path.as_ref(), Vec::new())
+        Self::open_impl(wal_path.as_ref(), Vec::new(), None)
     }
 
     /// Explicit prototype recovery: a missing, corrupt or WAL-mismatched tile fails
@@ -126,7 +131,7 @@ impl Engine {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "tile path must be a plain filename inside the engine directory"));
         }
         let tile = Tile::open(tile_path)?;
-        Self::open_impl(wal_path.as_ref(), vec![TileHandle { tile, name }])
+        Self::open_impl(wal_path.as_ref(), vec![TileHandle { tile, name }], None)
     }
 
     /// Durable-root recovery: select the highest valid manifest page in `dir`, open
@@ -137,9 +142,23 @@ impl Engine {
     /// referenced by plain filename. A missing manifest file is the empty initial
     /// state (no tiles); full WAL replay still happens, so open time and RAM stay
     /// unbounded in this slice.
+    ///
+    /// Segment-aware: once the root references a WAL segment, that named file
+    /// replaces `data.wal` as the replay source and holds only the post-rotation
+    /// suffix. Any record at or below the segment's start CSN fails closed; the
+    /// checkpoint below the segment floor supplies the CSN/handle frontier and
+    /// dedup is built from suffix records only (pre-rotation block ids are
+    /// forgotten by design — a published tile covers their state).
     pub fn open_discover(dir: impl AsRef<Path>) -> io::Result<Engine> {
         let dir = dir.as_ref();
         let manifest = Manifest::open(&dir.join(manifest::MANIFEST_NAME))?;
+        // The root names the live WAL segment once rotation has happened; before
+        // that, replay reads the conventional `data.wal` in full.
+        let segment = manifest.as_ref().and_then(|m| m.root().segment.clone());
+        let wal_name = match &segment {
+            Some(s) => s.name.as_str(),
+            None => manifest::WAL_NAME,
+        };
         let mut tiles = Vec::new();
         if let Some(m) = manifest.as_ref() {
             for t in &m.root().tiles {
@@ -152,29 +171,48 @@ impl Engine {
                 tiles.push(TileHandle { tile: opened, name: t.name.clone() });
             }
         }
-        let mut e = Self::open_impl(&dir.join(manifest::WAL_NAME), tiles)?;
+        let mut e = Self::open_impl(&dir.join(wal_name), tiles, segment.as_ref().map(|s| s.start_csn))?;
         if let Some(m) = &manifest {
-            // While the WAL is fully retained these can only fire on divergence;
-            // after WAL retirement the watermark check must become a max() merge
-            // against the checkpointed watermark rather than replay-derived state.
             let cp = m.root().checkpoint;
-            if cp.csn > e.csn {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "manifest checkpoint CSN is ahead of the retained WAL"));
-            }
-            if cp.handle_watermark > e.max_handle {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "manifest handle watermark is ahead of the retained WAL"));
+            match &segment {
+                None => {
+                    // While the WAL is fully retained these can only fire on divergence;
+                    // after WAL retirement the watermark check must become a max() merge
+                    // against the checkpointed watermark rather than replay-derived state.
+                    if cp.csn > e.csn {
+                        return Err(io::Error::new(io::ErrorKind::InvalidData, "manifest checkpoint CSN is ahead of the retained WAL"));
+                    }
+                    if cp.handle_watermark > e.max_handle {
+                        return Err(io::Error::new(io::ErrorKind::InvalidData, "manifest handle watermark is ahead of the retained WAL"));
+                    }
+                }
+                Some(_) => {
+                    // Segment replay covers only the post-rotation suffix by
+                    // design; the frontier established below the segment floor
+                    // comes from the checkpoint, so merge instead of cross-check.
+                    e.csn = e.csn.max(cp.csn);
+                    e.max_handle = e.max_handle.max(cp.handle_watermark);
+                }
             }
         }
         e.manifest = manifest;
+        e.segment = segment;
         Ok(e)
     }
 
-    fn open_impl(wal_path: &Path, tiles: Vec<TileHandle>) -> io::Result<Engine> {
+    /// Shared recovery core. `floor` is `Some(segment.start_csn)` for segment
+    /// recovery: the replayed file holds only the post-rotation suffix, so tiles
+    /// at or below the floor bound digests over the retired pre-rotation prefix
+    /// (their state is durable in the tiles) and cannot be re-verified against
+    /// the suffix; tiles above the floor are verified against the above-floor
+    /// suffix range exactly as in full replay.
+    fn open_impl(wal_path: &Path, tiles: Vec<TileHandle>, floor: Option<u64>) -> io::Result<Engine> {
         if !tiles.windows(2).all(|w| w[0].cutoff() < w[1].cutoff()) {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "tile cutoffs overlap or are not strictly increasing"));
         }
         let (wal, records) = Wal::open_or_recover(wal_path)?;
         for t in &tiles {
+            if floor.is_some_and(|f| t.cutoff() <= f) { continue; }
             if wal_digest(&records, t.cutoff())? != *t.tile.digest() {
                 return Err(io::Error::new(io::ErrorKind::InvalidData, "tile WAL prefix mismatch"));
             }
@@ -187,21 +225,27 @@ impl Engine {
         let covered_through = tiles.last().map(|t| t.cutoff()).unwrap_or(0);
         for payload in &records {
             let (rec_csn, block_id, ops) = decode_payload(payload)?;
+            // Fail closed: a segment must hold only the live suffix; a record
+            // at or below the floor means stale or foreign segment content.
+            if floor.is_some_and(|f| rec_csn <= f) {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "WAL segment contains pre-rotation records"));
+            }
             max_handle = max_handle.max(ops.iter().map(op_handle).max().unwrap_or(0));
             let destination = if rec_csn <= covered_through { &mut covered } else { &mut mt };
             for op in &ops { apply_op(destination, op, rec_csn); }
             csn = csn.max(rec_csn);
             dedup.insert(block_id, rec_csn);
         }
-        let mut lower = 0u64;
+        let mut lower = floor.unwrap_or(0);
         for t in &tiles {
+            if floor.is_some_and(|f| t.cutoff() <= f) { continue; }
             // Tiles hold exactly the newest version per logical key within their
             // CSN range (same reduction the tile writers apply), so the WAL
             // projection is reduced the same way before the 1:1 comparison.
             t.tile.verify_projection(&newest_projection(&covered, lower, t.cutoff()), lower, t.cutoff())?;
             lower = t.cutoff();
         }
-        Ok(Engine { wal, mt, tiles, wal_path: wal_path.to_path_buf(), dir: parent_dir(wal_path), manifest: None, csn, dedup, max_handle })
+        Ok(Engine { wal, mt, tiles, wal_path: wal_path.to_path_buf(), dir: parent_dir(wal_path), manifest: None, segment: None, csn, dedup, max_handle })
     }
 
     /// Build one immutable P/U/R tile holding, for the WAL-published versions
@@ -324,8 +368,13 @@ impl Engine {
     // must never overwrite a root it did not read. Any error poisons the writer
     // until reopen.
     fn manifest_publish(&mut self, refs: Vec<TileRef>, checkpoint: Checkpoint) -> io::Result<()> {
+        // Every new root carries the engine's current segment reference verbatim
+        // (`None` until rotation exists): a rotated engine's republished root
+        // must keep naming the live suffix, and a legacy engine stays
+        // None-encoded.
+        let segment = self.segment.clone();
         match &mut self.manifest {
-            Some(m) => m.publish(refs, checkpoint)?,
+            Some(m) => m.publish(refs, checkpoint, segment)?,
             None => {
                 let path = self.dir.join(manifest::MANIFEST_NAME);
                 let mut m = match Manifest::create(&path) {
@@ -341,7 +390,7 @@ impl Engine {
                     }
                     Err(e) => return Err(e),
                 };
-                m.publish(refs, checkpoint)?;
+                m.publish(refs, checkpoint, segment)?;
                 self.manifest = Some(m);
             }
         }
@@ -1338,6 +1387,107 @@ mod tests {
         // One tile remains: further compaction is refused as InvalidInput.
         assert_eq!(e.compact().unwrap_err().kind(), io::ErrorKind::InvalidInput);
         drop(e);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn open_discover_replays_segment_suffix_and_merges_checkpoint() {
+        // Hand-craft the post-rotation directory state a future rotation slice
+        // will produce: one tile covering (0,2], a manifest root referencing it
+        // plus SegmentRef { data-2.wal, start_csn 2 }, and a suffix-only
+        // data-2.wal holding just the csn-3 record. Rotation itself does not
+        // exist yet, so the test flips the manifest root directly.
+        let dir = tmp_dir("segment-discover");
+        let put = |h: u64, v: &[u8]| Op::PutDoc { entity: b"E".to_vec(), handle: h, doc: v.to_vec() };
+
+        // Pre-rotation phase: two committed blocks (csn 1..=2, handles up to 7)
+        // published as one tile; the manifest checkpoint then matches the cutoff.
+        let mut e = Engine::create(&dir.join("data.wal")).unwrap();
+        e.commit_block(b"pre-1", &[put(7, b"v1")]).unwrap();
+        e.commit_block(b"pre-2", &[put(7, b"v2")]).unwrap();
+        e.publish_tile(&dir.join("t1.tile"), 2).unwrap();
+        let tref = e.tiles[0].tile_ref();
+        let watermark = e.max_handle;
+        assert_eq!(watermark, 7);
+        drop(e);
+
+        // The suffix segment holds ONLY the post-rotation record; the
+        // pre-rotation prefix (data.wal) is retired.
+        let mut seg = Wal::create(&dir.join("data-2.wal")).unwrap();
+        seg.append(&encode_payload(3, b"post-3", &[put(1, b"v3")])).unwrap();
+        seg.sync().unwrap();
+        drop(seg);
+        fs::remove_file(dir.join("data.wal")).unwrap();
+
+        let mut m = Manifest::open(&dir.join(manifest::MANIFEST_NAME)).unwrap().unwrap();
+        m.publish(vec![tref], Checkpoint { csn: 2, handle_watermark: watermark },
+            Some(manifest::SegmentRef { name: "data-2.wal".to_string(), start_csn: 2 })).unwrap();
+        drop(m);
+
+        let mut e = Engine::open_discover(&dir).unwrap();
+        // Suffix replayed and checkpoint merged: CSN continues above both.
+        assert_eq!(e.csn(), 3);
+        assert_eq!(e.get(b"E", 1).unwrap(), Some(b"v3".to_vec()), "suffix record is served");
+        assert_eq!(e.get(b"E", 7).unwrap(), Some(b"v2".to_vec()), "pre-rotation state is served from the published tile");
+        // Checkpoint handle watermark respected: the suffix alone derives 1.
+        assert_eq!(e.max_handle, 7);
+        assert_eq!(e.next_handle().unwrap(), 8);
+        // Pre-rotation block ids are forgotten by design (suffix-only dedup).
+        assert_eq!(e.committed_block_csn(b"pre-1"), None);
+        assert_eq!(e.committed_block_csn(b"pre-2"), None);
+        assert_eq!(e.committed_block_csn(b"post-3"), Some(3));
+        // New commits work and go to the CURRENT segment.
+        let out = e.commit_block(b"post-4", &[put(1, b"v4")]).unwrap();
+        assert_eq!(out, Outcome::Committed { csn: 4 });
+        drop(e);
+
+        let (records, _) = wal::replay(&dir.join("data-2.wal")).unwrap();
+        assert_eq!(records.len(), 2, "new commits append to the referenced segment");
+        assert_eq!(decode_payload(&records[1]).unwrap().0, 4);
+        assert!(!dir.join("data.wal").exists());
+
+        // Reopening the rotated directory reproduces the same state.
+        let e = Engine::open_discover(&dir).unwrap();
+        assert_eq!(e.csn(), 4);
+        assert_eq!(e.get(b"E", 1).unwrap(), Some(b"v4".to_vec()));
+        assert_eq!(e.committed_block_csn(b"post-4"), Some(4));
+        assert_eq!(e.committed_block_csn(b"pre-1"), None);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn open_discover_fails_closed_on_pre_rotation_records_in_segment() {
+        // A segment whose file still contains a record at or below start_csn is
+        // stale/foreign content: recovery must refuse it, not replay it.
+        let dir = tmp_dir("segment-stale");
+        let put = |h: u64, v: &[u8]| Op::PutDoc { entity: b"E".to_vec(), handle: h, doc: v.to_vec() };
+        let mut e = Engine::create(&dir.join("data.wal")).unwrap();
+        e.commit_block(b"pre-1", &[put(7, b"v1")]).unwrap();
+        e.commit_block(b"pre-2", &[put(7, b"v2")]).unwrap();
+        e.publish_tile(&dir.join("t1.tile"), 2).unwrap();
+        let tref = e.tiles[0].tile_ref();
+        let watermark = e.max_handle;
+        drop(e);
+
+        // The copied "suffix" wrongly still holds the pre-rotation csn-2 record.
+        let mut seg = Wal::create(&dir.join("data-2.wal")).unwrap();
+        seg.append(&encode_payload(2, b"pre-2", &[put(7, b"v2")])).unwrap();
+        seg.append(&encode_payload(3, b"post-3", &[put(1, b"v3")])).unwrap();
+        seg.sync().unwrap();
+        drop(seg);
+        fs::remove_file(dir.join("data.wal")).unwrap();
+
+        let mut m = Manifest::open(&dir.join(manifest::MANIFEST_NAME)).unwrap().unwrap();
+        m.publish(vec![tref], Checkpoint { csn: 2, handle_watermark: watermark },
+            Some(manifest::SegmentRef { name: "data-2.wal".to_string(), start_csn: 2 })).unwrap();
+        drop(m);
+
+        let err = match Engine::open_discover(&dir) {
+            Err(e) => e,
+            Ok(_) => panic!("open_discover must fail closed on pre-rotation segment records"),
+        };
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("pre-rotation records"), "got: {err}");
         fs::remove_dir_all(&dir).unwrap();
     }
 
