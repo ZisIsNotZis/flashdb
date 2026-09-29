@@ -207,14 +207,30 @@ impl Tile {
     /// (`lower` is the previous tile's cutoff, 0 for the oldest), so a tile
     /// holding another range's versions fails closed here.
     pub(crate) fn verify_projection(&self, expected: &Memtable, lower: u64, cutoff: u64) -> io::Result<()> {
+        // Key-addressed 1:1 comparison instead of positional pairing: a floor-
+        // spanning compacted tile legitimately holds retired-prefix entries
+        // (csn <= lower) that were verified when compaction published it - the
+        // retired WAL can never be replayed to re-derive them.
+        let mut expect: std::collections::BTreeMap<Vec<u8>, Vec<u8>> = expected.entries()
+            .filter(|(key, _)| keys::key_csn(key).is_some_and(|csn| csn > lower && csn <= cutoff))
+            .map(|(k, v)| (k.to_vec(), v.to_vec()))
+            .collect();
         let mut actual = self.entries();
-        for (key, value) in expected.entries().filter(|(key, _)| {
-            keys::key_csn(key).is_some_and(|csn| csn > lower && csn <= cutoff)
-        }) {
-            let (got_key, got_value) = actual.next().ok_or_else(|| invalid("tile missing WAL entry"))??;
-            if got_key != key || got_value != value { return Err(invalid("tile entry disagrees with WAL")); }
+        loop {
+            let (key, value) = match actual.next() {
+                None => break,
+                Some(entry) => entry?,
+            };
+            let csn = keys::key_csn(&key).ok_or_else(|| invalid("tile entry without CSN"))?;
+            if csn <= lower { continue; }
+            if csn > cutoff { return Err(invalid("tile entry above cutoff")); }
+            match expect.remove(&key) {
+                Some(v) if v == value => {}
+                Some(_) => return Err(invalid("tile entry disagrees with WAL")),
+                None => return Err(invalid("tile contains extra WAL entry")),
+            }
         }
-        if let Some(entry) = actual.next() { entry?; return Err(invalid("tile contains extra WAL entry")); }
+        if !expect.is_empty() { return Err(invalid("tile missing WAL entry")); }
         Ok(())
     }
 }

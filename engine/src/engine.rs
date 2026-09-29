@@ -230,7 +230,7 @@ impl Engine {
             // (which follows the manifest's segment reference) can open it.
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
                 return Err(io::Error::new(io::ErrorKind::NotFound, format!(
-                    "WAL file {} is missing: legacy opens cannot recover a rotated directory - use open_discover (the manifest names the live segment)", wal_path.display())));
+                    "WAL segment {} is missing: the durable manifest names it as the live segment, so the directory is incomplete (deleted or never fully rotated)", wal_path.display())));
             }
             Err(e) => return Err(e),
         };
@@ -533,7 +533,17 @@ impl Engine {
         // Durable flip done: rebind to the empty segment, then unlink the old
         // segment best-effort.
         let old_path = self.wal_path.clone();
-        let (wal, records) = Wal::open_or_recover(&path)?;
+        let rebound = Wal::open_or_recover(&path);
+        let (wal, records) = match rebound {
+            ok => ok?,
+            // The durable root already names the new segment; a rebinding
+            // failure must not let later commits append to the old binding
+            // that recovery would ignore.
+            Err(e) => {
+                self.wal_detached = true;
+                return Err(e);
+            }
+        };
         if !records.is_empty() {
             self.wal_detached = true;
             return Err(io::Error::new(io::ErrorKind::InvalidData, "fresh rotation segment is not empty"));

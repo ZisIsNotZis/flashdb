@@ -459,3 +459,33 @@ fn rotation_crash_windows_leave_recoverable_state() {
     assert_eq!(e.rotate_wal(0).unwrap(), true);
     assert_eq!(e.get(b"E", 2).unwrap(), Some(b"b".to_vec()));
 }
+
+#[test]
+fn compact_after_rotation_spans_the_segment_floor_and_reopens() {
+    let files = Files::new();
+    let mut e = Engine::create(&files.wal).unwrap();
+    e.commit_block(b"b1", &[doc(1, b"pre")]).unwrap();
+    e.publish_tile(&files.dir.join("tile-1.tile"), 1).unwrap();
+    e.commit_block(b"b2", &[doc(2, b"post")]).unwrap();
+    e.publish_tile(&files.dir.join("tile-1b.tile"), 2).unwrap();
+    // Rotate at cutoff 2: floor = 2, the pre-rotation WAL is retired.
+    assert_eq!(e.rotate_wal(0).unwrap(), true);
+    e.commit_block(b"b3", &[doc(2, "later".as_bytes())]).unwrap();
+    e.publish_tile(&files.dir.join("tile-3.tile"), 3).unwrap();
+    // Compaction merges the below-floor tile with the suffix tile: the merged
+    // tile legitimately spans the floor and must reopen.
+    e.compact().unwrap();
+    assert!(files.dir.join("compact-3.tile").exists());
+    assert_eq!(e.get(b"E", 1).unwrap(), Some(b"pre".to_vec()));
+    assert_eq!(e.get(b"E", 2).unwrap(), Some(b"later".to_vec()));
+    drop(e);
+    let mut e = Engine::open_discover(&files.dir).unwrap();
+    assert_eq!(e.csn(), 3);
+    assert_eq!(e.get(b"E", 1).unwrap(), Some(b"pre".to_vec()));
+    assert_eq!(e.get(b"E", 2).unwrap(), Some(b"later".to_vec()));
+    assert_eq!(e.serving_memtable_entries(), 0);
+    assert_eq!(e.commit_block(b"b4", &[doc(4, b"four")]).unwrap(), Outcome::Committed { csn: 4 });
+    drop(e);
+    let e = Engine::open_discover(&files.dir).unwrap();
+    assert_eq!(e.get(b"E", 4).unwrap(), Some(b"four".to_vec()));
+}

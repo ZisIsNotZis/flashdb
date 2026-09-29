@@ -246,6 +246,9 @@ fn decode_payload(seq: u64, payload: &[u8]) -> io::Result<Root> {
     if tiles.is_empty() && segment.is_some() {
         return Err(invalid("empty manifest cannot reference a WAL segment"));
     }
+    if segment.as_ref().is_some_and(|s| s.start_csn > checkpoint.csn) {
+        return Err(invalid("manifest segment starts above the checkpoint CSN"));
+    }
     if payload[c.i..].iter().any(|&b| b != 0) {
         return Err(invalid("manifest payload has unparsed trailing bytes"));
     }
