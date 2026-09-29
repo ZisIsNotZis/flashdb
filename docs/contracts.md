@@ -69,7 +69,7 @@ Every block reports `{ name, status }` with `status` ∈ `ok | empty | failed | 
 ### Open — remaining after this redesign
 
 **Closed here:** L-01, L-05, L-06, L-11, L-12, L-13, L-14, L-18, L-20.
-**Still open:** L-02 (dedup-replay response and retention semantics), L-04 (`E` as a normalizer, not a list), L-07 (row cap, aggregate-to-write, generated-key round-trip), L-08 (schema canonicity), L-16 (wire-form canonicalization), and the expression grammar (`$name.field`, arithmetic, `where` operators) needs one page of exact rules.
+**Still open:** L-04 (`E` as a normalizer, not a list), L-07 (row cap, aggregate-to-write, generated-key round-trip), L-08 (schema canonicity), L-16 (wire-form canonicalization), and the expression grammar (`$name.field`, arithmetic, `where` operators) needs one page of exact rules. **L-02 is resolved (2026-09-29):** historical reads do not exist — reads always see the latest committed state, so compaction may drop every superseded version; dedup-replay responses are not a guarantee (see Idempotency).
 
 
 ### Blocks
@@ -164,7 +164,7 @@ If a request dies mid-program, the durable commit record holds a **prefix** of i
 
 ### Idempotency
 
-Because the client can crash after commit and before acknowledgement, every request carries a request id and every block a block id, and the engine deduplicates on `(request_id, block_id)` within a retention window.
+**Resolved (author, 2026-09-29): idempotency is business uniqueness enforced by the engine, not transport-level request ids.** The engine acks a block only after its WAL record is durable; the ack is one-way and needs no reply. A client that retries an ambiguous request must write at least one engine-enforced unique field whose value is minted once when the intent is created and reused verbatim on retry (for example an order number); the retry then hits `unique_violation` and the whole block rolls back atomically, so no side effect duplicates. Blocks without such a field may re-execute on retry — that is the client's contract, not an engine defect. Blocks that mix keyed and unkeyed writes get whole-block rollback from the keyed write's uniqueness. The engine keeps no durable request-id dedup; any in-memory dedup is an internal detail that dies with the current WAL segment and is never a guarantee. `retry_horizon_s` is not used for retention.
 
 ### Conflict policy
 

@@ -133,6 +133,15 @@ The items were recorded inline in `contracts.md`, which pushed that file past it
 
 本节覆盖前文 D5 中“guard-false **或 conflict** 都进入 `else`”的过宽表述，而不改动每块原子性。`else` 仅接预期中的条件不满足：读 probe 无匹配、写 probe/`when` 为 false；业务唯一性或其他约束冲突是原则性错误，直接失败，绝不默认重试或走 `else`。仅由并发时机造成的乐观读集验证不一致可在新快照上有界重试；重试后若业务条件不满足，才进入 `else`。`docs/contracts.md` 的请求树、结果分类与冲突策略和 `docs/engine.md` 的发布行为已按此解释更新。当前窄版适配器把 `x_unique` 映射为 `AlreadyExists`；未来瞬时竞争需单独结果类型，不能复用同一 `Conflict` 概念。
 
+## Decision addendum（2026-09-29，作者：幂等 = 业务唯一 + 块原子性）
+
+关闭 L-02 的另一半，并撤销 request-id 去重作为保障：
+
+- **不允许读历史数据。** 所有读只看最新提交状态；compaction 丢弃每个逻辑键的全部被取代版本（最新版本与墓碑语义保留——墓碑即"最新状态为已删除"）。快照租约、版本保留期整体取消，不需要注册表。
+- **幂等由引擎通过 schema 唯一强制：** 客户端在意图创建时铸造一次业务键（如订单号），重试原样携带；重试命中 `unique_violation` 且**整块原子回滚**（含无键写，如库存扣减）。满足"重试间键值稳定"的块是幂等的；不满足的块可能重复执行，这是客户端契约。
+- **request-id 去重降级为内部细节：** 引擎只在 fsync 后 ack（单向，不需回执）；现有内存去重随当前 WAL 段消亡，不做跨段持久化，`retry_horizon_s` 不用于保留。
+- `docs/contracts.md` 的 Idempotency 与 L-02 状态已同步。
+
 ## Not in scope
 
 Re-running the language review. This ticket resolves the findings it produced.
