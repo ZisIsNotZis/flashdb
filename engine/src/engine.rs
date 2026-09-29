@@ -224,11 +224,11 @@ impl Engine {
         if self.tiles.last().is_some_and(|t| t.cutoff() >= cutoff) {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "tile cutoff must be strictly above the newest active tile cutoff"));
         }
-        let tile = self.write_verified_tile(tile_path.as_ref(), cutoff)?;
+        let tile = self.write_verified_tile(tile_path, cutoff)?;
         self.mt.evict_through(cutoff);
         self.tiles.push(TileHandle {
             tile,
-            name: tile_path.as_ref().file_name().and_then(|n| n.to_str()).unwrap_or_default().to_string(),
+            name: tile_path.file_name().and_then(|n| n.to_str()).unwrap_or_default().to_string(),
         });
         Ok(())
     }
