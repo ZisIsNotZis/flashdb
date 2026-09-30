@@ -68,6 +68,20 @@ Worker `6c3e732f-35b4-41dd-a26f-3ea17a812d7b` timed out pre-commit; patch recove
 
 **Gate incident (recorded):** `c161bc6` was committed with a type-inference compile break that the `-q` gate grep hid; fixed in `315b49e`. Gate rule going forward: the test command must be asserted on `test result:` lines (or exit code), never on absence of output. Final checks: Rust 88 passed (46 unit + 6 manifest + 10 multi-tile + 7 order-flow + 5 read + 3 replay + 11 tile), Python 10, `git diff --check` passed.
 
+## Probe-cost quantification — 2026-09-30 (`dfb147c`)
+
+`engine/examples/probe_cost.rs` (200 random probes/row, page cache warm → CPU-bound):
+memtable probe 1.4–2.4 µs vs tile probe **29 ms @1.4 MB, 111 ms @5.6 MB, 450 ms @22.6 MB,
+1.65 s @90.8 MB** — linear in tile size (≈55 MB/s), i.e. the cliff is a missing tile
+index, not a design defect. Second independent finding: the reader's per-entry
+allocation+checksum caps *sequential* tile scans at ~55 MB/s vs 831 MiB/s device.
+Detail: `evidence/probe-cost.md`.
+
+Structural costs the index does not remove (author decision): strict global synchronous
+uniqueness is read-modify-write (bloom + ≤1 page read per tile per op ⇒ ~10k unique
+ops/s QD1 single-thread, ~200k/s with parallel probes); index+bloom RAM ∝ #distinct
+unique keys (declared cost); publish/compaction rewrite+re-verify whole tiles.
+
 ## Next action
 
 ## WAL rotation slice — 2026-09-29, in progress (split)
