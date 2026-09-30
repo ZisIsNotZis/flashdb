@@ -852,7 +852,12 @@ impl Engine {
         for (pfx, (entity, field, value, overlay)) in touched {
             let mut live: HashMap<u64, bool> = HashMap::new();
             self.scan_merged(&pfx, |key, val| {
-                if key.len() < pfx.len() + 16 { return Ok(true); }
+                // Fail closed: a key under the unique prefix that cannot be
+                // decoded cannot be proven to have no other live owner, so
+                // silently skipping it would fail *open* in a constraint check.
+                if key.len() != pfx.len() + 16 {
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, "malformed unique key in merged view"));
+                }
                 let handle = u64::from_be_bytes(key[pfx.len()..pfx.len() + 8].try_into().unwrap());
                 // 键按 handle 升序、每个 handle 内按 CSN 降序排列。
                 live.entry(handle).or_insert(!val.is_empty());
