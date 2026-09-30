@@ -22,7 +22,7 @@ use sha2::{Digest, Sha256};
 use crate::keys::{self, check_name};
 use crate::manifest::{self, Checkpoint, Manifest, SegmentRef, TileRef};
 use crate::memtable::Memtable;
-use crate::tile::Tile;
+use crate::tile::{Tile, TileCursor};
 use crate::wal::{self, Wal};
 
 const MAGIC: &[u8; 4] = b"FDB1";
@@ -678,35 +678,36 @@ impl Engine {
     // the memtable-wins skip below is defensive only.
     fn scan_merged(&self, prefix: &[u8], mut visit: impl FnMut(&[u8], &[u8]) -> io::Result<bool>) -> io::Result<()> {
         let mut mem = self.mt.scan_iter(prefix).peekable();
-        let mut iters: Vec<_> = self.tiles.iter().map(|t| t.tile.entries()).collect();
-        let mut heads: Vec<Option<(Vec<u8>, Vec<u8>)>> = Vec::with_capacity(iters.len());
-        for iter in iters.iter_mut() {
-            heads.push(next_matching(iter, prefix)?);
+        let mut cursors: Vec<TileCursor<'_>> = Vec::with_capacity(self.tiles.len());
+        for t in &self.tiles {
+            cursors.push(t.tile.prefix_cursor(prefix)?);
         }
+        let mut disk_key: Vec<u8> = Vec::new();
         loop {
-            if mem.peek().is_none() && heads.iter().all(Option::is_none) { break; }
-            let disk = smallest_disk_head(&heads);
-            let use_mem = match (mem.peek(), disk) {
-                (Some((mk, _)), Some(i)) => {
-                    let head = heads[i].as_ref().unwrap();
-                    *mk <= head.0.as_slice()
-                }
+            let disk = smallest_disk_head(&mut cursors, &mut disk_key)?;
+            let mem_head = mem.peek();
+            if mem_head.is_none() && disk.is_none() { break; }
+            let use_mem = match (mem_head, disk) {
+                (Some((mk, _)), Some(_)) => *mk <= disk_key.as_slice(),
                 (Some(_), None) => true,
                 (None, _) => false,
             };
             if use_mem {
                 let (key, value) = mem.next().unwrap();
                 if let Some(i) = disk {
-                    if heads[i].as_ref().is_some_and(|(k, _)| k.as_slice() == key) {
-                        heads[i] = next_matching(&mut iters[i], prefix)?;
+                    // Tile CSN ranges are disjoint, so an equal key is defensive only.
+                    if disk_key.as_slice() == key {
+                        cursors[i].next()?;
                     }
                 }
                 if !visit(key, value)? { return Ok(()); }
             } else {
                 let i = disk.unwrap();
-                let (key, value) = heads[i].take().unwrap();
-                heads[i] = next_matching(&mut iters[i], prefix)?;
-                if !visit(&key, &value)? { return Ok(()); }
+                let (key, value) = match cursors[i].next()? {
+                    Some(entry) => entry,
+                    None => return Err(io::Error::new(io::ErrorKind::InvalidData, "tile cursor lost its head")),
+                };
+                if !visit(key, value)? { return Ok(()); }
             }
         }
         Ok(())
@@ -815,6 +816,19 @@ impl Engine {
         })
     }
 
+    /// Full merged key-order pass over every serving key (primary, unique and
+    /// reverse). Inspection/benchmark hook for read throughput, not part of the
+    /// product read surface; `visit` returns `false` to stop early.
+    pub fn scan_all(
+        &self,
+        mut visit: impl FnMut(&[u8], &[u8]) -> io::Result<()>,
+    ) -> io::Result<()> {
+        self.scan_merged(&[], |key, value| {
+            visit(key, value)?;
+            Ok(true)
+        })
+    }
+
     /// 原子提交一个块。唯一约束冲突 → `Outcome::Conflict`（未写 WAL，调用方直接报业务错误）。
     pub fn commit_block(&mut self, block_id: &[u8], ops: &[Op]) -> io::Result<Outcome> {
         self.ensure_attached()?;
@@ -887,31 +901,22 @@ impl Engine {
     }
 }
 
-fn next_matching(
-    disk: &mut impl Iterator<Item = io::Result<(Vec<u8>, Vec<u8>)>>,
-    prefix: &[u8],
-) -> io::Result<Option<(Vec<u8>, Vec<u8>)>> {
-    for entry in disk {
-        let (key, value) = entry?;
-        if key.starts_with(prefix) { return Ok(Some((key, value))); }
-    }
-    Ok(None)
-}
-
 // Index of the smallest pending tile head, if any; linear over at most
-// manifest::MAX_TILES heads.
-fn smallest_disk_head(heads: &[Option<(Vec<u8>, Vec<u8>)>]) -> Option<usize> {
+// manifest::MAX_TILES cursors. The winning key is copied into `best_key` (one
+// reusable buffer) so no cursor's borrowed peek is held across another cursor's.
+fn smallest_disk_head(cursors: &mut [TileCursor<'_>], best_key: &mut Vec<u8>) -> io::Result<Option<usize>> {
+    best_key.clear();
     let mut best: Option<usize> = None;
-    for (i, head) in heads.iter().enumerate() {
-        if let Some((key, _)) = head {
-            let better = match best {
-                None => true,
-                Some(b) => key.as_slice() < heads[b].as_ref().unwrap().0.as_slice(),
-            };
-            if better { best = Some(i); }
+    for i in 0..cursors.len() {
+        if let Some((key, _)) = cursors[i].peek()? {
+            if best.is_none() || key < best_key.as_slice() {
+                best_key.clear();
+                best_key.extend_from_slice(key);
+                best = Some(i);
+            }
         }
     }
-    best
+    Ok(best)
 }
 
 // Bind a tile to the exact WAL range which produced it; the WAL remains the only

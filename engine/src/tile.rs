@@ -192,21 +192,55 @@ pub(crate) struct Tile {
     fences: Vec<Fence>,
 }
 
-struct Entries<'a> {
+/// Pull cursor over a tile's data blocks. Entries borrow the cursor's own block
+/// buffer, so streaming allocates nothing per entry (only the reused prefix and
+/// last-key buffers). Without a prefix it yields every entry; with one it starts
+/// at the block `dir_search` selects, skips entries sorting below the prefix,
+/// yields only keys that begin with it, and stops at the first key past the
+/// prefix range without reading further blocks. Yielded keys must be strictly
+/// increasing; any other order is `InvalidData`.
+pub(crate) struct TileCursor<'a> {
     tile: &'a Tile,
+    prefix: Option<Vec<u8>>,
     checked: bool,
     block: usize,
     buffer: Vec<u8>,
     pos: usize,
     left: u16,
+    /// Byte range of the parsed-but-not-yet-returned entry: key start, key end, value end.
+    current: Option<(usize, usize, usize)>,
+    /// Last yielded key, reused to prove strict order without a per-entry allocation.
+    last: Vec<u8>,
+    started: bool,
     done: bool,
 }
 
-impl Entries<'_> {
+impl<'a> TileCursor<'a> {
+    fn new(tile: &'a Tile, prefix: Option<&[u8]>, block: usize) -> Self {
+        TileCursor {
+            tile,
+            prefix: prefix.map(<[u8]>::to_vec),
+            checked: false,
+            block,
+            buffer: Vec::new(),
+            pos: 0,
+            left: 0,
+            current: None,
+            last: Vec::new(),
+            started: false,
+            done: false,
+        }
+    }
+
+    /// Read and validate the block selected by `self.block`, resetting the entry
+    /// position to its first entry.
     fn load_block(&mut self) -> io::Result<()> {
-        let fence = &self.tile.fences[self.block];
-        self.buffer.resize(fence.len as usize, 0);
-        read_exact_at(&self.tile.file, &mut self.buffer, fence.offset)?;
+        let (offset, len) = {
+            let fence = &self.tile.fences[self.block];
+            (fence.offset, fence.len as usize)
+        };
+        self.buffer.resize(len, 0);
+        read_exact_at(&self.tile.file, &mut self.buffer, offset)?;
         if self.buffer.len() < BLOCK_HEADER { return Err(invalid("tile block truncated")); }
         let blen = u32::from_le_bytes(self.buffer[..4].try_into().unwrap()) as usize;
         let block_crc = u32::from_le_bytes(self.buffer[4..8].try_into().unwrap());
@@ -219,7 +253,11 @@ impl Entries<'_> {
         Ok(())
     }
 
-    fn advance(&mut self) -> io::Result<Option<(Vec<u8>, Vec<u8>)>> {
+    /// Position `self.current` on the next acceptable entry, loading blocks as
+    /// needed; returns false once the stream (or prefix range) is exhausted.
+    fn fill(&mut self) -> io::Result<bool> {
+        if self.current.is_some() { return Ok(true); }
+        if self.done { return Ok(false); }
         if !self.checked {
             self.checked = true;
             if self.tile.file.metadata()?.len() != self.tile.size { return Err(invalid("tile size changed")); }
@@ -230,35 +268,87 @@ impl Entries<'_> {
             read_exact_at(&self.tile.file, &mut tr, self.tile.size - TRAILER as u64)?;
             if tr != self.tile.trailer { return Err(invalid("tile trailer changed")); }
         }
-        while self.left == 0 {
-            if self.block >= self.tile.fences.len() { return Ok(None); }
-            self.load_block()?;
-            if self.left == 0 { return Err(invalid("tile block declares no entries")); }
+        loop {
+            if self.left == 0 {
+                if self.block >= self.tile.fences.len() { self.done = true; return Ok(false); }
+                // A block whose first key sorts past the prefix without starting
+                // with it, and every later block, cannot match: stop before reading.
+                if let Some(prefix) = &self.prefix {
+                    let first = self.tile.fences[self.block].first_key.as_slice();
+                    if first > prefix.as_slice() && !first.starts_with(prefix.as_slice()) {
+                        self.done = true;
+                        return Ok(false);
+                    }
+                }
+                self.load_block()?;
+                if self.left == 0 { return Err(invalid("tile block declares no entries")); }
+            }
+            let buf = &self.buffer;
+            if self.pos + 8 > buf.len() { return Err(invalid("tile entry header truncated")); }
+            let k = u32::from_le_bytes(buf[self.pos..self.pos + 4].try_into().unwrap()) as usize;
+            let v = u32::from_le_bytes(buf[self.pos + 4..self.pos + 8].try_into().unwrap()) as usize;
+            if !(18..=MAX_KEY).contains(&k) || v > MAX_VALUE { return Err(invalid("tile entry length out of bounds")); }
+            let start = self.pos + 8;
+            let mid = start.checked_add(k).ok_or_else(|| invalid("tile key size overflow"))?;
+            let end = mid.checked_add(v).ok_or_else(|| invalid("tile value size overflow"))?;
+            if end > buf.len() { return Err(invalid("tile entry exceeds block")); }
+            let key = &buf[start..mid];
+            if let Some(prefix) = &self.prefix {
+                if !(key.len() >= prefix.len() && &key[..prefix.len()] == prefix.as_slice()) {
+                    if key < prefix.as_slice() {
+                        // Below the prefix range: skip and keep scanning.
+                        self.pos = end;
+                        self.left -= 1;
+                        if self.left == 0 { self.block += 1; }
+                        continue;
+                    }
+                    // Past the prefix range: no later key can match.
+                    self.done = true;
+                    return Ok(false);
+                }
+            }
+            if self.started && key <= self.last.as_slice() {
+                return Err(invalid("tile keys out of order"));
+            }
+            self.last.clear();
+            self.last.extend_from_slice(key);
+            self.started = true;
+            self.current = Some((start, mid, end));
+            self.pos = end;
+            self.left -= 1;
+            if self.left == 0 { self.block += 1; }
+            return Ok(true);
         }
-        let buf = &self.buffer;
-        if self.pos + 8 > buf.len() { return Err(invalid("tile entry header truncated")); }
-        let k = u32::from_le_bytes(buf[self.pos..self.pos + 4].try_into().unwrap()) as usize;
-        let v = u32::from_le_bytes(buf[self.pos + 4..self.pos + 8].try_into().unwrap()) as usize;
-        if !(18..=MAX_KEY).contains(&k) || v > MAX_VALUE { return Err(invalid("tile entry length out of bounds")); }
-        let start = self.pos + 8;
-        let mid = start.checked_add(k).ok_or_else(|| invalid("tile key size overflow"))?;
-        let end = mid.checked_add(v).ok_or_else(|| invalid("tile value size overflow"))?;
-        if end > buf.len() { return Err(invalid("tile entry exceeds block")); }
-        let key = buf[start..mid].to_vec();
-        let value = buf[mid..end].to_vec();
-        self.pos = end;
-        self.left -= 1;
-        if self.left == 0 { self.block += 1; self.buffer.clear(); self.pos = 0; }
-        Ok(Some((key, value)))
     }
+
+    /// The pending entry without consuming it, borrowing the block buffer.
+    pub(crate) fn peek(&mut self) -> io::Result<Option<(&[u8], &[u8])>> {
+        if !self.fill()? { return Ok(None); }
+        let (start, mid, end) = self.current.unwrap();
+        Ok(Some((&self.buffer[start..mid], &self.buffer[mid..end])))
+    }
+
+    /// Consume and return the pending entry, borrowing the block buffer.
+    pub(crate) fn next(&mut self) -> io::Result<Option<(&[u8], &[u8])>> {
+        if !self.fill()? { return Ok(None); }
+        let (start, mid, end) = self.current.take().unwrap();
+        Ok(Some((&self.buffer[start..mid], &self.buffer[mid..end])))
+    }
+}
+
+/// Owned (copying) view over a cursor, preserving `Tile::entries`'s
+/// `io::Result<(Vec<u8>, Vec<u8>)>` item type for callers that need owned keys.
+struct Entries<'a> {
+    cursor: TileCursor<'a>,
+    done: bool,
 }
 
 impl Iterator for Entries<'_> {
     type Item = io::Result<(Vec<u8>, Vec<u8>)>;
     fn next(&mut self) -> Option<Self::Item> {
         if self.done { return None; }
-        match self.advance() {
-            Ok(Some(entry)) => Some(Ok(entry)),
+        match self.cursor.next() {
+            Ok(Some((key, value))) => Some(Ok((key.to_vec(), value.to_vec()))),
             Ok(None) => { self.done = true; None }
             Err(e) => { self.done = true; Some(Err(e)) }
         }
@@ -416,6 +506,7 @@ impl Tile {
             return Err(invalid("tile directory missing for nonempty tile"));
         }
         let mut previous: Option<&[u8]> = None;
+        let mut previous_end: Option<u64> = None;
         let mut total: u64 = 0;
         for (index, fence) in fences.iter().enumerate() {
             if fence.offset < PAGE_SIZE as u64 || (fence.len as usize) < BLOCK_HEADER {
@@ -423,10 +514,16 @@ impl Tile {
             }
             let end = fence.offset.checked_add(fence.len as u64).ok_or_else(|| invalid("tile block overflow"))?;
             if end > dir_offset { return Err(invalid("tile block outside data region")); }
+            // Data blocks must be strictly increasing and non-overlapping: a
+            // directory whose offsets collide or overlap can alias blocks.
+            if previous_end.is_some_and(|prev_end| fence.offset < prev_end) {
+                return Err(invalid("tile data blocks overlap or are out of order"));
+            }
             if previous.is_some_and(|prev| prev >= fence.first_key.as_slice()) {
                 return Err(invalid("tile fence keys not strictly increasing"));
             }
             previous = Some(&fence.first_key);
+            previous_end = Some(end);
             // Block header consistency: the header's length, first key and entry
             // count must agree with the directory (data CRC is checked on read).
             let mut hdr = [0u8; BLOCK_HEADER];
@@ -452,7 +549,18 @@ impl Tile {
     pub(crate) fn digest(&self) -> &[u8; 32] { &self.digest }
     pub(crate) fn count(&self) -> u64 { self.count }
     pub(crate) fn entries(&self) -> impl Iterator<Item = io::Result<(Vec<u8>, Vec<u8>)>> + '_ {
-        Entries { tile: self, checked: false, block: 0, buffer: Vec::new(), pos: 0, left: 0, done: false }
+        Entries { cursor: TileCursor::new(self, None, 0), done: false }
+    }
+
+    /// Cursor starting at the block `dir_search` picks for `prefix`, yielding
+    /// only keys that begin with it. The prefix may be shorter than a stored key
+    /// (e.g. a unique-index prefix); the cursor stops at the first key past the
+    /// prefix range. Reading begins at the selected block, never block 0.
+    pub(crate) fn prefix_cursor(&self, prefix: &[u8]) -> io::Result<TileCursor<'_>> {
+        let block = dir_search(&self.fences, prefix);
+        let mut cursor = TileCursor::new(self, Some(prefix), block);
+        cursor.fill()?;
+        Ok(cursor)
     }
 
     /// Exact comparison against the WAL projection in the CSN range
@@ -644,6 +752,102 @@ mod tests {
         assert_eq!(key0_len, key1_len, "equal-length P keys make the swap clean");
         for i in 0..key0_len { bytes.swap(key0 + i, key1 + i); }
         // Repair the directory block CRC so only the ordering rule can reject it.
+        let crc = checksum(&bytes[dir_offset + 8..dir_offset + blen]);
+        bytes[dir_offset + 4..dir_offset + 8].copy_from_slice(&crc.to_le_bytes());
+        std::fs::write(&path, &bytes).unwrap();
+        assert_eq!(Tile::open(&path).err().unwrap().kind(), ErrorKind::InvalidData);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn prefix_cursor_seeks_the_prefix_range_and_stops() {
+        let mut mt = Memtable::new();
+        let mut expected = Vec::new();
+        for handle in 1..=600u64 {
+            let key = keys::unique_key(b"E", b"f", b"v", handle, 1).unwrap();
+            mt.apply(key.clone(), handle.to_be_bytes().to_vec());
+            expected.push((key, handle.to_be_bytes().to_vec()));
+        }
+        // A longer value whose key shares a byte prefix with "v" but not the
+        // length-delimited unique prefix; it must never be yielded.
+        mt.apply(keys::unique_key(b"E", b"f", b"vv", 99, 1).unwrap(), 99u64.to_be_bytes().to_vec());
+        let (path, tile) = write_tile("prefix.tile", 5, &mt);
+        assert!(tile.fences.len() >= 2, "the prefix range must span blocks: {}", tile.fences.len());
+
+        let prefix = keys::unique_prefix(b"E", b"f", b"v").unwrap();
+        assert!(prefix.len() < expected[0].0.len(), "prefix is shorter than a stored key");
+        let mut cursor = tile.prefix_cursor(&prefix).unwrap();
+        let mut got = Vec::new();
+        while let Some((key, value)) = cursor.next().unwrap() {
+            assert!(key.starts_with(&prefix), "only prefix-range keys are yielded");
+            got.push((key.to_vec(), value.to_vec()));
+        }
+        assert_eq!(got, expected, "the cursor yields exactly the strict-prefix range, in order");
+
+        // A value shared by no key yields nothing.
+        let missing = keys::unique_prefix(b"E", b"f", b"zzz").unwrap();
+        let mut cursor = tile.prefix_cursor(&missing).unwrap();
+        assert!(cursor.next().unwrap().is_none());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn reordered_but_crc_valid_data_block_fails_closed_when_read() {
+        let mut mt = Memtable::new();
+        put(&mut mt, 1, 1, b"v");
+        put(&mut mt, 2, 1, b"v");
+        put(&mut mt, 3, 1, b"v");
+        let (path, _) = write_tile("reorder-data.tile", 5, &mt);
+        let mut bytes = std::fs::read(&path).unwrap();
+        let start = PAGE_SIZE as usize;
+        let blen = u32::from_le_bytes(bytes[start..start + 4].try_into().unwrap()) as usize;
+        let first_key_len = u32::from_le_bytes(bytes[start + 8..start + 12].try_into().unwrap()) as usize;
+        let entry_count = u16::from_le_bytes(bytes[start + 12..start + 14].try_into().unwrap()) as usize;
+        assert_eq!(entry_count, 3);
+        let mut ranges = Vec::new();
+        let mut q = start + BLOCK_HEADER + first_key_len;
+        for _ in 0..entry_count {
+            let k = u32::from_le_bytes(bytes[q..q + 4].try_into().unwrap()) as usize;
+            let v = u32::from_le_bytes(bytes[q + 4..q + 8].try_into().unwrap()) as usize;
+            ranges.push((q, q + 8 + k + v));
+            q += 8 + k + v;
+        }
+        let (a0, a1) = ranges[0];
+        let (b0, b1) = ranges[1];
+        assert_eq!(a1 - a0, b1 - b0, "equal-length entries make the swap clean");
+        let first = bytes[a0..a1].to_vec();
+        let second = bytes[b0..b1].to_vec();
+        bytes[a0..a1].copy_from_slice(&second);
+        bytes[b0..b1].copy_from_slice(&first);
+        // Repair the block CRC so only the ordering rule can reject the tile.
+        let crc = checksum(&bytes[start + 8..start + blen]);
+        bytes[start + 4..start + 8].copy_from_slice(&crc.to_le_bytes());
+        std::fs::write(&path, &bytes).unwrap();
+        // Open validates headers and the directory but never entry order in data.
+        let tile = Tile::open(&path).unwrap();
+        let mut cursor = tile.entries();
+        assert!(cursor.next().unwrap().is_ok(), "the first stored entry still reads");
+        assert_eq!(cursor.next().unwrap().unwrap_err().kind(), ErrorKind::InvalidData,
+            "a reordered but CRC-valid entry stream is rejected");
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn overlapping_data_block_offsets_rejected_at_open() {
+        let mut mt = Memtable::new();
+        for handle in 1..=600 { put(&mut mt, handle, 1, b"v"); }
+        let (path, tile) = write_tile("overlap.tile", 5, &mt);
+        assert!(tile.fences.len() >= 2, "need two data blocks");
+        drop(tile);
+        let mut bytes = std::fs::read(&path).unwrap();
+        let dir_offset = u64::from_le_bytes(bytes[56..64].try_into().unwrap()) as usize;
+        let blen = u32::from_le_bytes(bytes[dir_offset..dir_offset + 4].try_into().unwrap()) as usize;
+        let key0_len = u32::from_le_bytes(bytes[dir_offset + DIR_HEADER..dir_offset + DIR_HEADER + 4].try_into().unwrap()) as usize;
+        let off0 = u64::from_le_bytes(bytes[dir_offset + DIR_HEADER + 4..dir_offset + DIR_HEADER + 12].try_into().unwrap());
+        let off1_field = dir_offset + DIR_HEADER + 16 + key0_len + 4;
+        // Strictly increasing (off0 + 1 > off0) but inside block 0's extent.
+        bytes[off1_field..off1_field + 8].copy_from_slice(&(off0 + 1).to_le_bytes());
+        // Repair the directory block CRC so only the overlap rule can reject it.
         let crc = checksum(&bytes[dir_offset + 8..dir_offset + blen]);
         bytes[dir_offset + 4..dir_offset + 8].copy_from_slice(&crc.to_le_bytes());
         std::fs::write(&path, &bytes).unwrap();
