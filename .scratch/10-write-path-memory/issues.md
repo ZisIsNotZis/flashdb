@@ -158,3 +158,31 @@ scale rather than the ~0.4:1 the old implementation produced.
 Reporting rules for the result: state data bytes on disk, process peak RSS, cgroup peak,
 the ratio of each, the window W, and the caveat that the ratio is a function of W (the
 working set is window-bounded, not data-bounded) rather than a constant of the design.
+
+## 10d interim result and why the run was stopped (2026-09-30)
+
+Interim numbers before stopping (window W = 64 MiB, `MemoryMax=1G` scope, 5000 docs/block):
+
+| docs | data on disk | process rss_peak | note |
+|---|---|---|---|
+| 500 k | 0.8 GB | 205 MB | retained WAL 48-65 MiB throughout |
+| 1.75 M | 2.4 GB | 218 MB | |
+| 3.5 M | 5.8 GB | 246 MB | |
+| 6.0 M | 13 GB (transient) | 274 MB | |
+
+So at ~6 GB of data the process peaks at ~274 MB, i.e. **data:RAM ≈ 22:1**, and RSS is
+essentially flat rather than tracking the data (the 205 → 274 MB drift is largely glibc arena
+retention from publish/compaction churn, which `write_memory`'s `malloc_trim` measurement
+shows is returned to the OS). The private 1 GB cgroup cap was never approached.
+
+The run was stopped deliberately, not because it failed: it was executing the pre-12a driver,
+so every few checkpoints it invoked full-dataset `compact()` (ticket 12) - cumulative
+throughput decayed 8.3k → ~1.7k docs/s as data grew, and the directory reached 13 GB for 6 GB
+of payload (transient duplication while a full rewrite is in flight). Its remaining value
+(multi-GB correctness verification via the verify/scanbench phases) will be obtained from a
+re-run on the bounded-compaction driver (12b), which should be both faster and representative.
+
+Caveats that must accompany any ratio quoted from this table: (a) the ratio is a function of
+the rotate/checkpoint window W, not a constant of the design (working set ≈ 2.3 x W); (b) the
+process view excludes page cache, which a `MemoryMax` cap does count - report the pair
+(rss_peak, scope memory.peak) whenever a cap is in play; (c) RSS includes allocator retention.
