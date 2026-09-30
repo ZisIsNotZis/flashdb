@@ -51,11 +51,23 @@ measurements (07/evidence/probe-cost.md, `b718fab`).
   `scan_merged` on cursor heads, `scan_all` as a documented read-only hook. Measured:
   **probe 65.6 ms → 14–32 µs** at a 22.4 MB tile (target ≤1 ms met, no longer linear);
   scan 323→324 MiB/s (allocation removal only ~4%). 113 Rust (+3, no test weakened).
-- **08c-fast-crc DISPATCHED** (worker `12ee7e0f`): shared `engine/src/crc.rs` with
-  SSE4.2 hardware CRC-32C + slice-by-16 fallback, equivalence-proved against the old
-  table implementation (incl. the 0xE3069283 vector and length sweep), rewiring
-  wal/manifest/tile. Targets: scan ≥700 MiB/s, CRC-only ≥4 GB/s, probe unchanged.
-  Rationale: an IO-dense engine must not be CPU-bound below device rate.
+- **08c-crc DONE** (`59861dd`, worker `12ee7e0f`). Shared `engine/src/crc.rs`: `crc32c` +
+  incremental `Crc32c` (raw state !0, inversion only in finish, so composition matches the
+  old tile code), SSE4.2 backend behind runtime detection, portable slice-by-16 fallback,
+  old byte-at-a-time table kept only as the test oracle; wal (pub re-export), manifest and
+  all 11 tile call sites rewired, duplicated tables deleted. Equivalence proved by 5 tests
+  (`0xE3069283`, every length 0..=1024 plus 4096/4097/65536/1 MiB, both backends called
+  directly, 1-byte-chunk update vs one-shot). Worker also verified on-disk bytes
+  independently: WAL/manifest/tile are sha256-identical at baseline `d641cca` and at this
+  revision. Measured: CRC-only 0.44 → 8.8-9.7 GB/s; sequential tile scan 324 → 1158-1570
+  MiB/s (page-cache warm, i.e. no longer CPU-bound below the 831 MiB/s device); probe
+  unchanged (5.6-17.4 µs). Rust 118 (+5).
+- **08d/08e/08f PENDING** the author D1–D5 decisions (09): bloom keyed by the net-affected
+  anchor set, publish verifying only new pages, then the data:RAM re-run.
+- **Batch review DISPATCHED** (reviewer `97c2923c`) over 08a+08b+08c as one subsystem,
+  with the parent-identified attack list (prefix-cursor false negatives, order-check
+  bypass, open-validation holes, CRC equivalence, scan_merged arbitration, floor-spanning
+  verification).
 
 ## Planned slices (each independently reviewable)
 
@@ -68,12 +80,12 @@ measurements (07/evidence/probe-cost.md, `b718fab`).
   allocating per entry; per-page CRC means a probe verifies only the page it read.
   Acceptance: sequential scan ≥ 400 MB/s on cached data, probe = directory binary
   search + one page read.
-- **08c — per-tile bloom over declared unique values**: probe answers "definitely
+- **08d — per-tile bloom over declared unique values**: probe answers "definitely
   absent" in RAM (no I/O) or "maybe" (one page read); bits/key a tunable with a
   documented RAM cost.
-- **08d — publish verifies only new pages** (whole-tile digest retained at open),
+- **08e — publish verifies only new pages** (whole-tile digest retained at open),
   then re-measure write amplification.
-- **08e — re-run the data:RAM experiment** (the 07 run) on the fixed engine.
+- **08f — re-run the data:RAM experiment** (the 07 run) on the fixed engine.
 
 ## Constraint strategy — corrected understanding (2026-09-30, parent + author)
 
@@ -119,5 +131,5 @@ What remains genuinely deferred/absent:
 Consequence for this ticket: post-state validation is the semantic core and needs no
 author decision. The probe set is the block's **net-affected key set**, which
 intra-block cancellation can shrink or empty (a swap needs no disk probe for values
-whose owners are all in the block). 08c bloom applies to that set: "no published owner"
+whose owners are all in the block). 08d bloom applies to that set: "no published owner"
 answers in RAM with zero I/O. 08a/08b are unaffected (pure implementation gaps).
