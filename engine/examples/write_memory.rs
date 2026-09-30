@@ -394,13 +394,20 @@ fn run_compaction(w_mb: u64, tiles: u64) -> io::Result<()> {
     e.compact()?;
     let elapsed = started.elapsed().as_secs_f64();
     let rss_post = rss_kb();
+    // Separate the live set from arena glibc has not returned: after a trim,
+    // what remains over baseline is resident state, not unavoidable glibc slack.
+    malloc_trim();
+    let rss_post_trim = rss_kb();
     let hwm = hwm_kb();
     let tile_bytes_after = ext_bytes(&dir, "tile")?;
     let delta = hwm.saturating_sub(base);
     emit(&format!(
         "mode=compaction window_mb={w_mb} tiles={tiles} tile_bytes_before={tile_bytes} tile_bytes_after={tile_bytes_after} \
-         wal_bytes={wal_bytes} ram_base_kb={base} ram_post_kb={rss_post} ram_hwm_kb={hwm} peak_delta_kb={delta} \
+         wal_bytes={wal_bytes} ram_base_kb={base} ram_post_kb={rss_post} ram_post_delta_kb={} \
+         ram_post_trim_kb={rss_post_trim} ram_post_trim_delta_kb={} ram_hwm_kb={hwm} peak_delta_kb={delta} \
          peak_over_tile_bytes={:.3} elapsed_s={elapsed:.3}",
+        rss_post.saturating_sub(base),
+        rss_post_trim.saturating_sub(base),
         delta as f64 * 1024.0 / tile_bytes.max(1) as f64,
     ));
     let _ = fs::remove_dir_all(&dir);

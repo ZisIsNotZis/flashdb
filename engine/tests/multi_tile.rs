@@ -374,6 +374,37 @@ fn tiles_and_compaction_keep_only_the_newest_version_per_logical_key() {
     assert_eq!(e.serving_memtable_entries(), 0, "merged tile verified against the reduced WAL projection at open");
 }
 
+#[test]
+fn compaction_streams_a_multi_block_merge_and_reopens() {
+    let files = Files::new();
+    let mut e = Engine::create(&files.wal).unwrap();
+    // Two tiles whose union spans many 4 KiB blocks, so the merge must stream a
+    // multi-block cursor per tile while an overlap key is rewritten in the
+    // second tile and reduced to its newest version by the merge.
+    let n = 3000u64;
+    let first: Vec<Op> = (1..=n).map(|h| doc(h, b"first")).collect();
+    e.commit_block(b"b1", &first).unwrap();
+    e.publish_tile(&files.dir.join("tile-1.tile"), 1).unwrap();
+    let mut second: Vec<Op> = (1..=n).map(|h| doc(h, b"second")).collect();
+    second.push(doc(1, b"final"));
+    e.commit_block(b"b2", &second).unwrap();
+    e.publish_tile(&files.dir.join("tile-2.tile"), 2).unwrap();
+    e.compact().unwrap();
+    // Exactly one newest version per logical key survives across both tiles.
+    assert!(tile_entry_count(&files.dir.join("compact-2.tile")) > 100,
+        "the merged tile spans many blocks");
+    assert_eq!(tile_entry_count(&files.dir.join("compact-2.tile")), n);
+    assert_eq!(e.get(b"E", 1).unwrap(), Some(b"final".to_vec()), "same-block rewrite wins");
+    assert_eq!(e.get(b"E", 2).unwrap(), Some(b"second".to_vec()));
+    assert_eq!(e.get(b"E", n).unwrap(), Some(b"second".to_vec()));
+    drop(e);
+    let e = Engine::open_discover(&files.dir).unwrap();
+    assert_eq!(e.get(b"E", 1).unwrap(), Some(b"final".to_vec()));
+    assert_eq!(e.get(b"E", 2).unwrap(), Some(b"second".to_vec()));
+    assert_eq!(e.get(b"E", n).unwrap(), Some(b"second".to_vec()));
+    assert_eq!(e.serving_memtable_entries(), 0, "the streamed merge verifies against the WAL at open");
+}
+
 fn tile_entry_count(path: &PathBuf) -> u64 {
     // FDBTILE2 superblock: magic(8) cutoff(8) wal-digest(32) entry-count(8)
     // dir-offset(8) dir-length(8) page-size(4) superblock-crc(4). Parse the

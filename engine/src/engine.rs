@@ -12,7 +12,7 @@
 //! [`Outcome::Conflict`] 由调用方重试。反向唯一（`reverse: "unique"`）的
 //! 强制执行本切片未实现，已记录在 ticket 04/03。
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -22,7 +22,7 @@ use sha2::{Digest, Sha256};
 use crate::keys::{self, check_name};
 use crate::manifest::{self, Checkpoint, Manifest, SegmentRef, TileRef};
 use crate::memtable::Memtable;
-use crate::tile::{Tile, TileCursor};
+use crate::tile::{Tile, TileCursor, TileWriter};
 use crate::wal::{self, Wal};
 
 const MAGIC: &[u8; 4] = b"FDB1";
@@ -615,34 +615,131 @@ impl Engine {
     /// `(segment start, cutoff]` range combined with the already-verified
     /// tile-carried prefix, before any caller may reference it. Each input tile
     /// was itself verified against its disjoint WAL range at open/publish, so
-    /// building from the WAL projection IS the multi-tile merge (same codec,
-    /// same key order, newest version per logical key, tombstones retained as
-    /// newest state) — and the verification is `publish`'s extended to the union.
+    /// merging the tiles with the retained WAL suffix and reducing to the newest
+    /// version per logical key IS the multi-tile merge (same codec, same key
+    /// order, tombstones retained as newest state).
+    ///
+    /// Nothing here materializes the union: the tiles are streamed by one
+    /// [`TileCursor`] each (borrowing a single 4 KiB block apiece) and only the
+    /// WAL suffix - already bounded by the rotation window - is copied into a
+    /// key-ordered map. [`Engine::stream_merged_reduction`] merges both sources
+    /// and pushes the reduced stream straight into the streaming writer, so peak
+    /// compaction RAM tracks the WAL window, not the total tile bytes.
     fn write_compacted_tile(&self, tile_path: &Path, cutoff: u64) -> io::Result<Tile> {
         let (records, _) = wal::replay(&self.wal_path)?;
         self.verify_wal_matches_state(&records)?;
         let digest = wal_digest(&records, cutoff, self.wal_floor())?;
-        let mut expected = Memtable::new();
-        // Segment mode: the retired prefix (0, segment start] survives only in
-        // the already-verified published tiles, so the union projection seeds
-        // from their exact entries before the suffix records are applied. In
-        // full mode the WAL alone already covers every tile range.
-        if self.segment.is_some() {
-            for t in &self.tiles {
-                for entry in t.tile.entries() {
-                    let (key, value) = entry?;
-                    expected.apply(key, value);
+        // Source (b): the retained WAL suffix at or below `cutoff`, key-ordered by
+        // construction. A later op overwrites an earlier one for the exact same
+        // key, matching `Memtable::apply`.
+        let mut wal_entries: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+        for payload in &records {
+            let (csn, _, ops) = decode_payload(payload)?;
+            if csn <= cutoff {
+                for op in &ops {
+                    let (key, value) = op_kv(op, csn);
+                    wal_entries.insert(key, value);
                 }
             }
         }
-        for payload in &records {
-            let (csn, _, ops) = decode_payload(payload)?;
-            if csn <= cutoff { for op in &ops { apply_op(&mut expected, op, csn); } }
-        }
-        let expected = newest_projection(&expected, 0, cutoff);
-        let tile = Tile::write(tile_path, cutoff, &digest, &expected)?;
-        tile.verify_projection(&expected, 0, cutoff)?;
+        // Source (a): every published tile, streamed. Merge + reduce runs
+        // straight into the encoder (one 4 KiB block buffered): no projection of
+        // the union ever exists.
+        let mut writer = TileWriter::new(tile_path, cutoff, &digest)?;
+        self.stream_merged_reduction(cutoff, &wal_entries, |key, value| writer.push(key, value))?;
+        let tile = writer.finish()?;
+        // Fail closed without a second materialization: re-run the identical merge
+        // and compare it 1:1, streaming, against the written tile.
+        self.verify_compacted_tile(&tile, &wal_entries, cutoff)?;
         Ok(tile)
+    }
+
+    /// K-way merge of every published tile (one [`TileCursor`] each) and the
+    /// key-ordered WAL suffix map, in ascending encoded-key order, reduced to the
+    /// newest version per logical key within `(0, cutoff]` - the same reduction
+    /// [`newest_projection`] performs. Keys within one logical key sort by CSN
+    /// descending, so the first entry of each logical-key group wins and the rest
+    /// are skipped; a tombstone (empty value) is itself the newest state. Only one
+    /// logical key is retained as state, so nothing here is proportional to the
+    /// tile bytes.
+    fn stream_merged_reduction(
+        &self,
+        cutoff: u64,
+        wal_entries: &BTreeMap<Vec<u8>, Vec<u8>>,
+        mut visit: impl FnMut(&[u8], &[u8]) -> io::Result<()>,
+    ) -> io::Result<()> {
+        let mut cursors: Vec<TileCursor<'_>> = Vec::with_capacity(self.tiles.len());
+        for t in &self.tiles {
+            // Empty prefix = the whole tile, still borrowed and block-streamed.
+            cursors.push(t.tile.prefix_cursor(b"")?);
+        }
+        let mut wal_iter = wal_entries.iter().peekable();
+        let mut disk_key: Vec<u8> = Vec::new();
+        let mut have_logical = false;
+        let mut last_logical: Vec<u8> = Vec::new();
+        loop {
+            let disk = smallest_disk_head(&mut cursors, &mut disk_key)?;
+            let use_wal = match (disk, wal_iter.peek()) {
+                (None, None) => break,
+                (None, Some(_)) => true,
+                (Some(_), None) => false,
+                // Equal keys are the same logical key+CSN; prefer the WAL, the
+                // recovery authority (a verified tile entry carries the same value).
+                (Some(_), Some((wk, _))) => wk.as_slice() <= disk_key.as_slice(),
+            };
+            let (key, value): (&[u8], &[u8]) = if use_wal {
+                let (k, v) = wal_iter.next().unwrap();
+                (k.as_slice(), v.as_slice())
+            } else {
+                let i = disk.unwrap();
+                match cursors[i].next()? {
+                    Some(entry) => entry,
+                    None => return Err(io::Error::new(io::ErrorKind::InvalidData, "tile cursor lost its head")),
+                }
+            };
+            let Some(csn) = keys::key_csn(key) else { continue };
+            if csn == 0 || csn > cutoff { continue; }
+            let logical = &key[..key.len() - 8];
+            if have_logical && last_logical.as_slice() == logical { continue; }
+            have_logical = true;
+            last_logical.clear();
+            last_logical.extend_from_slice(logical);
+            visit(key, value)?;
+        }
+        Ok(())
+    }
+
+    /// Stream the written tile against the merged reduction and require an exact
+    /// 1:1 match: every reduced entry must appear in key order with the same
+    /// value, and any extra tile entry is an error.
+    fn verify_compacted_tile(
+        &self,
+        tile: &Tile,
+        wal_entries: &BTreeMap<Vec<u8>, Vec<u8>>,
+        cutoff: u64,
+    ) -> io::Result<()> {
+        let mut actual = tile.entries();
+        let mut pending = actual.next();
+        let mut compare = |key: &[u8], value: &[u8]| -> io::Result<()> {
+            let Some(entry) = pending.take() else {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "compacted tile is missing an entry"));
+            };
+            let (akey, avalue) = entry?;
+            if akey.as_slice() != key {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "compacted tile entry key disagrees with the merged projection"));
+            }
+            if avalue.as_slice() != value {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "compacted tile entry value disagrees with the merged projection"));
+            }
+            pending = actual.next();
+            Ok(())
+        };
+        self.stream_merged_reduction(cutoff, wal_entries, &mut compare)?;
+        if let Some(entry) = pending {
+            entry?;
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "compacted tile contains an extra entry"));
+        }
+        Ok(())
     }
 
     /// Automatic checkpoint trigger. When the retained WAL's valid length
@@ -959,24 +1056,27 @@ fn op_handle(op: &Op) -> u64 {
 }
 
 fn apply_op(mt: &mut Memtable, op: &Op, csn: u64) {
+    let (key, value) = op_kv(op, csn);
+    mt.apply(key, value);
+}
+
+/// The encoded key/value an op applies at `csn` - the single spelling shared by
+/// [`apply_op`] and compaction's WAL-suffix map.
+fn op_kv(op: &Op, csn: u64) -> (Vec<u8>, Vec<u8>) {
     match op {
-        Op::PutDoc { entity, handle, doc } => {
-            mt.apply(keys::primary_key(entity, *handle, csn).unwrap(), doc.clone());
-        }
-        Op::DelDoc { entity, handle } => {
-            mt.apply(keys::primary_key(entity, *handle, csn).unwrap(), Vec::new());
-        }
+        Op::PutDoc { entity, handle, doc } => (keys::primary_key(entity, *handle, csn).unwrap(), doc.clone()),
+        Op::DelDoc { entity, handle } => (keys::primary_key(entity, *handle, csn).unwrap(), Vec::new()),
         Op::PutUnique { entity, field, value, handle } => {
-            mt.apply(keys::unique_key(entity, field, value, *handle, csn).unwrap(), handle.to_be_bytes().to_vec());
+            (keys::unique_key(entity, field, value, *handle, csn).unwrap(), handle.to_be_bytes().to_vec())
         }
         Op::DelUnique { entity, field, value, handle } => {
-            mt.apply(keys::unique_key(entity, field, value, *handle, csn).unwrap(), Vec::new());
+            (keys::unique_key(entity, field, value, *handle, csn).unwrap(), Vec::new())
         }
         Op::PutReverse { entity, field, target, source } => {
-            mt.apply(keys::reverse_key(entity, field, *target, *source, csn).unwrap(), vec![1]);
+            (keys::reverse_key(entity, field, *target, *source, csn).unwrap(), vec![1])
         }
         Op::DelReverse { entity, field, target, source } => {
-            mt.apply(keys::reverse_key(entity, field, *target, *source, csn).unwrap(), Vec::new());
+            (keys::reverse_key(entity, field, *target, *source, csn).unwrap(), Vec::new())
         }
     }
 }
