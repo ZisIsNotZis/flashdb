@@ -90,3 +90,19 @@ be reported separately.
 A scaled run at ≥ 10:1 data:RAM completes under a cgroup cap with peak process RSS
 reported, and the reported RSS is consistent with the stated per-window budget (with the
 multiplier documented, not asserted).
+
+## Slice log
+
+- **10a DONE** (`34d17a9`, worker `c79ec36d`): measurements above. Corrected this ticket's own
+  numbers (publish+rotate = 5.6-6.4×W, not 8-10×; the plateau is compaction at 3.28× tile
+  bytes and stays resident). Levers ranked by measured bytes.
+- **10b = streaming `TileWriter`** (prerequisite for streaming compaction): first attempt
+  (worker `0ac81316`) produced **zero tool calls in 25 minutes** — the events log is a chain
+  of `auto_retry_start`, i.e. a provider/model failure, not a task failure; nothing to
+  recover. Re-dispatched as `f5bc2afe` with `github-copilot/gpt-5.4` and a narrower scope
+  (byte-identity proof; RSS measurement dropped). Acceptance: files produced through the
+  streaming API must be byte-identical to `Tile::write` output.
+- **10c (next, after 10b)**: switch `write_verified_tile` and `write_compacted_tile` to the
+  streaming writer with a bounded merge, i.e. no full materialization: target compaction
+  peak ≤ ~1.5× tile bytes and publish peak ≤ ~2×W, then re-measure with `write_memory`'s
+  protocol and re-run the scaled experiment.
