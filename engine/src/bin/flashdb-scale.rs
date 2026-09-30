@@ -67,8 +67,18 @@ const ROTATE_BYTES: u64 = 64 << 20;
 /// `maybe_compact` to respect, so one merge is meant to rewrite only the oldest
 /// run under that cap rather than the whole dataset. The `seed` accounting is
 /// the check on that intent, not an assumption of it.
+/// Merge budget in rotation windows. Overridable with `FLASHDB_COMPACT_WINDOWS` so a
+/// budget sweep needs no rebuild; the default is the shipped policy.
 const COMPACT_MERGE_WINDOWS: u64 = 8;
-const COMPACT_MERGE_BUDGET: u64 = COMPACT_MERGE_WINDOWS * ROTATE_BYTES;
+
+fn compact_merge_budget() -> u64 {
+    std::env::var("FLASHDB_COMPACT_WINDOWS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|v| *v >= 1)
+        .unwrap_or(COMPACT_MERGE_WINDOWS)
+        * ROTATE_BYTES
+}
 /// unique_lookup probes per entity in `verify`. Deliberately small: each probe
 /// is a full prefix scan over tiles + memtable (O(data)).
 const PROBES_PER_ENTITY: u64 = 20;
@@ -331,7 +341,7 @@ fn cmd_seed(
         // memtable). All three are per-block calls, each a no-op below threshold.
         if e.maybe_checkpoint(CHECKPOINT_BYTES)? {
             count_published_tiles(dir, &mut seen_publish_tiles, &mut tile_bytes_publish)?;
-            if let Some(merged) = e.maybe_compact(COMPACT_MERGE_BUDGET, MAX_ACTIVE_TILES)? {
+            if let Some(merged) = e.maybe_compact(compact_merge_budget(), MAX_ACTIVE_TILES)? {
                 compactions += 1;
                 tile_bytes_compact += merged;
             }
