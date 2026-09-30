@@ -138,3 +138,23 @@ Gate for every slice from now on: (1) `cargo test --workspace --offline` with th
 `test result:` lines reported verbatim, **and** (2) `cargo build --workspace --offline`
 reporting **zero warnings** (or an explicit statement of any that remain and why they are
 acceptable), plus (3) `git diff --check`.
+
+## 10d — scaled re-run in progress (2026-09-30)
+
+Parameters: 10,000,000 docs x 1 KiB (~10.4 GB of data), 5000 docs/block,
+rotate/checkpoint window 64 MiB, `MemoryMax=1G` systemd scope, phases seed →
+verify → scanbench(2 passes). Purpose: produce the **data:RAM ratio** with the memory
+discipline now in place, reported as a pair (process `rss_peak` vs the scope's
+`memory.peak`, since the cap counts page cache).
+
+Early progress (first minute): 500 k docs, `rss_kb=205,040`, retained WAL bounded at
+48-60 MiB. Compare with the pre-fix run, which stalled at 200 k docs with RSS climbing
+to 600 MB and was then SIGKILLed.
+
+Expected on completion: RSS roughly `2.3 x W` (~150-210 MB) plus the sparse directory
+index (0.20 MiB per GiB of tiles, ticket 11), i.e. data:RAM well above 20:1 at this
+scale rather than the ~0.4:1 the old implementation produced.
+
+Reporting rules for the result: state data bytes on disk, process peak RSS, cgroup peak,
+the ratio of each, the window W, and the caveat that the ratio is a function of W (the
+working set is window-bounded, not data-bounded) rather than a constant of the design.
