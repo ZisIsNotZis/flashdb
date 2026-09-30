@@ -290,3 +290,23 @@ Consequences to keep in mind:
   manifests remain the way to buy more tier headroom.
 - Memory is unaffected: rss_peak 220-232 MB at 5.16 GB of payload across all shapes, i.e.
   data:RAM ~= 22:1 holds.
+
+## Budget sweep under BudgetPrefix: there is a real optimum (2026-09-30)
+
+2 M docs x 1 KiB, shape budget_prefix, deterministic metrics only:
+
+| budget (windows / bytes) | write_amp | compactions | compaction output |
+|---|---|---|---|
+| 2 / 128 MiB | 3.827 | 19 | 3,491,862,107 |
+| **8 / 512 MiB** | **2.998** | **4** | **1,782,336,058** |
+| 32 / 2 GiB | 3.394 | 2 | 2,599,539,326 |
+
+Both ends are worse, for opposite reasons: a small budget cannot absorb a tier's worth of tiles,
+so the policy degenerates back toward pairwise merges (matching the CheapestPair numbers), while
+a budget far larger than the tier structure lets one merge swallow nearly the whole active list -
+which is the full-dataset rewrite this ticket exists to remove. The 512 MiB default happens to sit
+at the optimum at this scale and cap (12 tiles).
+
+Open follow-ups (recorded, not scheduled): the optimum is a function of data size and the tile
+cap, so a future policy could derive the budget from the tile-size distribution instead of fixing
+it - and the cap (multi-page manifests) is what limits how good any budget can be.
