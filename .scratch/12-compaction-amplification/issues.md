@@ -119,3 +119,42 @@ cheapest run chosen, fallback when everything is oversized).
 at 12 tiles each unique op pays ~12 indexed seeks + block reads. The measured justification
 for the planned bloom slice (08d) is exactly this: a per-tile bloom answers "no published
 owner" in RAM for the append-mostly case, turning that constant into ~12 hash probes.
+
+## 12c result: cost-based run selection works, and the bottleneck moved
+
+Same driver, same machine, 1 KiB docs, budget 512 MiB, cap 12:
+
+| docs | payload | 12b write_amp | 12c write_amp | 12c compaction output |
+|---|---|---|---|---|
+| 2.0 M | 2.06 GB | 8.92x | 3.82x | 3.48 GB |
+| 2.25 M | 2.32 GB | - | 3.99x | 4.30 GB |
+| 3.75 M | 3.87 GB | - | 5.17x | 11.71 GB |
+
+So 12c removed the pathological "giant + window" rewrite (8.92x -> 3.99x at 2 M docs, a 3.3x
+reduction in total bytes written) and the remaining growth is the expected tiered behaviour:
+each byte is rewritten ~log2(data / budget) times, i.e. ~3 at 3.9 GB with a 512 MiB budget.
+The earlier "<= 4x flat" target was optimistic; the honest claim is O(log N) rewrites, and the
+absolute number should be quoted together with the budget and the data size.
+
+**The bottleneck has moved to the probe path.** At 3.75 M docs the interval rate is ~2.4 k
+docs/s for ~5 MB of payload per commit, i.e. ~2 s per block. Decomposing one 5000-doc block
+(all numbers page-cache warm):
+- ~5000 distinct unique values -> ~5000 `scan_merged` calls, each opening one clipped cursor
+  per active tile (12): ~60 k cursor constructions, each allocating a 4 KiB block buffer
+  (~245 MB of allocation churn per block) plus ~60 k directory+data block reads;
+- WAL append + fsync for 5 MB;
+- amortized publish (every ~64 MiB of WAL): WAL replay + map + tile write;
+- amortized compaction: ~3-5x the publish bytes.
+
+The probe terms dominate. Two cheap fixes, in order of cost:
+1. **Per-tile key-range fast reject (no format change).** Cache each tile's first and last key
+   in RAM (bounded by the tile count, not by data) at open, and skip a tile for a prefix
+   outside that range without creating a cursor at all. For append-mostly keys (monotonic
+   order numbers) this rejects nearly every tile instantly.
+2. **Per-tile bloom (format bump).** For prefixes that fall inside the range but are absent,
+   a bloom answers "no key with this prefix" in RAM. This is the measured justification
+   recorded under 12b.
+
+Both are read-path changes and none of them need the author's D1-D5 decision, which only
+affects how the *partial-unique* predicate is resolved (outside the filter, by row
+materialization).
