@@ -158,3 +158,21 @@ The probe terms dominate. Two cheap fixes, in order of cost:
 Both are read-path changes and none of them need the author's D1-D5 decision, which only
 affects how the *partial-unique* predicate is resolved (outside the filter, by row
 materialization).
+
+## End-to-end 5 GB run on the 12c driver (all phases OK)
+
+5,000,000 docs x 1 KiB, budget 512 MiB, cap 12, `MemoryMax=1G` scope:
+
+| phase | result |
+|---|---|
+| seed | 5.16 GB payload in 1545 s, cumulative 3238 docs/s, 65 compactions, **write_amp 5.87x** |
+| memory | process `rss_peak` 215 MB -> **data:RAM ~= 24:1**; scope `memory.peak` = 1,073,741,824 B (exactly the cap, i.e. the cap was consumed by reclaimable page cache; the process peaked far below it and the run completed normally) |
+| verify | 34 s, docsA 2.5 M + docsB 2.5 M, 40 unique probes + 6 full scans, rss 151 MB |
+| scanbench | 5.12 GB in 8.07 s = **605 MiB/s** on one pass (device sequential reference: 831 MiB/s) |
+
+write_amp 5.87 matches the tiered model (log2(5.16 GB / 512 MiB) ~= 3.3 compaction rewrites
+plus publish ~1.1 and WAL ~1.05), which is the honest claim to make: O(log N) rewrites, with
+the absolute number quoted together with budget and data size.
+
+Remaining known cost: the probe path (see above). 3238 docs/s cumulative is CPU-bound on
+per-unique-op probing across up to 12 tiles, not on I/O, disk, or memory.
