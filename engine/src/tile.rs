@@ -232,6 +232,14 @@ impl<'a> TileCursor<'a> {
         if crc32c(&self.buffer[8..]) != block_crc { return Err(invalid("tile block checksum")); }
         let first_key_len = u32::from_le_bytes(self.buffer[8..12].try_into().unwrap()) as usize;
         if BLOCK_HEADER + first_key_len > blen { return Err(invalid("tile block first key out of bounds")); }
+        // Re-bind the block to its fence on every load. Open verified this once,
+        // but the fence is cached in RAM: a CRC-consistent rewrite of the file
+        // could otherwise serve a block whose first key disagrees with the fence
+        // and, because the order check only sees *yielded* keys, a prefix cursor
+        // could stop early and silently drop matches.
+        if self.buffer[BLOCK_HEADER..BLOCK_HEADER + first_key_len] != *self.tile.fences[self.block].first_key {
+            return Err(invalid("tile block first key disagrees with its fence"));
+        }
         self.pos = BLOCK_HEADER + first_key_len;
         self.left = u16::from_le_bytes(self.buffer[12..14].try_into().unwrap());
         Ok(())

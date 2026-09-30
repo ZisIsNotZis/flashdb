@@ -137,3 +137,16 @@ to widen all three to u32 LE while keeping `MAX_KEY = 1<<24` and
 `MAX_VALUE = 1<<26` enforced with `InvalidData` (no behavior regression).
 `entry_count` stays u16. The writer additionally checks that a fully encoded
 block length still fits the u32 `block_len` field and fails closed otherwise.
+
+## Trust boundary: below-floor entries in a floor-spanning tile
+
+A compacted tile may span the rotation floor: it holds entries at or below
+`segment.start_csn` that came from tiles whose WAL prefix has been retired. Those entries
+were verified against the union projection when compaction *published* the tile, and they
+can never be re-derived afterwards (the retired WAL is gone), so `verify_projection`
+skips everything with `csn <= lower` and `open_impl` skips tiles whose cutoff is at or
+below the floor. Consequence, stated plainly: **below-floor content of a floor-spanning
+tile is trusted after publication and is not re-verified on reopen.** Entries above the
+floor are compared 1:1 and extra/missing/duplicate entries there fail closed. Anything
+that changes below-floor bytes on disk after publication is outside the corruption model
+the reopen verification covers (it is still covered by the per-block CRC on read).
