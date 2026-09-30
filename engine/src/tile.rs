@@ -12,7 +12,7 @@
 use std::fs::{File, OpenOptions};
 use std::io::{self, ErrorKind, Seek, SeekFrom, Write};
 use std::os::unix::fs::FileExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::crc::crc32c;
 use crate::keys;
@@ -347,63 +347,108 @@ impl Iterator for Entries<'_> {
     }
 }
 
-impl Tile {
-    pub(crate) fn write(path: &Path, cutoff: u64, digest: &[u8; 32], mt: &Memtable) -> io::Result<Self> {
-        // create_new never replaces a verified tile. A failed/crashed build leaves a partial
-        // candidate, but cannot change the Engine's serving state; caller may remove it explicitly.
-        let mut f = OpenOptions::new().write(true).create_new(true).open(path)?;
-        // Reserve the superblock page; the real superblock is written last, once
-        // the directory offset/length are known. This puts the first data block
-        // on the 4096-byte boundary.
-        f.write_all(&[0u8; PAGE_SIZE as usize])?;
-        let mut offset = PAGE_SIZE as u64;
-        let mut count = 0u64;
-        let mut fences: Vec<Fence> = Vec::new();
-        let mut first_key: Vec<u8> = Vec::new();
-        let mut entries: Vec<u8> = Vec::new();
-        let mut block_entries: u16 = 0;
-        for (key, value) in mt.entries() {
-            if keys::key_csn(key).is_none_or(|csn| csn > cutoff) { continue; }
-            if !valid_key(key) || key.len() > MAX_KEY || value.len() > MAX_VALUE {
-                return Err(invalid("unsupported tile entry; memtable unchanged"));
-            }
-            let entry_size = 8u64 + key.len() as u64 + value.len() as u64;
-            if entry_size > MAX_ENTRY as u64 { return Err(invalid("tile entry size overflow")); }
-            // Whole entries only: start a new block when the next one would not fit.
-            if !entries.is_empty() && entries.len() as u64 + entry_size > BLOCK_TARGET as u64 {
-                let block = encode_block(&first_key, &entries, block_entries)?;
-                fences.push(Fence { first_key: std::mem::take(&mut first_key), offset, len: block.len() as u32 });
-                f.write_all(&block)?;
-                offset = offset.checked_add(block.len() as u64).ok_or_else(|| invalid("tile offset overflow"))?;
-                entries.clear();
-                block_entries = 0;
-            }
-            if block_entries == u16::MAX { return Err(invalid("tile block entry count overflow")); }
-            if block_entries == 0 { first_key = key.to_vec(); }
-            entries.extend_from_slice(&(key.len() as u32).to_le_bytes());
-            entries.extend_from_slice(&(value.len() as u32).to_le_bytes());
-            entries.extend_from_slice(key);
-            entries.extend_from_slice(value);
-            block_entries += 1;
-            count = count.checked_add(1).ok_or_else(|| invalid("tile count overflow"))?;
+/// Streaming FDBTILE2 encoder: buffers only the in-progress block, so a tile can be
+/// produced from a key-ordered iterator without materializing its entries. `push`
+/// requires strictly increasing keys (the memtable used to provide that ordering
+/// implicitly); `finish` writes the directory, the trailer and - last, so a torn file
+/// cannot have a valid magic - the superblock, then syncs and reopens for the same
+/// self-check `Tile::write` performs. `Tile::write` is implemented on top of this so
+/// there is exactly one encoder.
+pub(crate) struct TileWriter {
+    file: File,
+    path: PathBuf,
+    cutoff: u64,
+    digest: [u8; 32],
+    offset: u64,
+    count: u64,
+    fences: Vec<Fence>,
+    first_key: Vec<u8>,
+    entries: Vec<u8>,
+    block_entries: u16,
+    last_key: Vec<u8>,
+    started: bool,
+    finished: bool,
+}
+
+impl TileWriter {
+    /// `create_new` never replaces an existing tile. A failed or crashed build leaves a
+    /// partial candidate that cannot change the engine's serving state; the caller may
+    /// remove it explicitly.
+    pub(crate) fn new(path: &Path, cutoff: u64, digest: &[u8; 32]) -> io::Result<Self> {
+        let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
+        // Reserve the superblock page; the real superblock is written last, once the
+        // directory offset/length are known. This puts the first data block on the
+        // 4096-byte boundary.
+        file.write_all(&[0u8; PAGE_SIZE as usize])?;
+        Ok(Self {
+            file,
+            path: path.to_path_buf(),
+            cutoff,
+            digest: *digest,
+            offset: PAGE_SIZE as u64,
+            count: 0,
+            fences: Vec::new(),
+            first_key: Vec::new(),
+            entries: Vec::new(),
+            block_entries: 0,
+            last_key: Vec::new(),
+            started: false,
+            finished: false,
+        })
+    }
+
+    /// Append one entry. Keys must be strictly increasing; anything a `Tile::write`
+    /// of the same sequence would reject is rejected here with the same error.
+    pub(crate) fn push(&mut self, key: &[u8], value: &[u8]) -> io::Result<()> {
+        if self.finished { return Err(invalid("tile writer already finished")); }
+        if !valid_key(key) || key.len() > MAX_KEY || value.len() > MAX_VALUE {
+            return Err(invalid("unsupported tile entry; memtable unchanged"));
         }
-        if !entries.is_empty() {
-            let block = encode_block(&first_key, &entries, block_entries)?;
-            fences.push(Fence { first_key: std::mem::take(&mut first_key), offset, len: block.len() as u32 });
-            f.write_all(&block)?;
-            offset = offset.checked_add(block.len() as u64).ok_or_else(|| invalid("tile offset overflow"))?;
-            entries.clear();
+        if self.started && key <= self.last_key.as_slice() {
+            return Err(invalid("tile keys must be strictly increasing"));
         }
-        // Directory: one fence record per data block, chunked into CRC-protected blocks.
-        let dir_offset = offset;
+        let entry_size = 8u64 + key.len() as u64 + value.len() as u64;
+        if entry_size > MAX_ENTRY as u64 { return Err(invalid("tile entry size overflow")); }
+        // Whole entries only: start a new block when the next one would not fit.
+        if !self.entries.is_empty() && self.entries.len() as u64 + entry_size > BLOCK_TARGET as u64 {
+            self.flush_block()?;
+        }
+        if self.block_entries == u16::MAX { return Err(invalid("tile block entry count overflow")); }
+        if self.block_entries == 0 { self.first_key = key.to_vec(); }
+        self.entries.extend_from_slice(&(key.len() as u32).to_le_bytes());
+        self.entries.extend_from_slice(&(value.len() as u32).to_le_bytes());
+        self.entries.extend_from_slice(key);
+        self.entries.extend_from_slice(value);
+        self.block_entries += 1;
+        self.count = self.count.checked_add(1).ok_or_else(|| invalid("tile count overflow"))?;
+        self.last_key.clear();
+        self.last_key.extend_from_slice(key);
+        self.started = true;
+        Ok(())
+    }
+
+    fn flush_block(&mut self) -> io::Result<()> {
+        if self.entries.is_empty() { return Ok(()); }
+        let block = encode_block(&self.first_key, &self.entries, self.block_entries)?;
+        self.fences.push(Fence { first_key: std::mem::take(&mut self.first_key), offset: self.offset, len: block.len() as u32 });
+        self.file.write_all(&block)?;
+        self.offset = self.offset.checked_add(block.len() as u64).ok_or_else(|| invalid("tile offset overflow"))?;
+        self.entries.clear();
+        self.block_entries = 0;
+        Ok(())
+    }
+
+    /// Directory: one fence record per data block, chunked into CRC-protected blocks.
+    fn write_directory(&mut self) -> io::Result<(u64, u64)> {
+        let dir_offset = self.offset;
         let mut dir_len = 0u64;
         let mut records: Vec<u8> = Vec::new();
         let mut rec_count: u16 = 0;
-        for fence in &fences {
+        for fence in &self.fences {
             let rec_len = 16usize + fence.first_key.len();
             if !records.is_empty() && DIR_HEADER + records.len() + rec_len > BLOCK_TARGET {
                 let block = encode_dir_block(&records, rec_count)?;
-                f.write_all(&block)?;
+                self.file.write_all(&block)?;
                 dir_len = dir_len.checked_add(block.len() as u64).ok_or_else(|| invalid("tile directory size overflow"))?;
                 records.clear();
                 rec_count = 0;
@@ -417,19 +462,37 @@ impl Tile {
         }
         if !records.is_empty() {
             let block = encode_dir_block(&records, rec_count)?;
-            f.write_all(&block)?;
+            self.file.write_all(&block)?;
             dir_len = dir_len.checked_add(block.len() as u64).ok_or_else(|| invalid("tile directory size overflow"))?;
         }
-        f.write_all(&trailer_bytes(dir_offset, dir_len))?;
-        f.seek(SeekFrom::Start(0))?;
-        f.write_all(&superblock_bytes(cutoff, digest, count, dir_offset, dir_len))?;
-        f.sync_data()?; // No parent-directory durability claim.
-        drop(f);
-        let tile = Self::open(path)?;
-        if tile.cutoff != cutoff || tile.digest != *digest || tile.count() != count {
+        Ok((dir_len, dir_offset))
+    }
+
+    pub(crate) fn finish(mut self) -> io::Result<Tile> {
+        if self.finished { return Err(invalid("tile writer already finished")); }
+        self.finished = true;
+        self.flush_block()?;
+        let (dir_len, dir_offset) = self.write_directory()?;
+        self.file.write_all(&trailer_bytes(dir_offset, dir_len))?;
+        self.file.seek(SeekFrom::Start(0))?;
+        self.file.write_all(&superblock_bytes(self.cutoff, &self.digest, self.count, dir_offset, dir_len))?;
+        self.file.sync_data()?; // No parent-directory durability claim.
+        let tile = Tile::open(&self.path)?;
+        if tile.cutoff != self.cutoff || tile.digest != self.digest || tile.count() != self.count {
             return Err(invalid("tile verification mismatch"));
         }
         Ok(tile)
+    }
+}
+
+impl Tile {
+    pub(crate) fn write(path: &Path, cutoff: u64, digest: &[u8; 32], mt: &Memtable) -> io::Result<Self> {
+        let mut writer = TileWriter::new(path, cutoff, digest)?;
+        for (key, value) in mt.entries() {
+            if keys::key_csn(key).is_none_or(|csn| csn > cutoff) { continue; }
+            writer.push(key, value)?;
+        }
+        writer.finish()
     }
 
     pub(crate) fn open(path: &Path) -> io::Result<Self> {
@@ -845,5 +908,81 @@ mod tests {
         std::fs::write(&path, &bytes).unwrap();
         assert_eq!(Tile::open(&path).err().unwrap().kind(), ErrorKind::InvalidData);
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn streaming_writer_matches_memtable_write_byte_for_byte() {
+        let mut mt = Memtable::new();
+        for handle in 1..=3000u64 { put(&mut mt, handle, 1, &vec![b'v'; 300]); }
+        let (path_mt, tile_mt) = write_tile("writer-identical-mt", 1, &mt);
+        let path_stream = tmp("writer-identical-stream");
+        let mut w = TileWriter::new(&path_stream, 1, &[9u8; 32]).unwrap();
+        for (key, value) in mt.entries() { w.push(key, value).unwrap(); }
+        let tile_stream = w.finish().unwrap();
+        assert_eq!(tile_mt.count(), 3000);
+        assert_eq!(tile_stream.count(), 3000);
+        assert!(tile_mt.fences.len() > 1, "multi-block tile");
+        let a = std::fs::read(&path_mt).unwrap();
+        let b = std::fs::read(&path_stream).unwrap();
+        assert_eq!(a.len(), b.len(), "file sizes must match");
+        assert_eq!(a, b, "streaming writer must be byte-identical to Tile::write");
+        let _ = std::fs::remove_file(&path_mt);
+        let _ = std::fs::remove_file(&path_stream);
+    }
+
+    #[test]
+    fn streaming_writer_handles_empty_and_exact_block_fill() {
+        let empty = Memtable::new();
+        let (path_mt, tile_mt) = write_tile("writer-empty-mt", 0, &empty);
+        let path_stream = tmp("writer-empty-stream");
+        let tile_stream = TileWriter::new(&path_stream, 0, &[9u8; 32]).unwrap().finish().unwrap();
+        assert_eq!(tile_mt.count(), 0);
+        assert_eq!(tile_stream.count(), 0);
+        assert_eq!(std::fs::read(&path_mt).unwrap(), std::fs::read(&path_stream).unwrap());
+        let _ = std::fs::remove_file(&path_mt);
+        let _ = std::fs::remove_file(&path_stream);
+
+        // 14 (block header) + 18 (first key) + 8 * (8 + 18 + 482) = exactly 4096, so the
+        // ninth entry must open a second block.
+        let value = vec![b'x'; 482];
+        let mut mt = Memtable::new();
+        for handle in 1..=9u64 { put(&mut mt, handle, 1, &value); }
+        let (path_mt, tile_mt) = write_tile("writer-exact-mt", 1, &mt);
+        assert_eq!(tile_mt.fences.len(), 2, "exact fill then spill");
+        let path_stream = tmp("writer-exact-stream");
+        let mut w = TileWriter::new(&path_stream, 1, &[9u8; 32]).unwrap();
+        for (key, val) in mt.entries() { w.push(key, val).unwrap(); }
+        let tile_stream = w.finish().unwrap();
+        assert_eq!(tile_stream.count(), 9);
+        assert_eq!(std::fs::read(&path_mt).unwrap(), std::fs::read(&path_stream).unwrap());
+        let _ = std::fs::remove_file(&path_mt);
+        let _ = std::fs::remove_file(&path_stream);
+    }
+
+    #[test]
+    fn streaming_writer_gives_an_oversized_entry_its_own_block() {
+        let mut mt = Memtable::new();
+        put(&mut mt, 1, 1, &vec![b'a'; 100]);
+        put(&mut mt, 2, 1, &vec![b'b'; 5000]);
+        put(&mut mt, 3, 1, &vec![b'c'; 100]);
+        let (path_mt, tile_mt) = write_tile("writer-big-mt", 1, &mt);
+        assert_eq!(tile_mt.fences.len(), 3, "oversized entry alone in its block");
+        let path_stream = tmp("writer-big-stream");
+        let mut w = TileWriter::new(&path_stream, 1, &[9u8; 32]).unwrap();
+        for (key, val) in mt.entries() { w.push(key, val).unwrap(); }
+        assert_eq!(w.finish().unwrap().count(), 3);
+        assert_eq!(std::fs::read(&path_mt).unwrap(), std::fs::read(&path_stream).unwrap());
+        let _ = std::fs::remove_file(&path_mt);
+        let _ = std::fs::remove_file(&path_stream);
+    }
+
+    #[test]
+    fn streaming_writer_rejects_out_of_order_and_duplicate_keys() {
+        let path = tmp("writer-order");
+        let mut w = TileWriter::new(&path, 1, &[9u8; 32]).unwrap();
+        w.push(&pkey(2, 1), b"x").unwrap();
+        assert_eq!(w.push(&pkey(1, 1), b"y").unwrap_err().kind(), ErrorKind::InvalidData);
+        assert_eq!(w.push(&pkey(2, 1), b"z").unwrap_err().kind(), ErrorKind::InvalidData);
+        let _ = std::fs::remove_file(&path);
     }
 }
