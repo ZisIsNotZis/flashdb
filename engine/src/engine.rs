@@ -27,6 +27,12 @@ use crate::wal::{self, Wal};
 
 const MAGIC: &[u8; 4] = b"FDB1";
 
+/// The largest active-tile list the manifest can hold. The real limit is the
+/// 4092-byte manifest payload ([`crate::manifest::MAX_TILES`]), not a policy
+/// knob; this exposes that cap so callers size their compaction trigger from
+/// the engine's real bound instead of a hard-coded count.
+pub const MAX_ACTIVE_TILES: usize = manifest::MAX_TILES;
+
 /// 一个块内的键空间变更。键的 CSN 部分由引擎在发布时填充。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Op {

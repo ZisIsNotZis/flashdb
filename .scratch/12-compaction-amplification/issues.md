@@ -83,3 +83,39 @@ Consequences to handle in the same design:
 This is NOT a memory or correctness defect: every compaction output is verified and the
 durable states are consistent. It is a cost/endurance defect, and it is the write-side
 analogue of the read-side O(n²) found earlier in ticket 07.
+
+## 12a/12b outcome: the policy still rewrites a growing tile (measured)
+
+12a added `maybe_compact(budget, cap)` and `publish_replacing`; 12b wired the driver to it
+(budget = 8 x 64 MiB = 512 MiB, cap = `MAX_ACTIVE_TILES` = 12) and added cumulative
+accounting. The 2 M-doc x 1 KiB demo finished in 471.9 s and **falsified the fix**:
+
+| docs | cumulative docs/s | compactions | write_amp |
+|---|---|---|---|
+| 200 k | 19,976 | 0 | 2.13 |
+| 1 M | 7,357 | 1 | 2.63 |
+| 2 M | 4,238 | 14 | **8.92** |
+
+`payload_bytes` 2.06 GB, `wal_written_bytes` 2.17 GB, `tile_bytes_publish` 2.22 GB,
+`tile_bytes_compact` **14.0 GB**. The reason is selection, not the manifest operation:
+`select_run` always starts at the OLDEST tile, so once the first merge output exceeds the
+512 MiB budget, every later merge is "the one giant tile + one window", and the giant keeps
+growing - still O(data^2/window). Merge outputs grew 518 MB -> 593 MB -> ~740 MB -> ~960 MB
+-> ~1.2 GB -> ~1.4 GB across 14 compactions.
+
+**12c fix (policy only, no format/manifest change): select by size, never lead with a giant.**
+Choose the contiguous run of length >= 2 that minimises combined size, ignoring tiles
+already larger than the budget wherever a cheaper run exists (an oversized tile is a finished
+tier, not a merge input); fall back to the two smallest adjacent tiles only when no eligible
+run exists. That bounds per-merge work by the budget, and makes each byte's rewrite count
+O(log N) instead of O(N/window). Acceptance: flat `write_amp` at ~5 GB (target <= 4x) and no
+throughput decay in a 5 GB seed run; plus unit tests for the selection rule (giant skipped,
+cheapest run chosen, fallback when everything is oversized).
+
+## 12b also exposed a second, separate cost
+
+`commit_block` probes uniqueness with `scan_merged` per unique op across EVERY active tile
+(up to 12). That is bounded by the tile count, not by data size, but it is a large constant:
+at 12 tiles each unique op pays ~12 indexed seeks + block reads. The measured justification
+for the planned bloom slice (08d) is exactly this: a per-tile bloom answers "no published
+owner" in RAM for the append-mostly case, turning that constant into ~12 hash probes.

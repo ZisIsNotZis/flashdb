@@ -20,17 +20,40 @@
 //! `rotate_wal(64 MiB)`. `rotate_wal` only fires once every committed block is
 //! published as a tile (newest tile cutoff == csn, empty memtable) AND the
 //! active WAL file exceeds the threshold — exactly what a just-fired checkpoint
-//! provides. After COMPACT_EVERY_CHECKPOINTS published tiles the list is merged
-//! with `Engine::compact()`: `publish_tile` refuses once the manifest's active
-//! tile list is full (8 tiles), so seeds beyond a few hundred MiB of WAL must
-//! compact to keep going.
+//! provides.
+//!
+//! Compaction is bounded and policy-driven, not "merge everything every N
+//! checkpoints". After each successful checkpoint the driver calls
+//! `Engine::maybe_compact(COMPACT_MERGE_BUDGET, MAX_ACTIVE_TILES)`: the trigger
+//! is the engine's real active-tile cap (`MAX_ACTIVE_TILES`, the manifest-page
+//! bound — not a hard-coded 8/12) and the driver asks `maybe_compact` to cap
+//! each merge at eight 64 MiB rotation windows of tile bytes. Whether a merge
+//! actually stays bounded — and therefore whether write amplification stays
+//! flat as the dataset grows — is exactly what the accounting below measures:
+//! `tile_bytes_compact` against `payload_bytes`. `publish_tile` still refuses
+//! once the active list is full, and compaction happens right after the
+//! checkpoint that reached the cap, before the next publish, so it never blocks
+//! a seed.
+//!
+//! `seed` reports measured, never extrapolated, accounting on every progress
+//! line and at the end:
+//!   `payload_bytes`        document bodies + unique-key values handed to commit_block
+//!   `wal_written_bytes`    WAL bytes appended (sum of every rotated segment + live segment)
+//!   `tile_bytes_publish`   bytes of ordinary `tile-<csn>.tile` files as they appear
+//!   `tile_bytes_compact`   bytes of `compact-<cutoff>.tile` outputs (maybe_compact's result)
+//!   `tile_bytes_total`     publish + compact
+//!   `compactions`          maybe_compact calls that actually merged a run
+//!   `write_amplification`  (wal_written_bytes + tile_bytes_total) / payload_bytes
+//!   `docs_s_interval`      throughput since the previous progress line
+//!   `docs_s_cumulative`    throughput since seed started
 
+use std::collections::HashMap;
 use std::fs;
 use std::io::{self, Write};
 use std::path::Path;
 use std::time::Instant;
 
-use flashdb_engine::engine::{Engine, Op, Outcome};
+use flashdb_engine::engine::{Engine, Op, Outcome, MAX_ACTIVE_TILES};
 use serde::{Deserialize, Serialize};
 
 const ENTITY_A: &[u8] = b"EntityA";
@@ -39,9 +62,13 @@ const FIELD_A: &[u8] = b"ua";
 const FIELD_B: &[u8] = b"ub";
 const CHECKPOINT_BYTES: u64 = 64 << 20;
 const ROTATE_BYTES: u64 = 64 << 20;
-/// Headroom below the manifest's 8-active-tile cap: compact after this many
-/// checkpoint publications so long seeds never hit the publish refusal.
-const COMPACT_EVERY_CHECKPOINTS: u32 = 4;
+/// Compaction merge budget as a multiple of the 64 MiB rotation window: 8 * 64
+/// MiB = 512 MiB of tile bytes. This is the size cap the driver asks
+/// `maybe_compact` to respect, so one merge is meant to rewrite only the oldest
+/// run under that cap rather than the whole dataset. The `seed` accounting is
+/// the check on that intent, not an assumption of it.
+const COMPACT_MERGE_WINDOWS: u64 = 8;
+const COMPACT_MERGE_BUDGET: u64 = COMPACT_MERGE_WINDOWS * ROTATE_BYTES;
 /// unique_lookup probes per entity in `verify`. Deliberately small: each probe
 /// is a full prefix scan over tiles + memtable (O(data)).
 const PROBES_PER_ENTITY: u64 = 20;
@@ -94,6 +121,33 @@ fn wal_bytes(dir: &Path) -> io::Result<u64> {
         }
     }
     Ok(total)
+}
+
+/// Sum the on-disk size of every ordinary `tile-<csn>.tile` file not yet
+/// counted in `seen`, adding the newly appeared bytes to `total`. Compaction
+/// outputs (`compact-*.tile`) are excluded here: their size is `maybe_compact`'s
+/// return value, so they are counted exactly once and separately. Counting a
+/// file the first time it appears makes the total cumulative even though
+/// compaction later unlinks superseded ordinary tiles.
+fn count_published_tiles(
+    dir: &Path,
+    seen: &mut HashMap<String, u64>,
+    total: &mut u64,
+) -> io::Result<()> {
+    for entry in fs::read_dir(dir)? {
+        let path = entry?.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else { continue };
+        if !name.starts_with("tile-") || path.extension().and_then(|e| e.to_str()) != Some("tile") {
+            continue;
+        }
+        if seen.contains_key(name) {
+            continue;
+        }
+        let len = fs::metadata(&path)?.len();
+        seen.insert(name.to_string(), len);
+        *total += len;
+    }
+    Ok(())
 }
 
 fn parse_num(text: &str, name: &str) -> Result<u64, Box<dyn std::error::Error>> {
@@ -210,9 +264,17 @@ fn cmd_seed(
     let total_blocks = total_docs.div_ceil(docs_per_commit);
     let interval = (total_blocks / 10).clamp(1, 50);
     let mut next_handle = e.next_handle()?;
-    let mut checkpoints_since_compact: u32 = 0;
     let mut rss_peak = rss_kb();
     let started = Instant::now();
+    // Cumulative, measured accounting (definitions in the module header).
+    let mut payload_bytes: u64 = 0;
+    let mut wal_written: u64 = 0;
+    let mut tile_bytes_publish: u64 = 0;
+    let mut tile_bytes_compact: u64 = 0;
+    let mut compactions: u64 = 0;
+    let mut seen_publish_tiles: HashMap<String, u64> = HashMap::new();
+    let mut last_progress = started;
+    let mut last_progress_docs: u64 = 0;
 
     for block in 0..total_blocks {
         let begin = block * docs_per_commit;
@@ -223,28 +285,26 @@ fn cmd_seed(
             next_handle += 1;
             if g < docs_a {
                 let i = g;
-                ops.push(Op::PutDoc {
-                    entity: ENTITY_A.to_vec(),
-                    handle,
-                    doc: doc_bytes(b'A', i, value_bytes),
-                });
+                let doc = doc_bytes(b'A', i, value_bytes);
+                let value = format!("a{i}").into_bytes();
+                payload_bytes += (doc.len() + value.len()) as u64;
+                ops.push(Op::PutDoc { entity: ENTITY_A.to_vec(), handle, doc });
                 ops.push(Op::PutUnique {
                     entity: ENTITY_A.to_vec(),
                     field: FIELD_A.to_vec(),
-                    value: format!("a{i}").into_bytes(),
+                    value,
                     handle,
                 });
             } else {
                 let i = g - docs_a;
-                ops.push(Op::PutDoc {
-                    entity: ENTITY_B.to_vec(),
-                    handle,
-                    doc: doc_bytes(b'B', i, value_bytes),
-                });
+                let doc = doc_bytes(b'B', i, value_bytes);
+                let value = format!("b{i}").into_bytes();
+                payload_bytes += (doc.len() + value.len()) as u64;
+                ops.push(Op::PutDoc { entity: ENTITY_B.to_vec(), handle, doc });
                 ops.push(Op::PutUnique {
                     entity: ENTITY_B.to_vec(),
                     field: FIELD_B.to_vec(),
-                    value: format!("b{i}").into_bytes(),
+                    value,
                     handle,
                 });
             }
@@ -263,26 +323,46 @@ fn cmd_seed(
             return Err(format!("handle watermark drifted at block {block}").into());
         }
         // Checkpoint first (publishes everything through csn when the WAL file
-        // exceeds the threshold), then rotate (only legal once a tile covers
-        // csn with an empty memtable). Both are per-block calls; each is a no-op
-        // below its threshold.
+        // exceeds the threshold); a successful checkpoint is the only event that
+        // grows the active tile list. Then compact if the engine's real cap is
+        // reached -- right here, before the next publish can hit the refusal.
+        // `maybe_compact` is a no-op below the cap, so most blocks do no merge
+        // work. Rotate last (only legal once a tile covers csn with an empty
+        // memtable). All three are per-block calls, each a no-op below threshold.
         if e.maybe_checkpoint(CHECKPOINT_BYTES)? {
-            checkpoints_since_compact += 1;
-            if checkpoints_since_compact >= COMPACT_EVERY_CHECKPOINTS {
-                e.compact()?;
-                checkpoints_since_compact = 0;
+            count_published_tiles(dir, &mut seen_publish_tiles, &mut tile_bytes_publish)?;
+            if let Some(merged) = e.maybe_compact(COMPACT_MERGE_BUDGET, MAX_ACTIVE_TILES)? {
+                compactions += 1;
+                tile_bytes_compact += merged;
             }
         }
-        e.rotate_wal(ROTATE_BYTES)?;
+        // Account the live segment's bytes toward WAL-written only when a
+        // rotation is about to unlink it; the remainder is added by size at
+        // report time, so every appended byte is counted exactly once.
+        let segment_bytes = wal_bytes(dir)?;
+        if e.rotate_wal(ROTATE_BYTES)? {
+            wal_written += segment_bytes;
+        }
         rss_peak = rss_peak.max(rss_kb());
         let done = block + 1;
         if done % interval == 0 || done == total_blocks {
+            let now = Instant::now();
+            let wal_appended = wal_written + wal_bytes(dir)?;
+            let tile_bytes = tile_bytes_publish + tile_bytes_compact;
+            let docs_s_interval =
+                (end - last_progress_docs) as f64 / now.duration_since(last_progress).as_secs_f64().max(1e-9);
+            let docs_s_cumulative =
+                end as f64 / now.duration_since(started).as_secs_f64().max(1e-9);
+            let write_amp =
+                (wal_appended + tile_bytes) as f64 / payload_bytes.max(1) as f64;
             emit(&format!(
-                "phase=seed docs={end} csn={} wal_bytes={} rss_kb={} rss_peak_kb={rss_peak}",
+                "phase=seed docs={end} csn={} payload_bytes={payload_bytes} wal_bytes={} wal_written_bytes={wal_appended} tile_bytes_publish={tile_bytes_publish} tile_bytes_compact={tile_bytes_compact} tile_bytes_total={tile_bytes} compactions={compactions} write_amplification={write_amp:.3} docs_s_interval={docs_s_interval:.0} docs_s_cumulative={docs_s_cumulative:.0} rss_kb={} rss_peak_kb={rss_peak}",
                 e.csn(),
                 wal_bytes(dir)?,
                 rss_kb(),
             ));
+            last_progress = now;
+            last_progress_docs = end;
         }
     }
 
@@ -296,12 +376,16 @@ fn cmd_seed(
     };
     let meta_file = fs::File::create(dir.join(META_NAME))?;
     serde_json::to_writer_pretty(io::BufWriter::new(meta_file), &meta)?;
+    let elapsed = started.elapsed().as_secs_f64();
+    let wal_appended = wal_written + wal_bytes(dir)?;
+    let tile_bytes = tile_bytes_publish + tile_bytes_compact;
+    let write_amp = (wal_appended + tile_bytes) as f64 / payload_bytes.max(1) as f64;
     emit(&format!(
-        "phase=seed ok=true docs={total_docs} csn={} wal_bytes={} rss_kb={} rss_peak_kb={rss_peak} blocks={total_blocks} elapsed_s={:.3}",
+        "phase=seed ok=true docs={total_docs} csn={} blocks={total_blocks} payload_bytes={payload_bytes} wal_bytes={} wal_written_bytes={wal_appended} tile_bytes_publish={tile_bytes_publish} tile_bytes_compact={tile_bytes_compact} tile_bytes_total={tile_bytes} compactions={compactions} write_amplification={write_amp:.3} docs_s_cumulative={:.0} rss_kb={} rss_peak_kb={rss_peak} elapsed_s={elapsed:.3}",
         e.csn(),
         wal_bytes(dir)?,
+        total_docs as f64 / elapsed.max(1e-9),
         rss_kb(),
-        started.elapsed().as_secs_f64(),
     ));
     Ok(())
 }
