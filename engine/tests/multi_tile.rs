@@ -768,3 +768,57 @@ fn bounded_compaction_keeps_cutoffs_disjoint_and_reopens_across_rounds() {
     assert_eq!(e.active_tile_cutoffs(), vec![cap]);
     assert_eq!(rounds, cap - 1, "the tiered merges collapse the list one tile per round");
 }
+
+/// A monotonic-unique workload split across several tiles, exercised through
+/// `scan_merged` (the path the key-range fast reject filters). Results must be
+/// identical for present keys and for absent keys below the first tile, above
+/// the last tile and in the gap between tiles, both before and after a reopen.
+#[test]
+fn range_filter_preserves_scan_merged_results_across_tiles() {
+    fn uval(value: &[u8], h: u64) -> Op {
+        Op::PutUnique { entity: b"E".to_vec(), field: b"u".to_vec(), value: value.to_vec(), handle: h }
+    }
+    fn del_uval(value: &[u8], h: u64) -> Op {
+        Op::DelUnique { entity: b"E".to_vec(), field: b"u".to_vec(), value: value.to_vec(), handle: h }
+    }
+    fn assert_reads(e: &Engine) {
+        // Present: tile one (handles 1-3), tile two (handles 11-13), memtable (21).
+        assert_eq!(e.get(b"E", 1).unwrap(), Some(b"d1".to_vec()), "below-tile handle");
+        assert_eq!(e.get(b"E", 11).unwrap(), Some(b"d11".to_vec()), "tile-two handle");
+        assert_eq!(e.get(b"E", 13).unwrap(), Some(b"d13".to_vec()), "tile-two handle");
+        assert_eq!(e.get(b"E", 21).unwrap(), Some(b"d21".to_vec()), "memtable handle");
+        // Tombstone written after tile two: the tile version must stay hidden.
+        assert_eq!(e.get(b"E", 12).unwrap(), None, "tombstoned tile-two handle");
+        // Absent: below the first tile, above the last tile, between tiles.
+        assert_eq!(e.get(b"E", 0).unwrap(), None, "below the first tile");
+        assert_eq!(e.get(b"E", 5).unwrap(), None, "between the two tiles");
+        assert_eq!(e.get(b"E", 100).unwrap(), None, "above the last tile");
+        // Unique probes across the same ranges.
+        assert_eq!(e.unique_lookup(b"E", b"u", b"a2").unwrap(), Some(2), "present in tile one");
+        assert_eq!(e.unique_lookup(b"E", b"u", b"b3").unwrap(), Some(13), "present in tile two");
+        assert_eq!(e.unique_lookup(b"E", b"u", b"c1").unwrap(), Some(21), "present in memtable");
+        assert_eq!(e.unique_lookup(b"E", b"u", b"b2").unwrap(), None, "tombstoned in tile two");
+        assert_eq!(e.unique_lookup(b"E", b"u", b"a0").unwrap(), None, "value below tile one");
+        assert_eq!(e.unique_lookup(b"E", b"u", b"zz").unwrap(), None, "value above every tile");
+        // Full scan stays exact and ordered.
+        let mut handles = Vec::new();
+        e.scan_primary(b"E", |h, _| { handles.push(h); Ok(()) }).unwrap();
+        assert_eq!(handles, vec![1, 2, 3, 11, 13, 21], "scan spans tiles, memtable and the tombstone");
+    }
+
+    let files = Files::new();
+    let mut e = Engine::create(&files.wal).unwrap();
+    e.commit_block(b"t1", &[doc(1, b"d1"), doc(2, b"d2"), doc(3, b"d3"), uval(b"a1", 1), uval(b"a2", 2), uval(b"a3", 3)]).unwrap();
+    e.publish_tile(&files.dir.join("tile-1.tile"), 1).unwrap();
+    // A deliberate gap: the next tile starts at handle 11, so handle 5 falls
+    // between the two tiles' ranges.
+    e.commit_block(b"t2", &[doc(11, b"d11"), doc(12, b"d12"), doc(13, b"d13"), uval(b"b1", 11), uval(b"b2", 12), uval(b"b3", 13)]).unwrap();
+    e.publish_tile(&files.dir.join("tile-2.tile"), 2).unwrap();
+    e.commit_block(b"t3", &[doc(21, b"d21"), uval(b"c1", 21)]).unwrap();
+    e.commit_block(b"t4", &[del_doc(12), del_uval(b"b2", 12)]).unwrap();
+
+    assert_reads(&e);
+    drop(e);
+    let e = Engine::open_discover(&files.dir).unwrap();
+    assert_reads(&e);
+}

@@ -243,6 +243,37 @@ pub(crate) struct Tile {
     dir: Vec<DirBlockRef>,
     /// Total number of data blocks (directory fence records) in the tile.
     data_blocks: u64,
+    /// First key in the tile (the first fence's key). Empty for an empty tile.
+    /// Cached in RAM with `last_key` so [`Tile::could_contain_prefix`] can reject
+    /// a whole tile without touching a cursor or the directory; the footprint is
+    /// two byte strings per tile, bounded by the tile count rather than by data.
+    first_key: Vec<u8>,
+    /// Last key in the tile, read once from the final data block at open. `None`
+    /// for an empty tile, and also when that single read could not be trusted
+    /// (framing or CRC failure): a missing upper bound only makes
+    /// [`Tile::could_contain_prefix`] more conservative, never wrong. Data blocks
+    /// are still CRC-verified when actually read, so a corrupt tile still fails
+    /// closed on any read that reaches it.
+    last_key: Option<Vec<u8>>,
+}
+
+/// Smallest key strictly greater than every key that starts with `prefix`:
+/// increment the last non-`0xff` byte and drop everything after it. `None` when
+/// every byte is `0xff`, i.e. there is no finite upper bound. Used by
+/// [`Tile::could_contain_prefix`] to build the exclusive lower bound of the next
+/// key range. Conservative: a `false` answer is a proof, a `true` answer is only
+/// a maybe.
+fn prefix_successor(prefix: &[u8]) -> Option<Vec<u8>> {
+    let mut i = prefix.len();
+    while i > 0 {
+        i -= 1;
+        if prefix[i] != 0xff {
+            let mut s = prefix[..=i].to_vec();
+            s[i] += 1;
+            return Some(s);
+        }
+    }
+    None
 }
 
 /// Cursor-local cache of exactly one on-disk directory block. Advancing through
@@ -646,6 +677,7 @@ impl Tile {
         let mut data_blocks: u64 = 0;
         let mut previous_key: Option<Vec<u8>> = None;
         let mut previous_end: Option<u64> = None;
+        let mut last_fence: Option<(u64, u32)> = None;
         let mut total: u64 = 0;
         let mut hdr = [0u8; BLOCK_HEADER];
         let mut key_buf: Vec<u8> = Vec::new();
@@ -688,6 +720,7 @@ impl Tile {
                         return Err(invalid("tile fence keys not strictly increasing"));
                     }
                     previous_end = Some(end);
+                    last_fence = Some((fence.offset, fence.len));
                     // Block header consistency: the header's length, first key and entry
                     // count must agree with the directory (data CRC is checked on read).
                     read_exact_at(&file, &mut hdr, fence.offset)?;
@@ -712,7 +745,50 @@ impl Tile {
             return Err(invalid("tile directory missing for nonempty tile"));
         }
         if total != count { return Err(invalid("tile block entry count disagrees")); }
-        Ok(Tile { file, superblock: sb, trailer: tr, cutoff, digest, count, size, dir, data_blocks })
+        let first_key = dir.first().map(|r| r.first_key.clone()).unwrap_or_default();
+        let last_key = match (count, last_fence) {
+            (0, _) | (_, None) => None,
+            (_, Some((offset, len))) => Self::read_last_key(&file, offset, len),
+        };
+        Ok(Tile {
+            file, superblock: sb, trailer: tr, cutoff, digest, count, size, dir, data_blocks,
+            first_key, last_key,
+        })
+    }
+
+    /// Best-effort last key of one data block: checks length and CRC, then walks
+    /// its entries requiring them strictly increasing (the writer's invariant and
+    /// what the read path's order check enforces), returning the final key. `None`
+    /// on any framing/CRC/order failure so the caller falls back to "no upper
+    /// bound" rather than storing a key that could reject a tile which does contain
+    /// the prefix. The block is not re-verified on later reads through this path;
+    /// the read path still CRC-checks it.
+    fn read_last_key(file: &File, offset: u64, len: u32) -> Option<Vec<u8>> {
+        let block = read_range(file, offset, len as u64).ok()?;
+        if block.len() < BLOCK_HEADER { return None; }
+        let blen = u32::from_le_bytes(block[..4].try_into().unwrap()) as usize;
+        if blen != block.len() { return None; }
+        if crc32c(&block[8..]) != u32::from_le_bytes(block[4..8].try_into().unwrap()) { return None; }
+        let first_key_len = u32::from_le_bytes(block[8..12].try_into().unwrap()) as usize;
+        if BLOCK_HEADER + first_key_len > blen { return None; }
+        let entry_count = u16::from_le_bytes(block[12..14].try_into().unwrap());
+        let mut pos = BLOCK_HEADER + first_key_len;
+        let mut last: Option<Vec<u8>> = None;
+        for _ in 0..entry_count {
+            if pos + 8 > block.len() { return None; }
+            let k = u32::from_le_bytes(block[pos..pos + 4].try_into().unwrap()) as usize;
+            let v = u32::from_le_bytes(block[pos + 4..pos + 8].try_into().unwrap()) as usize;
+            if !(18..=MAX_KEY).contains(&k) || v > MAX_VALUE { return None; }
+            let start = pos + 8;
+            let mid = start.checked_add(k)?;
+            let end = mid.checked_add(v)?;
+            if end > block.len() { return None; }
+            let key = &block[start..mid];
+            if last.as_deref().is_some_and(|prev| key <= prev) { return None; }
+            last = Some(key.to_vec());
+            pos = end;
+        }
+        last
     }
 
     /// Directory-block index whose fence range contains global data block
@@ -757,6 +833,31 @@ impl Tile {
     pub(crate) fn cutoff(&self) -> u64 { self.cutoff }
     pub(crate) fn digest(&self) -> &[u8; 32] { &self.digest }
     pub(crate) fn count(&self) -> u64 { self.count }
+
+    /// Conservative prefix fast-reject: returns `false` ONLY when it is certain
+    /// that no stored key starts with `prefix`, so a `false` never hides a match
+    /// (a false NEGATIVE would be a correctness bug; a false positive only costs
+    /// the work the filter exists to avoid). The two sufficient conditions:
+    ///
+    /// - `prefix > last_key`: every stored key is `<= last_key < prefix`, and any
+    ///   key starting with `prefix` sorts at or above `prefix`.
+    /// - `prefix_successor(prefix) <= first_key`: every key starting with `prefix`
+    ///   sorts strictly below its successor, which is already at or below the
+    ///   tile's first key.
+    ///
+    /// An empty tile answers `false` (it holds no keys). A tile whose cached last
+    /// key was untrustworthy answers with only the lower-bound test. An empty
+    /// `prefix` matches every key, so it always answers `true`.
+    pub(crate) fn could_contain_prefix(&self, prefix: &[u8]) -> bool {
+        if self.count == 0 { return false; }
+        if let Some(last) = &self.last_key {
+            if prefix > last.as_slice() { return false; }
+        }
+        if let Some(successor) = prefix_successor(prefix) {
+            if successor.as_slice() <= self.first_key.as_slice() { return false; }
+        }
+        true
+    }
     pub(crate) fn entries(&self) -> impl Iterator<Item = io::Result<(Vec<u8>, Vec<u8>)>> + '_ {
         Entries { cursor: TileCursor::new(self, None, 0), done: false }
     }
@@ -1213,6 +1314,109 @@ mod tests {
         bytes[off1 + 4..off1 + 8].copy_from_slice(&crc.to_le_bytes());
         std::fs::write(&path, &bytes).unwrap();
         assert_eq!(Tile::open(&path).err().unwrap().kind(), ErrorKind::InvalidData);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn prefix_successor_rule() {
+        assert_eq!(prefix_successor(b"abc"), Some(b"abd".to_vec()), "increment the last byte");
+        assert_eq!(prefix_successor(b"ab\xff"), Some(b"ac".to_vec()), "carry past a 0xff byte");
+        assert_eq!(prefix_successor(b"a\xff\xff"), Some(b"b".to_vec()), "truncate after the increment");
+        assert_eq!(prefix_successor(b"ab\x00"), Some(b"ab\x01".to_vec()), "0x00 is a valid byte to increment");
+        assert_eq!(prefix_successor(b""), None, "the empty prefix has no finite upper bound");
+        assert_eq!(prefix_successor(b"\xff"), None, "every byte 0xff has no upper bound");
+        assert_eq!(prefix_successor(b"\xff\xff\xff"), None, "all-0xff has no upper bound");
+    }
+
+    /// The filter's contract: it may over-approximate (a false positive only
+    /// costs work) but must never reject a prefix that a stored key actually
+    /// starts with. Exhaustive over every present key and every prefix of it.
+    #[test]
+    fn could_contain_prefix_has_no_false_negatives() {
+        let mut mt = Memtable::new();
+        let mut keys: Vec<Vec<u8>> = Vec::new();
+        for handle in 1..=300u64 {
+            let k = pkey(handle, 1);
+            mt.apply(k.clone(), b"v".to_vec());
+            keys.push(k);
+        }
+        // Values chosen to exercise arbitrary bytes and lengths, including 0xff
+        // runs (the boundary `prefix_successor` has to carry through) and the
+        // length-delimited empty value.
+        for (i, value) in [&b""[..], b"\x00", b"\xff", b"\xff\xff", b"zz\xff"].into_iter().enumerate() {
+            let k = keys::unique_key(b"E", b"f", value, i as u64 + 1, 1).unwrap();
+            mt.apply(k.clone(), b"v".to_vec());
+            keys.push(k);
+        }
+        let (path, tile) = write_tile("no-false-negative.tile", 100, &mt);
+        assert_eq!(tile.count(), keys.len() as u64);
+        // The cached upper bound is exactly the greatest stored key.
+        let max = keys.iter().max().unwrap().clone();
+        assert_eq!(tile.last_key.as_ref(), Some(&max));
+        for key in &keys {
+            assert!(tile.could_contain_prefix(key), "a stored key must never be rejected");
+            for n in 0..=key.len() {
+                assert!(
+                    tile.could_contain_prefix(&key[..n]),
+                    "prefix len {n} of a stored key (len {}) must never be rejected",
+                    key.len()
+                );
+            }
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn could_contain_prefix_boundaries() {
+        let empty = Memtable::new();
+        let (epath, etile) = write_tile("boundary-empty.tile", 5, &empty);
+        assert_eq!(etile.count(), 0);
+        assert!(etile.first_key.is_empty());
+        assert!(etile.last_key.is_none());
+        assert!(!etile.could_contain_prefix(b""), "an empty tile holds no keys");
+        assert!(!etile.could_contain_prefix(b"P"));
+        std::fs::remove_file(epath).unwrap();
+
+        let mut mt = Memtable::new();
+        for handle in 1..=50u64 { put(&mut mt, handle, 1, b"v"); }
+        let (path, tile) = write_tile("boundary.tile", 5, &mt);
+        assert_eq!(tile.first_key, pkey(1, 1));
+        let last = tile.last_key.clone().expect("a nonempty tile caches its last key");
+        assert_eq!(last, pkey(50, 1));
+
+        assert!(tile.could_contain_prefix(b""), "the empty prefix matches everything");
+        assert!(tile.could_contain_prefix(&last), "the last key itself");
+        assert!(tile.could_contain_prefix(&last[..last.len() - 1]), "a proper prefix of the last key");
+        assert!(tile.could_contain_prefix(&last[..1]), "the shortest shared prefix");
+        assert!(tile.could_contain_prefix(&tile.first_key), "the first key itself");
+
+        let mut above = last.clone();
+        above.push(0);
+        assert!(!tile.could_contain_prefix(&above), "strictly above the last key");
+        assert!(!tile.could_contain_prefix(&[0xff; 8]), "an all-0xff prefix sorts above every key");
+        assert!(!tile.could_contain_prefix(b"O"), "successor(\"O\") = \"P\" <= first_key");
+        std::fs::remove_file(path).unwrap();
+    }
+
+    /// A final data block that fails its CRC is not trusted for the upper bound:
+    /// open still succeeds (data blocks are verified on read, not at open) and the
+    /// tile falls back to "no upper bound", which only weakens the filter.
+    #[test]
+    fn untrusted_final_block_leaves_no_upper_bound() {
+        let mut mt = Memtable::new();
+        put(&mut mt, 1, 1, b"payload");
+        let (path, _) = write_tile("untrusted-last.tile", 5, &mt);
+        let mut bytes = std::fs::read(&path).unwrap();
+        let start = PAGE_SIZE as usize;
+        let block_len = u32::from_le_bytes(bytes[start..start + 4].try_into().unwrap()) as usize;
+        bytes[start + block_len - 1] ^= 1; // value tail: block CRC now wrong, header intact
+        std::fs::write(&path, &bytes).unwrap();
+        let tile = Tile::open(&path).unwrap();
+        assert!(tile.last_key.is_none(), "a corrupt final block is not trusted for the upper bound");
+        assert_eq!(tile.first_key, pkey(1, 1));
+        assert!(tile.could_contain_prefix(b"zzzz"), "no upper bound must not reject above the tile");
+        assert!(tile.entries().next().unwrap().unwrap_err().kind() == ErrorKind::InvalidData,
+            "the corruption is still detected on the read that reaches it");
         std::fs::remove_file(path).unwrap();
     }
 }

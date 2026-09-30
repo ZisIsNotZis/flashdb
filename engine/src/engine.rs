@@ -986,6 +986,12 @@ impl Engine {
         let mut mem = self.mt.scan_iter(prefix).peekable();
         let mut cursors: Vec<TileCursor<'_>> = Vec::with_capacity(self.tiles.len());
         for t in &self.tiles {
+            // Conservative fast reject: a tile whose cached key range cannot hold
+            // `prefix` is skipped without even a directory read, let alone the
+            // cursor and its 4 KiB block buffer. Append-mostly keys (ascending
+            // order numbers) reject every older tile here, which is the common
+            // case and the measured bottleneck this filter targets.
+            if !t.tile.could_contain_prefix(prefix) { continue; }
             cursors.push(t.tile.prefix_cursor(prefix)?);
         }
         let mut disk_key: Vec<u8> = Vec::new();

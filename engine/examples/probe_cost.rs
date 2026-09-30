@@ -2,16 +2,23 @@
 //! (b) a published tile, as a function of tile size. Not a correctness test.
 //!
 //! usage: cargo run --release --example probe_cost -- [scan|crc] [DOCS ...]
+//!        cargo run --release --example probe_cost -- tiles [TILES ...]
 //!
 //! `scan` additionally reports the full sequential tile scan throughput (MiB/s);
 //! without it only the probe cost is printed. `crc` reports one-shot CRC-32C
 //! throughput (GB/s) on a buffer sized like a tile (default 64 MiB, optional
-//! second argument overrides it in bytes).
+//! second argument overrides it in bytes). `tiles` builds N independent,
+//! disjoint-range tiles (each `DOCS_PER_TILE` docs) and reports µs per probe for
+//! an existing value and for a not-yet-stored value above every tile (the append
+//! case): the tile-count axis of the probe cost, i.e. exactly what the key-range
+//! fast reject targets.
 
-use flashdb_engine::engine::{Engine, Op};
+use flashdb_engine::engine::{Engine, Op, Outcome};
 use std::time::Instant;
 
 const SCAN_ITERS: usize = 3;
+const DOCS_PER_TILE: u64 = 5_000;
+const TILE_PROBES: usize = 200;
 
 fn run(docs: u64, probes: usize, measure_scan: bool) -> std::io::Result<()> {
     let dir = std::env::temp_dir().join(format!("flashdb-probe-cost-{}", std::process::id()));
@@ -60,6 +67,61 @@ fn run(docs: u64, probes: usize, measure_scan: bool) -> std::io::Result<()> {
     }
     let _ = std::fs::remove_dir_all(&dir);
     Ok(())
+}
+
+/// Probe cost against exactly `tiles` disjoint-range published tiles: one random
+/// existing value (probes fall inside every tile's range, so the filter can only
+/// reject the tiles below it) and one not-yet-stored value above every tile (the
+/// append case, where the filter rejects all existing tiles in RAM).
+fn run_multi_tile(tiles: usize, docs_per_tile: u64, probes: usize) -> std::io::Result<()> {
+    let dir = std::env::temp_dir().join(format!("flashdb-probe-cost-{}-t{tiles}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir)?;
+    let mut e = Engine::create(dir.join("data.wal"))?;
+    let payload = vec![b'x'; 200];
+    let mut docs = 0u64;
+    for tile in 0..tiles {
+        let start = tile as u64 * docs_per_tile + 1;
+        let end = start + docs_per_tile - 1;
+        let mut ops = Vec::with_capacity((docs_per_tile * 2) as usize);
+        for h in start..=end {
+            ops.push(Op::PutDoc { entity: b"P".to_vec(), handle: h, doc: payload.clone() });
+            ops.push(Op::PutUnique {
+                entity: b"P".to_vec(),
+                field: b"no".to_vec(),
+                value: format!("u{h}").into_bytes(),
+                handle: h,
+            });
+        }
+        let cutoff = match e.commit_block(format!("tile-block-{tile}").as_bytes(), &ops)? {
+            Outcome::Committed { csn } => csn,
+            other => return Err(std::io::Error::new(std::io::ErrorKind::Other, format!("unexpected outcome {other:?}"))),
+        };
+        e.publish_tile(dir.join(format!("tile-{tile}.tile")), cutoff)?;
+        docs = end;
+    }
+    // Two probe shapes: an existing value (random tile, so probes fall inside
+    // every tile's range and the filter can only reject the tiles *below* it),
+    // and a not-yet-stored value above every tile (the append case, where the
+    // filter rejects all existing tiles in RAM).
+    let existing_us = time_probes(&e, docs, probes)?;
+    let append_us = time_lookup(&e, format!("u{}", docs + 1).as_bytes(), probes)?;
+    println!("tiles={tiles} docs={docs} probe_existing_us={existing_us:.2} probe_append_us={append_us:.2}");
+    let _ = std::fs::remove_dir_all(&dir);
+    Ok(())
+}
+
+/// Average µs of `unique_lookup` over `probes` calls for one fixed value; the
+/// result is not asserted, so an absent value is allowed.
+fn time_lookup(e: &Engine, value: &[u8], probes: usize) -> std::io::Result<f64> {
+    let mut total = 0f64;
+    for _ in 0..probes {
+        let t = Instant::now();
+        let got = e.unique_lookup(b"P", b"no", value)?;
+        total += t.elapsed().as_secs_f64() * 1e6;
+        std::hint::black_box(got);
+    }
+    Ok(total / probes as f64)
 }
 
 fn time_probes(e: &Engine, docs: u64, probes: usize) -> std::io::Result<f64> {
@@ -116,6 +178,17 @@ fn main() -> std::io::Result<()> {
     if args.first().is_some_and(|a| a == "crc") {
         let bytes = args.get(1).and_then(|a| a.parse().ok()).unwrap_or(64 << 20);
         println!("crc_bytes={bytes} crc_gb_s={:.2}", time_crc(bytes));
+        return Ok(());
+    }
+    if args.first().is_some_and(|a| a == "tiles") {
+        let counts: Vec<usize> = if args.len() > 1 {
+            args[1..].iter().map(|a| a.parse().unwrap()).collect()
+        } else {
+            vec![1, 4, 12]
+        };
+        for tiles in counts {
+            run_multi_tile(tiles, DOCS_PER_TILE, TILE_PROBES)?;
+        }
         return Ok(());
     }
     let scan = args.first().is_some_and(|a| a == "scan");
