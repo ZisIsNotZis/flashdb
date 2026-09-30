@@ -176,3 +176,28 @@ the absolute number quoted together with budget and data size.
 
 Remaining known cost: the probe path (see above). 3238 docs/s cumulative is CPU-bound on
 per-unique-op probing across up to 12 tiles, not on I/O, disk, or memory.
+
+## Probe path after the bloom (08d-2b), measured on one binary
+
+`probe_cost spread` builds tiles whose keys are spread across the whole keyspace, so probes land
+INSIDE tile ranges and are absent - the case the key-range filter cannot reject. Same binary,
+same run parameters; the only difference is whether the writer attaches a bloom (measured by
+temporarily skipping `set_bloom` and restoring it):
+
+| tiles | no bloom (µs/probe) | with bloom (µs/probe) | speedup |
+|---|---|---|---|
+| 1 | 15.59 | 0.93 | 17x |
+| 4 | 94.57 | 0.56 | 169x |
+| 12 | **151.84** | **1.59** | **95x** |
+
+Without a bloom the cost grows with the tile count (15.6 -> 151.8 µs) because every probe reads a
+directory block and a data block per tile; with a bloom it is ~1 µs and **tile-count
+independent**, because the answer comes from RAM. Combined with 08d-1 (sequential-key probes:
+130.89 -> 0.46 µs, range reject without touching the bloom), the probe path is now cheap in both
+shapes.
+
+Remaining probe cost: PRIMARY-key probes (`get(entity, handle)`) are not covered by this bloom
+(its keys are unique-index prefixes), so a point read still costs one indexed seek per tile.
+Measured motivation for a future slice: ~12 µs per tile at 12 tiles, i.e. ~150 µs before any
+match. It is not the current bottleneck (the workload is write-heavy), so it is recorded rather
+than scheduled.
