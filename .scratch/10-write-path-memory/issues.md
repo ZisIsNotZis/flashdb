@@ -102,7 +102,14 @@ multiplier documented, not asserted).
   recover. Re-dispatched as `f5bc2afe` with `github-copilot/gpt-5.4` and a narrower scope
   (byte-identity proof; RSS measurement dropped). Acceptance: files produced through the
   streaming API must be byte-identical to `Tile::write` output.
-- **10c (next, after 10b)**: switch `write_verified_tile` and `write_compacted_tile` to the
+- **10b DONE** (`c185575`, parent-executed): `TileWriter` streams blocks (buffers only the
+  in-progress 4 KiB block), `push` enforces strictly increasing keys, `finish` writes
+  directory/trailer/superblock-last and self-checks; `Tile::write` is now a thin wrapper so
+  there is one encoder (format bytes unchanged). Byte-identity proven by test for a
+  3000-entry multi-block tile plus empty/exact-fill/spill/oversized/out-of-order cases.
+  Rust 122 (+4). Parent executed it because three worker dispatches produced zero tool calls
+  (two provider failures: `litellm/volcengine` retry loop, then `github-copilot` 429).
+- **10c (next)**: switch `write_verified_tile` and `write_compacted_tile` to the
   streaming writer with a bounded merge, i.e. no full materialization: target compaction
   peak ≤ ~1.5× tile bytes and publish peak ≤ ~2×W, then re-measure with `write_memory`'s
   protocol and re-run the scaled experiment.
