@@ -867,16 +867,7 @@ impl Engine {
         // never be re-derived - so the comparison starts at the floor. That is the
         // documented trust boundary (see FDBTILE2.md/FDBTILE3.md), stated here so
         // the gap is visible at the call site rather than implied.
-        let floor = self.wal_floor();
-        let verify_lower = lower.max(floor);
-        if verify_lower < cutoff {
-            let mut wal_view = Memtable::new();
-            for (key, value) in &wal_entries {
-                wal_view.apply(key.clone(), value.clone());
-            }
-            let expected = newest_projection(&wal_view, verify_lower, cutoff);
-            tile.verify_projection(&expected, verify_lower, cutoff)?;
-        }
+        self.verify_compacted_against_wal(&tile, &wal_entries, lower.max(self.wal_floor()), cutoff)?;
         Ok(tile)
     }
 
@@ -970,6 +961,63 @@ impl Engine {
         if let Some(entry) = pending {
             entry?;
             return Err(io::Error::new(io::ErrorKind::InvalidData, "compacted tile contains an extra entry"));
+        }
+        Ok(())
+    }
+
+    /// Independent, streaming check of a compacted tile against the WAL-derived
+    /// expectation for `(lower, cutoff]`: the retained WAL suffix is the authority
+    /// for versions above the rotation floor, so this does NOT re-run the merge
+    /// that wrote the tile (the self-referential check `verify_compacted_tile`
+    /// does that) and it holds no extra materialization - it walks the tile's
+    /// cursor positionally against the already-built `wal_entries` map, skipping
+    /// tile entries at or below `lower` (below-floor content cannot be re-derived
+    /// and was verified when the floor-spanning tile was first published; see the
+    /// trust boundary in FDBTILE2.md/FDBTILE3.md).
+    fn verify_compacted_against_wal(
+        &self,
+        tile: &Tile,
+        wal_entries: &BTreeMap<Vec<u8>, Vec<u8>>,
+        lower: u64,
+        cutoff: u64,
+    ) -> io::Result<()> {
+        let mut actual = tile.entries();
+        // The map holds raw ops, so several versions of one logical key can be
+        // present while the tile keeps only the newest; keys sort CSN-descending
+        // within a logical key, so the first in-range row of a group is the one the
+        // tile must carry and later rows are skipped.
+        let mut last_logical: Option<Vec<u8>> = None;
+        for (key, value) in wal_entries {
+            let Some(csn) = keys::key_csn(key) else { continue };
+            if csn <= lower || csn > cutoff { continue; }
+            let logical = &key[..key.len() - 8];
+            if last_logical.as_deref() == Some(logical) { continue; }
+            last_logical = Some(logical.to_vec());
+            // Advance past tile entries at or below `lower`: below-floor content
+            // cannot be re-derived from the retained WAL and was verified when the
+            // floor-spanning tile was first published (see the trust boundary).
+            let mut found = None;
+            while let Some(entry) = actual.next() {
+                let (akey, avalue) = entry?;
+                if keys::key_csn(&akey).is_some_and(|acsn| acsn <= lower) { continue; }
+                found = Some((akey, avalue));
+                break;
+            }
+            let (akey, avalue) = found.ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "compacted tile is missing a WAL entry")
+            })?;
+            if akey.as_slice() != key.as_slice() {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "compacted tile entry key disagrees with the WAL projection"));
+            }
+            if avalue.as_slice() != value.as_slice() {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "compacted tile entry value disagrees with the WAL projection"));
+            }
+        }
+        while let Some(entry) = actual.next() {
+            let (akey, _) = entry?;
+            if keys::key_csn(&akey).is_none_or(|csn| csn > lower) {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "compacted tile contains an entry absent from the WAL projection"));
+            }
         }
         Ok(())
     }
