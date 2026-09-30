@@ -122,3 +122,19 @@ below the cap. `scripts/scale-run.sh` now reports both views per phase:
 `cgroup_peak_bytes=` (the scope's own `memory.peak`, read from inside the scope after the
 binary exits). Neither number alone is evidence; always report the pair. Smoke check:
 4000 docs under `MemoryMax=256M` gives rss_peak 5572 KiB vs cgroup peak 5,857,280 B.
+
+## Gate rule added (2026-09-30)
+
+Two failure classes have now escaped a gate that only asserts on `test result:` lines:
+a `-q` grep that hid a compile break (recorded in ticket 07), and an **inert fix** hidden by
+a rustc warning. While landing 10c-2, `cargo build` reported
+`warning: unreachable pattern` at `engine.rs:582` - the Err arm of the rotation rebinding
+match was dead code because the Ok case was bound with an irrefutable `ok` pattern, so the
+P1-2 fix from `19026c3` ("set `wal_detached` on rebinding failure") had never executed. No
+test covers that path (it needs an I/O failure inside `rotate_wal`), so only the compiler
+could have caught it.
+
+Gate for every slice from now on: (1) `cargo test --workspace --offline` with the
+`test result:` lines reported verbatim, **and** (2) `cargo build --workspace --offline`
+reporting **zero warnings** (or an explicit statement of any that remain and why they are
+acceptable), plus (3) `git diff --check`.
