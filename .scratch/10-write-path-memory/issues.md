@@ -113,3 +113,12 @@ multiplier documented, not asserted).
   streaming writer with a bounded merge, i.e. no full materialization: target compaction
   peak ≤ ~1.5× tile bytes and publish peak ≤ ~2×W, then re-measure with `write_memory`'s
   protocol and re-run the scaled experiment.
+
+## Measurement protocol (fixed after the first scaled run)
+
+A `MemoryMax` cap counts page cache, so a run can be killed while the process RSS is well
+below the cap. `scripts/scale-run.sh` now reports both views per phase:
+`rss_peak_kb=` (process, from the binary's own progress lines) and
+`cgroup_peak_bytes=` (the scope's own `memory.peak`, read from inside the scope after the
+binary exits). Neither number alone is evidence; always report the pair. Smoke check:
+4000 docs under `MemoryMax=256M` gives rss_peak 5572 KiB vs cgroup peak 5,857,280 B.

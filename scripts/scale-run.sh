@@ -71,14 +71,26 @@ run_phase() {
     echo "phase=$name status=skipped"
     return 0
   fi
-  local log="$LOGDIR/$name.log" t0 t1 rc peak
+  local log="$LOGDIR/$name.log" t0 t1 rc peak cgpeak
   echo "phase=$name status=running log=$log"
   t0=$(date +%s)
-  "${WRAP[@]}" "$BIN" "$@" >"$log" 2>&1
+  # Run the phase through a subshell inside the scope so the cgroup's own accounting
+  # (which includes page cache) can be reported next to the process RSS: a MemoryMax cap
+  # counts page cache too, so the two views must never be conflated.
+  LOG="$log" BIN="$BIN" "${WRAP[@]}" bash -c '
+    "$BIN" "$@" > "$LOG" 2>&1
+    rc=$?
+    cg=$(sed -n "s/^0:://p" /proc/self/cgroup 2>/dev/null)
+    if [ -n "$cg" ] && [ -r "/sys/fs/cgroup$cg/memory.peak" ]; then
+      echo "cgroup_peak_bytes=$(cat "/sys/fs/cgroup$cg/memory.peak")" >> "$LOG.cgroup"
+    fi
+    exit $rc
+  ' bash "$@"
   rc=$?
   t1=$(date +%s)
   peak=$(grep -hoE 'rss(_peak)?_kb=[0-9]+' "$log" | sed 's/.*=//' | sort -n | tail -1)
-  echo "phase=$name exit=$rc elapsed_s=$((t1 - t0)) rss_peak_kb=${peak:-na} log=$log"
+  cgpeak=$(sed -n 's/^cgroup_peak_bytes=//p' "$log.cgroup" 2>/dev/null | tail -1)
+  echo "phase=$name exit=$rc elapsed_s=$((t1 - t0)) rss_peak_kb=${peak:-na} cgroup_peak_bytes=${cgpeak:-na} log=$log"
   if [ "$rc" -ne 0 ]; then
     echo "phase=$name ok=false" >&2
     tail -n 20 "$log" >&2
