@@ -33,6 +33,39 @@ that drift is glibc arena retention, see 10c's `malloc_trim` measurements).
 - It makes long seed runs (and any benchmark that must reach multi-GB scale) an
   endurance test rather than a measurement.
 
+## Design constraints the fix must respect
+
+The current read path and recovery verification depend on the active tile list having
+**strictly increasing, non-overlapping CSN ranges**: `verify_projection` checks each tile
+against its own `(lower, cutoff]` WAL slice, and the merge relies on a key appearing in at
+most one tile. A leveled design with overlapping ranges would break both. So the fix must
+preserve disjoint ranges, which rules out classic leveled compaction and points at:
+
+**Size-budgeted tiered merge of the oldest contiguous run.** Keep the increasing ranges, and
+when the tile count would exceed the cap, merge only a *bounded subset* - the oldest
+contiguous run whose combined size is at most `max_merge_bytes`, at least two tiles. The
+output covers exactly the merged run's union range (so cutoffs stay strictly increasing and
+disjoint), and only the merged inputs are retired. With geometrically growing tile sizes
+this rewrites each byte O(log N) times instead of O(N / window), and it is the usual tiered
+argument.
+
+Consequences to handle in the same design:
+
+- `manifest::MAX_TILES` is bounded by the 4092-byte manifest payload (a tile ref is
+  `4 + name + 8 + 32` bytes), i.e. roughly 90 tiles at short names. A tiered policy wants
+  more than the current 8, so raise the cap to what the page can hold (and record that the
+  manifest page, not the policy, is the real limit - multi-page manifests are a later
+  concern).
+- Compaction must become a policy: `maybe_compact(budget)` chosen by the caller (or by the
+  engine from a declared budget), instead of "merge everything" being the only option and the
+  benchmark driver calling it every few checkpoints.
+- The streaming merge from 10c-1 already bounds *memory* for the merge set; this ticket
+  bounds *work*.
+- Acceptance: (a) bytes written per byte ingested, measured at multi-GB scale, reported as a
+  number and compared with today's; (b) a seed run whose throughput does not decay with
+  dataset size; (c) the rotate-then-compact-then-reopen regression and the disjoint-range
+  verification stay green.
+
 ## Direction (needs a design decision)
 
 - **Leveled/tiered compaction**: merge only a bounded subset (e.g. the K oldest tiles or
