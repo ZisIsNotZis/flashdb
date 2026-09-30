@@ -19,6 +19,7 @@ use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 
+use crate::bloom::BloomBuilder;
 use crate::keys::{self, check_name};
 use crate::manifest::{self, Checkpoint, Manifest, SegmentRef, TileRef};
 use crate::memtable::Memtable;
@@ -26,6 +27,15 @@ use crate::tile::{Tile, TileCursor, TileWriter};
 use crate::wal::{self, Wal};
 
 const MAGIC: &[u8; 4] = b"FDB1";
+
+/// Bits per *expected* entry for a tile's unique-prefix bloom. The tile stores
+/// this value in its superblock and bloom header; 10 implies 7 probes. The
+/// effective bits per *inserted* prefix is higher because the filter is sized
+/// from an upper bound on the tile's entry count (which also counts P/R keys)
+/// while only U-key prefixes are inserted, so the filter is over-provisioned and
+/// its false-positive rate is below the nominal one. The rate is measured in
+/// `bloom.rs`, never asserted.
+const UNIQUE_BLOOM_BITS_PER_KEY: u32 = 10;
 
 /// The largest active-tile list the manifest can hold. The real limit is the
 /// 4092-byte manifest payload ([`crate::manifest::MAX_TILES`]), not a policy
@@ -390,6 +400,12 @@ impl Engine {
         // logical key (first of each group: keys sort CSN-descending) within
         // `(lower, cutoff]`, streamed straight into the encoder.
         let mut writer = TileWriter::new(tile_path, cutoff, &digest)?;
+        // Bloom over exactly the unique prefixes this pass stores, sized from a
+        // known upper bound (the serving memtable's entry count) so the publish
+        // pass stays single and streaming: no second read to count keys and no
+        // entry retained. Only U keys are inserted, so the filter is
+        // over-provisioned relative to its stored `bits_per_key`.
+        let mut bloom = BloomBuilder::new(self.mt.len() as u64, UNIQUE_BLOOM_BITS_PER_KEY);
         let mut last_logical: Option<Vec<u8>> = None;
         for (key, value) in self.mt.entries() {
             let Some(csn) = keys::key_csn(key) else { continue };
@@ -398,7 +414,9 @@ impl Engine {
             if last_logical.as_deref() == Some(logical) { continue; }
             last_logical = Some(logical.to_vec());
             writer.push(key, value)?;
+            if let Some(prefix) = unique_prefix_of(key) { bloom.insert(prefix); }
         }
+        writer.set_bloom(bloom.finish())?;
         let tile = writer.finish()?;
         // Source (b): the WAL-derived expectation map. Independent of the
         // memtable the tile was written from, so a divergence between the two
@@ -848,8 +866,22 @@ impl Engine {
         // Source (a): the run's tiles, streamed. Merge + reduce runs straight
         // into the encoder (one 4 KiB block buffered): no projection of the
         // union ever exists.
+        // Bloom over exactly the unique prefixes the merge stores, sized from a
+        // known upper bound on the reduced stream: the input tiles' stored-entry
+        // counts plus the WAL suffix map length. No second pass and no retained
+        // projection, so the merge stays single and streaming; only U keys are
+        // inserted, so the filter is over-provisioned w.r.t. its `bits_per_key`.
+        let expected: u64 = tiles
+            .iter()
+            .fold(wal_entries.len() as u64, |acc, t| acc.saturating_add(t.tile.count()));
+        let mut bloom = BloomBuilder::new(expected, UNIQUE_BLOOM_BITS_PER_KEY);
         let mut writer = TileWriter::new(tile_path, cutoff, &digest)?;
-        self.stream_merged_reduction(tiles, lower, cutoff, &wal_entries, |key, value| writer.push(key, value))?;
+        self.stream_merged_reduction(tiles, lower, cutoff, &wal_entries, |key, value| {
+            writer.push(key, value)?;
+            if let Some(prefix) = unique_prefix_of(key) { bloom.insert(prefix); }
+            Ok(())
+        })?;
+        writer.set_bloom(bloom.finish())?;
         let tile = writer.finish()?;
         // Fail closed: re-run the identical merge and compare it 1:1, streaming,
         // against the written tile. That catches encoder/streaming defects but is
@@ -1055,6 +1087,10 @@ impl Engine {
     // the memtable-wins skip below is defensive only.
     fn scan_merged(&self, prefix: &[u8], mut visit: impl FnMut(&[u8], &[u8]) -> io::Result<bool>) -> io::Result<()> {
         let mut mem = self.mt.scan_iter(prefix).peekable();
+        // The bloom reject below is only sound for a full unique prefix, so it is
+        // gated once per scan on the prefix shape; every other probe (primary,
+        // reverse, partial, whole-range) stays on the exact path.
+        let unique_prefix = is_unique_prefix(prefix);
         let mut cursors: Vec<TileCursor<'_>> = Vec::with_capacity(self.tiles.len());
         for t in &self.tiles {
             // Conservative fast reject: a tile whose cached key range cannot hold
@@ -1063,6 +1099,11 @@ impl Engine {
             // order numbers) reject every older tile here, which is the common
             // case and the measured bottleneck this filter targets.
             if !t.tile.could_contain_prefix(prefix) { continue; }
+            // In-range membership reject: the tile's persisted bloom is keyed by
+            // the unique prefixes it stored, so `false` is a proof this tile
+            // holds no key with this prefix, answered from RAM. A tile with no
+            // bloom answers `true`.
+            if unique_prefix && !t.tile.might_contain_unique_prefix(prefix) { continue; }
             cursors.push(t.tile.prefix_cursor(prefix)?);
         }
         let mut disk_key: Vec<u8> = Vec::new();
@@ -1341,6 +1382,38 @@ fn wal_digest_finish(hash: Sha256, last: u64, cutoff: u64, floor: u64) -> io::Re
 // Directory a manifest or tile name resolves against; empty parents mean ".".
 fn parent_dir(path: &Path) -> PathBuf {
     path.parent().filter(|p| !p.as_os_str().is_empty()).map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// The unique-index prefix a stored key belongs to, or `None` for a non-`U`
+/// key. The prefix is the key up to and including its value terminator - exactly
+/// the bytes `keys::unique_prefix(entity, field, value)` produces, i.e. without
+/// the trailing 8-byte handle and 8-byte `~csn`. A bloom built from these strings
+/// is safe to probe for a full unique prefix: a `false` can never hide a stored
+/// key that a probe for that prefix would match.
+fn unique_prefix_of(key: &[u8]) -> Option<&[u8]> {
+    if key.first() != Some(&keys::U) || key.len() < 17 { return None; }
+    Some(&key[..key.len() - 16])
+}
+
+/// Whether `prefix` is exactly a full unique-index prefix as
+/// [`keys::unique_prefix`] spells it (`U | entity | 0 | field | 0 | len(4 BE) |
+/// value`, nonempty entity/field, `len` matching the value bytes). The
+/// probe-path bloom reject is gated on this: a primary/reverse prefix or a
+/// partial unique prefix was never inserted into a tile's bloom, so testing it
+/// there could answer `false` for a tile that holds a matching key - a false
+/// negative.
+fn is_unique_prefix(prefix: &[u8]) -> bool {
+    if prefix.first() != Some(&keys::U) { return false; }
+    let rest = &prefix[1..];
+    let Some(entity_end) = rest.iter().position(|&b| b == 0) else { return false };
+    if entity_end == 0 { return false; }
+    let after_entity = &rest[entity_end + 1..];
+    let Some(field_end) = after_entity.iter().position(|&b| b == 0) else { return false };
+    if field_end == 0 { return false; }
+    let value = &after_entity[field_end + 1..];
+    if value.len() < 4 { return false; }
+    let value_len = u32::from_be_bytes(value[..4].try_into().unwrap()) as usize;
+    value.len() == 4 + value_len
 }
 
 // ---------- op → memtable ----------
@@ -2090,6 +2163,66 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         assert!(err.to_string().contains("pre-rotation records"), "got: {err}");
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// White-box check that BOTH engine write paths attach a generated unique
+    /// bloom and that it never rejects a stored prefix. The reject is gated on a
+    /// full unique prefix (`is_unique_prefix`), and a tile with no bloom answers
+    /// `true` for everything, so "some absent prefix is rejected" is exactly the
+    /// evidence that a filter is present. The false-positive RATE is measured in
+    /// `probe_cost`; only the no-false-negative direction is asserted here.
+    #[test]
+    fn published_and_compacted_tiles_carry_a_working_unique_bloom() {
+        let dir = tmp_dir("bloom_wiring");
+        let mut e = Engine::create(dir.join("data.wal")).unwrap();
+        let uval = |value: &[u8], handle: u64| Op::PutUnique {
+            entity: b"E".to_vec(), field: b"u".to_vec(), value: value.to_vec(), handle,
+        };
+        e.commit_block(b"t1", &[
+            Op::PutDoc { entity: b"E".to_vec(), handle: 1, doc: b"d1".to_vec() },
+            uval(b"a1", 1), uval(b"a3", 3), uval(b"a5", 5),
+        ]).unwrap();
+        e.publish_tile(dir.join("tile-1.tile"), 1).unwrap();
+        e.commit_block(b"t2", &[
+            Op::PutDoc { entity: b"E".to_vec(), handle: 11, doc: b"d11".to_vec() },
+            uval(b"b1", 11), uval(b"b3", 13),
+        ]).unwrap();
+        e.publish_tile(dir.join("tile-2.tile"), 2).unwrap();
+
+        let no_false_negatives = |tile: &Tile, values: &[&[u8]]| {
+            for v in values {
+                let pfx = keys::unique_prefix(b"E", b"u", v).unwrap();
+                assert!(tile.might_contain_unique_prefix(&pfx), "a stored prefix must never be rejected: {v:?}");
+            }
+        };
+        let rejects_absent = |tile: &Tile, values: &[&[u8]]| values.iter().any(|v| {
+            let pfx = keys::unique_prefix(b"E", b"u", v).unwrap();
+            !tile.might_contain_unique_prefix(&pfx)
+        });
+        let absent = [b"a2".as_slice(), b"a4".as_slice(), b"c9".as_slice(), b"zzz".as_slice(), b"a2x".as_slice()];
+
+        no_false_negatives(&e.tiles[0].tile, &[b"a1", b"a3", b"a5"]);
+        no_false_negatives(&e.tiles[1].tile, &[b"b1", b"b3"]);
+        // The range filter accepts an in-range absent prefix on tile one, so
+        // only the bloom can skip it; a filter-less tile answers `true` always,
+        // so a rejection proves the filter is attached.
+        let in_range_absent = keys::unique_prefix(b"E", b"u", b"a2").unwrap();
+        assert!(e.tiles[0].tile.could_contain_prefix(&in_range_absent), "a2 sorts inside tile one's range");
+        assert!(rejects_absent(&e.tiles[0].tile, &absent), "the published tile must carry a bloom");
+
+        // The compaction output carries one too.
+        e.compact().unwrap();
+        assert_eq!(e.tiles.len(), 1);
+        no_false_negatives(&e.tiles[0].tile, &[b"a1", b"a3", b"a5", b"b1", b"b3"]);
+        assert!(e.tiles[0].tile.could_contain_prefix(&keys::unique_prefix(b"E", b"u", b"b2").unwrap()));
+        assert!(rejects_absent(&e.tiles[0].tile, &absent), "the compacted tile must carry a bloom");
+
+        // The persisted filter survives reopen.
+        drop(e);
+        let e = Engine::open_discover(&dir).unwrap();
+        no_false_negatives(&e.tiles[0].tile, &[b"a1", b"a3", b"a5", b"b1", b"b3"]);
+        assert!(rejects_absent(&e.tiles[0].tile, &absent), "the persisted bloom survives reopen");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     fn remove(p: &Path) {

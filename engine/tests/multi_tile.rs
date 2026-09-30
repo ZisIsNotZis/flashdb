@@ -823,3 +823,95 @@ fn range_filter_preserves_scan_merged_results_across_tiles() {
     let e = Engine::open_discover(&files.dir).unwrap();
     assert_reads(&e);
 }
+
+/// The per-tile unique bloom (08d-2b): a probe for an absent value that falls
+/// INSIDE a tile's unique-value range must still resolve to None (the key-range
+/// fast reject cannot drop that tile; only the bloom can), while every present
+/// value - including one held only by a tile below the probe target - reads
+/// exactly as it did before the filter existed, across reopen.
+#[test]
+fn unique_bloom_preserves_reads_and_rejects_in_range_absent_values() {
+    fn uval(value: &[u8], h: u64) -> Op {
+        Op::PutUnique { entity: b"E".to_vec(), field: b"u".to_vec(), value: value.to_vec(), handle: h }
+    }
+    fn assert_reads(e: &Engine) {
+        assert_eq!(e.get(b"E", 1).unwrap(), Some(b"d1".to_vec()));
+        assert_eq!(e.get(b"E", 11).unwrap(), Some(b"d11".to_vec()));
+        // Present in tile one (below the probe target once tile two exists).
+        assert_eq!(e.unique_lookup(b"E", b"u", b"a1").unwrap(), Some(1));
+        assert_eq!(e.unique_lookup(b"E", b"u", b"a3").unwrap(), Some(3), "value held only by the tile below");
+        assert_eq!(e.unique_lookup(b"E", b"u", b"a5").unwrap(), Some(5));
+        // Present in tile two.
+        assert_eq!(e.unique_lookup(b"E", b"u", b"b1").unwrap(), Some(11));
+        assert_eq!(e.unique_lookup(b"E", b"u", b"b3").unwrap(), Some(13));
+        // Absent but IN RANGE: these sort inside the tile's own unique range, so
+        // the range filter accepts them and only the bloom can skip the tile.
+        assert_eq!(e.unique_lookup(b"E", b"u", b"a2").unwrap(), None, "hole between a1 and a3");
+        assert_eq!(e.unique_lookup(b"E", b"u", b"a4").unwrap(), None, "hole between a3 and a5");
+        assert_eq!(e.unique_lookup(b"E", b"u", b"b2").unwrap(), None, "hole between b1 and b3");
+        // Above every range: rejected by the range filter, still absent.
+        assert_eq!(e.unique_lookup(b"E", b"u", b"zz").unwrap(), None);
+    }
+
+    let files = Files::new();
+    let mut e = Engine::create(&files.wal).unwrap();
+    e.commit_block(b"t1", &[doc(1, b"d1"), doc(3, b"d3"), doc(5, b"d5"), uval(b"a1", 1), uval(b"a3", 3), uval(b"a5", 5)]).unwrap();
+    e.publish_tile(&files.dir.join("tile-1.tile"), 1).unwrap();
+    e.commit_block(b"t2", &[doc(11, b"d11"), doc(13, b"d13"), uval(b"b1", 11), uval(b"b3", 13)]).unwrap();
+    e.publish_tile(&files.dir.join("tile-2.tile"), 2).unwrap();
+
+    assert_reads(&e);
+    drop(e);
+    let e = Engine::open_discover(&files.dir).unwrap();
+    assert_reads(&e);
+}
+
+/// A unique value whose NEWEST stored state in a tile is a tombstone must still
+/// be consulted. The tombstone sits in the newer tile above an older live owner,
+/// so skipping the tombstone tile (a bloom false negative) would resurrect the
+/// deleted owner; the bloom must include tombstoned unique prefixes.
+#[test]
+fn unique_bloom_keeps_a_tombstone_tile_consulted() {
+    let files = Files::new();
+    let mut e = Engine::create(&files.wal).unwrap();
+    e.commit_block(b"t1", &[doc(1, b"d1"), unique(1)]).unwrap();
+    e.publish_tile(&files.dir.join("tile-1.tile"), 1).unwrap();
+    e.commit_block(b"t2", &[del_doc(1), del_unique(1)]).unwrap();
+    e.publish_tile(&files.dir.join("tile-2.tile"), 2).unwrap();
+    let assert_reads = |e: &Engine| {
+        assert_eq!(e.unique_lookup(b"E", b"u", b"v").unwrap(), None, "the newer tombstone shadows the older live owner");
+        assert_eq!(e.get(b"E", 1).unwrap(), None);
+    };
+    assert_reads(&e);
+    drop(e);
+    let e = Engine::open_discover(&files.dir).unwrap();
+    assert_reads(&e);
+}
+
+/// A compaction output carries a working bloom: after merging two published
+/// tiles, an absent in-range value still resolves to None and present values
+/// resolve exactly as before, across reopen.
+#[test]
+fn compacted_tile_carries_a_working_unique_bloom() {
+    fn uval(value: &[u8], h: u64) -> Op {
+        Op::PutUnique { entity: b"E".to_vec(), field: b"u".to_vec(), value: value.to_vec(), handle: h }
+    }
+    let files = Files::new();
+    let mut e = Engine::create(&files.wal).unwrap();
+    e.commit_block(b"t1", &[doc(1, b"d1"), doc(3, b"d3"), uval(b"a1", 1), uval(b"a3", 3)]).unwrap();
+    e.publish_tile(&files.dir.join("tile-1.tile"), 1).unwrap();
+    e.commit_block(b"t2", &[doc(11, b"d11"), doc(13, b"d13"), uval(b"b1", 11), uval(b"b3", 13)]).unwrap();
+    e.publish_tile(&files.dir.join("tile-2.tile"), 2).unwrap();
+    e.compact().unwrap();
+    assert!(files.dir.join("compact-2.tile").exists(), "the merged tile is the single active tile");
+    let assert_reads = |e: &Engine| {
+        assert_eq!(e.unique_lookup(b"E", b"u", b"a2").unwrap(), None, "absent in-range value against the compacted tile");
+        assert_eq!(e.unique_lookup(b"E", b"u", b"b2").unwrap(), None, "absent in-range value against the compacted tile");
+        assert_eq!(e.unique_lookup(b"E", b"u", b"a3").unwrap(), Some(3));
+        assert_eq!(e.unique_lookup(b"E", b"u", b"b3").unwrap(), Some(13));
+    };
+    assert_reads(&e);
+    drop(e);
+    let e = Engine::open_discover(&files.dir).unwrap();
+    assert_reads(&e);
+}

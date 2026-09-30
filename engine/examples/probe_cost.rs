@@ -3,6 +3,7 @@
 //!
 //! usage: cargo run --release --example probe_cost -- [scan|crc] [DOCS ...]
 //!        cargo run --release --example probe_cost -- tiles [TILES ...]
+//!        cargo run --release --example probe_cost -- spread [TILES ...]
 //!
 //! `scan` additionally reports the full sequential tile scan throughput (MiB/s);
 //! without it only the probe cost is printed. `crc` reports one-shot CRC-32C
@@ -11,7 +12,12 @@
 //! disjoint-range tiles (each `DOCS_PER_TILE` docs) and reports µs per probe for
 //! an existing value and for a not-yet-stored value above every tile (the append
 //! case): the tile-count axis of the probe cost, i.e. exactly what the key-range
-//! fast reject targets.
+//! fast reject targets. `spread` builds the same N tiles but spreads the stored
+//! unique values across the whole keyspace so an absent probe falls INSIDE every
+//! tile's range (the case the key-range fast reject cannot help) and reports µs
+//! per abort probe: the tile-count axis the per-tile bloom (08d-2b) targets. Run
+//! `spread` at both this revision and its pre-bloom parent to get the
+//! with/without-bloom comparison.
 
 use flashdb_engine::engine::{Engine, Op, Outcome};
 use std::time::Instant;
@@ -111,6 +117,57 @@ fn run_multi_tile(tiles: usize, docs_per_tile: u64, probes: usize) -> std::io::R
     Ok(())
 }
 
+/// Probe cost when the stored unique values are SPREAD across the whole keyspace,
+/// so an absent probe falls INSIDE every tile's key range: the key-range fast
+/// reject cannot drop any tile, and with no bloom every probe pays one clipped
+/// cursor (directory block + data block + 4 KiB buffer) per active tile. With the
+/// per-tile bloom (08d-2b) an absent prefix is rejected in RAM for every tile.
+/// Each tile stores even slots `s<slot:06>-v<tile>`; a probe uses an odd slot, so
+/// it is absent everywhere yet sorts between every tile's first and last unique
+/// value. Compare against the same mode run at the pre-bloom parent revision.
+fn run_spread(tiles: usize, docs_per_tile: u64, probes: usize) -> std::io::Result<()> {
+    let dir = std::env::temp_dir().join(format!("flashdb-probe-cost-spread-{}-t{tiles}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir)?;
+    let mut e = Engine::create(dir.join("data.wal"))?;
+    let payload = vec![b'x'; 200];
+    let mut handles = 0u64;
+    for tile in 0..tiles {
+        let mut ops = Vec::with_capacity((docs_per_tile * 2) as usize);
+        for slot in 0..docs_per_tile {
+            handles += 1;
+            ops.push(Op::PutDoc { entity: b"P".to_vec(), handle: handles, doc: payload.clone() });
+            ops.push(Op::PutUnique {
+                entity: b"P".to_vec(),
+                field: b"no".to_vec(),
+                value: format!("s{:06}-v{tile}", slot * 2).into_bytes(),
+                handle: handles,
+            });
+        }
+        let cutoff = match e.commit_block(format!("spread-block-{tile}").as_bytes(), &ops)? {
+            Outcome::Committed { csn } => csn,
+            other => return Err(std::io::Error::new(std::io::ErrorKind::Other, format!("unexpected outcome {other:?}"))),
+        };
+        e.publish_tile(dir.join(format!("tile-{tile}.tile")), cutoff)?;
+    }
+    // Absent, in-range probes: odd slots with each tile's suffix sort inside every
+    // tile's range and are stored by no tile.
+    let mut total = 0f64;
+    for p in 0..probes {
+        let slot = (p as u64 % 64) * 2 + 1;
+        let tile = (p * 7) % tiles;
+        let value = format!("s{:06}-v{tile}", slot);
+        let t = Instant::now();
+        let got = e.unique_lookup(b"P", b"no", value.as_bytes())?;
+        total += t.elapsed().as_secs_f64() * 1e6;
+        debug_assert!(got.is_none(), "spread probes are absent by construction");
+    }
+    let us = total / probes.max(1) as f64;
+    println!("mode=spread tiles={tiles} docs_per_tile={docs_per_tile} probe_absent_us={us:.2}");
+    let _ = std::fs::remove_dir_all(&dir);
+    Ok(())
+}
+
 /// Average µs of `unique_lookup` over `probes` calls for one fixed value; the
 /// result is not asserted, so an absent value is allowed.
 fn time_lookup(e: &Engine, value: &[u8], probes: usize) -> std::io::Result<f64> {
@@ -188,6 +245,17 @@ fn main() -> std::io::Result<()> {
         };
         for tiles in counts {
             run_multi_tile(tiles, DOCS_PER_TILE, TILE_PROBES)?;
+        }
+        return Ok(());
+    }
+    if args.first().is_some_and(|a| a == "spread") {
+        let counts: Vec<usize> = if args.len() > 1 {
+            args[1..].iter().map(|a| a.parse().unwrap()).collect()
+        } else {
+            vec![1, 4, 12]
+        };
+        for tiles in counts {
+            run_spread(tiles, DOCS_PER_TILE, TILE_PROBES)?;
         }
         return Ok(());
     }

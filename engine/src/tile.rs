@@ -298,7 +298,6 @@ pub(crate) struct Tile {
     /// The tile's persisted bloom filter, loaded and structurally validated at
     /// open. `None` means the tile has no bloom (`bloom_len == 0`), in which case
     /// [`Tile::might_contain_unique_prefix`] answers `true` for every prefix.
-    #[allow(dead_code)] // Read by `might_contain_unique_prefix`, wired into probes in 08d-2b.
     bloom: Option<Bloom>,
 }
 
@@ -615,7 +614,6 @@ impl TileWriter {
     /// before `finish`; calling it twice (or on an already-finished writer) is an
     /// error so a tile can never silently carry the wrong filter. The filter is
     /// independent of the entry stream, so it may be set before or after `push`.
-    #[allow(dead_code)] // Available to the engine's publish path; wired into probes in 08d-2b.
     pub(crate) fn set_bloom(&mut self, bloom: Bloom) -> io::Result<()> {
         if self.finished { return Err(invalid("tile writer already finished")); }
         if self.bloom.is_some() { return Err(invalid("tile bloom already set")); }
@@ -998,7 +996,6 @@ impl Tile {
     /// must query with those same strings (08d-2b builds it over the unique
     /// prefixes it will probe). It is orthogonal to [`Tile::could_contain_prefix`]:
     /// that one is a range proof over the tile's key span, this one is membership.
-    #[allow(dead_code)] // Consumed by the probe path in 08d-2b; tests cover it now.
     pub(crate) fn might_contain_unique_prefix(&self, prefix: &[u8]) -> bool {
         match &self.bloom {
             None => true,

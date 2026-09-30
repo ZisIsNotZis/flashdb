@@ -1,9 +1,9 @@
 //! FDBTILE3 page-structured tile format through the public Engine API: a
-//! multi-block tile round-trips with its directory index and its (absent) bloom
-//! section, and directory corruption is rejected at open (before any data block
-//! is read). The bloom filter itself is unit-tested in `src/bloom.rs`; the
-//! engine does not build one until slice 08d-2b, so every tile written here has
-//! `bloom_len == 0`.
+//! multi-block tile round-trips with its directory index and its bloom section,
+//! and directory corruption is rejected at open (before any data block is read).
+//! The bloom filter itself is unit-tested in `src/bloom.rs`; since slice 08d-2b
+//! the engine builds one over each tile's unique prefixes, so every tile written
+//! here has a nonempty bloom section.
 
 use flashdb_engine::engine::{Engine, Op};
 use std::fs;
@@ -61,13 +61,21 @@ fn multi_block_tile_roundtrips_and_directory_indexes_every_block() {
     assert!(dir_offset >= 4096 && dir_len > 0, "directory is present after the superblock page");
     let fence_count = u16::from_le_bytes(bytes[dir_offset + 8..dir_offset + 10].try_into().unwrap());
     assert!(fence_count >= 8, "directory lists one fence per data block, got {fence_count}");
-    // The engine does not wire a bloom until 08d-2b: the bloom section is absent,
-    // and `Tile::open` reads any such tile as "no bloom".
-    assert_eq!(superblock_field(&bytes, "bloom_len"), 0, "no bloom is written by this slice");
-    assert_eq!(superblock_field(&bytes, "bloom_offset"), dir_offset as u64, "a bloomless tile starts its directory where the bloom would have been");
-    assert_eq!(superblock_field(&bytes, "bloom_crc32c"), 0);
-    assert_eq!(superblock_field(&bytes, "bits_per_key"), 0);
-    assert_eq!(superblock_field(&bytes, "hash_count"), 0);
+    // The engine wires a per-tile bloom in 08d-2b: the section sits between the
+    // data blocks and the directory, and both its own header and the superblock
+    // record 10 bits/key (7 probes).
+    let bloom_offset = superblock_field(&bytes, "bloom_offset") as usize;
+    let bloom_len = superblock_field(&bytes, "bloom_len") as usize;
+    assert!(bloom_len > 0, "the engine writes a bloom");
+    assert!(bloom_offset >= 4096, "the bloom starts after the superblock page");
+    assert!(bloom_offset + bloom_len <= dir_offset, "the bloom ends at or before the directory");
+    assert_eq!(superblock_field(&bytes, "bits_per_key"), 10);
+    assert_eq!(superblock_field(&bytes, "hash_count"), 7);
+    let bit_count = u64::from_le_bytes(bytes[bloom_offset..bloom_offset + 8].try_into().unwrap());
+    let header_bpk = u32::from_le_bytes(bytes[bloom_offset + 16..bloom_offset + 20].try_into().unwrap());
+    assert_eq!(header_bpk, 10, "the bloom header agrees with the superblock copy");
+    assert_eq!(bytes[bloom_offset + 20], 7);
+    assert_eq!(bloom_len, 24 + bit_count.div_ceil(8) as usize, "the section length matches its bit count");
 
     let reopened = Engine::open_with_tile(&files.wal, &files.tile).unwrap();
     assert_eq!(reopened.serving_memtable_entries(), 0);
