@@ -19,6 +19,29 @@ measurements (07/evidence/probe-cost.md, `b718fab`).
    ~K× write amplification). Publish re-derives the full projection; open re-verifies
    every tile against the WAL.
 
+## Progress
+
+- **08a DONE** (`9b5eeff`, recovered from worker `d7fdeb6c`). FDBTILE2 page-structured,
+  directory-indexed format; spec `.scratch/08-tile-pages/FDBTILE2.md`. Supervisor decision
+  recorded: `first_key_len`/`key_len`/`value_len` are u32 (u16 could not encode existing
+  2 MiB values), `entry_count` u16, MAX_KEY/MAX_VALUE unchanged and fail-closed. Parent
+  review: superblock written last, superblock/trailer cross-checked, directory bounds vs
+  trailer, fence monotonicity, block-header consistency, per-block CRC on read, and a
+  re-read of size/superblock/trailer on first entry read; byte-offset tests adapted with
+  intent preserved. Gates: 110 Rust (+11), Python 10, `git diff --check` clean. Measured:
+  tile probe 110ms→16.4ms @5.6MB, 450ms→65.1ms @22.4MB (per-entry CRC removed) — still
+  linear, which 08b removes.
+  Parent review findings recorded as 08b work items: (i) within-block key order is no
+  longer verified anywhere (key-addressed verification replaced the positional check that
+  implied it) → must be enforced while streaming; (ii) data-block offsets are not checked
+  for overlap/gaps → add strictly-increasing/non-overlapping validation.
+- **08b DISPATCHED** (worker `0d5cc873`): allocation-free borrowed-entry cursor, prefix
+  seek via dir_search (first caller), streaming strict-order check, engine.rs scan_merged
+  rewired onto prefix cursors, plus the two review findings. Acceptance targets: probe at
+  a 22 MB tile ≤ 1 ms, sequential scan ≥ 400 MB/s, all 110 tests still green.
+- Review batching: 08a+08b are one subsystem (tile read path) → one fresh adversarial
+  reviewer after 08b lands, per the earlier batching decision.
+
 ## Planned slices (each independently reviewable)
 
 - **08a — page-structured tile format (FDBTILE2)**: 4 KiB pages, per-page CRC, page
