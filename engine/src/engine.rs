@@ -43,6 +43,57 @@ const UNIQUE_BLOOM_BITS_PER_KEY: u32 = 10;
 /// the engine's real bound instead of a hard-coded count.
 pub const MAX_ACTIVE_TILES: usize = manifest::MAX_TILES;
 
+/// Which contiguous run [`Engine::maybe_compact_shape`] merges. All three
+/// policies live entirely in `select_run`; the rest of compaction is unchanged.
+/// The scale driver picks one at runtime from `FLASHDB_COMPACT_SHAPE` so a shape
+/// sweep needs no rebuild.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CompactShape {
+    /// Today's tiered policy: the contiguous run of length >= 2 with the
+    /// smallest combined on-disk size (ties: the oldest), so a tile larger than
+    /// the budget is skipped while a cheaper run exists. The minimum is always
+    /// attained by an adjacent pair, so this is a Huffman-style pairwise tier
+    /// merge; per-merge work is bounded by the budget and rewrites per byte are
+    /// O(log N). When no run fits the budget, the two smallest adjacent tiles
+    /// merge (progress guarantee).
+    CheapestPair,
+    /// Universal-compaction shape: seed on the globally smallest tile (ties:
+    /// oldest) and repeatedly absorb the smaller eligible adjacent tile while
+    /// every input stays within 2x of the run's smallest size (the seed's size,
+    /// since the seed is the global minimum) and the run fits the budget and
+    /// the tile cap. Falls back to `CheapestPair` when the run is shorter than
+    /// two tiles.
+    RatioGroup,
+    /// Budget-maximal interval around the smallest tile: seed on the globally
+    /// smallest tile (ties: oldest) and repeatedly absorb the smaller eligible
+    /// adjacent tile while the run fits the budget and the tile cap, with no
+    /// ratio limit. Falls back to `CheapestPair` when the run is shorter than
+    /// two tiles (no neighbour fits the budget).
+    BudgetPrefix,
+}
+
+impl CompactShape {
+    /// Parse the `FLASHDB_COMPACT_SHAPE` spelling; `None` for an unknown name so
+    /// the caller can warn and keep its shipped default.
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "cheapest_pair" => Some(Self::CheapestPair),
+            "ratio_group" => Some(Self::RatioGroup),
+            "budget_prefix" => Some(Self::BudgetPrefix),
+            _ => None,
+        }
+    }
+
+    /// The canonical `FLASHDB_COMPACT_SHAPE` spelling, for driver reporting.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::CheapestPair => "cheapest_pair",
+            Self::RatioGroup => "ratio_group",
+            Self::BudgetPrefix => "budget_prefix",
+        }
+    }
+}
+
 /// 一个块内的键空间变更。键的 CSN 部分由引擎在发布时填充。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Op {
@@ -645,15 +696,15 @@ impl Engine {
     /// replaces exactly that run with one tile covering its union range, and
     /// returns the merged output's size in bytes.
     ///
-    /// The rule is to consider every contiguous run of length >= 2 and pick the
-    /// one with the SMALLEST combined size (ties: the oldest). Because sizes are
-    /// positive the minimum is always attained by an adjacent pair, so a tile
-    /// larger than the budget is a finished tier: any run containing it costs
-    /// more than a cheaper eligible run of smaller tiles, and is never selected
-    /// while that cheaper run exists. When no run fits the budget at all (every
-    /// adjacent pair exceeds it), the fallback merges the two adjacent tiles with
-    /// the smallest combined size, so every call still makes progress (the active
-    /// count strictly drops).
+    /// This is [`Engine::maybe_compact_shape`] with the shipped default, [`CompactShape::CheapestPair`]:
+    /// the contiguous run of length >= 2 with the SMALLEST combined size (ties:
+    /// the oldest). Because sizes are positive the minimum is always attained by
+    /// an adjacent pair, so a tile larger than the budget is a finished tier:
+    /// any run containing it costs more than a cheaper eligible run of smaller
+    /// tiles, and is never selected while that cheaper run exists. When no run
+    /// fits the budget at all (every adjacent pair exceeds it), the fallback
+    /// merges the two adjacent tiles with the smallest combined size, so every
+    /// call still makes progress (the active count strictly drops).
     ///
     /// "Size" is the sum of the selected tiles' on-disk file lengths, stat'ed
     /// once per call. The replacement's cutoff is the run's newest cutoff and its
@@ -663,6 +714,15 @@ impl Engine {
     /// the streaming reduction that buffers one block per input plus the
     /// WAL-window map.
     pub fn maybe_compact(&mut self, max_merge_bytes: u64, max_tiles: usize) -> io::Result<Option<u64>> {
+        self.maybe_compact_shape(max_merge_bytes, max_tiles, CompactShape::CheapestPair)
+    }
+
+    /// [`Engine::maybe_compact`] with an explicit run-selection policy, so the
+    /// scale driver can measure a shape sweep at runtime without a rebuild. The
+    /// invariants (contiguous run, length >= 2, union range, disjoint ranges,
+    /// streaming merge) are shared by every [`CompactShape`]; only `select_run`
+    /// differs.
+    pub fn maybe_compact_shape(&mut self, max_merge_bytes: u64, max_tiles: usize, shape: CompactShape) -> io::Result<Option<u64>> {
         if self.tiles.len() < max_tiles || self.tiles.len() < 2 {
             return Ok(None);
         }
@@ -670,23 +730,32 @@ impl Engine {
             return Err(io::Error::new(io::ErrorKind::Other, "manifest writer poisoned; reopen to recover"));
         }
         self.ensure_attached()?;
-        let (start, len) = self.select_run(max_merge_bytes)?;
+        let (start, len) = self.select_run(max_merge_bytes, max_tiles, shape)?;
         self.merge_run(start, len).map(Some)
     }
 
-    /// Start and length of the contiguous run to merge: the run of length >= 2
-    /// with the smallest combined on-disk size within `max_merge_bytes`, ties
-    /// resolved in favour of the oldest start; otherwise the two adjacent tiles
-    /// with the smallest combined size (progress guarantee). All tile sizes are
-    /// read once here and every candidate run reuses them. Requires >= 2 active
-    /// tiles.
-    fn select_run(&self, max_merge_bytes: u64) -> io::Result<(usize, usize)> {
+    /// Start and length of the contiguous run to merge under `shape`. The
+    /// cheapest-pair policy is the run of length >= 2 with the smallest combined
+    /// on-disk size within `max_merge_bytes`, ties in favour of the oldest
+    /// start; `RatioGroup` and `BudgetPrefix` seed on the smallest tile and grow
+    /// an interval around it (see below), falling back to the cheapest-pair rule
+    /// when they cannot reach two tiles. Every policy ends at the two adjacent
+    /// tiles with the smallest combined size when nothing fits the budget, so
+    /// every call makes progress. All tile sizes are read once here and every
+    /// candidate run reuses them. Requires >= 2 active tiles.
+    fn select_run(&self, max_merge_bytes: u64, max_tiles: usize, shape: CompactShape) -> io::Result<(usize, usize)> {
         debug_assert!(self.tiles.len() >= 2);
         let sizes: Vec<u64> = self.tiles
             .iter()
             .map(|t| fs::metadata(self.dir.join(&t.name)).map(|m| m.len()))
             .collect::<io::Result<Vec<_>>>()?;
         let n = sizes.len();
+        if shape != CompactShape::CheapestPair {
+            let ratio = (shape == CompactShape::RatioGroup).then_some(2u64);
+            if let Some(run) = Self::grow_around_smallest(&sizes, max_merge_bytes, max_tiles, ratio) {
+                return Ok(run);
+            }
+        }
         let mut best: Option<(u64, usize, usize)> = None; // (combined size, start, len)
         for start in 0..n {
             let mut sum = 0u64;
@@ -709,6 +778,43 @@ impl Engine {
             .min_by_key(|&i| (sizes[i].saturating_add(sizes[i + 1]), i))
             .expect("select_run requires at least two tiles");
         Ok((start, 2))
+    }
+
+    /// Greedy interval around the globally smallest tile, the seed policy shared
+    /// by `RatioGroup` and `BudgetPrefix`. Start with the seed (smallest size,
+    /// ties: oldest) and repeatedly absorb the smaller eligible adjacent tile;
+    /// on equal sizes prefer the older. A candidate is eligible while the running
+    /// total stays within `max_merge_bytes` and, when `max_ratio` is `Some(f)`,
+    /// while its size is within `f` of the seed's size (the run's smallest, since
+    /// the seed is the global minimum). Growth stops when neither neighbour is
+    /// eligible or the run reaches `max_tiles` inputs, so at most `max_tiles`
+    /// tiles merge. `None` when the run holds fewer than two tiles, i.e. no
+    /// neighbour fits, so the caller can fall back to the cheapest pair.
+    fn grow_around_smallest(sizes: &[u64], max_merge_bytes: u64, max_tiles: usize, max_ratio: Option<u64>) -> Option<(usize, usize)> {
+        let n = sizes.len();
+        let seed = (0..n).min_by_key(|&i| (sizes[i], i))?;
+        let limit = max_ratio.map_or(u64::MAX, |f| sizes[seed].saturating_mul(f));
+        let mut lo = seed;
+        let mut hi = seed;
+        let mut total = sizes[seed];
+        while hi - lo + 1 < max_tiles {
+            let left = lo.checked_sub(1).map(|i| (i, sizes[i]));
+            let right = (hi + 1 < n).then(|| (hi + 1, sizes[hi + 1]));
+            let eligible = |c: (usize, u64)| c.1 <= limit && total.saturating_add(c.1) <= max_merge_bytes;
+            let pick = match (left, right) {
+                (Some(l), Some(r)) if eligible(l) && eligible(r) => {
+                    Some(if (l.1, l.0) <= (r.1, r.0) { l } else { r })
+                }
+                (Some(l), _) if eligible(l) => Some(l),
+                (_, Some(r)) if eligible(r) => Some(r),
+                _ => None,
+            };
+            let Some((idx, size)) = pick else { break };
+            total = total.saturating_add(size);
+            lo = lo.min(idx);
+            hi = hi.max(idx);
+        }
+        (hi - lo + 1 >= 2).then_some((lo, hi - lo + 1))
     }
 
     /// Merge the active run `tiles[start..start + len]` (`2 <= len`, with at

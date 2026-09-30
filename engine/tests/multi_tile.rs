@@ -3,7 +3,7 @@
 //! [`Engine::maybe_checkpoint`] trigger. The WAL stays the sole recovery
 //! authority and is never rotated or truncated here.
 
-use flashdb_engine::engine::{Engine, Op, Outcome};
+use flashdb_engine::engine::{CompactShape, Engine, Op, Outcome};
 use std::fs;
 use std::io::ErrorKind;
 use std::path::PathBuf;
@@ -914,4 +914,128 @@ fn compacted_tile_carries_a_working_unique_bloom() {
     drop(e);
     let e = Engine::open_discover(&files.dir).unwrap();
     assert_reads(&e);
+}
+
+// ---------- Slice 12d: compaction merge SHAPES ----------
+
+/// Build one single-block tile per entry in `counts` (each doc exactly 64
+/// bytes) at cutoffs 1..=n and return their on-disk sizes. Handles are spaced
+/// `100_000` apart per tile so no two tiles share one.
+fn publish_sized_tiles(files: &Files, e: &mut Engine, counts: &[u64]) -> Vec<u64> {
+    counts.iter().enumerate().map(|(i, &n)| {
+        let cutoff = (i + 1) as u64;
+        publish_docs(files, e, &format!("b{cutoff}"), &format!("tile-{cutoff}.tile"), cutoff * 100_000, n, 64)
+    }).collect()
+}
+
+/// Publish `counts`, ask `shape` to merge under `budget`/`cap`, and return the
+/// surviving cutoffs plus the still-present ordinary tile file names.
+fn select_shape(counts: &[u64], shape: CompactShape, budget: u64, cap: usize) -> (Files, Vec<u64>, Vec<String>) {
+    let files = Files::new();
+    let mut e = Engine::create(&files.wal).unwrap();
+    publish_sized_tiles(&files, &mut e, counts);
+    assert!(e.maybe_compact_shape(budget, cap, shape).unwrap().is_some(),
+        "{shape:?} on counts={counts:?} must merge at least one run");
+    let survivors = e.active_tile_cutoffs();
+    let mut names: Vec<String> = fs::read_dir(&files.dir).unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with("tile-"))
+        .collect();
+    names.sort();
+    (files, survivors, names)
+}
+
+/// `cheapest_pair`: the exact-budget case and a giant in the middle. The budget
+/// is set to exactly the cheapest adjacent pair, and every other pair contains
+/// or exceeds the giant, so the giant is a finished tier.
+#[test]
+fn compact_shape_cheapest_pair_merges_the_exact_budget_pair_and_skips_the_middle_giant() {
+    let files = Files::new();
+    let mut e = Engine::create(&files.wal).unwrap();
+    let counts = [100u64, 110, 600, 100, 130];
+    let sizes = publish_sized_tiles(&files, &mut e, &counts);
+    let budget = sizes[0] + sizes[1];
+    assert!(sizes[2] > 2 * budget, "tile 3 must dwarf the cheapest pair: {} vs {budget}", sizes[2]);
+    assert!(e.maybe_compact_shape(budget, 5, CompactShape::CheapestPair).unwrap().is_some());
+    assert_eq!(e.active_tile_cutoffs(), vec![2, 3, 4, 5], "the oldest cheapest pair merges");
+    assert!(files.dir.join("tile-3.tile").exists(), "the giant middle tile is not an input");
+    assert!(!files.dir.join("tile-1.tile").exists());
+    assert!(!files.dir.join("tile-2.tile").exists());
+}
+
+/// `ratio_group`: seed on the smallest tile and absorb tiles within 2x of it,
+/// stopping at the ratio boundary (the giant at the end stays a finished tier).
+#[test]
+fn compact_shape_ratio_group_merges_the_group_and_stops_at_the_ratio_boundary() {
+    let counts = [100u64, 150, 170, 180, 800];
+    let (files, survivors, names) = select_shape(&counts, CompactShape::RatioGroup, u64::MAX, 5);
+    assert_eq!(survivors, vec![4, 5], "tiles 1-4 are within 2x of the seed; the giant stops the group");
+    assert!(names.contains(&"tile-5.tile".to_string()), "the out-of-ratio tile is untouched");
+    assert!(!names.contains(&"tile-1.tile".to_string()));
+    drop(files);
+}
+
+/// `ratio_group` on a giant in the middle: the seed (tile 1) absorbs tile 2 but
+/// the giant (tile 3) is above the 2x ratio, so the run ends before it.
+#[test]
+fn compact_shape_ratio_group_does_not_cross_a_middle_giant() {
+    let counts = [100u64, 190, 800, 120, 120];
+    let (_files, survivors, _names) = select_shape(&counts, CompactShape::RatioGroup, u64::MAX, 5);
+    assert_eq!(survivors, vec![2, 3, 4, 5], "the seed plus its in-ratio neighbour merge, the giant stays");
+}
+
+/// `budget_prefix`: the run stops at the tile cap even though the budget has room
+/// for the whole list.
+#[test]
+fn compact_shape_budget_prefix_grows_to_the_cap_boundary() {
+    let counts = [100u64, 120, 140, 160, 180, 200];
+    let (_files, survivors, names) = select_shape(&counts, CompactShape::BudgetPrefix, u64::MAX, 4);
+    assert_eq!(survivors, vec![4, 5, 6], "tiles 1-4 merge; the cap stops the run at four inputs");
+    assert!(names.contains(&"tile-5.tile".to_string()));
+    assert!(names.contains(&"tile-6.tile".to_string()));
+}
+
+/// `budget_prefix`: with neighbours on both sides it repeatedly absorbs the
+/// smaller eligible one, and the budget stops it before the larger left tile.
+#[test]
+fn compact_shape_budget_prefix_prefers_the_smaller_neighbour_and_stops_at_the_budget() {
+    let files = Files::new();
+    let mut e = Engine::create(&files.wal).unwrap();
+    let counts = [150u64, 100, 120, 140, 110];
+    let sizes = publish_sized_tiles(&files, &mut e, &counts);
+    let seed_and_right = sizes[1] + sizes[2] + sizes[3] + sizes[4];
+    let budget = seed_and_right + sizes[0] / 2;
+    assert!(sizes[0] > budget - seed_and_right, "the left tile alone does not fit the remaining budget");
+    assert!(e.maybe_compact_shape(budget, 5, CompactShape::BudgetPrefix).unwrap().is_some());
+    assert_eq!(e.active_tile_cutoffs(), vec![1, 5], "tiles 2-5 merge (picking the smaller right neighbours)");
+    assert!(files.dir.join("tile-1.tile").exists(), "the larger left tile stays untouched");
+}
+
+/// With a 1-byte budget no run fits, so every policy falls back to the two
+/// smallest adjacent tiles (2 and 3), leaving the giants at the ends.
+#[test]
+fn compact_shape_all_oversized_falls_back_to_the_two_smallest_adjacent() {
+    let counts = [600u64, 100, 100, 600];
+    for shape in [CompactShape::CheapestPair, CompactShape::RatioGroup, CompactShape::BudgetPrefix] {
+        let (_files, survivors, _names) = select_shape(&counts, shape, 1, 4);
+        assert_eq!(survivors, vec![1, 3, 4], "{shape:?} fallback merges the two smallest adjacent tiles");
+    }
+}
+
+/// One size pattern, three visibly different selections: the policies are not
+/// aliases of each other. CheapestPair takes the cheapest pair (tiles 3-4),
+/// RatioGroup takes the seed's whole in-ratio group (tiles 1-4), and
+/// BudgetPrefix takes every tile that fits (all five).
+#[test]
+fn compact_shapes_differ_on_one_size_pattern() {
+    let counts = [100u64, 190, 120, 120, 500];
+    let (files, cheapest, _) = select_shape(&counts, CompactShape::CheapestPair, u64::MAX, 5);
+    let (files2, ratio, _) = select_shape(&counts, CompactShape::RatioGroup, u64::MAX, 5);
+    let (files3, prefix, _) = select_shape(&counts, CompactShape::BudgetPrefix, u64::MAX, 5);
+    assert_eq!(cheapest, vec![1, 2, 4, 5], "cheapest pair is tiles 3-4");
+    assert_eq!(ratio, vec![4, 5], "ratio group is tiles 1-4");
+    assert_eq!(prefix, vec![5], "budget-maximal run is all five tiles");
+    drop(files);
+    drop(files2);
+    drop(files3);
 }

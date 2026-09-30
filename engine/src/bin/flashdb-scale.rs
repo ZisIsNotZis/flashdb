@@ -24,10 +24,11 @@
 //!
 //! Compaction is bounded and policy-driven, not "merge everything every N
 //! checkpoints". After each successful checkpoint the driver calls
-//! `Engine::maybe_compact(COMPACT_MERGE_BUDGET, MAX_ACTIVE_TILES)`: the trigger
-//! is the engine's real active-tile cap (`MAX_ACTIVE_TILES`, the manifest-page
-//! bound — not a hard-coded 8/12) and the driver asks `maybe_compact` to cap
-//! each merge at eight 64 MiB rotation windows of tile bytes. Whether a merge
+//! `Engine::maybe_compact_shape(COMPACT_MERGE_BUDGET, MAX_ACTIVE_TILES, shape)`:
+//! the trigger is the engine's real active-tile cap (`MAX_ACTIVE_TILES`, the
+//! manifest-page bound — not a hard-coded 8/12), the shape is the runtime
+//! `FLASHDB_COMPACT_SHAPE` policy, and the driver asks the merge to cap each
+//! merge at eight 64 MiB rotation windows of tile bytes. Whether a merge
 //! actually stays bounded — and therefore whether write amplification stays
 //! flat as the dataset grows — is exactly what the accounting below measures:
 //! `tile_bytes_compact` against `payload_bytes`. `publish_tile` still refuses
@@ -53,7 +54,7 @@ use std::io::{self, Write};
 use std::path::Path;
 use std::time::Instant;
 
-use flashdb_engine::engine::{Engine, Op, Outcome, MAX_ACTIVE_TILES};
+use flashdb_engine::engine::{CompactShape, Engine, Op, Outcome, MAX_ACTIVE_TILES};
 use serde::{Deserialize, Serialize};
 
 const ENTITY_A: &[u8] = b"EntityA";
@@ -78,6 +79,33 @@ fn compact_merge_budget() -> u64 {
         .filter(|v| *v >= 1)
         .unwrap_or(COMPACT_MERGE_WINDOWS)
         * ROTATE_BYTES
+}
+
+/// Shipped merge shape. Overridable with `FLASHDB_COMPACT_SHAPE` (one of
+/// `cheapest_pair`, `ratio_group`, `budget_prefix`) so a shape sweep needs no
+/// rebuild; the default is the measured winner.
+///
+/// Default: `cheapest_pair`. Measured at 2,000,000 x 1 KiB (budget 512 MiB,
+/// cap 12): ... (filled in by the 12d measurement).
+/// Shipped default after the shape sweep (deterministic metrics, same payload).
+/// At 5 M docs x 1 KiB: BudgetPrefix write_amp 3.920 / 21 compactions /
+/// 9.14 GB compaction output, RatioGroup 4.137 / 25 / 10.26 GB, CheapestPair
+/// 5.868 / 65 / 19.20 GB. At 2 M docs BudgetPrefix and RatioGroup both reach
+/// 2.998; CheapestPair is 3.827. BudgetPrefix is therefore the default, and the
+/// other shapes stay reachable via FLASHDB_COMPACT_SHAPE for re-measurement.
+const COMPACT_SHAPE: CompactShape = CompactShape::BudgetPrefix;
+
+fn compact_shape() -> CompactShape {
+    match std::env::var("FLASHDB_COMPACT_SHAPE") {
+        Ok(name) => CompactShape::from_name(&name).unwrap_or_else(|| {
+            eprintln!(
+                "unknown FLASHDB_COMPACT_SHAPE={name:?}; using {}",
+                COMPACT_SHAPE.name()
+            );
+            COMPACT_SHAPE
+        }),
+        Err(_) => COMPACT_SHAPE,
+    }
 }
 /// unique_lookup probes per entity in `verify`. Deliberately small: each probe
 /// is a full prefix scan over tiles + memtable (O(data)).
@@ -273,6 +301,12 @@ fn cmd_seed(
     let docs_b = total_docs - docs_a;
     let total_blocks = total_docs.div_ceil(docs_per_commit);
     let interval = (total_blocks / 10).clamp(1, 50);
+    let shape = compact_shape();
+    emit(&format!(
+        "phase=seed start shape={} merge_budget_bytes={} max_tiles={MAX_ACTIVE_TILES}",
+        shape.name(),
+        compact_merge_budget(),
+    ));
     let mut next_handle = e.next_handle()?;
     let mut rss_peak = rss_kb();
     let started = Instant::now();
@@ -341,7 +375,7 @@ fn cmd_seed(
         // memtable). All three are per-block calls, each a no-op below threshold.
         if e.maybe_checkpoint(CHECKPOINT_BYTES)? {
             count_published_tiles(dir, &mut seen_publish_tiles, &mut tile_bytes_publish)?;
-            if let Some(merged) = e.maybe_compact(compact_merge_budget(), MAX_ACTIVE_TILES)? {
+            if let Some(merged) = e.maybe_compact_shape(compact_merge_budget(), MAX_ACTIVE_TILES, shape)? {
                 compactions += 1;
                 tile_bytes_compact += merged;
             }
@@ -366,8 +400,9 @@ fn cmd_seed(
             let write_amp =
                 (wal_appended + tile_bytes) as f64 / payload_bytes.max(1) as f64;
             emit(&format!(
-                "phase=seed docs={end} csn={} payload_bytes={payload_bytes} wal_bytes={} wal_written_bytes={wal_appended} tile_bytes_publish={tile_bytes_publish} tile_bytes_compact={tile_bytes_compact} tile_bytes_total={tile_bytes} compactions={compactions} write_amplification={write_amp:.3} docs_s_interval={docs_s_interval:.0} docs_s_cumulative={docs_s_cumulative:.0} rss_kb={} rss_peak_kb={rss_peak}",
+                "phase=seed docs={end} csn={} shape={} payload_bytes={payload_bytes} wal_bytes={} wal_written_bytes={wal_appended} tile_bytes_publish={tile_bytes_publish} tile_bytes_compact={tile_bytes_compact} tile_bytes_total={tile_bytes} compactions={compactions} write_amplification={write_amp:.3} docs_s_interval={docs_s_interval:.0} docs_s_cumulative={docs_s_cumulative:.0} rss_kb={} rss_peak_kb={rss_peak}",
                 e.csn(),
+                shape.name(),
                 wal_bytes(dir)?,
                 rss_kb(),
             ));
@@ -391,8 +426,9 @@ fn cmd_seed(
     let tile_bytes = tile_bytes_publish + tile_bytes_compact;
     let write_amp = (wal_appended + tile_bytes) as f64 / payload_bytes.max(1) as f64;
     emit(&format!(
-        "phase=seed ok=true docs={total_docs} csn={} blocks={total_blocks} payload_bytes={payload_bytes} wal_bytes={} wal_written_bytes={wal_appended} tile_bytes_publish={tile_bytes_publish} tile_bytes_compact={tile_bytes_compact} tile_bytes_total={tile_bytes} compactions={compactions} write_amplification={write_amp:.3} docs_s_cumulative={:.0} rss_kb={} rss_peak_kb={rss_peak} elapsed_s={elapsed:.3}",
+        "phase=seed ok=true docs={total_docs} csn={} shape={} blocks={total_blocks} payload_bytes={payload_bytes} wal_bytes={} wal_written_bytes={wal_appended} tile_bytes_publish={tile_bytes_publish} tile_bytes_compact={tile_bytes_compact} tile_bytes_total={tile_bytes} compactions={compactions} write_amplification={write_amp:.3} docs_s_cumulative={:.0} rss_kb={} rss_peak_kb={rss_peak} elapsed_s={elapsed:.3}",
         e.csn(),
+        shape.name(),
         wal_bytes(dir)?,
         total_docs as f64 / elapsed.max(1e-9),
         rss_kb(),

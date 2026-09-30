@@ -255,3 +255,38 @@ Therefore, for every comparison in this ticket and in the paper:
 - The design docs already demand a pre-registered measurement protocol; this is a concrete
   instance of why: a docs/s table taken on this box without that control would have been noise
   presented as a policy effect.
+
+## 12d result: the merge shape was the real knob; BudgetPrefix is now the default
+
+Three shapes measured with the same driver, payload and config; **deterministic metrics only**
+(timing on this shared box is indicative - see the caveat above).
+
+2,000,000 docs x 1 KiB (payload 2,061,777,780 B):
+
+| shape | compaction output | tile bytes total | compactions | write_amp |
+|---|---|---|---|---|
+| `cheapest_pair` (old default) | 3,491,862,107 | 5,719,943,853 | 19 | 3.827 |
+| `ratio_group` | 1,782,336,058 | 4,010,417,804 | 4 | 2.998 |
+| `budget_prefix` | 1,782,336,058 | 4,010,417,804 | 4 | 2.998 |
+
+5,000,000 docs x 1 KiB (payload 5,157,777,780 B):
+
+| shape | compaction output | tile bytes total | compactions | write_amp |
+|---|---|---|---|---|
+| `cheapest_pair` | 19,204,614,555 | 24,840,172,661 | 65 | 5.868 |
+| `ratio_group` | 10,259,877,823 | 15,907,787,753 | 25 | 4.137 |
+| **`budget_prefix`** | **9,144,257,067** | **14,792,166,997** | **21** | **3.920** |
+
+So the pairwise "cheapest" merge was paying roughly 1.5-2x the necessary writes: absorbing as
+many of the smallest adjacent tiles as fit the budget per merge halves the compaction output at
+5 GB and cuts the number of merges from 65 to 21. **BudgetPrefix is now the shipped default**,
+with the measured numbers recorded in the code comment and the other two shapes reachable via
+`FLASHDB_COMPACT_SHAPE` for re-measurement.
+
+Consequences to keep in mind:
+- The budget *does* bind under BudgetPrefix (unlike under CheapestPair), so the budget is now a
+  real policy knob again; a later sweep can tune it.
+- The tile cap (12) still bounds how many tiles a single merge can absorb, so multi-page
+  manifests remain the way to buy more tier headroom.
+- Memory is unaffected: rss_peak 220-232 MB at 5.16 GB of payload across all shapes, i.e.
+  data:RAM ~= 22:1 holds.
