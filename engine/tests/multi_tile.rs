@@ -87,6 +87,29 @@ fn multi_tile_publish_cross_tier_reads_and_checkpointed_reopen() {
 }
 
 #[test]
+fn publish_fails_closed_when_retained_wal_disagrees_with_serving_memtable() {
+    use flashdb_engine::wal::crc32c;
+    let files = Files::new();
+    let mut e = Engine::create(&files.wal).unwrap();
+    e.commit_block(b"b1", &[doc(1, b"aaaa"), doc(2, b"bbbb")]).unwrap();
+    // The tile is written from the serving memtable; its verification must come
+    // from the WAL. Flip one byte of the last record's final doc value and
+    // repair the frame CRC, so the WAL still replays but no longer matches the
+    // served state: the publish must refuse to bind a tile to a divergent WAL.
+    let mut bytes = fs::read(&files.wal).unwrap();
+    let last = bytes.len() - 1;
+    bytes[last] ^= 0x01;
+    let crc = crc32c(&bytes[8..]);
+    bytes[4..8].copy_from_slice(&crc.to_le_bytes());
+    fs::write(&files.wal, &bytes).unwrap();
+
+    let err = e.publish_tile(&files.dir.join("tile-1.tile"), 1).unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::InvalidData, "a memtable/WAL value disagreement fails closed");
+    assert_eq!(e.serving_memtable_entries(), 2, "no version was evicted by the refused publish");
+    assert!(files.dir.join("tile-1.tile").exists(), "the candidate is left unreferenced, as publish's leftover rule requires");
+}
+
+#[test]
 fn maybe_checkpoint_triggers_only_past_threshold_and_advances_root() {
     let files = Files::new();
     let mut e = Engine::create(&files.wal).unwrap();

@@ -94,6 +94,13 @@ fn read_u64(path: &Path) -> Option<u64> {
     fs::read_to_string(path).ok()?.trim().parse().ok()
 }
 
+/// This process's own cgroup `memory.peak`, if readable. Monotonic for the
+/// scope and it counts page cache, so it is context beside the process VmHWM
+/// (which is the attributable number).
+fn cgroup_peak_bytes() -> Option<u64> {
+    cgroup_dir().and_then(|p| read_u64(&p.join("memory.peak")))
+}
+
 fn fresh_dir(tag: &str) -> io::Result<PathBuf> {
     let dir = std::env::temp_dir().join(format!("flashdb-write-memory-{}-{tag}", std::process::id()));
     let _ = fs::remove_dir_all(&dir);
@@ -235,10 +242,11 @@ fn run_window(w_mb: u64, cycles: u64) -> io::Result<()> {
         "mode=window window_mb={w_mb} cycles={done} blocks={blocks} payload_bytes={payload} \
          tile_bytes={tile_bytes} wal_bytes={wal_bytes} disk_bytes={disk_bytes} \
          ram_base_kb={base} ram_peak_sampled_kb={sampled_peak} ram_hwm_kb={hwm} ram_delta_kb={delta} \
-         delta_over_window={:.3} delta_over_payload={:.4} delta_over_disk={:.4} elapsed_s={:.3}",
+         delta_over_window={:.3} delta_over_payload={:.4} delta_over_disk={:.4} cgroup_peak_bytes={} elapsed_s={:.3}",
         delta as f64 * 1024.0 / w as f64,
         delta as f64 * 1024.0 / payload as f64,
         delta as f64 * 1024.0 / disk_bytes.max(1) as f64,
+        cgroup_peak_bytes().unwrap_or(0),
         started.elapsed().as_secs_f64(),
     ));
     let _ = fs::remove_dir_all(&dir);

@@ -128,9 +128,17 @@ impl Wal {
 /// 不完整尾和全零区域停止；完整帧 CRC/长度损坏时失败并保留原文件。
 /// 不完整尾仍无法与外部截断的已确认数据区分；不要据此声称抗任意介质损坏。
 pub fn replay(path: impl AsRef<Path>) -> io::Result<(Vec<Vec<u8>>, u64)> {
+    let mut records = Vec::new();
+    let valid = replay_each(path, |payload| { records.push(payload.to_vec()); Ok(()) })?;
+    Ok((records, valid))
+}
+
+/// 流式读取 WAL：逐条把完整载荷交给 `visit`，不收集整段后缀，因此一次遍历的
+/// 调用方不必再持有一份 replay 记录向量。分帧、CRC、全零尾与失败即拒绝的规则
+/// 与 [`replay`] 完全一致；返回有效字节数。
+pub fn replay_each(path: impl AsRef<Path>, mut visit: impl FnMut(&[u8]) -> io::Result<()>) -> io::Result<u64> {
     let file = File::open(path.as_ref())?;
     let mut r = BufReader::with_capacity(1 << 16, file);
-    let mut records = Vec::new();
     let mut valid: u64 = 0;
     loop {
         let mut header = [0u8; HEADER];
@@ -171,10 +179,10 @@ pub fn replay(path: impl AsRef<Path>) -> io::Result<(Vec<Vec<u8>>, u64)> {
             // after sync. Never silently truncate it as an unacknowledged tail.
             return Err(io::Error::new(io::ErrorKind::InvalidData, "WAL record CRC mismatch"));
         }
-        records.push(payload);
+        visit(&payload)?;
         valid += (HEADER + len) as u64;
     }
-    Ok((records, valid))
+    Ok(valid)
 }
 
 /// 仅删除文件（测试与工具用）。
@@ -224,6 +232,26 @@ mod tests {
         let (records, len) = replay(&p).unwrap();
         assert_eq!(records, vec![b"alpha".to_vec(), b"beta".to_vec(), b"gamma".to_vec()]);
         assert_eq!(len, w.valid_len());
+        remove(&p);
+    }
+
+    #[test]
+    fn replay_each_matches_replay_and_propagates_errors() {
+        let p = tmp("replay_each.wal");
+        let mut w = Wal::create(&p).unwrap();
+        for rec in [b"alpha".as_slice(), b"beta", b"gamma"] {
+            w.append(rec).unwrap();
+        }
+        w.sync().unwrap();
+        drop(w);
+        let mut seen: Vec<Vec<u8>> = Vec::new();
+        let valid = replay_each(&p, |payload| { seen.push(payload.to_vec()); Ok(()) }).unwrap();
+        let (records, replay_valid) = replay(&p).unwrap();
+        assert_eq!(seen, records, "streaming reader must yield the same records as replay");
+        assert_eq!(valid, replay_valid);
+        // A visitor error aborts the scan and is returned unchanged.
+        let err = replay_each(&p, |_| Err(io::Error::new(io::ErrorKind::Other, "stop"))).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Other);
         remove(&p);
     }
 

@@ -299,6 +299,12 @@ impl Engine {
     /// the engine never served.
     fn verify_wal_matches_state(&self, records: &[Vec<u8>]) -> io::Result<()> {
         let wal_max = records.last().map(|r| decode_payload(r).map(|v| v.0)).transpose()?.unwrap_or(0);
+        self.verify_wal_max(wal_max)
+    }
+
+    /// The republish guard's comparison, shared by the collected-record callers
+    /// and the streaming publish path so both reject the same divergences.
+    fn verify_wal_max(&self, wal_max: u64) -> io::Result<()> {
         let expected = if self.segment.is_some() { self.segment_suffix_csn } else { self.csn };
         if wal_max != expected && self.csn != 0 {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "WAL differs from serving state"));
@@ -343,21 +349,55 @@ impl Engine {
     /// (the prefix below the segment floor is already verified state carried by
     /// the published tiles and the manifest checkpoint) — before any caller may
     /// reference it.
+    ///
+    /// One bounded WAL-side copy: the suffix in `(previous cutoff, cutoff]` is
+    /// decoded once, in a single streaming pass, into a key-ordered
+    /// [`BTreeMap`]. The tile itself is written by streaming the serving
+    /// memtable through [`TileWriter`]; no projection of either side is
+    /// materialized, so the publish peak is one memtable plus one WAL window.
     fn write_verified_tile(&self, tile_path: &Path, cutoff: u64) -> io::Result<Tile> {
-        let (records, _) = wal::replay(&self.wal_path)?;
-        self.verify_wal_matches_state(&records)?;
-        let digest = wal_digest(&records, cutoff, self.wal_floor())?;
         let lower = self.tiles.last().map(|t| t.cutoff()).unwrap_or(0);
-        let mut expected = Memtable::new();
-        for payload in &records {
+        // Stream the retained WAL suffix once. Alongside the `(lower, cutoff]`
+        // expectation map this reproduces exactly the two former preconditions:
+        // the last record's CSN must match the serving state
+        // (`verify_wal_matches_state`) and the digest binds `(floor, cutoff]`
+        // (`wal_digest`). `op_kv` is the single op -> key/value spelling shared
+        // with `apply_op` and compaction, so the map matches `Memtable::apply`.
+        let mut wal_entries: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+        let mut hash = Sha256::new();
+        let mut last_csn = 0u64;
+        wal::replay_each(&self.wal_path, |payload| {
             let (csn, _, ops) = decode_payload(payload)?;
-            if csn <= cutoff && csn > lower { for op in &ops { apply_op(&mut expected, op, csn); } }
+            wal_digest_record(&mut hash, &mut last_csn, payload, csn, cutoff)?;
+            if csn <= cutoff && csn > lower {
+                for op in &ops {
+                    let (key, value) = op_kv(op, csn);
+                    wal_entries.insert(key, value);
+                }
+            }
+            Ok(())
+        })?;
+        self.verify_wal_max(last_csn)?;
+        let digest = wal_digest_finish(hash, last_csn, cutoff, self.wal_floor())?;
+        // Source (a): the serving memtable, already key-ordered and holding
+        // exactly the versions above `lower`. Keep the newest version per
+        // logical key (first of each group: keys sort CSN-descending) within
+        // `(lower, cutoff]`, streamed straight into the encoder.
+        let mut writer = TileWriter::new(tile_path, cutoff, &digest)?;
+        let mut last_logical: Option<Vec<u8>> = None;
+        for (key, value) in self.mt.entries() {
+            let Some(csn) = keys::key_csn(key) else { continue };
+            if csn <= lower || csn > cutoff { continue; }
+            let logical = &key[..key.len() - 8];
+            if last_logical.as_deref() == Some(logical) { continue; }
+            last_logical = Some(logical.to_vec());
+            writer.push(key, value)?;
         }
-        // The serving memtable holds exactly the versions above `lower`; both
-        // sides reduce to the newest version per logical key in the disjoint
-        // range, so filtering to `<= cutoff` writes precisely the new tile.
-        let tile = Tile::write(tile_path, cutoff, &digest, &newest_projection(&self.mt, lower, cutoff))?;
-        tile.verify_projection(&newest_projection(&expected, lower, cutoff), lower, cutoff)?;
+        let tile = writer.finish()?;
+        // Source (b): the WAL-derived expectation map. Independent of the
+        // memtable the tile was written from, so a divergence between the two
+        // fails closed here - unlike compaction's self-referential re-merge.
+        verify_tile_against_wal(&tile, &wal_entries, lower, cutoff)?;
         Ok(tile)
     }
 
@@ -533,12 +573,16 @@ impl Engine {
         // Durable flip done: rebind to the empty segment, then unlink the old
         // segment best-effort.
         let old_path = self.wal_path.clone();
-        let rebound = Wal::open_or_recover(&path);
-        let (wal, records) = match rebound {
-            ok => ok?,
-            // The durable root already names the new segment; a rebinding
-            // failure must not let later commits append to the old binding
-            // that recovery would ignore.
+        // The durable root already names the new segment; a rebinding failure must
+        // not let later commits append to the old binding that recovery would
+        // ignore, so it detaches the writer instead of only propagating.
+        //
+        // (The earlier version of this match bound the Ok case with an irrefutable
+        // `ok` pattern, which made the Err arm dead code: the `?` still returned the
+        // error but `wal_detached` was never set. Caught by a rustc unreachable-pattern
+        // warning, not by a test - hence the warnings gate.)
+        let (wal, records) = match Wal::open_or_recover(&path) {
+            Ok(recovered) => recovered,
             Err(e) => {
                 self.wal_detached = true;
                 return Err(e);
@@ -1027,15 +1071,27 @@ fn wal_digest(records: &[Vec<u8>], cutoff: u64, floor: u64) -> io::Result<[u8; 3
     let mut last = 0u64;
     for payload in records {
         let (csn, _, _) = decode_payload(payload)?;
-        if csn == 0 || csn <= last {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "WAL CSN reordering"));
-        }
-        if csn <= cutoff {
-            hash.update((payload.len() as u64).to_le_bytes());
-            hash.update(payload);
-        }
-        last = csn;
+        wal_digest_record(&mut hash, &mut last, payload, csn, cutoff)?;
     }
+    wal_digest_finish(hash, last, cutoff, floor)
+}
+
+/// Fold one record into the running digest and CSN-ordering check. Shared by the
+/// collected-record callers and the streaming publish path, so both bind exactly
+/// the same bytes and reject reordering identically.
+fn wal_digest_record(hash: &mut Sha256, last: &mut u64, payload: &[u8], csn: u64, cutoff: u64) -> io::Result<()> {
+    if csn == 0 || csn <= *last {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "WAL CSN reordering"));
+    }
+    if csn <= cutoff {
+        hash.update((payload.len() as u64).to_le_bytes());
+        hash.update(payload);
+    }
+    *last = csn;
+    Ok(())
+}
+
+fn wal_digest_finish(hash: Sha256, last: u64, cutoff: u64, floor: u64) -> io::Result<[u8; 32]> {
     if cutoff > last.max(floor) { return Err(io::Error::new(io::ErrorKind::InvalidData, "tile cutoff exceeds WAL")); }
     Ok(hash.finalize().into())
 }
@@ -1099,6 +1155,47 @@ fn newest_projection(mt: &Memtable, lower: u64, cutoff: u64) -> Memtable {
         out.apply(key.to_vec(), value.to_vec());
     }
     out
+}
+
+/// Publish verification against the WAL-derived expectation map: stream the map
+/// in key order with the same newest-version-per-logical-key / `(lower, cutoff]`
+/// reduction as the tile write, and require an exact 1:1 match with the written
+/// tile - missing, extra, key or value mismatches all fail closed. The tile was
+/// written from the *serving memtable*, so this comparison is genuinely
+/// independent (two different sources), unlike a re-derivation of the writer's
+/// own input.
+fn verify_tile_against_wal(
+    tile: &Tile,
+    wal_entries: &BTreeMap<Vec<u8>, Vec<u8>>,
+    lower: u64,
+    cutoff: u64,
+) -> io::Result<()> {
+    let mut actual = tile.entries();
+    let mut pending = actual.next();
+    let mut last_logical: Option<Vec<u8>> = None;
+    for (key, value) in wal_entries {
+        let Some(csn) = keys::key_csn(key) else { continue };
+        if csn <= lower || csn > cutoff { continue; }
+        let logical = &key[..key.len() - 8];
+        if last_logical.as_deref() == Some(logical) { continue; }
+        last_logical = Some(logical.to_vec());
+        let Some(entry) = pending.take() else {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "tile is missing a WAL entry"));
+        };
+        let (akey, avalue) = entry?;
+        if akey.as_slice() != key.as_slice() {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "tile entry key disagrees with WAL"));
+        }
+        if avalue.as_slice() != value.as_slice() {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "tile entry value disagrees with WAL"));
+        }
+        pending = actual.next();
+    }
+    if let Some(entry) = pending {
+        entry?;
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "tile contains an extra entry"));
+    }
+    Ok(())
 }
 
 // ---------- WAL payload 编解码（v0 二进制，LE） ----------

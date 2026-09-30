@@ -123,13 +123,10 @@ pub(crate) fn valid_tile_name(name: &str) -> bool {
 
 fn encode_root(root: &Root) -> io::Result<[u8; PAYLOAD]> {
     let mut p = [0u8; PAYLOAD];
-    let mut i = 0;
-    if root.tiles.is_empty() {
-        if root.seq != 0 {
-            return Err(invalid("empty manifest requires seq 0"));
-        }
-        i = 4; // tile_count = 0, rest zeroed
-    } else {
+    if root.tiles.is_empty() && root.seq != 0 {
+        return Err(invalid("empty manifest requires seq 0"));
+    }
+    if !root.tiles.is_empty() {
         if root.tiles.len() > MAX_TILES {
             return Err(invalid("manifest tile list exceeds one page"));
         }
@@ -137,22 +134,23 @@ fn encode_root(root: &Root) -> io::Result<[u8; PAYLOAD]> {
             return Err(invalid("manifest tile cutoffs overlap or are not strictly increasing"));
         }
         p[..4].copy_from_slice(&(root.tiles.len() as u32).to_le_bytes());
-        i = 4;
-        for t in &root.tiles {
-            let name = t.name.as_bytes();
-            if !valid_tile_name(&t.name) {
-                return Err(invalid("tile name is not a plain directory-local file"));
-            }
-            // MAX_TILES * (4 + MAX_NAME + 8 + 32) + 20 stays far below PAYLOAD,
-            // so these fixed-size writes cannot run past the page.
-            p[i..i + 4].copy_from_slice(&(name.len() as u32).to_le_bytes());
-            p[i + 4..i + 4 + name.len()].copy_from_slice(name);
-            i += 4 + name.len();
-            p[i..i + 8].copy_from_slice(&t.cutoff.to_le_bytes());
-            i += 8;
-            p[i..i + 32].copy_from_slice(&t.digest);
-            i += 32;
+    }
+    // tile_count is zero for an empty manifest, then the tile records (none when empty).
+    let mut i = 4;
+    for t in &root.tiles {
+        let name = t.name.as_bytes();
+        if !valid_tile_name(&t.name) {
+            return Err(invalid("tile name is not a plain directory-local file"));
         }
+        // MAX_TILES * (4 + MAX_NAME + 8 + 32) + 20 stays far below PAYLOAD,
+        // so these fixed-size writes cannot run past the page.
+        p[i..i + 4].copy_from_slice(&(name.len() as u32).to_le_bytes());
+        p[i + 4..i + 4 + name.len()].copy_from_slice(name);
+        i += 4 + name.len();
+        p[i..i + 8].copy_from_slice(&t.cutoff.to_le_bytes());
+        i += 8;
+        p[i..i + 32].copy_from_slice(&t.digest);
+        i += 32;
     }
     p[i..i + 8].copy_from_slice(&root.checkpoint.csn.to_le_bytes());
     p[i + 8..i + 16].copy_from_slice(&root.checkpoint.handle_watermark.to_le_bytes());
