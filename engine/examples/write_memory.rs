@@ -16,6 +16,8 @@
 //!                                            window (replay / expected memtable /
 //!                                            newest projection / live memtable)
 //!   compaction <w_mb> <tiles>                exp4: compaction peak vs tile bytes
+//!   reopen     <w_mb> <tiles>                exp5: RAM a reopen retains per tile
+//!                                            (sparse directory index, slice 11)
 //!
 //! One process per invocation: `VmHWM` is monotonic, and `clear_refs` value 5
 //! resets it to the current RSS so each phase's peak is measured from a clean
@@ -365,10 +367,9 @@ fn run_breakdown(w_mb: u64) -> io::Result<()> {
 
 // ---------- exp 4: compaction peak vs tile bytes ----------
 
-fn run_compaction(w_mb: u64, tiles: u64) -> io::Result<()> {
-    let w = w_mb << 20;
-    let dir = fresh_dir("compaction")?;
-    let mut e = Engine::create(dir.join("data.wal"))?;
+/// Checkpoint + rotate `tiles` windows of `w` bytes into `e`, returning
+/// (next_handle, blocks_written). Shared by the compaction and reopen measurements.
+fn build_rotated_tiles(e: &mut Engine, w: u64, tiles: u64) -> io::Result<(u64, u64)> {
     let mut handle = e.next_handle()?;
     let mut blocks = 0u64;
     let blocks_per_window = (w / (BLOCK_DOCS * DOC_V as u64)).max(1);
@@ -393,6 +394,14 @@ fn run_compaction(w_mb: u64, tiles: u64) -> io::Result<()> {
             return Err(io::Error::new(io::ErrorKind::Other, "rotate_wal refused right after a checkpoint"));
         }
     }
+    Ok((handle, blocks))
+}
+
+fn run_compaction(w_mb: u64, tiles: u64) -> io::Result<()> {
+    let w = w_mb << 20;
+    let dir = fresh_dir("compaction")?;
+    let mut e = Engine::create(dir.join("data.wal"))?;
+    let (_, _) = build_rotated_tiles(&mut e, w, tiles)?;
     malloc_trim();
     let base = rss_kb();
     reset_hwm();
@@ -422,12 +431,50 @@ fn run_compaction(w_mb: u64, tiles: u64) -> io::Result<()> {
     Ok(())
 }
 
+// ---------- exp 5: RAM retained by reopening every tile ----------
+
+/// Build `tiles` windows, close the engine, trim the allocator, then reopen
+/// through the durable manifest and report the resident delta and the per-GiB
+/// figure. Open validates the superblock, trailer, directory blocks and every
+/// block header but reads no data block; the only alive set it retains is the
+/// sparse directory index (one entry per directory block, slice 11).
+fn run_reopen(w_mb: u64, tiles: u64) -> io::Result<()> {
+    let w = w_mb << 20;
+    let dir = fresh_dir("reopen")?;
+    let mut e = Engine::create(dir.join("data.wal"))?;
+    let (_, blocks) = build_rotated_tiles(&mut e, w, tiles)?;
+    let tile_bytes = ext_bytes(&dir, "tile")?;
+    let wal_bytes = ext_bytes(&dir, "wal")?;
+    drop(e); // close the engine and every tile file handle before the baseline
+    malloc_trim();
+    let base = rss_kb();
+    reset_hwm();
+    let e = Engine::open_discover(&dir)?;
+    malloc_trim(); // return transient verification arena before sampling the live set
+    let rss_open = rss_kb();
+    let hwm = hwm_kb();
+    let delta = rss_open.saturating_sub(base);
+    let gib = tile_bytes as f64 / (1u64 << 30) as f64;
+    emit(&format!(
+        "mode=reopen window_mb={w_mb} tiles={tiles} blocks={blocks} tile_bytes={tile_bytes} wal_bytes={wal_bytes} \
+         ram_base_kb={base} ram_open_kb={rss_open} ram_open_hwm_kb={hwm} ram_delta_kb={delta} \
+         retained_mib={:.3} fence_ram_kib_per_gib={:.1} delta_over_tile_bytes={:.6}",
+        delta as f64 / 1024.0,
+        if gib > 0.0 { delta as f64 / gib } else { 0.0 },
+        delta as f64 * 1024.0 / tile_bytes.max(1) as f64,
+    ));
+    drop(e);
+    let _ = fs::remove_dir_all(&dir);
+    Ok(())
+}
+
 // ---------- main ----------
 
 const USAGE: &str = "usage: write_memory memtable <value_bytes> <total_bytes>\n\
                      usage: write_memory window <w_mb> <cycles>\n\
                      usage: write_memory breakdown <w_mb>\n\
-                     usage: write_memory compaction <w_mb> <tiles>";
+                     usage: write_memory compaction <w_mb> <tiles>\n\
+                     usage: write_memory reopen <w_mb> <tiles>";
 
 fn parse(s: Option<&String>, name: &str) -> io::Result<u64> {
     s.and_then(|v| v.parse::<u64>().ok())
@@ -453,6 +500,7 @@ fn main() -> io::Result<()> {
         Some("window") => run_window(parse(args.get(2), "w_mb")?, parse(args.get(3), "cycles")?),
         Some("breakdown") => run_breakdown(parse(args.get(2), "w_mb")?),
         Some("compaction") => run_compaction(parse(args.get(2), "w_mb")?, parse(args.get(3), "tiles")?),
+        Some("reopen") => run_reopen(parse(args.get(2), "w_mb")?, parse(args.get(3), "tiles")?),
         _ => {
             eprintln!("{USAGE}");
             std::process::exit(2);

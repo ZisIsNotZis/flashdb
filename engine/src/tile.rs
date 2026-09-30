@@ -8,6 +8,16 @@
 //! validates the superblock, trailer, directory structure and block headers but
 //! deliberately does not read data blocks; `entries()` streams blocks in key
 //! order, verifying each block's CRC on the way.
+//!
+//! The directory stays on disk as the authoritative index. RAM holds only a
+//! sparse index with one [`DirBlockRef`] per *directory block* (its file offset,
+//! length, cumulative first data-block index and first fence key), not one
+//! entry per data block. A lookup binary-searches that sparse index to pick the
+//! directory block, reads and CRC-verifies that one block on demand, parses its
+//! fences and binary-searches them. A wrong candidate costs an extra block read
+//! but never a wrong answer: the cursor re-verifies the loaded data block and its
+//! fence. A directory that fits in a single 4 KiB block therefore yields a
+//! single-entry index — not actually sparse, which is fine.
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, ErrorKind, Seek, SeekFrom, Write};
@@ -70,6 +80,32 @@ struct Fence {
     first_key: Vec<u8>,
     offset: u64,
     len: u32,
+}
+
+/// Retained RAM footprint of one on-disk directory block. The fence records
+/// themselves stay on disk; this holds only where the block lives, how many data
+/// blocks it precedes (cumulative) and its first fence key, so the sparse index
+/// grows with the number of directory blocks, not the number of data blocks.
+struct DirBlockRef {
+    offset: u64,
+    len: u32,
+    /// Global data-block index of the block's first fence.
+    first_block: u64,
+    fence_count: u16,
+    first_key: Vec<u8>,
+}
+
+/// Directory-block index of the greatest block whose first fence key is `<= key`,
+/// or 0 when the key sorts below the first block's first key. The caller reads
+/// that one block and binary-searches its fences with [`dir_search`].
+fn sparse_search(dir: &[DirBlockRef], key: &[u8]) -> usize {
+    let mut lo = 0usize;
+    let mut hi = dir.len();
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        if dir[mid].first_key.as_slice() <= key { lo = mid + 1; } else { hi = mid; }
+    }
+    if lo == 0 { 0 } else { lo - 1 }
 }
 
 /// Candidate data block for `key`: the greatest fence whose first key is `<= key`,
@@ -136,6 +172,35 @@ fn encode_dir_block(records: &[u8], fence_count: u16) -> io::Result<Vec<u8>> {
     Ok(b)
 }
 
+/// CRC-verify one directory block (its own bytes, length prefix included) and
+/// parse its fence records. Framing rules match what `Tile::open` enforces: the
+/// declared length must equal the buffer, the CRC covers `block[8..]`, and the
+/// records must fill the block exactly.
+fn decode_dir_block(block: &[u8]) -> io::Result<Vec<Fence>> {
+    if block.len() < DIR_HEADER { return Err(invalid("tile directory block truncated")); }
+    let blen = u32::from_le_bytes(block[..4].try_into().unwrap()) as usize;
+    if blen != block.len() { return Err(invalid("tile directory block length")); }
+    let block_crc = u32::from_le_bytes(block[4..8].try_into().unwrap());
+    if crc32c(&block[8..]) != block_crc { return Err(invalid("tile directory checksum")); }
+    let fence_count = u16::from_le_bytes(block[8..10].try_into().unwrap()) as usize;
+    let mut fences = Vec::with_capacity(fence_count);
+    let mut q = DIR_HEADER;
+    for _ in 0..fence_count {
+        if blen - q < 16 { return Err(invalid("tile fence record truncated")); }
+        let first_key_len = u32::from_le_bytes(block[q..q + 4].try_into().unwrap()) as usize;
+        let block_offset = u64::from_le_bytes(block[q + 4..q + 12].try_into().unwrap());
+        let block_len = u32::from_le_bytes(block[q + 12..q + 16].try_into().unwrap());
+        q += 16;
+        if first_key_len < 1 || first_key_len > MAX_KEY || blen - q < first_key_len {
+            return Err(invalid("tile fence key length"));
+        }
+        fences.push(Fence { first_key: block[q..q + first_key_len].to_vec(), offset: block_offset, len: block_len });
+        q += first_key_len;
+    }
+    if q != blen { return Err(invalid("tile directory block trailing bytes")); }
+    Ok(fences)
+}
+
 // Positional reads never expose borrowed file-backed bytes. Truncation and
 // corruption yield io::Error, never SIGBUS/panic. Open validates the file's
 // structure (superblock, trailer, directory, block headers) without touching
@@ -173,13 +238,46 @@ pub(crate) struct Tile {
     digest: [u8; 32],
     count: u64,
     size: u64,
+    /// Sparse directory index: one entry per on-disk directory block. The fence
+    /// records stay on disk; see the module docs.
+    dir: Vec<DirBlockRef>,
+    /// Total number of data blocks (directory fence records) in the tile.
+    data_blocks: u64,
+}
+
+/// Cursor-local cache of exactly one on-disk directory block. Advancing through
+/// the data blocks only re-reads the directory when it crosses a block boundary,
+/// so a full scan reads each directory block at most once while retaining no
+/// more fences than a single directory block holds.
+struct DirCache {
+    index: Option<usize>,
+    base: u64,
     fences: Vec<Fence>,
+}
+
+impl DirCache {
+    fn new() -> Self {
+        DirCache { index: None, base: 0, fences: Vec::new() }
+    }
+
+    /// The fence for global data block `block`, loading the containing directory
+    /// block on a miss. The returned reference borrows the cache, so callers do
+    /// not copy each fence out of it.
+    fn fence<'t>(&'t mut self, tile: &'t Tile, block: usize) -> io::Result<&'t Fence> {
+        let index = tile.dir_block_of(block);
+        if self.index != Some(index) {
+            self.fences = tile.read_dir_fences(index)?;
+            self.base = tile.dir[index].first_block;
+            self.index = Some(index);
+        }
+        self.fences.get(block - self.base as usize).ok_or_else(|| invalid("tile directory block changed"))
+    }
 }
 
 /// Pull cursor over a tile's data blocks. Entries borrow the cursor's own block
 /// buffer, so streaming allocates nothing per entry (only the reused prefix and
 /// last-key buffers). Without a prefix it yields every entry; with one it starts
-/// at the block `dir_search` selects, skips entries sorting below the prefix,
+/// at the block `candidate` selects, skips entries sorting below the prefix,
 /// yields only keys that begin with it, and stops at the first key past the
 /// prefix range without reading further blocks. Yielded keys must be strictly
 /// increasing; any other order is `InvalidData`.
@@ -197,6 +295,8 @@ pub(crate) struct TileCursor<'a> {
     last: Vec<u8>,
     started: bool,
     done: bool,
+    /// At most one parsed directory block, read on demand from the sparse index.
+    dir: DirCache,
 }
 
 impl<'a> TileCursor<'a> {
@@ -213,6 +313,7 @@ impl<'a> TileCursor<'a> {
             last: Vec::new(),
             started: false,
             done: false,
+            dir: DirCache::new(),
         }
     }
 
@@ -220,7 +321,7 @@ impl<'a> TileCursor<'a> {
     /// position to its first entry.
     fn load_block(&mut self) -> io::Result<()> {
         let (offset, len) = {
-            let fence = &self.tile.fences[self.block];
+            let fence = self.dir.fence(self.tile, self.block)?;
             (fence.offset, fence.len as usize)
         };
         self.buffer.resize(len, 0);
@@ -233,13 +334,16 @@ impl<'a> TileCursor<'a> {
         let first_key_len = u32::from_le_bytes(self.buffer[8..12].try_into().unwrap()) as usize;
         if BLOCK_HEADER + first_key_len > blen { return Err(invalid("tile block first key out of bounds")); }
         // Re-bind the block to its fence on every load. Open verified this once,
-        // but the fence is cached in RAM: a CRC-consistent rewrite of the file
-        // could otherwise serve a block whose first key disagrees with the fence
-        // and, because the order check only sees *yielded* keys, a prefix cursor
-        // could stop early and silently drop matches.
-        if self.buffer[BLOCK_HEADER..BLOCK_HEADER + first_key_len] != *self.tile.fences[self.block].first_key {
-            return Err(invalid("tile block first key disagrees with its fence"));
-        }
+        // but the fence now comes from a per-read directory block: a
+        // CRC-consistent rewrite of the file could otherwise serve a block whose
+        // first key disagrees with the fence and, because the order check only
+        // sees *yielded* keys, a prefix cursor could stop early and silently drop
+        // matches.
+        let rebound = {
+            let fence = self.dir.fence(self.tile, self.block)?;
+            self.buffer[BLOCK_HEADER..BLOCK_HEADER + first_key_len] == *fence.first_key
+        };
+        if !rebound { return Err(invalid("tile block first key disagrees with its fence")); }
         self.pos = BLOCK_HEADER + first_key_len;
         self.left = u16::from_le_bytes(self.buffer[12..14].try_into().unwrap());
         Ok(())
@@ -262,12 +366,13 @@ impl<'a> TileCursor<'a> {
         }
         loop {
             if self.left == 0 {
-                if self.block >= self.tile.fences.len() { self.done = true; return Ok(false); }
+                if self.block as u64 >= self.tile.data_blocks { self.done = true; return Ok(false); }
                 // A block whose first key sorts past the prefix without starting
-                // with it, and every later block, cannot match: stop before reading.
+                // with it, and every later block, cannot match: stop before
+                // reading. The fence comes from the cached directory block.
                 if let Some(prefix) = &self.prefix {
-                    let first = self.tile.fences[self.block].first_key.as_slice();
-                    if first > prefix.as_slice() && !first.starts_with(prefix.as_slice()) {
+                    let first = { let fence = self.dir.fence(self.tile, self.block)?; fence.first_key.as_slice() > prefix.as_slice() && !fence.first_key.starts_with(prefix.as_slice()) };
+                    if first {
                         self.done = true;
                         return Ok(false);
                     }
@@ -486,6 +591,10 @@ impl TileWriter {
 }
 
 impl Tile {
+    /// Whole-memtable convenience writer. Production publishes stream through
+    /// [`TileWriter`] directly (10c-2); this stays as the test-facing entry point that
+    /// the byte-identity test compares the streaming API against.
+    #[cfg(test)]
     pub(crate) fn write(path: &Path, cutoff: u64, digest: &[u8; 32], mt: &Memtable) -> io::Result<Self> {
         let mut writer = TileWriter::new(path, cutoff, digest)?;
         for (key, value) in mt.entries() {
@@ -526,78 +635,123 @@ impl Tile {
         if dir_offset < PAGE_SIZE as u64 || dir_offset.checked_add(dir_len) != Some(size - TRAILER as u64) {
             return Err(invalid("tile directory bounds"));
         }
-        let mut fences: Vec<Fence> = Vec::new();
+        // Stream the directory: one block at a time, validating and then dropping
+        // its fences, so open RAM is the sparse index (one entry per directory
+        // block) rather than one entry per data block. Every check the old in-RAM
+        // pass made is still performed here (CRC, framing, fence monotonicity
+        // across the whole directory, data-block offset monotonicity and
+        // non-overlap, and each block header); only the fence catalog is not
+        // retained. Validation cost stays O(directory); its RAM does not.
+        let mut dir: Vec<DirBlockRef> = Vec::new();
+        let mut data_blocks: u64 = 0;
+        let mut previous_key: Option<Vec<u8>> = None;
+        let mut previous_end: Option<u64> = None;
+        let mut total: u64 = 0;
+        let mut hdr = [0u8; BLOCK_HEADER];
+        let mut key_buf: Vec<u8> = Vec::new();
         if dir_len > 0 {
-            let dir = read_range(&file, dir_offset, dir_len)?;
-            let mut pos = 0usize;
-            while pos < dir.len() {
-                if dir.len() - pos < DIR_HEADER { return Err(invalid("tile directory block truncated")); }
-                let blen = u32::from_le_bytes(dir[pos..pos + 4].try_into().unwrap()) as usize;
-                if blen < DIR_HEADER || blen > dir.len() - pos { return Err(invalid("tile directory block length")); }
-                let block_crc = u32::from_le_bytes(dir[pos + 4..pos + 8].try_into().unwrap());
-                if crc32c(&dir[pos + 8..pos + blen]) != block_crc { return Err(invalid("tile directory checksum")); }
-                let fence_count = u16::from_le_bytes(dir[pos + 8..pos + 10].try_into().unwrap()) as usize;
-                let mut q = pos + DIR_HEADER;
-                for _ in 0..fence_count {
-                    if blen - (q - pos) < 16 { return Err(invalid("tile fence record truncated")); }
-                    let first_key_len = u32::from_le_bytes(dir[q..q + 4].try_into().unwrap()) as usize;
-                    let block_offset = u64::from_le_bytes(dir[q + 4..q + 12].try_into().unwrap());
-                    let block_len = u32::from_le_bytes(dir[q + 12..q + 16].try_into().unwrap());
-                    q += 16;
-                    if first_key_len < 1 || first_key_len > MAX_KEY || blen - (q - pos) < first_key_len {
-                        return Err(invalid("tile fence key length"));
-                    }
-                    fences.push(Fence {
-                        first_key: dir[q..q + first_key_len].to_vec(),
-                        offset: block_offset,
-                        len: block_len,
-                    });
-                    q += first_key_len;
+            let dir_end = dir_offset + dir_len; // == size - TRAILER, checked above
+            let mut pos = dir_offset;
+            while pos < dir_end {
+                let mut len_buf = [0u8; 4];
+                read_exact_at(&file, &mut len_buf, pos)?;
+                let blen = u32::from_le_bytes(len_buf) as u64;
+                if blen < DIR_HEADER as u64 || blen > dir_end - pos {
+                    return Err(invalid("tile directory block length"));
                 }
-                if q != pos + blen { return Err(invalid("tile directory block trailing bytes")); }
+                let block = read_range(&file, pos, blen)?;
+                let block_fences = decode_dir_block(&block)?;
+                dir.push(DirBlockRef {
+                    offset: pos,
+                    len: blen as u32,
+                    first_block: data_blocks,
+                    fence_count: block_fences.len() as u16,
+                    first_key: block_fences.first().map(|f| f.first_key.clone()).unwrap_or_default(),
+                });
+                for i in 0..block_fences.len() {
+                    let fence = &block_fences[i];
+                    if fence.offset < PAGE_SIZE as u64 || (fence.len as usize) < BLOCK_HEADER {
+                        return Err(invalid("tile block offset/length"));
+                    }
+                    let end = fence.offset.checked_add(fence.len as u64).ok_or_else(|| invalid("tile block overflow"))?;
+                    if end > dir_offset { return Err(invalid("tile block outside data region")); }
+                    // Data blocks must be strictly increasing and non-overlapping: a
+                    // directory whose offsets collide or overlap can alias blocks.
+                    if previous_end.is_some_and(|prev_end| fence.offset < prev_end) {
+                        return Err(invalid("tile data blocks overlap or are out of order"));
+                    }
+                    // Fence keys must be strictly increasing across the whole
+                    // directory, including across directory-block boundaries
+                    // (within a block, compare against the previous record directly).
+                    let prev = if i == 0 { previous_key.as_deref() } else { Some(block_fences[i - 1].first_key.as_slice()) };
+                    if prev.is_some_and(|prev| prev >= fence.first_key.as_slice()) {
+                        return Err(invalid("tile fence keys not strictly increasing"));
+                    }
+                    previous_end = Some(end);
+                    // Block header consistency: the header's length, first key and entry
+                    // count must agree with the directory (data CRC is checked on read).
+                    read_exact_at(&file, &mut hdr, fence.offset)?;
+                    let hlen = u32::from_le_bytes(hdr[..4].try_into().unwrap());
+                    let first_key_len = u32::from_le_bytes(hdr[8..12].try_into().unwrap()) as usize;
+                    let entry_count = u16::from_le_bytes(hdr[12..14].try_into().unwrap());
+                    if hlen != fence.len { return Err(invalid("tile block length mismatch")); }
+                    if first_key_len != fence.first_key.len() { return Err(invalid("tile block first key length mismatch")); }
+                    if BLOCK_HEADER + first_key_len > fence.len as usize { return Err(invalid("tile block first key out of bounds")); }
+                    if entry_count == 0 { return Err(invalid("tile block declares no entries")); }
+                    key_buf.resize(first_key_len, 0);
+                    read_exact_at(&file, &mut key_buf, fence.offset + BLOCK_HEADER as u64)?;
+                    if key_buf != fence.first_key { return Err(invalid("tile block first key mismatch")); }
+                    total = total.checked_add(entry_count as u64).ok_or_else(|| invalid("tile entry count overflow"))?;
+                }
+                if let Some(last) = block_fences.last() { previous_key = Some(last.first_key.clone()); }
+                data_blocks += block_fences.len() as u64;
                 pos += blen;
             }
+            if pos != dir_end { return Err(invalid("tile directory bounds")); }
         } else if count != 0 {
             return Err(invalid("tile directory missing for nonempty tile"));
         }
-        let mut previous: Option<&[u8]> = None;
-        let mut previous_end: Option<u64> = None;
-        let mut total: u64 = 0;
-        for (index, fence) in fences.iter().enumerate() {
-            if fence.offset < PAGE_SIZE as u64 || (fence.len as usize) < BLOCK_HEADER {
-                return Err(invalid("tile block offset/length"));
-            }
-            let end = fence.offset.checked_add(fence.len as u64).ok_or_else(|| invalid("tile block overflow"))?;
-            if end > dir_offset { return Err(invalid("tile block outside data region")); }
-            // Data blocks must be strictly increasing and non-overlapping: a
-            // directory whose offsets collide or overlap can alias blocks.
-            if previous_end.is_some_and(|prev_end| fence.offset < prev_end) {
-                return Err(invalid("tile data blocks overlap or are out of order"));
-            }
-            if previous.is_some_and(|prev| prev >= fence.first_key.as_slice()) {
-                return Err(invalid("tile fence keys not strictly increasing"));
-            }
-            previous = Some(&fence.first_key);
-            previous_end = Some(end);
-            // Block header consistency: the header's length, first key and entry
-            // count must agree with the directory (data CRC is checked on read).
-            let mut hdr = [0u8; BLOCK_HEADER];
-            read_exact_at(&file, &mut hdr, fence.offset)?;
-            let blen = u32::from_le_bytes(hdr[..4].try_into().unwrap());
-            let first_key_len = u32::from_le_bytes(hdr[8..12].try_into().unwrap()) as usize;
-            let entry_count = u16::from_le_bytes(hdr[12..14].try_into().unwrap());
-            if blen != fence.len { return Err(invalid("tile block length mismatch")); }
-            if first_key_len != fence.first_key.len() { return Err(invalid("tile block first key length mismatch")); }
-            if BLOCK_HEADER + first_key_len > fence.len as usize { return Err(invalid("tile block first key out of bounds")); }
-            if entry_count == 0 { return Err(invalid("tile block declares no entries")); }
-            let mut first = vec![0u8; first_key_len];
-            read_exact_at(&file, &mut first, fence.offset + BLOCK_HEADER as u64)?;
-            if first != fence.first_key { return Err(invalid("tile block first key mismatch")); }
-            total = total.checked_add(entry_count as u64).ok_or_else(|| invalid("tile entry count overflow"))?;
-            debug_assert_eq!(dir_search(&fences, &fences[index].first_key), index);
-        }
         if total != count { return Err(invalid("tile block entry count disagrees")); }
-        Ok(Tile { file, superblock: sb, trailer: tr, cutoff, digest, count, size, fences })
+        Ok(Tile { file, superblock: sb, trailer: tr, cutoff, digest, count, size, dir, data_blocks })
+    }
+
+    /// Directory-block index whose fence range contains global data block
+    /// `block`: the last block whose `first_block` is `<= block`.
+    fn dir_block_of(&self, block: usize) -> usize {
+        let block = block as u64;
+        let mut lo = 0usize;
+        let mut hi = self.dir.len();
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if self.dir[mid].first_block <= block { lo = mid + 1; } else { hi = mid; }
+        }
+        if lo == 0 { 0 } else { lo - 1 }
+    }
+
+    /// Read, CRC-verify and parse one directory block on demand. The block is
+    /// checked against the open-time sparse entry so a CRC-consistent rewrite
+    /// cannot make the cursor index past the block's fences.
+    fn read_dir_fences(&self, index: usize) -> io::Result<Vec<Fence>> {
+        let r = self.dir.get(index).ok_or_else(|| invalid("tile directory index"))?;
+        let block = read_range(&self.file, r.offset, r.len as u64)?;
+        let fences = decode_dir_block(&block)?;
+        if fences.len() != r.fence_count as usize
+            || fences.first().map(|f| f.first_key.as_slice()).unwrap_or_default() != r.first_key.as_slice() {
+            return Err(invalid("tile directory block changed"));
+        }
+        Ok(fences)
+    }
+
+    /// Global data-block index of the greatest fence whose first key is `<= key`,
+    /// or 0 when every fence is greater (and for an empty directory). Reads at
+    /// most one directory block; the caller still verifies the block it loads, so
+    /// a wrong candidate only ever costs an extra read, never a wrong answer.
+    fn candidate(&self, key: &[u8]) -> io::Result<usize> {
+        if self.dir.is_empty() { return Ok(0); }
+        let di = sparse_search(&self.dir, key);
+        let fences = self.read_dir_fences(di)?;
+        let li = dir_search(&fences, key);
+        Ok(self.dir[di].first_block as usize + li)
     }
 
     pub(crate) fn cutoff(&self) -> u64 { self.cutoff }
@@ -607,12 +761,12 @@ impl Tile {
         Entries { cursor: TileCursor::new(self, None, 0), done: false }
     }
 
-    /// Cursor starting at the block `dir_search` picks for `prefix`, yielding
+    /// Cursor starting at the block `candidate` picks for `prefix`, yielding
     /// only keys that begin with it. The prefix may be shorter than a stored key
     /// (e.g. a unique-index prefix); the cursor stops at the first key past the
     /// prefix range. Reading begins at the selected block, never block 0.
     pub(crate) fn prefix_cursor(&self, prefix: &[u8]) -> io::Result<TileCursor<'_>> {
-        let block = dir_search(&self.fences, prefix);
+        let block = self.candidate(prefix)?;
         let mut cursor = TileCursor::new(self, Some(prefix), block);
         cursor.fill()?;
         Ok(cursor)
@@ -694,7 +848,8 @@ mod tests {
         let mt = Memtable::new();
         let (path, tile) = write_tile("empty.tile", 5, &mt);
         assert_eq!(tile.count(), 0);
-        assert_eq!(tile.fences.len(), 0, "no data blocks means no fences");
+        assert_eq!(tile.data_blocks, 0, "no data blocks means no fences");
+        assert!(tile.dir.is_empty(), "an empty tile has no sparse index entries");
         assert!(collect(&tile).is_empty());
         let reopened = Tile::open(&path).unwrap();
         assert_eq!(reopened.count(), 0);
@@ -708,7 +863,7 @@ mod tests {
         put(&mut mt, 1, 1, b"value");
         let (path, tile) = write_tile("one.tile", 5, &mt);
         assert_eq!(tile.count(), 1);
-        assert_eq!(tile.fences.len(), 1);
+        assert_eq!(tile.data_blocks, 1);
         let reopened = Tile::open(&path).unwrap();
         assert_eq!(collect(&reopened), vec![(pkey(1, 1), b"value".to_vec())]);
         std::fs::remove_file(path).unwrap();
@@ -721,7 +876,8 @@ mod tests {
         for handle in 1..=n { put(&mut mt, handle, 1, b"v"); }
         let (path, tile) = write_tile("many.tile", 100, &mt);
         assert_eq!(tile.count(), n);
-        assert!(tile.fences.len() >= 8, "4 KiB target yields multiple blocks: {}", tile.fences.len());
+        assert!(tile.data_blocks >= 8, "4 KiB target yields multiple blocks: {}", tile.data_blocks);
+        assert_eq!(tile.dir.len(), 1, "eight data blocks fit one directory block, so the sparse index is single-entry");
         let entries = collect(&tile);
         assert_eq!(entries.len() as u64, n);
         assert!(entries.windows(2).all(|w| w[0].0 < w[1].0), "entries stream in key order");
@@ -738,7 +894,7 @@ mod tests {
         put(&mut mt, 2, 1, b"small");
         let (path, tile) = write_tile("oversized.tile", 100, &mt);
         assert_eq!(tile.count(), 2);
-        assert_eq!(tile.fences.len(), 2, "the oversized entry occupies its own block");
+        assert_eq!(tile.data_blocks, 2, "the oversized entry occupies its own block");
         let entries = collect(&tile);
         assert_eq!(entries[0].1, big);
         assert_eq!(entries[1].1, b"small".to_vec());
@@ -794,7 +950,7 @@ mod tests {
         let mut mt = Memtable::new();
         for handle in 1..=600 { put(&mut mt, handle, 1, b"v"); }
         let (path, tile) = write_tile("order.tile", 5, &mt);
-        assert!(tile.fences.len() >= 2, "need two fences to reorder");
+        assert!(tile.data_blocks >= 2, "need two fences to reorder");
         drop(tile);
         let mut bytes = std::fs::read(&path).unwrap();
         let dir_offset = u64::from_le_bytes(bytes[56..64].try_into().unwrap()) as usize;
@@ -827,7 +983,7 @@ mod tests {
         // length-delimited unique prefix; it must never be yielded.
         mt.apply(keys::unique_key(b"E", b"f", b"vv", 99, 1).unwrap(), 99u64.to_be_bytes().to_vec());
         let (path, tile) = write_tile("prefix.tile", 5, &mt);
-        assert!(tile.fences.len() >= 2, "the prefix range must span blocks: {}", tile.fences.len());
+        assert!(tile.data_blocks >= 2, "the prefix range must span blocks: {}", tile.data_blocks);
 
         let prefix = keys::unique_prefix(b"E", b"f", b"v").unwrap();
         assert!(prefix.len() < expected[0].0.len(), "prefix is shorter than a stored key");
@@ -892,7 +1048,7 @@ mod tests {
         let mut mt = Memtable::new();
         for handle in 1..=600 { put(&mut mt, handle, 1, b"v"); }
         let (path, tile) = write_tile("overlap.tile", 5, &mt);
-        assert!(tile.fences.len() >= 2, "need two data blocks");
+        assert!(tile.data_blocks >= 2, "need two data blocks");
         drop(tile);
         let mut bytes = std::fs::read(&path).unwrap();
         let dir_offset = u64::from_le_bytes(bytes[56..64].try_into().unwrap()) as usize;
@@ -921,7 +1077,7 @@ mod tests {
         let tile_stream = w.finish().unwrap();
         assert_eq!(tile_mt.count(), 3000);
         assert_eq!(tile_stream.count(), 3000);
-        assert!(tile_mt.fences.len() > 1, "multi-block tile");
+        assert!(tile_mt.data_blocks > 1, "multi-block tile");
         let a = std::fs::read(&path_mt).unwrap();
         let b = std::fs::read(&path_stream).unwrap();
         assert_eq!(a.len(), b.len(), "file sizes must match");
@@ -948,7 +1104,7 @@ mod tests {
         let mut mt = Memtable::new();
         for handle in 1..=9u64 { put(&mut mt, handle, 1, &value); }
         let (path_mt, tile_mt) = write_tile("writer-exact-mt", 1, &mt);
-        assert_eq!(tile_mt.fences.len(), 2, "exact fill then spill");
+        assert_eq!(tile_mt.data_blocks, 2, "exact fill then spill");
         let path_stream = tmp("writer-exact-stream");
         let mut w = TileWriter::new(&path_stream, 1, &[9u8; 32]).unwrap();
         for (key, val) in mt.entries() { w.push(key, val).unwrap(); }
@@ -966,7 +1122,7 @@ mod tests {
         put(&mut mt, 2, 1, &vec![b'b'; 5000]);
         put(&mut mt, 3, 1, &vec![b'c'; 100]);
         let (path_mt, tile_mt) = write_tile("writer-big-mt", 1, &mt);
-        assert_eq!(tile_mt.fences.len(), 3, "oversized entry alone in its block");
+        assert_eq!(tile_mt.data_blocks, 3, "oversized entry alone in its block");
         let path_stream = tmp("writer-big-stream");
         let mut w = TileWriter::new(&path_stream, 1, &[9u8; 32]).unwrap();
         for (key, val) in mt.entries() { w.push(key, val).unwrap(); }
@@ -984,5 +1140,79 @@ mod tests {
         assert_eq!(w.push(&pkey(1, 1), b"y").unwrap_err().kind(), ErrorKind::InvalidData);
         assert_eq!(w.push(&pkey(2, 1), b"z").unwrap_err().kind(), ErrorKind::InvalidData);
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// A tile whose directory needs more than one block: the retained index has
+    /// one entry per directory block (not per data block), and a lookup that
+    /// crosses a directory-block boundary still lands on the right data block.
+    #[test]
+    fn sparse_index_spans_directory_blocks_and_seeks_correctly() {
+        let mut mt = Memtable::new();
+        let n = 1200u64;
+        let value = vec![b'v'; 500];
+        for handle in 1..=n { put(&mut mt, handle, 1, &value); }
+        let (path, tile) = write_tile("sparse.tile", 100, &mt);
+        assert!(tile.data_blocks > 100, "need many data blocks: {}", tile.data_blocks);
+        assert!(tile.dir.len() >= 2, "many data blocks must span directory blocks: {}", tile.dir.len());
+        // The sparse index is one entry per directory block, far smaller than the
+        // data-block count it replaces.
+        assert!(tile.dir.len() < tile.data_blocks as usize);
+
+        let entries = collect(&tile);
+        assert_eq!(entries.len() as u64, n);
+        assert!(entries.windows(2).all(|w| w[0].0 < w[1].0), "entries stream in key order");
+
+        // Every fence key probes blocks across the directory-block boundaries and
+        // must land on the block that actually stores it.
+        let mut probed = 0usize;
+        for i in 0..tile.dir.len() {
+            for f in &tile.read_dir_fences(i).unwrap() {
+                let block = tile.candidate(&f.first_key).unwrap();
+                let mut cursor = TileCursor::new(&tile, None, block);
+                let (key, _) = cursor.peek().unwrap().unwrap();
+                assert_eq!(key, f.first_key.as_slice(), "candidate block stores its fence key");
+                probed += 1;
+            }
+        }
+        assert_eq!(probed as u64, tile.data_blocks);
+        // Below the first fence and above the last both select a valid block.
+        assert_eq!(tile.candidate(b"\x00").unwrap(), 0);
+        let last = tile.candidate(b"\xff\xff\xff\xff").unwrap();
+        let mut cursor = TileCursor::new(&tile, None, last);
+        assert!(cursor.peek().unwrap().is_some());
+
+        let reopened = Tile::open(&path).unwrap();
+        assert_eq!(reopened.dir.len(), tile.dir.len());
+        assert_eq!(collect(&reopened), entries);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    /// Fence monotonicity is enforced across directory-block boundaries, not just
+    /// within one block: making the second block's first fence equal the first
+    /// block's last fence is rejected at open.
+    #[test]
+    fn out_of_order_fence_keys_across_directory_blocks_detected_at_open() {
+        let mut mt = Memtable::new();
+        let value = vec![b'v'; 500];
+        for handle in 1..=1200u64 { put(&mut mt, handle, 1, &value); }
+        let (path, tile) = write_tile("order-cross.tile", 100, &mt);
+        assert!(tile.dir.len() >= 2, "need two directory blocks: {}", tile.dir.len());
+        drop(tile);
+        let mut bytes = std::fs::read(&path).unwrap();
+        let dir_offset = u64::from_le_bytes(bytes[56..64].try_into().unwrap()) as usize;
+        let blen0 = u32::from_le_bytes(bytes[dir_offset..dir_offset + 4].try_into().unwrap()) as usize;
+        let last0 = decode_dir_block(&bytes[dir_offset..dir_offset + blen0]).unwrap().pop().unwrap().first_key;
+        let off1 = dir_offset + blen0;
+        let blen1 = u32::from_le_bytes(bytes[off1..off1 + 4].try_into().unwrap()) as usize;
+        let key1_len = u32::from_le_bytes(bytes[off1 + DIR_HEADER..off1 + DIR_HEADER + 4].try_into().unwrap()) as usize;
+        assert_eq!(key1_len, last0.len(), "equal-length P keys make the rewrite clean");
+        let key1 = off1 + DIR_HEADER + 16;
+        bytes[key1..key1 + key1_len].copy_from_slice(&last0);
+        // Repair the second directory block's CRC so only ordering can reject it.
+        let crc = crc32c(&bytes[off1 + 8..off1 + blen1]);
+        bytes[off1 + 4..off1 + 8].copy_from_slice(&crc.to_le_bytes());
+        std::fs::write(&path, &bytes).unwrap();
+        assert_eq!(Tile::open(&path).err().unwrap().kind(), ErrorKind::InvalidData);
+        std::fs::remove_file(path).unwrap();
     }
 }
