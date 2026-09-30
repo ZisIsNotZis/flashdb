@@ -851,9 +851,32 @@ impl Engine {
         let mut writer = TileWriter::new(tile_path, cutoff, &digest)?;
         self.stream_merged_reduction(tiles, lower, cutoff, &wal_entries, |key, value| writer.push(key, value))?;
         let tile = writer.finish()?;
-        // Fail closed without a second materialization: re-run the identical merge
-        // and compare it 1:1, streaming, against the written tile.
+        // Fail closed: re-run the identical merge and compare it 1:1, streaming,
+        // against the written tile. That catches encoder/streaming defects but is
+        // self-referential (same reduction, same inputs), so it is paired with an
+        // INDEPENDENT check against the WAL-derived expectation below.
         self.verify_compacted_tile(&tile, tiles, lower, &wal_entries, cutoff)?;
+        // Independent verification of everything above the rotation floor: the
+        // retained WAL suffix is the authority for versions in (floor, cutoff], so
+        // compare the written tile against it. This restores the check that the
+        // old materialized projection provided, at the cost of one bounded
+        // (window-sized) expectation instead of an all-tiles one.
+        //
+        // Entries at or below the floor have no retained WAL behind them - they
+        // were verified when the floor-spanning tile was first published and can
+        // never be re-derived - so the comparison starts at the floor. That is the
+        // documented trust boundary (see FDBTILE2.md/FDBTILE3.md), stated here so
+        // the gap is visible at the call site rather than implied.
+        let floor = self.wal_floor();
+        let verify_lower = lower.max(floor);
+        if verify_lower < cutoff {
+            let mut wal_view = Memtable::new();
+            for (key, value) in &wal_entries {
+                wal_view.apply(key.clone(), value.clone());
+            }
+            let expected = newest_projection(&wal_view, verify_lower, cutoff);
+            tile.verify_projection(&expected, verify_lower, cutoff)?;
+        }
         Ok(tile)
     }
 

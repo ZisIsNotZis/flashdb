@@ -469,10 +469,18 @@ impl Manifest {
         }
         let mut tiles: Vec<TileRef> = Vec::with_capacity(self.root.tiles.len() - retire.len() + 1);
         tiles.extend_from_slice(&self.root.tiles[..start]);
+        let replacement_name = replacement.name.clone();
         tiles.push(replacement);
         tiles.extend_from_slice(&self.root.tiles[end..]);
         if !cutoffs_strictly_increasing(&tiles) {
             return Err(invalid("replacement would make tile cutoffs overlap or not strictly increase"));
+        }
+        // Defense in depth: the replacement name must not collide with a tile that
+        // survives the replacement. The caller checks this against the live tile
+        // list, but a duplicate-name root would otherwise only be rejected at
+        // recovery, so the operation refuses it itself.
+        if tiles.iter().filter(|t| t.name == replacement_name).count() > 1 {
+            return Err(invalid("replacement name collides with a surviving active tile"));
         }
         self.publish_inner(tiles, checkpoint, segment)
     }
@@ -826,5 +834,10 @@ mod tests {
         case("replace-wrong-cutoff", &["a.tile", "b.tile"], tile("m.tile", 3));
         case("replace-absent", &["zz.tile"], tile("m.tile", 1));
         case("replace-too-long", &["a.tile", "b.tile", "c.tile", "d.tile"], tile("m.tile", 3));
+        // Defense in depth: the replacement must not take the name of a tile that
+        // survives (a duplicate-name root would otherwise only be caught at
+        // recovery). Retiring a+b and installing "c.tile" would collide with the
+        // surviving tile c.
+        case("replace-name-collision", &["a.tile", "b.tile"], tile("c.tile", 2));
     }
 }
