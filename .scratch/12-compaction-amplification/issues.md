@@ -201,3 +201,37 @@ Remaining probe cost: PRIMARY-key probes (`get(entity, handle)`) are not covered
 Measured motivation for a future slice: ~12 µs per tile at 12 tiles, i.e. ~150 µs before any
 match. It is not the current bottleneck (the workload is write-heavy), so it is recorded rather
 than scheduled.
+
+## Budget sweep: the budget is inert, the merge SHAPE is the knob (2026-09-30)
+
+2 M docs x 1 KiB, cap 12, budget = 2 / 8 / 32 rotation windows (a new
+`FLASHDB_COMPACT_WINDOWS` env override made the sweep possible without rebuilds):
+
+| budget (windows) | write_amp | compactions | tile_bytes_compact | docs/s | elapsed |
+|---|---|---|---|---|---|
+| 2 (128 MiB) | 3.827 | 19 | 3,491,862,107 | 12,506 | 160 s |
+| 8 (512 MiB) | 3.827 | 19 | 3,491,862,107 | 13,049 | 153 s |
+| 32 (2 GiB) | 3.827 | 19 | 3,491,862,107 | 9,866 | 203 s |
+
+Byte-for-byte identical outcomes: the budget never binds. `select_run` always picks the run with
+the SMALLEST combined size, which at this tile count is invariably the two smallest adjacent
+tiles, so the policy is effectively "merge the cheapest pair" (a Huffman-style tier merge) and
+the budget only matters if a single merge would exceed it. The wall-clock differences are noise
+plus cache warmth from the preceding run, not policy effects.
+
+**Consequence: the real compaction knob is the merge SHAPE, not the budget.** Candidate policies
+to measure against the current one, all implementable inside `select_run` with no format or
+protocol change:
+
+1. **cheapest pair** (today) - baseline;
+2. **size-ratio group**: merge every run of adjacent tiles whose sizes are within a factor
+   (e.g. 2x) of the run's smallest, capped by the budget - the standard universal-compaction
+   shape, which bounds tier waste instead of always paying a pairwise merge;
+3. **budget-maximal prefix of the smallest**: merge as many of the smallest tiles as fit the
+   budget in one pass, which cuts the number of rewrites per byte at the cost of bigger single
+   merges.
+
+Acceptance for the follow-up: measure all three at 2 M and 5 M docs (write_amp, compaction count,
+docs/s) and make the winner the default, with the losing numbers recorded rather than deleted.
+The tile CAP (12, page-bound) is the other half of tier headroom and needs multi-page manifests;
+that is a separate, larger decision.
