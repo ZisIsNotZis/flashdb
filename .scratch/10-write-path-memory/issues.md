@@ -12,6 +12,13 @@ The 08a-08c read-path work removed the old cliff completely:
 | seed progress | 200 k docs then stalled ~9 min | 800 k docs in **29 s** (~27.6 k docs/s) |
 | outcome | never finished | **SIGKILL (exit 137)** at `rss_peak_kb=600132` |
 
+**CORRECTED 2026-09-30 by slice 10a's measurements (see `measurements.md`):** the
+publish+rotate path is **5.6-6.4× the window W** (independent of total data, confirmed at
+200 MB and 466 MB), not the 8-10× guessed here; and the 600 MB plateau is the
+**compaction** path, not publish — `write_compacted_tile` peaks at **3.28× total tile
+bytes** and its RSS **stays resident afterwards** (the arena is not returned). The bench
+reproduces the failure exactly: 400 k docs → `rss_peak_kb=1055136`.
+
 RSS trajectory (seed progress lines): 200 k docs → 134 MB, 400 k → 573 MB,
 600 k → 596 MB, 800 k → 551 MB (peak 600 MB). It **plateaus**: the working set is
 not proportional to data, it is proportional to the WAL/checkpoint window (64 MB in
@@ -43,6 +50,26 @@ point was ~250 MB data : 600 MB RAM — the opposite of the ≥20:1 objective.
    compaction time. That is the same defect class as (1) and must be fixed in the same
    pass (stream the k-way tile merge instead of materializing it).
 
+## Measured breakdown (10a, `measurements.md`)
+
+| artifact | bytes |
+|---|---|
+| live memtable, one window | 1.14×W |
+| `newest_projection(live)` | 1.14×W |
+| `expected` memtable over replayed records | 1.14×W |
+| `wal::replay` records | 1.04×WAL payload |
+| publish peak (all of the above live) | 5.6-6.4×W |
+| compaction peak (`write_compacted_tile`) | 3.28× total tile bytes, resident after |
+| Memtable factor, 1 KiB docs | 1.17× payload (only 0.177 B overhead/byte) |
+| Memtable factor, 64 B docs | 3.25× payload |
+
+So the measured ranking is: **stream the compacted tile (2.28× tile bytes)** >
+**single materialization in `write_verified_tile` (~3.3×W)** > memtable layout (17% at
+1 KiB docs, up to 65% for tiny docs). Also measured: under a 1 G cgroup scope the
+cgroup's `memory.peak` exceeded the process delta by ~128 MiB for 106 MB of files
+written, i.e. the cap was partly page cache — the cgroup view and the process view must
+be reported separately.
+
 ## Direction
 
 - Single materialization rule: the serving memtable is the only full copy of a window;
@@ -51,8 +78,10 @@ point was ~250 MB data : 600 MB RAM — the opposite of the ≥20:1 objective.
 - Verification should not rebuild the projection from the WAL in RAM: stream the tile
   being written (block by block) against the same source, and keep the WAL digest as the
   integrity anchor.
-- Quantify and reduce `Memtable` bytes per payload byte (arena/sorted-Vec layout instead
-  of `BTreeMap<Vec,Vec>` is the obvious candidate).
+- Quantify and reduce `Memtable` bytes per payload byte (measured: 1.17× at 1 KiB docs,
+  3.25× at 64 B docs; arena/sorted-Vec is the candidate, lowest leverage at 1 KiB).
+- Make released memory actually return: compaction's peak stays resident, so peak RSS
+  today is also the steady-state cost after any compaction.
 - Make the window size an explicit, documented memory budget, then re-run the scaled
   experiment and report data:RAM and peak RSS vs window.
 
