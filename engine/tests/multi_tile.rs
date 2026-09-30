@@ -180,21 +180,22 @@ fn compaction_name_owned_by_live_tile_fails_closed_without_hint_to_delete() {
 fn manifest_refuses_more_than_max_tiles() {
     let files = Files::new();
     let mut e = Engine::create(&files.wal).unwrap();
-    // manifest::MAX_TILES = 8: eight tiles fill the bounded page payload.
-    for i in 1..=8u64 {
+    // manifest::MAX_TILES = 12: twelve worst-case 299-byte entries plus the
+    // count/checkpoint/segment fields fill the 4092-byte page payload.
+    for i in 1..=12u64 {
         e.commit_block(&format!("b{i}").into_bytes(), &[doc(i, b"d")]).unwrap();
         e.publish_tile(&files.dir.join(format!("tile-{i}.tile")), i).unwrap();
     }
-    e.commit_block(b"b9", &[doc(9, b"d")]).unwrap();
-    let err = e.publish_tile(&files.dir.join("tile-9.tile"), 9).unwrap_err();
+    e.commit_block(b"b13", &[doc(13, b"d")]).unwrap();
+    let err = e.publish_tile(&files.dir.join("tile-13.tile"), 13).unwrap_err();
     assert_eq!(err.kind(), ErrorKind::InvalidInput, "the tile list is bounded, and a full list is InvalidInput on publish, not corruption");
     assert_eq!(e.serving_memtable_entries(), 1, "refused publish left the memtable serving");
     drop(e);
     let e = Engine::open_discover(&files.dir).unwrap();
-    assert_eq!(e.csn(), 9);
-    assert_eq!(e.serving_memtable_entries(), 1, "all eight tiles re-verified against the WAL at open");
+    assert_eq!(e.csn(), 13);
+    assert_eq!(e.serving_memtable_entries(), 1, "all twelve tiles re-verified against the WAL at open");
     assert_eq!(e.get(b"E", 1).unwrap(), Some(b"d".to_vec()));
-    assert_eq!(e.get(b"E", 8).unwrap(), Some(b"d".to_vec()));
+    assert_eq!(e.get(b"E", 12).unwrap(), Some(b"d".to_vec()));
 }
 
 #[test]
@@ -342,27 +343,27 @@ fn compact_refuses_under_two_tiles_and_leftover_candidates() {
 fn compact_releases_the_max_tiles_bound() {
     let files = Files::new();
     let mut e = Engine::create(&files.wal).unwrap();
-    // Fill the manifest page: eight tiles is manifest::MAX_TILES.
-    for i in 1..=8u64 {
+    // Fill the manifest page: twelve tiles is manifest::MAX_TILES.
+    for i in 1..=12u64 {
         e.commit_block(&format!("b{i}").into_bytes(), &[doc(i, b"d")]).unwrap();
         e.publish_tile(&files.dir.join(format!("tile-{i}.tile")), i).unwrap();
     }
-    e.commit_block(b"b9", &[doc(9, b"d")]).unwrap();
-    assert_eq!(e.publish_tile(&files.dir.join("tile-9.tile"), 9).unwrap_err().kind(), ErrorKind::InvalidInput);
+    e.commit_block(b"b13", &[doc(13, b"d")]).unwrap();
+    assert_eq!(e.publish_tile(&files.dir.join("tile-13.tile"), 13).unwrap_err().kind(), ErrorKind::InvalidInput);
     assert_eq!(e.serving_memtable_entries(), 1, "refused publish left the memtable serving");
     e.compact().unwrap();
-    assert!(files.dir.join("compact-8.tile").exists());
+    assert!(files.dir.join("compact-12.tile").exists());
     assert!(!files.dir.join("tile-1.tile").exists());
-    assert!(!files.dir.join("tile-8.tile").exists());
+    assert!(!files.dir.join("tile-12.tile").exists());
     assert_eq!(e.serving_memtable_entries(), 1, "compaction still never touches the memtable");
     // The freed page slot accepts new tiles again.
-    e.publish_tile(&files.dir.join("tile-9.tile"), 9).unwrap();
+    e.publish_tile(&files.dir.join("tile-13.tile"), 13).unwrap();
     assert_eq!(e.serving_memtable_entries(), 0);
     drop(e);
     let e = Engine::open_discover(&files.dir).unwrap();
     assert_eq!(e.get(b"E", 1).unwrap(), Some(b"d".to_vec()));
-    assert_eq!(e.get(b"E", 8).unwrap(), Some(b"d".to_vec()));
-    assert_eq!(e.get(b"E", 9).unwrap(), Some(b"d".to_vec()));
+    assert_eq!(e.get(b"E", 12).unwrap(), Some(b"d".to_vec()));
+    assert_eq!(e.get(b"E", 13).unwrap(), Some(b"d".to_vec()));
     assert_eq!(e.serving_memtable_entries(), 0);
 }
 
@@ -547,4 +548,84 @@ fn compact_after_rotation_spans_the_segment_floor_and_reopens() {
     drop(e);
     let e = Engine::open_discover(&files.dir).unwrap();
     assert_eq!(e.get(b"E", 4).unwrap(), Some(b"four".to_vec()));
+}
+
+#[test]
+fn maybe_compact_selects_the_oldest_run_within_budget() {
+    let files = Files::new();
+    let mut e = Engine::create(&files.wal).unwrap();
+    // Six published tiles, each roughly one 4 KiB superblock page plus a small
+    // data block, so a byte budget maps cleanly onto a run length.
+    for i in 1..=6u64 {
+        e.commit_block(&format!("b{i}").into_bytes(), &[doc(i, b"d")]).unwrap();
+        e.publish_tile(&files.dir.join(format!("tile-{i}.tile")), i).unwrap();
+    }
+    // Below max_tiles: nothing merges even with an unlimited budget.
+    assert_eq!(e.maybe_compact(u64::MAX, 7).unwrap(), None);
+    assert_eq!(e.active_tile_cutoffs(), vec![1, 2, 3, 4, 5, 6]);
+
+    // Budget exactly two files: the run stops after two and is the OLDEST two
+    // (output cutoff 2; tiles 1 and 2 retired, tiles 3+ untouched).
+    let two = fs::metadata(files.dir.join("tile-1.tile")).unwrap().len()
+        + fs::metadata(files.dir.join("tile-2.tile")).unwrap().len();
+    let out = e.maybe_compact(two, 3).unwrap().unwrap();
+    assert_eq!(out, fs::metadata(files.dir.join("compact-2.tile")).unwrap().len(),
+        "maybe_compact reports the merged output size");
+    assert_eq!(e.active_tile_cutoffs(), vec![2, 3, 4, 5, 6]);
+    assert!(!files.dir.join("tile-1.tile").exists());
+    assert!(!files.dir.join("tile-2.tile").exists());
+    assert!(files.dir.join("tile-3.tile").exists(), "tiles past the run are untouched");
+
+    // A budget too small for two lets the 2-tile progress minimum win: the two
+    // oldest (compact-2 and tile-3) still merge.
+    assert!(e.maybe_compact(1, 3).unwrap().is_some());
+    assert_eq!(e.active_tile_cutoffs(), vec![3, 4, 5, 6]);
+
+    // A budget that fits three extends past two.
+    let three = fs::metadata(files.dir.join("compact-3.tile")).unwrap().len()
+        + fs::metadata(files.dir.join("tile-4.tile")).unwrap().len()
+        + fs::metadata(files.dir.join("tile-5.tile")).unwrap().len();
+    assert!(e.maybe_compact(three, 3).unwrap().is_some());
+    assert_eq!(e.active_tile_cutoffs(), vec![5, 6]);
+}
+
+#[test]
+fn bounded_compaction_keeps_cutoffs_disjoint_and_reopens_across_rounds() {
+    let files = Files::new();
+    let mut e = Engine::create(&files.wal).unwrap();
+    let cap = 12u64;
+    // Fill the manifest page (manifest::MAX_TILES = 12) with one doc per cutoff;
+    // the newest version of handle 1 is always v<cap>.
+    for i in 1..=cap {
+        e.commit_block(&format!("b{i}").into_bytes(), &[doc(1, format!("v{i}").as_bytes())]).unwrap();
+        e.publish_tile(&files.dir.join(format!("tile-{i}.tile")), i).unwrap();
+    }
+    let newest = || Some(format!("v{cap}").into_bytes());
+    assert_eq!(e.active_tile_cutoffs(), (1..=cap).collect::<Vec<_>>());
+    assert_eq!(e.get(b"E", 1).unwrap(), newest());
+
+    // Repeated bounded compaction with a per-tile budget and max_tiles = 2 so a
+    // merge fires whenever at least two tiles remain. Every round must shrink
+    // the list by exactly one, keep the cutoffs strictly increasing and disjoint,
+    // keep the newest read correct, stay within the cap, and survive a reopen
+    // through open_discover reproducing the same ordered list.
+    let mut rounds = 0;
+    while e.active_tile_cutoffs().len() > 1 {
+        let before = e.active_tile_cutoffs();
+        assert!(e.maybe_compact(1, 2).unwrap().is_some(), "round {rounds} must make progress");
+        let after = e.active_tile_cutoffs();
+        assert_eq!(after.len(), before.len() - 1, "each round merges exactly the two oldest");
+        assert!(after.windows(2).all(|w| w[0] < w[1]), "cutoffs strictly increasing: {after:?}");
+        assert!(after.len() <= cap as usize, "tile count never exceeds the cap");
+        assert_eq!(*after.last().unwrap(), cap, "the newest frontier is unchanged");
+        assert_eq!(e.get(b"E", 1).unwrap(), newest(), "newest version survives round {rounds}");
+        drop(e);
+        e = Engine::open_discover(&files.dir).unwrap();
+        assert_eq!(e.active_tile_cutoffs(), after, "open_discover reproduces the compacted list");
+        assert_eq!(e.get(b"E", 1).unwrap(), newest());
+        assert_eq!(e.serving_memtable_entries(), 0, "recovered tiles are not rematerialized");
+        rounds += 1;
+    }
+    assert_eq!(e.active_tile_cutoffs(), vec![cap]);
+    assert_eq!(rounds, cap - 1, "the tiered merges collapse the list one tile per round");
 }

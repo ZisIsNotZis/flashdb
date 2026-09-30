@@ -498,37 +498,6 @@ impl Engine {
         Ok(())
     }
 
-    /// Merge every published tile into ONE new whole tile file covering the full
-    /// `(0, newest tile cutoff]` CSN range, publish it through the manifest
-    /// protocol, and only after the new root is durable unlink the superseded
-    /// tile files.
-    ///
-    /// **Only the newest version per logical key survives.** Reads never see
-    /// historical state (2026-09-29, `docs/contracts.md` L-02 resolution), so
-    /// superseded versions are unreadable garbage: the merged tile keeps the
-    /// newest version of every logical key (everything before the trailing
-    /// `~csn`), where a tombstone is itself the newest state and is retained.
-    /// The WAL is never rotated or truncated, and the serving memtable (exactly
-    /// the versions above the newest cutoff) is untouched. Compaction's purpose
-    /// is reducing the per-read file count / rewrite bound
-    /// ([`manifest::MAX_TILES`] tiles collapse to one).
-    ///
-    /// Refusals: fewer than two active tiles (`InvalidInput` — merging one tile
-    /// into a fresh copy buys nothing) or a leftover candidate file with the
-    /// engine-chosen name `compact-<cutoff>.tile` inside the engine directory
-    /// (`AlreadyExists`, mirroring `publish_tile`'s leftover handling — cutoffs
-    /// strictly increase across compactions because compaction requires at
-    /// least two tiles, so live names never collide). Reads are unavailable for
-    /// the duration: single-writer `&mut self`.
-    ///
-    /// Ordering is `publish_tile`'s: create-new + sync + verify the merged tile
-    /// against the retained WAL, sync the directory entry, manifest
-    /// write-inactive-page(seq+1) → sync file → sync dir → flip. A crash before
-    /// the flip leaves the merged file an unreferenced orphan; a crash (or
-    /// unlink failure) between the flip and the unlinks leaves the superseded
-    /// tiles on disk as unreferenced orphans. Discovery must — and does —
-    /// ignore both kinds: unreferenced files are never adopted; they are leaked
-    /// until manually removed.
     /// Rotate the WAL onto a fresh, empty segment once the live segment exceeds
     /// `max_wal_bytes`. Preconditions: every committed block must already be
     /// published as a tile (`newest cutoff == csn`) and at least one tile must
@@ -603,6 +572,35 @@ impl Engine {
         Ok(true)
     }
 
+    /// Merge every active tile into ONE new whole tile file covering the full
+    /// `(0, newest tile cutoff]` CSN range, publish it through the manifest
+    /// protocol, and only after the new root is durable unlink the superseded
+    /// tile files. This is the whole-prefix case of the bounded merge; use
+    /// [`Engine::maybe_compact`] for a tiered policy that merges only as much as
+    /// a byte budget allows.
+    ///
+    /// **Only the newest version per logical key survives.** Reads never see
+    /// historical state (2026-09-29, `docs/contracts.md` L-02 resolution), so
+    /// superseded versions are unreadable garbage: the merged tile keeps the
+    /// newest version of every logical key (everything before the trailing
+    /// `~csn`), where a tombstone is itself the newest state and is retained.
+    /// The WAL is never rotated or truncated, and the serving memtable (exactly
+    /// the versions above the newest cutoff) is untouched. Compaction's purpose
+    /// is reducing the per-read file count / rewrite bound.
+    ///
+    /// Refusals: fewer than two active tiles (`InvalidInput` — merging one tile
+    /// into a fresh copy buys nothing) or a leftover candidate file with the
+    /// engine-chosen name `compact-<cutoff>.tile` inside the engine directory
+    /// (`AlreadyExists`, mirroring `publish_tile`'s leftover handling).
+    ///
+    /// Ordering is `publish_tile`'s: create-new + sync + verify the merged tile
+    /// against the retained WAL, sync the directory entry, manifest
+    /// write-inactive-page(seq+1) → sync file → sync dir → flip. A crash before
+    /// the flip leaves the merged file an unreferenced orphan; a crash (or
+    /// unlink failure) between the flip and the unlinks leaves the superseded
+    /// tiles on disk as unreferenced orphans. Discovery must — and does —
+    /// ignore both kinds: unreferenced files are never adopted; they are leaked
+    /// until manually removed.
     pub fn compact(&mut self) -> io::Result<()> {
         if self.manifest.as_ref().is_some_and(|m| m.poisoned()) {
             return Err(io::Error::new(io::ErrorKind::Other, "manifest writer poisoned; reopen to recover"));
@@ -611,18 +609,78 @@ impl Engine {
         if self.tiles.len() < 2 {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "compaction requires at least two active tiles"));
         }
-        let cutoff = self.tiles.last().unwrap().cutoff();
-        let path = self.dir.join(format!("compact-{cutoff}.tile"));
+        let len = self.tiles.len();
+        self.merge_oldest_run(len)?;
+        Ok(())
+    }
+
+    /// Bounded, tiered compaction: merge only a size-budgeted oldest run instead
+    /// of rewriting the whole dataset. Does nothing (`Ok(None)`) while fewer
+    /// than `max_tiles` tiles are active. Otherwise it selects the OLDEST
+    /// CONTIGUOUS RUN of at least two tiles whose combined on-disk size is at
+    /// most `max_merge_bytes`, replaces exactly that run with one tile covering
+    /// its union range, and returns the merged output's size in bytes. When even
+    /// the two oldest tiles together exceed the budget, those two are merged
+    /// anyway so every call makes progress (the active count strictly drops).
+    ///
+    /// "Size" is the sum of the selected tiles' on-disk file lengths. The
+    /// replacement's cutoff is the run's newest cutoff, so the surviving active
+    /// list stays strictly increasing and disjoint — the invariant the read path
+    /// and recovery verification depend on — while the run always starts at the
+    /// oldest tile, so the merged tile's lower bound is 0 exactly as for
+    /// [`Engine::compact`]. Memory stays bounded: the merge reuses the streaming
+    /// reduction that buffers one block per input plus the WAL-window map.
+    pub fn maybe_compact(&mut self, max_merge_bytes: u64, max_tiles: usize) -> io::Result<Option<u64>> {
+        if self.tiles.len() < max_tiles || self.tiles.len() < 2 {
+            return Ok(None);
+        }
+        if self.manifest.as_ref().is_some_and(|m| m.poisoned()) {
+            return Err(io::Error::new(io::ErrorKind::Other, "manifest writer poisoned; reopen to recover"));
+        }
+        self.ensure_attached()?;
+        let len = self.select_run(max_merge_bytes)?;
+        self.merge_oldest_run(len).map(Some)
+    }
+
+    /// Length of the oldest contiguous run to merge: extend from the oldest tile
+    /// while the combined file size stays within `max_merge_bytes` (the first
+    /// tile is always included, even when it alone exceeds the budget), then
+    /// guarantee progress by returning at least two. Requires >= 2 active tiles.
+    fn select_run(&self, max_merge_bytes: u64) -> io::Result<usize> {
+        debug_assert!(self.tiles.len() >= 2);
+        let mut sum = 0u64;
+        let mut len = 0usize;
+        for t in &self.tiles {
+            let size = fs::metadata(self.dir.join(&t.name))?.len();
+            if len >= 1 && sum.saturating_add(size) > max_merge_bytes { break; }
+            sum = sum.saturating_add(size);
+            len += 1;
+        }
+        Ok(len.max(2).min(self.tiles.len()))
+    }
+
+    /// Merge the oldest `len` active tiles (`2 <= len <= tiles.len()`, i.e. a
+    /// prefix) into one tile covering exactly `(0, tiles[len - 1].cutoff]` via
+    /// the streaming merge, replace that run through the range-preserving
+    /// manifest protocol, and only after the durable flip unlink the retired
+    /// inputs. Returns the merged output size. The WAL digest binding is
+    /// [`Engine::write_compacted_tile`]'s, i.e. exactly the digest an ordinary
+    /// publish at that cutoff would carry.
+    fn merge_oldest_run(&mut self, len: usize) -> io::Result<u64> {
+        debug_assert!((2..=self.tiles.len()).contains(&len));
+        let cutoff = self.tiles[len - 1].cutoff();
         let name = format!("compact-{cutoff}.tile");
+        let path = self.dir.join(&name);
         if self.tiles.iter().any(|t| t.name == name) {
-            // A LIVE published tile owns this name; deleting it per a generic
-            // "remove the leftover" hint would brick discovery after restart.
+            // A LIVE published tile owns this name; overwriting it while it is
+            // also a merge input (or deleting it) would brick discovery after
+            // restart. This can only arise from a hand-published colliding name.
             return Err(io::Error::new(io::ErrorKind::AlreadyExists,
                 format!("compaction candidate {name} is a live published tile; compaction cannot proceed under this name")));
         }
-        // 1. Build + verify the merged tile against the full retained WAL union
-        //    projection, exactly as publish verifies a single tile's range.
-        let tile = match self.write_compacted_tile(&path, cutoff) {
+        // 1. Build + verify the merged tile for the run's union range against the
+        //    retained WAL projection, exactly as publish verifies one tile.
+        let tile = match self.write_compacted_tile(&path, &self.tiles[..len], cutoff) {
             Ok(t) => t,
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
                 return Err(io::Error::new(io::ErrorKind::AlreadyExists, format!(
@@ -630,38 +688,63 @@ impl Engine {
             }
             Err(e) => return Err(e),
         };
+        let out_size = fs::metadata(&path)?.len();
         // 2. The tile's own directory entry must be durable before the manifest
         //    can reference it (checkpoint publication ordering).
         File::open(&self.dir)?.sync_all()?;
-        // 3. Manifest protocol: the new root lists exactly one tile. The cutoff
-        //    (and therefore the checkpoint frontier) is unchanged; only the
-        //    number of files carrying `(0, cutoff]` shrinks.
-        let tref = TileRef { name: name.clone(), cutoff, digest: *tile.digest() };
-        let checkpoint = Checkpoint { csn: cutoff, handle_watermark: self.max_handle };
-        self.manifest_publish(vec![tref], checkpoint, self.segment.clone())?;
-        // 4. In-memory flip: one tile replaces the whole ordered list; the
-        //    memtable is untouched (it only holds versions above `cutoff`).
-        let superseded = std::mem::replace(&mut self.tiles, vec![TileHandle { tile, name }]);
-        // 5. Only now drop the superseded files. Unlink after the durable flip
+        // 3. Manifest protocol: the retired run is replaced by the one new tile.
+        //    The global newest cutoff (and therefore the checkpoint) is unchanged
+        //    because the run is a prefix: later tiles keep the frontier, or the
+        //    replacement itself carries it when the run reached the end.
+        let replacement = TileRef { name: name.clone(), cutoff, digest: *tile.digest() };
+        let checkpoint = Checkpoint { csn: self.tiles.last().unwrap().cutoff(), handle_watermark: self.max_handle };
+        let segment = self.segment.clone();
+        if self.manifest.is_some() {
+            let retire: Vec<String> = self.tiles[..len].iter().map(|t| t.name.clone()).collect();
+            let retire: Vec<&str> = retire.iter().map(String::as_str).collect();
+            self.manifest.as_mut().unwrap().publish_replacing(&retire, replacement, checkpoint, segment)?;
+        } else {
+            // No manifest yet (tiles built by `build_tile`, which never creates
+            // one): create it listing the replacement plus every surviving tile,
+            // none of which is retired.
+            let mut refs: Vec<TileRef> = Vec::with_capacity(self.tiles.len() - len + 1);
+            refs.push(replacement);
+            refs.extend(self.tiles[len..].iter().map(|t| t.tile_ref()));
+            self.manifest_publish(refs, checkpoint, segment)?;
+        }
+        // 4. In-memory flip: the replacement takes the run's place in the ordered
+        //    list; the memtable is untouched (it holds only versions above the
+        //    global newest cutoff).
+        let retired: Vec<TileHandle> = self.tiles.drain(0..len).collect();
+        self.tiles.insert(0, TileHandle { tile, name });
+        // 5. Only now drop the retired input files. Unlink after the durable flip
         //    is safe: open fds keep working (POSIX) and the new root no longer
-        //    references them. Failures here are best-effort ignored — the
-        //    compaction is already durably committed and a leftover file is a
-        //    harmless orphan that discovery ignores and never adopts.
-        for old in &superseded {
+        //    references them. Failures are best-effort ignored — the compaction
+        //    is already durable and a leftover file is a harmless orphan that
+        //    discovery ignores and never adopts.
+        for old in &retired {
             let _ = fs::remove_file(self.dir.join(&old.name));
         }
-        Ok(())
+        Ok(out_size)
     }
 
-    /// Create-new the compacted tile for the full `(0, cutoff]` union of every
-    /// published tile range, sync it, reopen it and re-check its exact
+    /// Active tile cutoffs in order (inspection/benchmark hook). Strictly
+    /// increasing and disjoint while the engine is consistent.
+    pub fn active_tile_cutoffs(&self) -> Vec<u64> {
+        self.tiles.iter().map(|t| t.cutoff()).collect()
+    }
+
+    /// Create-new the compacted tile for the `(0, cutoff]` union of the given
+    /// active tile run, sync it, reopen it and re-check its exact
     /// newest-version-per-logical-key projection against the active WAL file's
     /// `(segment start, cutoff]` range combined with the already-verified
     /// tile-carried prefix, before any caller may reference it. Each input tile
     /// was itself verified against its disjoint WAL range at open/publish, so
-    /// merging the tiles with the retained WAL suffix and reducing to the newest
-    /// version per logical key IS the multi-tile merge (same codec, same key
-    /// order, tombstones retained as newest state).
+    /// merging the run's tiles with the retained WAL suffix and reducing to the
+    /// newest version per logical key IS the multi-tile merge (same codec, same
+    /// key order, tombstones retained as newest state). The run is always a
+    /// prefix starting at the oldest tile, so `cutoff` is its newest cutoff and
+    /// the digest is exactly what a publish at `cutoff` would bind.
     ///
     /// Nothing here materializes the union: the tiles are streamed by one
     /// [`TileCursor`] each (borrowing a single 4 KiB block apiece) and only the
@@ -669,7 +752,7 @@ impl Engine {
     /// key-ordered map. [`Engine::stream_merged_reduction`] merges both sources
     /// and pushes the reduced stream straight into the streaming writer, so peak
     /// compaction RAM tracks the WAL window, not the total tile bytes.
-    fn write_compacted_tile(&self, tile_path: &Path, cutoff: u64) -> io::Result<Tile> {
+    fn write_compacted_tile(&self, tile_path: &Path, tiles: &[TileHandle], cutoff: u64) -> io::Result<Tile> {
         let (records, _) = wal::replay(&self.wal_path)?;
         self.verify_wal_matches_state(&records)?;
         let digest = wal_digest(&records, cutoff, self.wal_floor())?;
@@ -686,19 +769,19 @@ impl Engine {
                 }
             }
         }
-        // Source (a): every published tile, streamed. Merge + reduce runs
-        // straight into the encoder (one 4 KiB block buffered): no projection of
-        // the union ever exists.
+        // Source (a): the run's tiles, streamed. Merge + reduce runs straight
+        // into the encoder (one 4 KiB block buffered): no projection of the
+        // union ever exists.
         let mut writer = TileWriter::new(tile_path, cutoff, &digest)?;
-        self.stream_merged_reduction(cutoff, &wal_entries, |key, value| writer.push(key, value))?;
+        self.stream_merged_reduction(tiles, cutoff, &wal_entries, |key, value| writer.push(key, value))?;
         let tile = writer.finish()?;
         // Fail closed without a second materialization: re-run the identical merge
         // and compare it 1:1, streaming, against the written tile.
-        self.verify_compacted_tile(&tile, &wal_entries, cutoff)?;
+        self.verify_compacted_tile(&tile, tiles, &wal_entries, cutoff)?;
         Ok(tile)
     }
 
-    /// K-way merge of every published tile (one [`TileCursor`] each) and the
+    /// K-way merge of the given active tile run (one [`TileCursor`] each) and the
     /// key-ordered WAL suffix map, in ascending encoded-key order, reduced to the
     /// newest version per logical key within `(0, cutoff]` - the same reduction
     /// [`newest_projection`] performs. Keys within one logical key sort by CSN
@@ -708,12 +791,13 @@ impl Engine {
     /// tile bytes.
     fn stream_merged_reduction(
         &self,
+        tiles: &[TileHandle],
         cutoff: u64,
         wal_entries: &BTreeMap<Vec<u8>, Vec<u8>>,
         mut visit: impl FnMut(&[u8], &[u8]) -> io::Result<()>,
     ) -> io::Result<()> {
-        let mut cursors: Vec<TileCursor<'_>> = Vec::with_capacity(self.tiles.len());
-        for t in &self.tiles {
+        let mut cursors: Vec<TileCursor<'_>> = Vec::with_capacity(tiles.len());
+        for t in tiles {
             // Empty prefix = the whole tile, still borrowed and block-streamed.
             cursors.push(t.tile.prefix_cursor(b"")?);
         }
@@ -759,6 +843,7 @@ impl Engine {
     fn verify_compacted_tile(
         &self,
         tile: &Tile,
+        tiles: &[TileHandle],
         wal_entries: &BTreeMap<Vec<u8>, Vec<u8>>,
         cutoff: u64,
     ) -> io::Result<()> {
@@ -778,7 +863,7 @@ impl Engine {
             pending = actual.next();
             Ok(())
         };
-        self.stream_merged_reduction(cutoff, wal_entries, &mut compare)?;
+        self.stream_merged_reduction(tiles, cutoff, wal_entries, &mut compare)?;
         if let Some(entry) = pending {
             entry?;
             return Err(io::Error::new(io::ErrorKind::InvalidData, "compacted tile contains an extra entry"));

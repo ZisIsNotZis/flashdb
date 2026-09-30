@@ -57,12 +57,23 @@ const HEADER: usize = 12; // seq u64 LE + crc32c u32 LE
 const PAYLOAD: usize = PAGE - HEADER;
 const MAX_NAME: usize = 255;
 
-/// Small active-tile bound: [`MAX_TILES`] entries of at most
-/// 4 + [`MAX_NAME`] + 8 + 32 bytes each always fit one payload with the count
-/// and checkpoint fields to spare, so the bound is about the one-page invariant,
-/// not an arbitrary engine limit. A publish beyond it is refused as
-/// `InvalidInput`; a CRC-valid page claiming more is corruption (fail closed).
-pub(crate) const MAX_TILES: usize = 8;
+/// The active-tile bound is exactly what one 4092-byte payload can hold at the
+/// worst case, not a policy knob. One entry costs `4 + name + 8 + 32` bytes
+/// (length-prefixed name, cutoff, WAL digest); taking the longest legal name
+/// ([`MAX_NAME`] = 255) makes an entry 299 bytes. The payload additionally
+/// holds a 4-byte count, a 16-byte checkpoint and - once the WAL is rotated -
+/// a segment reference of at most `4 + 255 + 8 = 267` bytes. 12 entries need
+/// `12 * 299 + 4 + 16 + 267 = 3875 <= PAYLOAD`; 13 would overflow, so the cap is
+/// 12 regardless of how short the actual names are (short names merely leave
+/// unused tail padding). The compile-time assertion below ties the two
+/// together, so changing any field size is a build failure, not a silently torn
+/// page. A publish beyond it is refused as `InvalidInput`; a CRC-valid page
+/// claiming more is corruption (fail closed).
+pub(crate) const MAX_TILES: usize = 12;
+const _: () = assert!(
+    4 + MAX_TILES * (4 + MAX_NAME + 8 + 32) + 16 + (4 + MAX_NAME + 8) <= PAYLOAD,
+    "MAX_TILES active tile refs plus the count/checkpoint/segment fields must fit one payload"
+);
 
 fn invalid(message: &'static str) -> io::Error { io::Error::new(ErrorKind::InvalidData, message) }
 
@@ -142,8 +153,9 @@ fn encode_root(root: &Root) -> io::Result<[u8; PAYLOAD]> {
         if !valid_tile_name(&t.name) {
             return Err(invalid("tile name is not a plain directory-local file"));
         }
-        // MAX_TILES * (4 + MAX_NAME + 8 + 32) + 20 stays far below PAYLOAD,
-        // so these fixed-size writes cannot run past the page.
+        // The compile-time MAX_TILES assertion above proves the worst-case
+        // list plus count/checkpoint/segment fits PAYLOAD, so these fixed-size
+        // writes cannot run past the page.
         p[i..i + 4].copy_from_slice(&(name.len() as u32).to_le_bytes());
         p[i + 4..i + 4 + name.len()].copy_from_slice(name);
         i += 4 + name.len();
@@ -394,6 +406,75 @@ impl Manifest {
         self.root = root;
         self.slot = slot;
         Ok(())
+    }
+
+    /// Range-preserving replacement: atomically retire a contiguous run of the
+    /// current active list and install one `replacement` tile whose cutoff is the
+    /// run's newest cutoff. The retired CSN range is `(previous cutoff, run newest
+    /// cutoff]`; carrying that same cutoff into the replacement keeps the
+    /// resulting list strictly increasing (disjoint, non-overlapping ranges), so
+    /// `open_discover`/`open_impl` accept it unchanged. `retire` names the run's
+    /// tiles in list order and must match exactly one contiguous window.
+    ///
+    /// Fails closed, poisoning the writer like [`Manifest::publish`], if the
+    /// retired set is not a contiguous run of the current list, if the
+    /// replacement's cutoff is not that run's newest cutoff, or if the resulting
+    /// list would not be strictly increasing. The durable protocol is unchanged:
+    /// inactive page at `seq + 1` → sync manifest file → sync parent dir → flip.
+    pub(crate) fn publish_replacing(
+        &mut self,
+        retire: &[&str],
+        replacement: TileRef,
+        checkpoint: Checkpoint,
+        segment: Option<SegmentRef>,
+    ) -> io::Result<()> {
+        if self.poisoned {
+            return Err(io::Error::new(io::ErrorKind::Other, "manifest writer poisoned; reopen to recover"));
+        }
+        let result = self.publish_replacing_inner(retire, replacement, checkpoint, segment);
+        if result.is_err() { self.poisoned = true; }
+        result
+    }
+
+    fn publish_replacing_inner(
+        &mut self,
+        retire: &[&str],
+        replacement: TileRef,
+        checkpoint: Checkpoint,
+        segment: Option<SegmentRef>,
+    ) -> io::Result<()> {
+        if retire.is_empty() {
+            return Err(invalid("range replacement requires a non-empty retired run"));
+        }
+        if retire.len() > self.root.tiles.len() {
+            return Err(invalid("retired set is not a contiguous run of the active tile list"));
+        }
+        // Locate the run as exactly one contiguous window of the current list,
+        // matched by name in order; an absent or ambiguous window is corruption
+        // of the caller's intent, not a list to guess at.
+        let mut start = None;
+        for i in 0..=self.root.tiles.len().saturating_sub(retire.len()) {
+            let window = &self.root.tiles[i..i + retire.len()];
+            if window.iter().zip(retire).all(|(t, name)| t.name.as_str() == *name) {
+                if start.is_some() {
+                    return Err(invalid("retired run matches the active tile list ambiguously"));
+                }
+                start = Some(i);
+            }
+        }
+        let start = start.ok_or_else(|| invalid("retired set is not a contiguous run of the active tile list"))?;
+        let end = start + retire.len();
+        if self.root.tiles[end - 1].cutoff != replacement.cutoff {
+            return Err(invalid("replacement cutoff is not the retired run's newest cutoff"));
+        }
+        let mut tiles: Vec<TileRef> = Vec::with_capacity(self.root.tiles.len() - retire.len() + 1);
+        tiles.extend_from_slice(&self.root.tiles[..start]);
+        tiles.push(replacement);
+        tiles.extend_from_slice(&self.root.tiles[end..]);
+        if !cutoffs_strictly_increasing(&tiles) {
+            return Err(invalid("replacement would make tile cutoffs overlap or not strictly increase"));
+        }
+        self.publish_inner(tiles, checkpoint, segment)
     }
 }
 
@@ -702,5 +783,48 @@ mod tests {
         case("refuse-order", vec![tile("b.tile", 6), tile("a.tile", 5)], Checkpoint { csn: 6, handle_watermark: 0 });
         case("refuse-overlap", vec![tile("a.tile", 5), tile("b.tile", 5)], Checkpoint { csn: 5, handle_watermark: 0 });
         case("refuse-too-many", (0..MAX_TILES as u64 + 1).map(|i| tile(&format!("t{i}.tile"), i + 1)).collect::<Vec<_>>(), Checkpoint { csn: MAX_TILES as u64 + 1, handle_watermark: 0 });
+    }
+
+    #[test]
+    fn publish_replacing_retires_a_contiguous_run_and_fails_closed() {
+        let dir = tmp_dir("replace");
+        let path = dir.join(MANIFEST_NAME);
+        let mut m = Manifest::create(&path).unwrap();
+        m.publish(vec![tile("a.tile", 1), tile("b.tile", 2), tile("c.tile", 3)],
+            Checkpoint { csn: 3, handle_watermark: 4 }, None).unwrap();
+        let seq_before = m.root().seq;
+        // Retire the oldest two, installing a replacement bound to the run's
+        // newest cutoff (2); the surviving tile at cutoff 3 keeps the list
+        // strictly increasing and the checkpoint untouched.
+        m.publish_replacing(&["a.tile", "b.tile"], tile("m.tile", 2),
+            Checkpoint { csn: 3, handle_watermark: 4 }, None).unwrap();
+        assert_eq!(m.root().seq, seq_before + 1, "range replacement follows the seq+1 publication protocol");
+        let names: Vec<&str> = m.root().tiles.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, vec!["m.tile", "c.tile"]);
+        assert_eq!(m.root().tiles[0].cutoff, 2);
+        assert_eq!(m.root().tiles[0].digest, [7u8; 32]);
+        drop(m);
+        let reopened = Manifest::open(&path).unwrap().unwrap();
+        assert_eq!(reopened.root().tiles[0].name, "m.tile");
+        assert_eq!(reopened.root().tiles[1].name, "c.tile");
+        assert_eq!(reopened.root().checkpoint.csn, 3);
+
+        // Fail-closed cases: a non-contiguous retired set, a replacement whose
+        // cutoff is not the run's newest, and a name absent from the list. Each
+        // needs a fresh manifest because a refused publish poisons the writer.
+        let case = |name: &str, retire: &[&str], repl: TileRef| {
+            let path = tmp_dir(name).join(MANIFEST_NAME);
+            let mut m = Manifest::create(&path).unwrap();
+            m.publish(vec![tile("a.tile", 1), tile("b.tile", 2), tile("c.tile", 3)],
+                Checkpoint { csn: 3, handle_watermark: 4 }, None).unwrap();
+            let seq = m.root().seq;
+            assert_eq!(m.publish_replacing(retire, repl, Checkpoint { csn: 3, handle_watermark: 4 }, None).unwrap_err().kind(), ErrorKind::InvalidData);
+            assert!(m.poisoned());
+            assert_eq!(m.root().seq, seq, "refused replacement changed no durable state");
+        };
+        case("replace-gap", &["a.tile", "c.tile"], tile("m.tile", 3));
+        case("replace-wrong-cutoff", &["a.tile", "b.tile"], tile("m.tile", 3));
+        case("replace-absent", &["zz.tile"], tile("m.tile", 1));
+        case("replace-too-long", &["a.tile", "b.tile", "c.tile", "d.tile"], tile("m.tile", 3));
     }
 }
