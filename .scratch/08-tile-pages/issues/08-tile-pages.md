@@ -10,11 +10,13 @@ measurements (07/evidence/probe-cost.md, `b718fab`).
    until a prefix hit. Measured probe cost is linear in tile size:
    29 ms @1.4 MB → 1.65 s @90.8 MB (memtable probe: ~2 µs). With `K ≤ MAX_TILES = 8`
    tiles, a point/unique probe is O(total data).
-2. **Sequential tile scan rate ≈ 55 MB/s** (90.8 MB / 1.65 s, page cache warm),
-   i.e. ~15× below the 831 MiB/s measured device rate. Cause: per-entry `Vec`
-   allocation + per-entry checksum, and a whole-file digest instead of per-page CRCs.
-   This caps the prototype's *strongest* path (scan) below the device, so no
-   throughput claim from this engine is meaningful yet.
+2. **Scan rate was below the device rate** — CORRECTED 2026-09-30: the parent's
+   earlier "≈55 MB/s" figure was inferred from *probe* timings of the pre-08a code and
+   misstated as the scan rate. Measured full-scan rates: ~324 MiB/s at `d641cca`
+   (after 08a, before 08c) vs the 831 MiB/s device rate. Cause: byte-at-a-time CRC-32C
+   (6.8-8.3 us per 4 KiB block), i.e. the engine is CPU-bound, not device-bound.
+   Per-entry `Vec` allocation + per-entry checksum was the earlier, larger cause and
+   is fixed by 08a/08b (allocation removal alone bought ~4% after 08a).
 3. **Publish/compaction/rotation rewrite and re-verify whole tiles** (O(N) per event,
    ~K× write amplification). Publish re-derives the full projection; open re-verifies
    every tile against the WAL.
@@ -41,6 +43,19 @@ measurements (07/evidence/probe-cost.md, `b718fab`).
   a 22 MB tile ≤ 1 ms, sequential scan ≥ 400 MB/s, all 110 tests still green.
 - Review batching: 08a+08b are one subsystem (tile read path) → one fresh adversarial
   reviewer after 08b lands, per the earlier batching decision.
+
+- **08b DONE** (`d641cca`, worker `0d5cc873`). `TileCursor` (borrowed entries, no
+  per-entry allocation), `prefix_cursor` seeking via `dir_search` and never reading
+  blocks past the prefix range, streaming strict key-order check (restores what the old
+  positional comparison implied), `open()` overlap/order rejection of data blocks,
+  `scan_merged` on cursor heads, `scan_all` as a documented read-only hook. Measured:
+  **probe 65.6 ms → 14–32 µs** at a 22.4 MB tile (target ≤1 ms met, no longer linear);
+  scan 323→324 MiB/s (allocation removal only ~4%). 113 Rust (+3, no test weakened).
+- **08c-fast-crc DISPATCHED** (worker `12ee7e0f`): shared `engine/src/crc.rs` with
+  SSE4.2 hardware CRC-32C + slice-by-16 fallback, equivalence-proved against the old
+  table implementation (incl. the 0xE3069283 vector and length sweep), rewiring
+  wal/manifest/tile. Targets: scan ≥700 MiB/s, CRC-only ≥4 GB/s, probe unchanged.
+  Rationale: an IO-dense engine must not be CPU-bound below device rate.
 
 ## Planned slices (each independently reviewable)
 
