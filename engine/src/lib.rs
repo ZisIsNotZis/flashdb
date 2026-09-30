@@ -1,3 +1,4 @@
+pub mod crc;
 pub mod engine;
 pub mod keys;
 mod manifest;

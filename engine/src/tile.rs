@@ -13,8 +13,8 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, ErrorKind, Seek, SeekFrom, Write};
 use std::os::unix::fs::FileExt;
 use std::path::Path;
-use std::sync::LazyLock;
 
+use crate::crc::crc32c;
 use crate::keys;
 use crate::memtable::Memtable;
 
@@ -43,22 +43,6 @@ const MAX_ENTRY: usize = 8 + MAX_KEY + MAX_VALUE;
 const _: () = assert!(MAX_ENTRY <= u32::MAX as usize);
 
 fn invalid(message: &'static str) -> io::Error { io::Error::new(ErrorKind::InvalidData, message) }
-
-// Incremental CRC-32C permits large values without an entry-sized temporary buffer.
-fn crc(mut state: u32, bytes: &[u8]) -> u32 {
-    static TABLE: LazyLock<[u32; 256]> = LazyLock::new(|| {
-        let mut table = [0; 256];
-        for (i, slot) in table.iter_mut().enumerate() {
-            let mut c = i as u32;
-            for _ in 0..8 { c = (c >> 1) ^ (if c & 1 != 0 { 0x82f6_3b78 } else { 0 }); }
-            *slot = c;
-        }
-        table
-    });
-    for &byte in bytes { state = TABLE[((state ^ byte as u32) & 255) as usize] ^ (state >> 8); }
-    state
-}
-fn checksum(bytes: &[u8]) -> u32 { !crc(!0, bytes) }
 
 fn valid_key(key: &[u8]) -> bool {
     if key.len() < 18 { return false; }
@@ -111,7 +95,7 @@ fn superblock_bytes(cutoff: u64, digest: &[u8; 32], count: u64, dir_offset: u64,
     h[56..64].copy_from_slice(&dir_offset.to_le_bytes());
     h[64..72].copy_from_slice(&dir_len.to_le_bytes());
     h[72..76].copy_from_slice(&PAGE_SIZE.to_le_bytes());
-    let sum = checksum(&h[..SUPERBLOCK_CRC]);
+    let sum = crc32c(&h[..SUPERBLOCK_CRC]);
     h[SUPERBLOCK_CRC..].copy_from_slice(&sum.to_le_bytes());
     h
 }
@@ -121,7 +105,7 @@ fn trailer_bytes(dir_offset: u64, dir_len: u64) -> [u8; TRAILER] {
     t[..9].copy_from_slice(TRAILER_MAGIC);
     t[9..17].copy_from_slice(&dir_offset.to_le_bytes());
     t[17..25].copy_from_slice(&dir_len.to_le_bytes());
-    let sum = checksum(&t[..TRAILER_CRC]);
+    let sum = crc32c(&t[..TRAILER_CRC]);
     t[TRAILER_CRC..].copy_from_slice(&sum.to_le_bytes());
     t
 }
@@ -135,7 +119,7 @@ fn encode_block(first_key: &[u8], entries: &[u8], entry_count: u16) -> io::Resul
     b[12..14].copy_from_slice(&entry_count.to_le_bytes());
     b[BLOCK_HEADER..BLOCK_HEADER + first_key.len()].copy_from_slice(first_key);
     b[BLOCK_HEADER + first_key.len()..].copy_from_slice(entries);
-    let sum = checksum(&b[8..]);
+    let sum = crc32c(&b[8..]);
     b[4..8].copy_from_slice(&sum.to_le_bytes());
     Ok(b)
 }
@@ -147,7 +131,7 @@ fn encode_dir_block(records: &[u8], fence_count: u16) -> io::Result<Vec<u8>> {
     b[..4].copy_from_slice(&(total as u32).to_le_bytes());
     b[8..10].copy_from_slice(&fence_count.to_le_bytes());
     b[DIR_HEADER..].copy_from_slice(records);
-    let sum = checksum(&b[8..]);
+    let sum = crc32c(&b[8..]);
     b[4..8].copy_from_slice(&sum.to_le_bytes());
     Ok(b)
 }
@@ -245,7 +229,7 @@ impl<'a> TileCursor<'a> {
         let blen = u32::from_le_bytes(self.buffer[..4].try_into().unwrap()) as usize;
         let block_crc = u32::from_le_bytes(self.buffer[4..8].try_into().unwrap());
         if blen != self.buffer.len() { return Err(invalid("tile block length changed")); }
-        if checksum(&self.buffer[8..]) != block_crc { return Err(invalid("tile block checksum")); }
+        if crc32c(&self.buffer[8..]) != block_crc { return Err(invalid("tile block checksum")); }
         let first_key_len = u32::from_le_bytes(self.buffer[8..12].try_into().unwrap()) as usize;
         if BLOCK_HEADER + first_key_len > blen { return Err(invalid("tile block first key out of bounds")); }
         self.pos = BLOCK_HEADER + first_key_len;
@@ -447,7 +431,7 @@ impl Tile {
         let mut sb = [0u8; SUPERBLOCK];
         read_exact_at(&file, &mut sb, 0)?;
         if &sb[..8] != MAGIC { return Err(invalid("tile superblock magic")); }
-        if checksum(&sb[..SUPERBLOCK_CRC]) != u32::from_le_bytes(sb[SUPERBLOCK_CRC..].try_into().unwrap()) {
+        if crc32c(&sb[..SUPERBLOCK_CRC]) != u32::from_le_bytes(sb[SUPERBLOCK_CRC..].try_into().unwrap()) {
             return Err(invalid("tile superblock checksum"));
         }
         let cutoff = u64::from_le_bytes(sb[8..16].try_into().unwrap());
@@ -459,7 +443,7 @@ impl Tile {
         let mut tr = [0u8; TRAILER];
         read_exact_at(&file, &mut tr, size - TRAILER as u64)?;
         if &tr[..9] != TRAILER_MAGIC { return Err(invalid("tile trailer magic")); }
-        if checksum(&tr[..TRAILER_CRC]) != u32::from_le_bytes(tr[TRAILER_CRC..].try_into().unwrap()) {
+        if crc32c(&tr[..TRAILER_CRC]) != u32::from_le_bytes(tr[TRAILER_CRC..].try_into().unwrap()) {
             return Err(invalid("tile trailer checksum"));
         }
         if u64::from_le_bytes(tr[9..17].try_into().unwrap()) != dir_offset
@@ -480,7 +464,7 @@ impl Tile {
                 let blen = u32::from_le_bytes(dir[pos..pos + 4].try_into().unwrap()) as usize;
                 if blen < DIR_HEADER || blen > dir.len() - pos { return Err(invalid("tile directory block length")); }
                 let block_crc = u32::from_le_bytes(dir[pos + 4..pos + 8].try_into().unwrap());
-                if checksum(&dir[pos + 8..pos + blen]) != block_crc { return Err(invalid("tile directory checksum")); }
+                if crc32c(&dir[pos + 8..pos + blen]) != block_crc { return Err(invalid("tile directory checksum")); }
                 let fence_count = u16::from_le_bytes(dir[pos + 8..pos + 10].try_into().unwrap()) as usize;
                 let mut q = pos + DIR_HEADER;
                 for _ in 0..fence_count {
@@ -752,7 +736,7 @@ mod tests {
         assert_eq!(key0_len, key1_len, "equal-length P keys make the swap clean");
         for i in 0..key0_len { bytes.swap(key0 + i, key1 + i); }
         // Repair the directory block CRC so only the ordering rule can reject it.
-        let crc = checksum(&bytes[dir_offset + 8..dir_offset + blen]);
+        let crc = crc32c(&bytes[dir_offset + 8..dir_offset + blen]);
         bytes[dir_offset + 4..dir_offset + 8].copy_from_slice(&crc.to_le_bytes());
         std::fs::write(&path, &bytes).unwrap();
         assert_eq!(Tile::open(&path).err().unwrap().kind(), ErrorKind::InvalidData);
@@ -820,7 +804,7 @@ mod tests {
         bytes[a0..a1].copy_from_slice(&second);
         bytes[b0..b1].copy_from_slice(&first);
         // Repair the block CRC so only the ordering rule can reject the tile.
-        let crc = checksum(&bytes[start + 8..start + blen]);
+        let crc = crc32c(&bytes[start + 8..start + blen]);
         bytes[start + 4..start + 8].copy_from_slice(&crc.to_le_bytes());
         std::fs::write(&path, &bytes).unwrap();
         // Open validates headers and the directory but never entry order in data.
@@ -848,7 +832,7 @@ mod tests {
         // Strictly increasing (off0 + 1 > off0) but inside block 0's extent.
         bytes[off1_field..off1_field + 8].copy_from_slice(&(off0 + 1).to_le_bytes());
         // Repair the directory block CRC so only the overlap rule can reject it.
-        let crc = checksum(&bytes[dir_offset + 8..dir_offset + blen]);
+        let crc = crc32c(&bytes[dir_offset + 8..dir_offset + blen]);
         bytes[dir_offset + 4..dir_offset + 8].copy_from_slice(&crc.to_le_bytes());
         std::fs::write(&path, &bytes).unwrap();
         assert_eq!(Tile::open(&path).err().unwrap().kind(), ErrorKind::InvalidData);

@@ -1,10 +1,12 @@
 //! Micro-benchmark: cost of one unique probe against (a) the in-RAM memtable and
 //! (b) a published tile, as a function of tile size. Not a correctness test.
 //!
-//! usage: cargo run --release --example probe_cost -- [scan] [DOCS ...]
+//! usage: cargo run --release --example probe_cost -- [scan|crc] [DOCS ...]
 //!
 //! `scan` additionally reports the full sequential tile scan throughput (MiB/s);
-//! without it only the probe cost is printed.
+//! without it only the probe cost is printed. `crc` reports one-shot CRC-32C
+//! throughput (GB/s) on a buffer sized like a tile (default 64 MiB, optional
+//! second argument overrides it in bytes).
 
 use flashdb_engine::engine::{Engine, Op};
 use std::time::Instant;
@@ -95,8 +97,27 @@ fn time_scan(e: &Engine, tile_bytes: u64) -> std::io::Result<f64> {
     Ok(best)
 }
 
+/// Best-of-`SCAN_ITERS` one-shot CRC-32C throughput over a large buffer, in GB/s.
+fn time_crc(bytes: usize) -> f64 {
+    let data: Vec<u8> = (0..bytes).map(|i| (i.wrapping_mul(2654435761) >> 13) as u8).collect();
+    let mut best = 0f64;
+    for _ in 0..SCAN_ITERS {
+        let t = Instant::now();
+        let sum = flashdb_engine::crc::crc32c(&data);
+        let secs = t.elapsed().as_secs_f64();
+        std::hint::black_box(sum);
+        best = best.max((bytes as f64 / 1e9) / secs.max(1e-9));
+    }
+    best
+}
+
 fn main() -> std::io::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().is_some_and(|a| a == "crc") {
+        let bytes = args.get(1).and_then(|a| a.parse().ok()).unwrap_or(64 << 20);
+        println!("crc_bytes={bytes} crc_gb_s={:.2}", time_crc(bytes));
+        return Ok(());
+    }
     let scan = args.first().is_some_and(|a| a == "scan");
     let rest = if scan { &args[1..] } else { &args[..] };
     let docs: Vec<u64> = if rest.is_empty() {

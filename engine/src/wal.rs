@@ -17,36 +17,15 @@
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::LazyLock;
 
 const HEADER: usize = 8; // len u32 LE + crc u32 LE
 const MAX_RECORD: usize = 1 << 26; // 64 MiB，防御性上界
 
-fn table() -> &'static [u32; 256] {
-    static T: LazyLock<[u32; 256]> = LazyLock::new(|| {
-        let mut t = [0u32; 256];
-        for (i, slot) in t.iter_mut().enumerate() {
-            let mut c = i as u32;
-            for _ in 0..8 {
-                c = if c & 1 != 0 { 0x82F63B78 ^ (c >> 1) } else { c >> 1 };
-            }
-            *slot = c;
-        }
-        t
-    });
-    &*T
-}
-
 /// CRC-32C（Castagnoli，反射多项式 0x82F63B78）。
 /// 校验值：`crc32c(b"123456789") == 0xE3069283`。
-pub fn crc32c(data: &[u8]) -> u32 {
-    let t = table();
-    let mut c = !0u32;
-    for &b in data {
-        c = t[((c ^ b as u32) & 0xFF) as usize] ^ (c >> 8);
-    }
-    !c
-}
+///
+/// 共享实现见 [`crate::crc`]；此处保留再导出，使既有调用方不变。
+pub use crate::crc::crc32c;
 
 /// 追加日志句柄。单写者；`sync` 调 `fdatasync`。
 pub struct Wal {

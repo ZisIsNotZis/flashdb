@@ -45,7 +45,7 @@ use std::io::{self, ErrorKind};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 
-use crate::wal::crc32c;
+use crate::crc::crc32c;
 
 /// Fixed manifest filename inside the engine directory.
 pub(crate) const MANIFEST_NAME: &str = "manifest";
