@@ -616,26 +616,34 @@ impl Engine {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "compaction requires at least two active tiles"));
         }
         let len = self.tiles.len();
-        self.merge_oldest_run(len)?;
+        self.merge_run(0, len)?;
         Ok(())
     }
 
-    /// Bounded, tiered compaction: merge only a size-budgeted oldest run instead
-    /// of rewriting the whole dataset. Does nothing (`Ok(None)`) while fewer
-    /// than `max_tiles` tiles are active. Otherwise it selects the OLDEST
-    /// CONTIGUOUS RUN of at least two tiles whose combined on-disk size is at
-    /// most `max_merge_bytes`, replaces exactly that run with one tile covering
-    /// its union range, and returns the merged output's size in bytes. When even
-    /// the two oldest tiles together exceed the budget, those two are merged
-    /// anyway so every call makes progress (the active count strictly drops).
+    /// Bounded, tiered compaction: merge only a size-budgeted run instead of
+    /// rewriting the whole dataset. Does nothing (`Ok(None)`) while fewer than
+    /// `max_tiles` tiles are active. Otherwise it selects a CONTIGUOUS RUN of at
+    /// least two tiles whose combined on-disk size is at most `max_merge_bytes`,
+    /// replaces exactly that run with one tile covering its union range, and
+    /// returns the merged output's size in bytes.
     ///
-    /// "Size" is the sum of the selected tiles' on-disk file lengths. The
-    /// replacement's cutoff is the run's newest cutoff, so the surviving active
-    /// list stays strictly increasing and disjoint — the invariant the read path
-    /// and recovery verification depend on — while the run always starts at the
-    /// oldest tile, so the merged tile's lower bound is 0 exactly as for
-    /// [`Engine::compact`]. Memory stays bounded: the merge reuses the streaming
-    /// reduction that buffers one block per input plus the WAL-window map.
+    /// The rule is to consider every contiguous run of length >= 2 and pick the
+    /// one with the SMALLEST combined size (ties: the oldest). Because sizes are
+    /// positive the minimum is always attained by an adjacent pair, so a tile
+    /// larger than the budget is a finished tier: any run containing it costs
+    /// more than a cheaper eligible run of smaller tiles, and is never selected
+    /// while that cheaper run exists. When no run fits the budget at all (every
+    /// adjacent pair exceeds it), the fallback merges the two adjacent tiles with
+    /// the smallest combined size, so every call still makes progress (the active
+    /// count strictly drops).
+    ///
+    /// "Size" is the sum of the selected tiles' on-disk file lengths, stat'ed
+    /// once per call. The replacement's cutoff is the run's newest cutoff and its
+    /// content covers exactly the run's union range, so the surviving active list
+    /// stays strictly increasing and disjoint — the invariant the read path and
+    /// recovery verification depend on. Memory stays bounded: the merge reuses
+    /// the streaming reduction that buffers one block per input plus the
+    /// WAL-window map.
     pub fn maybe_compact(&mut self, max_merge_bytes: u64, max_tiles: usize) -> io::Result<Option<u64>> {
         if self.tiles.len() < max_tiles || self.tiles.len() < 2 {
             return Ok(None);
@@ -644,38 +652,76 @@ impl Engine {
             return Err(io::Error::new(io::ErrorKind::Other, "manifest writer poisoned; reopen to recover"));
         }
         self.ensure_attached()?;
-        let len = self.select_run(max_merge_bytes)?;
-        self.merge_oldest_run(len).map(Some)
+        let (start, len) = self.select_run(max_merge_bytes)?;
+        self.merge_run(start, len).map(Some)
     }
 
-    /// Length of the oldest contiguous run to merge: extend from the oldest tile
-    /// while the combined file size stays within `max_merge_bytes` (the first
-    /// tile is always included, even when it alone exceeds the budget), then
-    /// guarantee progress by returning at least two. Requires >= 2 active tiles.
-    fn select_run(&self, max_merge_bytes: u64) -> io::Result<usize> {
+    /// Start and length of the contiguous run to merge: the run of length >= 2
+    /// with the smallest combined on-disk size within `max_merge_bytes`, ties
+    /// resolved in favour of the oldest start; otherwise the two adjacent tiles
+    /// with the smallest combined size (progress guarantee). All tile sizes are
+    /// read once here and every candidate run reuses them. Requires >= 2 active
+    /// tiles.
+    fn select_run(&self, max_merge_bytes: u64) -> io::Result<(usize, usize)> {
         debug_assert!(self.tiles.len() >= 2);
-        let mut sum = 0u64;
-        let mut len = 0usize;
-        for t in &self.tiles {
-            let size = fs::metadata(self.dir.join(&t.name))?.len();
-            if len >= 1 && sum.saturating_add(size) > max_merge_bytes { break; }
-            sum = sum.saturating_add(size);
-            len += 1;
+        let sizes: Vec<u64> = self.tiles
+            .iter()
+            .map(|t| fs::metadata(self.dir.join(&t.name)).map(|m| m.len()))
+            .collect::<io::Result<Vec<_>>>()?;
+        let n = sizes.len();
+        let mut best: Option<(u64, usize, usize)> = None; // (combined size, start, len)
+        for start in 0..n {
+            let mut sum = 0u64;
+            for len in 1..=(n - start) {
+                sum = sum.saturating_add(sizes[start + len - 1]);
+                if len < 2 { continue; }
+                // Longer runs from this start only grow, so stop at the budget.
+                if sum > max_merge_bytes { break; }
+                if best.map_or(true, |(sum0, start0, _)| (sum, start) < (sum0, start0)) {
+                    best = Some((sum, start, len));
+                }
+            }
         }
-        Ok(len.max(2).min(self.tiles.len()))
+        if let Some((_, start, len)) = best {
+            return Ok((start, len));
+        }
+        // Nothing fits the budget; merge the two adjacent tiles with the
+        // smallest combined size so the active count still drops.
+        let start = (0..n - 1)
+            .min_by_key(|&i| (sizes[i].saturating_add(sizes[i + 1]), i))
+            .expect("select_run requires at least two tiles");
+        Ok((start, 2))
     }
 
-    /// Merge the oldest `len` active tiles (`2 <= len <= tiles.len()`, i.e. a
-    /// prefix) into one tile covering exactly `(0, tiles[len - 1].cutoff]` via
-    /// the streaming merge, replace that run through the range-preserving
-    /// manifest protocol, and only after the durable flip unlink the retired
-    /// inputs. Returns the merged output size. The WAL digest binding is
+    /// Merge the active run `tiles[start..start + len]` (`2 <= len`, with at
+    /// least two tiles in the run) into one tile covering exactly the run's
+    /// union range `(tiles[start - 1].cutoff, tiles[start + len - 1].cutoff]`
+    /// (lower bound 0 when the run starts at the oldest tile) via the streaming
+    /// merge, replace that run through the range-preserving manifest protocol,
+    /// and only after the durable flip unlink the retired inputs. The run need
+    /// not start at the oldest tile: a middle run leaves every tile outside it
+    /// untouched, so its lower bound is the previous tile's cutoff and its
+    /// coverage is exactly the newest version per logical key in that range —
+    /// the same projection `open_impl` verifies each tile against. Returns the
+    /// merged output size. The WAL digest binding is
     /// [`Engine::write_compacted_tile`]'s, i.e. exactly the digest an ordinary
-    /// publish at that cutoff would carry.
-    fn merge_oldest_run(&mut self, len: usize) -> io::Result<u64> {
-        debug_assert!((2..=self.tiles.len()).contains(&len));
-        let cutoff = self.tiles[len - 1].cutoff();
-        let name = format!("compact-{cutoff}.tile");
+    /// publish at the run's newest cutoff would carry.
+    fn merge_run(&mut self, start: usize, len: usize) -> io::Result<u64> {
+        debug_assert!(len >= 2 && start + len <= self.tiles.len());
+        let end = start + len;
+        let cutoff = self.tiles[end - 1].cutoff();
+        let lower = if start == 0 { 0 } else { self.tiles[start - 1].cutoff() };
+        // The run's newest input can itself be a prior compaction output named
+        // `compact-<cutoff>.tile` (a middle run may end on a compacted tier), so
+        // the deterministic base name would collide with a tile this merge
+        // retires. In that case pick a fresh suffixed name; a hand-published
+        // live tile under the base name is still refused below.
+        let base = format!("compact-{cutoff}.tile");
+        let name = if self.tiles[end - 1].name == base {
+            self.unique_compaction_name(cutoff)?
+        } else {
+            base
+        };
         let path = self.dir.join(&name);
         if self.tiles.iter().any(|t| t.name == name) {
             // A LIVE published tile owns this name; overwriting it while it is
@@ -686,7 +732,7 @@ impl Engine {
         }
         // 1. Build + verify the merged tile for the run's union range against the
         //    retained WAL projection, exactly as publish verifies one tile.
-        let tile = match self.write_compacted_tile(&path, &self.tiles[..len], cutoff) {
+        let tile = match self.write_compacted_tile(&path, &self.tiles[start..end], lower, cutoff) {
             Ok(t) => t,
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
                 return Err(io::Error::new(io::ErrorKind::AlreadyExists, format!(
@@ -699,30 +745,32 @@ impl Engine {
         //    can reference it (checkpoint publication ordering).
         File::open(&self.dir)?.sync_all()?;
         // 3. Manifest protocol: the retired run is replaced by the one new tile.
-        //    The global newest cutoff (and therefore the checkpoint) is unchanged
-        //    because the run is a prefix: later tiles keep the frontier, or the
-        //    replacement itself carries it when the run reached the end.
+        //    The global newest cutoff (and therefore the checkpoint) is unchanged:
+        //    tiles after the run keep the frontier, or the replacement itself
+        //    carries it when the run reached the end. `publish_replacing` accepts
+        //    any contiguous window, not just a prefix.
         let replacement = TileRef { name: name.clone(), cutoff, digest: *tile.digest() };
         let checkpoint = Checkpoint { csn: self.tiles.last().unwrap().cutoff(), handle_watermark: self.max_handle };
         let segment = self.segment.clone();
         if self.manifest.is_some() {
-            let retire: Vec<String> = self.tiles[..len].iter().map(|t| t.name.clone()).collect();
+            let retire: Vec<String> = self.tiles[start..end].iter().map(|t| t.name.clone()).collect();
             let retire: Vec<&str> = retire.iter().map(String::as_str).collect();
             self.manifest.as_mut().unwrap().publish_replacing(&retire, replacement, checkpoint, segment)?;
         } else {
             // No manifest yet (tiles built by `build_tile`, which never creates
-            // one): create it listing the replacement plus every surviving tile,
-            // none of which is retired.
+            // one): create it listing the replacement interleaved in cutoff
+            // order with every surviving tile, none of which is retired.
             let mut refs: Vec<TileRef> = Vec::with_capacity(self.tiles.len() - len + 1);
+            refs.extend(self.tiles[..start].iter().map(|t| t.tile_ref()));
             refs.push(replacement);
-            refs.extend(self.tiles[len..].iter().map(|t| t.tile_ref()));
+            refs.extend(self.tiles[end..].iter().map(|t| t.tile_ref()));
             self.manifest_publish(refs, checkpoint, segment)?;
         }
         // 4. In-memory flip: the replacement takes the run's place in the ordered
         //    list; the memtable is untouched (it holds only versions above the
         //    global newest cutoff).
-        let retired: Vec<TileHandle> = self.tiles.drain(0..len).collect();
-        self.tiles.insert(0, TileHandle { tile, name });
+        let retired: Vec<TileHandle> = self.tiles.drain(start..end).collect();
+        self.tiles.insert(start, TileHandle { tile, name });
         // 5. Only now drop the retired input files. Unlink after the durable flip
         //    is safe: open fds keep working (POSIX) and the new root no longer
         //    references them. Failures are best-effort ignored — the compaction
@@ -734,23 +782,43 @@ impl Engine {
         Ok(out_size)
     }
 
+    /// A free compaction output name: `compact-<cutoff>.tile` when no live tile
+    /// or on-disk file claims it, otherwise the first free
+    /// `compact-<cutoff>-<k>.tile`. Needed because a middle run may end on a
+    /// previous compaction output whose name already is the base name.
+    fn unique_compaction_name(&self, cutoff: u64) -> io::Result<String> {
+        let mut candidate = format!("compact-{cutoff}.tile");
+        let mut k = 0u64;
+        loop {
+            let live = self.tiles.iter().any(|t| t.name == candidate);
+            if !live && !self.dir.join(&candidate).try_exists()? {
+                return Ok(candidate);
+            }
+            k += 1;
+            candidate = format!("compact-{cutoff}-{k}.tile");
+        }
+    }
+
     /// Active tile cutoffs in order (inspection/benchmark hook). Strictly
     /// increasing and disjoint while the engine is consistent.
     pub fn active_tile_cutoffs(&self) -> Vec<u64> {
         self.tiles.iter().map(|t| t.cutoff()).collect()
     }
 
-    /// Create-new the compacted tile for the `(0, cutoff]` union of the given
-    /// active tile run, sync it, reopen it and re-check its exact
+    /// Create-new the compacted tile for the `(lower, cutoff]` union of the
+    /// given active tile run, sync it, reopen it and re-check its exact
     /// newest-version-per-logical-key projection against the active WAL file's
-    /// `(segment start, cutoff]` range combined with the already-verified
-    /// tile-carried prefix, before any caller may reference it. Each input tile
-    /// was itself verified against its disjoint WAL range at open/publish, so
-    /// merging the run's tiles with the retained WAL suffix and reducing to the
-    /// newest version per logical key IS the multi-tile merge (same codec, same
-    /// key order, tombstones retained as newest state). The run is always a
-    /// prefix starting at the oldest tile, so `cutoff` is its newest cutoff and
-    /// the digest is exactly what a publish at `cutoff` would bind.
+    /// `(lower, cutoff]` range combined with the already-verified tile-carried
+    /// prefix, before any caller may reference it. Each input tile was itself
+    /// verified against its disjoint WAL range at open/publish, so merging the
+    /// run's tiles with the retained WAL suffix and reducing to the newest
+    /// version per logical key IS the multi-tile merge (same codec, same key
+    /// order, tombstones retained as newest state). The run covers exactly
+    /// `(lower, cutoff]`: `lower` is the previous active tile's cutoff (0 for a
+    /// run starting at the oldest tile) and `cutoff` is the run's newest cutoff,
+    /// so the digest is exactly what a publish at `cutoff` would bind. The WAL
+    /// suffix map holds only records above `lower`, so a version outside the
+    /// run's range is never pulled into the output.
     ///
     /// Nothing here materializes the union: the tiles are streamed by one
     /// [`TileCursor`] each (borrowing a single 4 KiB block apiece) and only the
@@ -758,17 +826,19 @@ impl Engine {
     /// key-ordered map. [`Engine::stream_merged_reduction`] merges both sources
     /// and pushes the reduced stream straight into the streaming writer, so peak
     /// compaction RAM tracks the WAL window, not the total tile bytes.
-    fn write_compacted_tile(&self, tile_path: &Path, tiles: &[TileHandle], cutoff: u64) -> io::Result<Tile> {
+    fn write_compacted_tile(&self, tile_path: &Path, tiles: &[TileHandle], lower: u64, cutoff: u64) -> io::Result<Tile> {
         let (records, _) = wal::replay(&self.wal_path)?;
         self.verify_wal_matches_state(&records)?;
         let digest = wal_digest(&records, cutoff, self.wal_floor())?;
-        // Source (b): the retained WAL suffix at or below `cutoff`, key-ordered by
-        // construction. A later op overwrites an earlier one for the exact same
-        // key, matching `Memtable::apply`.
+        // Source (b): the retained WAL suffix inside `(lower, cutoff]`, key-ordered
+        // by construction. A later op overwrites an earlier one for the exact same
+        // key, matching `Memtable::apply`. Records at or below `lower` are carried
+        // by the run's own tiles (or an earlier, still-active tile) and must not be
+        // merged here, or they would escape the run's range.
         let mut wal_entries: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
         for payload in &records {
             let (csn, _, ops) = decode_payload(payload)?;
-            if csn <= cutoff {
+            if csn > lower && csn <= cutoff {
                 for op in &ops {
                     let (key, value) = op_kv(op, csn);
                     wal_entries.insert(key, value);
@@ -779,25 +849,28 @@ impl Engine {
         // into the encoder (one 4 KiB block buffered): no projection of the
         // union ever exists.
         let mut writer = TileWriter::new(tile_path, cutoff, &digest)?;
-        self.stream_merged_reduction(tiles, cutoff, &wal_entries, |key, value| writer.push(key, value))?;
+        self.stream_merged_reduction(tiles, lower, cutoff, &wal_entries, |key, value| writer.push(key, value))?;
         let tile = writer.finish()?;
         // Fail closed without a second materialization: re-run the identical merge
         // and compare it 1:1, streaming, against the written tile.
-        self.verify_compacted_tile(&tile, tiles, &wal_entries, cutoff)?;
+        self.verify_compacted_tile(&tile, tiles, lower, &wal_entries, cutoff)?;
         Ok(tile)
     }
 
     /// K-way merge of the given active tile run (one [`TileCursor`] each) and the
     /// key-ordered WAL suffix map, in ascending encoded-key order, reduced to the
-    /// newest version per logical key within `(0, cutoff]` - the same reduction
-    /// [`newest_projection`] performs. Keys within one logical key sort by CSN
-    /// descending, so the first entry of each logical-key group wins and the rest
-    /// are skipped; a tombstone (empty value) is itself the newest state. Only one
-    /// logical key is retained as state, so nothing here is proportional to the
-    /// tile bytes.
+    /// newest version per logical key within `(lower, cutoff]` - the same
+    /// reduction [`newest_projection`] performs. Keys within one logical key sort
+    /// by CSN descending, so the first in-range entry of each logical-key group
+    /// wins and the rest are skipped; a tombstone (empty value) is itself the
+    /// newest state. Entries at or below `lower` cannot belong to the run's
+    /// range and are dropped (a run tile may carry floor-spanning entries below
+    /// its lower bound). Only one logical key is retained as state, so nothing
+    /// here is proportional to the tile bytes.
     fn stream_merged_reduction(
         &self,
         tiles: &[TileHandle],
+        lower: u64,
         cutoff: u64,
         wal_entries: &BTreeMap<Vec<u8>, Vec<u8>>,
         mut visit: impl FnMut(&[u8], &[u8]) -> io::Result<()>,
@@ -832,7 +905,7 @@ impl Engine {
                 }
             };
             let Some(csn) = keys::key_csn(key) else { continue };
-            if csn == 0 || csn > cutoff { continue; }
+            if csn <= lower || csn > cutoff { continue; }
             let logical = &key[..key.len() - 8];
             if have_logical && last_logical.as_slice() == logical { continue; }
             have_logical = true;
@@ -850,6 +923,7 @@ impl Engine {
         &self,
         tile: &Tile,
         tiles: &[TileHandle],
+        lower: u64,
         wal_entries: &BTreeMap<Vec<u8>, Vec<u8>>,
         cutoff: u64,
     ) -> io::Result<()> {
@@ -869,7 +943,7 @@ impl Engine {
             pending = actual.next();
             Ok(())
         };
-        self.stream_merged_reduction(tiles, cutoff, wal_entries, &mut compare)?;
+        self.stream_merged_reduction(tiles, lower, cutoff, wal_entries, &mut compare)?;
         if let Some(entry) = pending {
             entry?;
             return Err(io::Error::new(io::ErrorKind::InvalidData, "compacted tile contains an extra entry"));

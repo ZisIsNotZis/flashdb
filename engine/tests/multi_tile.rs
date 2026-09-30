@@ -110,6 +110,29 @@ fn publish_fails_closed_when_retained_wal_disagrees_with_serving_memtable() {
 }
 
 #[test]
+fn compaction_output_name_collides_with_its_own_newest_input_and_is_disambiguated() {
+    let files = Files::new();
+    let mut e = Engine::create(&files.wal).unwrap();
+    e.commit_block(b"b1", &[doc(1, b"a")]).unwrap();
+    e.publish_tile(&files.dir.join("tile-1.tile"), 1).unwrap();
+    e.commit_block(b"b2", &[doc(2, b"b")]).unwrap();
+    // The run's newest input is itself named like a compaction output for its
+    // own cutoff (the shape a previous middle-run merge can leave behind).
+    e.publish_tile(&files.dir.join("compact-2.tile"), 2).unwrap();
+    assert!(e.maybe_compact(u64::MAX, 2).unwrap().is_some());
+    assert_eq!(e.active_tile_cutoffs(), vec![2]);
+    assert!(files.dir.join("compact-2-1.tile").exists(), "the colliding input name is not reused");
+    assert!(!files.dir.join("compact-2.tile").exists(), "the retired input is unlinked");
+    assert_eq!(e.get(b"E", 1).unwrap(), Some(b"a".to_vec()));
+    assert_eq!(e.get(b"E", 2).unwrap(), Some(b"b".to_vec()));
+    drop(e);
+    let e = Engine::open_discover(&files.dir).unwrap();
+    assert_eq!(e.active_tile_cutoffs(), vec![2]);
+    assert_eq!(e.get(b"E", 1).unwrap(), Some(b"a".to_vec()));
+    assert_eq!(e.get(b"E", 2).unwrap(), Some(b"b".to_vec()));
+}
+
+#[test]
 fn maybe_checkpoint_triggers_only_past_threshold_and_advances_root() {
     let files = Files::new();
     let mut e = Engine::create(&files.wal).unwrap();
@@ -550,43 +573,159 @@ fn compact_after_rotation_spans_the_segment_floor_and_reopens() {
     assert_eq!(e.get(b"E", 4).unwrap(), Some(b"four".to_vec()));
 }
 
+/// Publish a tile covering one block of `n` equal `len`-byte docs under handles
+/// `base..base + n`, and return the tile file's on-disk size.
+fn publish_docs(files: &Files, e: &mut Engine, block: &str, name: &str, base: u64, n: u64, len: usize) -> u64 {
+    let ops: Vec<Op> = (0..n)
+        .map(|i| Op::PutDoc { entity: b"E".to_vec(), handle: base + i, doc: vec![b'x'; len] })
+        .collect();
+    let cutoff = match e.commit_block(block.as_bytes(), &ops).unwrap() {
+        Outcome::Committed { csn } => csn,
+        other => panic!("unexpected commit outcome {other:?}"),
+    };
+    e.publish_tile(&files.dir.join(name), cutoff).unwrap();
+    fs::metadata(files.dir.join(name)).unwrap().len()
+}
+
 #[test]
-fn maybe_compact_selects_the_oldest_run_within_budget() {
+fn maybe_compact_selects_nothing_below_the_cap() {
     let files = Files::new();
     let mut e = Engine::create(&files.wal).unwrap();
-    // Six published tiles, each roughly one 4 KiB superblock page plus a small
-    // data block, so a byte budget maps cleanly onto a run length.
     for i in 1..=6u64 {
         e.commit_block(&format!("b{i}").into_bytes(), &[doc(i, b"d")]).unwrap();
         e.publish_tile(&files.dir.join(format!("tile-{i}.tile")), i).unwrap();
     }
-    // Below max_tiles: nothing merges even with an unlimited budget.
+    // Below max_tiles: nothing merges even with an unlimited budget, and no
+    // input tile is retired.
     assert_eq!(e.maybe_compact(u64::MAX, 7).unwrap(), None);
     assert_eq!(e.active_tile_cutoffs(), vec![1, 2, 3, 4, 5, 6]);
+    for i in 1..=6u64 {
+        assert!(files.dir.join(format!("tile-{i}.tile")).exists(), "no tile is retired below the cap");
+    }
+}
 
-    // Budget exactly two files: the run stops after two and is the OLDEST two
-    // (output cutoff 2; tiles 1 and 2 retired, tiles 3+ untouched).
+#[test]
+fn maybe_compact_chooses_the_cheapest_run_and_the_oldest_on_ties() {
+    let files = Files::new();
+    let mut e = Engine::create(&files.wal).unwrap();
+    // Six equal single-doc tiles: every adjacent pair has the same combined
+    // size, so the OLDEST pair must win the tie.
+    for i in 1..=6u64 {
+        e.commit_block(&format!("b{i}").into_bytes(), &[doc(i, b"d")]).unwrap();
+        e.publish_tile(&files.dir.join(format!("tile-{i}.tile")), i).unwrap();
+    }
     let two = fs::metadata(files.dir.join("tile-1.tile")).unwrap().len()
         + fs::metadata(files.dir.join("tile-2.tile")).unwrap().len();
     let out = e.maybe_compact(two, 3).unwrap().unwrap();
     assert_eq!(out, fs::metadata(files.dir.join("compact-2.tile")).unwrap().len(),
         "maybe_compact reports the merged output size");
-    assert_eq!(e.active_tile_cutoffs(), vec![2, 3, 4, 5, 6]);
+    assert_eq!(e.active_tile_cutoffs(), vec![2, 3, 4, 5, 6], "the oldest pair wins the tie");
     assert!(!files.dir.join("tile-1.tile").exists());
     assert!(!files.dir.join("tile-2.tile").exists());
     assert!(files.dir.join("tile-3.tile").exists(), "tiles past the run are untouched");
+}
 
-    // A budget too small for two lets the 2-tile progress minimum win: the two
-    // oldest (compact-2 and tile-3) still merge.
-    assert!(e.maybe_compact(1, 3).unwrap().is_some());
-    assert_eq!(e.active_tile_cutoffs(), vec![3, 4, 5, 6]);
+#[test]
+fn maybe_compact_skips_an_oversized_middle_tile() {
+    let files = Files::new();
+    let mut e = Engine::create(&files.wal).unwrap();
+    publish_docs(&files, &mut e, "b1", "tile-1.tile", 1, 1, 8);
+    // A tile far larger than the budget sits SECOND, between cheap tiles.
+    publish_docs(&files, &mut e, "b2", "tile-2.tile", 100, 4000, 256);
+    let giant = fs::metadata(files.dir.join("tile-2.tile")).unwrap().len();
+    publish_docs(&files, &mut e, "b3", "tile-3.tile", 2, 1, 8);
+    publish_docs(&files, &mut e, "b4", "tile-4.tile", 3, 1, 8);
+    let cheap = fs::metadata(files.dir.join("tile-3.tile")).unwrap().len()
+        + fs::metadata(files.dir.join("tile-4.tile")).unwrap().len();
+    assert!(giant > 4 * cheap, "the middle tile is oversized relative to the budget");
+    // The only eligible run under this budget is (tile-3, tile-4); any run
+    // containing the giant exceeds it, so the giant is a finished tier.
+    assert!(e.maybe_compact(cheap, 4).unwrap().is_some());
+    assert_eq!(e.active_tile_cutoffs(), vec![1, 2, 4],
+        "the run after the giant is merged, not the giant itself");
+    assert!(files.dir.join("tile-2.tile").exists(), "the oversized middle tile is never an input");
+    assert!(files.dir.join("tile-1.tile").exists(), "the tile before the giant is untouched");
+    assert!(!files.dir.join("tile-3.tile").exists());
+    assert!(!files.dir.join("tile-4.tile").exists());
+    assert_eq!(e.get(b"E", 100).unwrap(), Some(vec![b'x'; 256]), "the giant's data is still readable");
+    assert_eq!(e.get(b"E", 1).unwrap(), Some(vec![b'x'; 8]));
+    drop(e);
+    let e = Engine::open_discover(&files.dir).unwrap();
+    assert_eq!(e.active_tile_cutoffs(), vec![1, 2, 4], "open_discover reproduces the skipped-giant list");
+    assert_eq!(e.get(b"E", 100).unwrap(), Some(vec![b'x'; 256]));
+}
 
-    // A budget that fits three extends past two.
-    let three = fs::metadata(files.dir.join("compact-3.tile")).unwrap().len()
-        + fs::metadata(files.dir.join("tile-4.tile")).unwrap().len()
+#[test]
+fn maybe_compact_falls_back_to_the_two_smallest_adjacent_tiles() {
+    let files = Files::new();
+    let mut e = Engine::create(&files.wal).unwrap();
+    // A giant first tile, then two cheap ones: no adjacent pair fits a 1-byte
+    // budget, so the fallback must pick the two cheapest ADJACENT tiles
+    // (tile-2, tile-3), not the oldest pair (tile-1, tile-2).
+    publish_docs(&files, &mut e, "b1", "tile-1.tile", 1, 4000, 256);
+    publish_docs(&files, &mut e, "b2", "tile-2.tile", 2, 1, 8);
+    publish_docs(&files, &mut e, "b3", "tile-3.tile", 3, 1, 8);
+    assert!(e.maybe_compact(1, 3).unwrap().is_some(), "the fallback still makes progress");
+    assert_eq!(e.active_tile_cutoffs(), vec![1, 3],
+        "the two smallest adjacent tiles merge, leaving the giant first tile");
+    assert!(files.dir.join("tile-1.tile").exists(), "the giant is not part of the fallback run");
+    assert!(files.dir.join("compact-3.tile").exists());
+    assert_eq!(e.get(b"E", 2).unwrap(), Some(vec![b'x'; 8]));
+    assert_eq!(e.get(b"E", 3).unwrap(), Some(vec![b'x'; 8]));
+}
+
+#[test]
+fn bounded_compaction_skips_a_giant_middle_tier_across_rounds() {
+    let files = Files::new();
+    let mut e = Engine::create(&files.wal).unwrap();
+    // Two cheap tiles, a LARGE tile in the middle, then two cheap tiles.
+    publish_docs(&files, &mut e, "b1", "tile-1.tile", 1, 1, 8);
+    publish_docs(&files, &mut e, "b2", "tile-2.tile", 2, 1, 8);
+    publish_docs(&files, &mut e, "b3", "tile-3.tile", 100, 4000, 256);
+    publish_docs(&files, &mut e, "b4", "tile-4.tile", 3, 1, 8);
+    publish_docs(&files, &mut e, "b5", "tile-5.tile", 4, 1, 8);
+    let giant_before = fs::read(files.dir.join("tile-3.tile")).unwrap();
+    let budget = fs::metadata(files.dir.join("tile-4.tile")).unwrap().len()
         + fs::metadata(files.dir.join("tile-5.tile")).unwrap().len();
-    assert!(e.maybe_compact(three, 3).unwrap().is_some());
-    assert_eq!(e.active_tile_cutoffs(), vec![5, 6]);
+
+    // Round 1 merges the cheap pair BEFORE the giant, round 2 the cheap pair
+    // AFTER it. Both must leave the giant tier untouched and active, and every
+    // round must preserve the disjoint-range invariant, reads, and recovery.
+    for round in 0..2 {
+        let before = e.active_tile_cutoffs();
+        assert!(e.maybe_compact(budget, 2).unwrap().is_some(), "round {round} must make progress");
+        let after = e.active_tile_cutoffs();
+        assert_eq!(after.len(), before.len() - 1, "each round merges exactly one pair");
+        assert!(after.windows(2).all(|w| w[0] < w[1]), "cutoffs strictly increasing: {after:?}");
+        assert!(after.contains(&3), "the giant tier (cutoff 3) is still active after round {round}");
+        assert_eq!(fs::read(files.dir.join("tile-3.tile")).unwrap(), giant_before,
+            "the giant tile was not rewritten while a cheaper run existed");
+        assert_eq!(e.get(b"E", 100).unwrap(), Some(vec![b'x'; 256]));
+        assert_eq!(e.get(b"E", 1).unwrap(), Some(vec![b'x'; 8]));
+        assert_eq!(e.get(b"E", 3).unwrap(), Some(vec![b'x'; 8]));
+        assert_eq!(e.get(b"E", 4).unwrap(), Some(vec![b'x'; 8]));
+        drop(e);
+        e = Engine::open_discover(&files.dir).unwrap();
+        assert_eq!(e.active_tile_cutoffs(), after, "open_discover reproduces the compacted list");
+        assert_eq!(e.get(b"E", 100).unwrap(), Some(vec![b'x'; 256]));
+        assert_eq!(e.serving_memtable_entries(), 0, "recovered tiles are not rematerialized");
+    }
+
+    // With the cheap pairs on either side consumed, the only remaining runs
+    // contain the giant; the fallback may now merge it, but progress and the
+    // disjoint-range invariant still hold and the data survives a reopen.
+    let before = e.active_tile_cutoffs();
+    assert!(e.maybe_compact(budget, 2).unwrap().is_some());
+    let after = e.active_tile_cutoffs();
+    assert_eq!(after.len(), before.len() - 1);
+    assert!(after.windows(2).all(|w| w[0] < w[1]), "cutoffs strictly increasing: {after:?}");
+    drop(e);
+    let e = Engine::open_discover(&files.dir).unwrap();
+    assert_eq!(e.active_tile_cutoffs(), after);
+    assert_eq!(e.get(b"E", 100).unwrap(), Some(vec![b'x'; 256]));
+    assert_eq!(e.get(b"E", 1).unwrap(), Some(vec![b'x'; 8]));
+    assert_eq!(e.get(b"E", 3).unwrap(), Some(vec![b'x'; 8]));
+    assert_eq!(e.get(b"E", 4).unwrap(), Some(vec![b'x'; 8]));
 }
 
 #[test]
@@ -614,7 +753,7 @@ fn bounded_compaction_keeps_cutoffs_disjoint_and_reopens_across_rounds() {
         let before = e.active_tile_cutoffs();
         assert!(e.maybe_compact(1, 2).unwrap().is_some(), "round {rounds} must make progress");
         let after = e.active_tile_cutoffs();
-        assert_eq!(after.len(), before.len() - 1, "each round merges exactly the two oldest");
+        assert_eq!(after.len(), before.len() - 1, "each round merges exactly one pair");
         assert!(after.windows(2).all(|w| w[0] < w[1]), "cutoffs strictly increasing: {after:?}");
         assert!(after.len() <= cap as usize, "tile count never exceeds the cap");
         assert_eq!(*after.last().unwrap(), cap, "the newest frontier is unchanged");
