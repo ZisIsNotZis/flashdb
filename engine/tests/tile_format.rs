@@ -1,6 +1,9 @@
-//! FDBTILE2 page-structured tile format through the public Engine API: a
-//! multi-block tile round-trips with its directory index, and directory
-//! corruption is rejected at open (before any data block is read).
+//! FDBTILE3 page-structured tile format through the public Engine API: a
+//! multi-block tile round-trips with its directory index and its (absent) bloom
+//! section, and directory corruption is rejected at open (before any data block
+//! is read). The bloom filter itself is unit-tested in `src/bloom.rs`; the
+//! engine does not build one until slice 08d-2b, so every tile written here has
+//! `bloom_len == 0`.
 
 use flashdb_engine::engine::{Engine, Op};
 use std::fs;
@@ -25,6 +28,11 @@ fn superblock_field(bytes: &[u8], field: &str) -> u64 {
         "count" => u64::from_le_bytes(bytes[48..56].try_into().unwrap()),
         "dir_offset" => u64::from_le_bytes(bytes[56..64].try_into().unwrap()),
         "dir_len" => u64::from_le_bytes(bytes[64..72].try_into().unwrap()),
+        "bloom_offset" => u64::from_le_bytes(bytes[76..84].try_into().unwrap()),
+        "bloom_len" => u64::from_le_bytes(bytes[84..92].try_into().unwrap()),
+        "bloom_crc32c" => u32::from_le_bytes(bytes[92..96].try_into().unwrap()) as u64,
+        "bits_per_key" => u32::from_le_bytes(bytes[96..100].try_into().unwrap()) as u64,
+        "hash_count" => bytes[100] as u64,
         other => panic!("unknown superblock field {other}"),
     }
 }
@@ -46,17 +54,39 @@ fn multi_block_tile_roundtrips_and_directory_indexes_every_block() {
     drop(e);
 
     let bytes = fs::read(&files.tile).unwrap();
-    assert_eq!(&bytes[..8], b"FDBTILE2");
+    assert_eq!(&bytes[..8], b"FDBTILE3");
     assert_eq!(superblock_field(&bytes, "count"), 1200);
     let dir_offset = superblock_field(&bytes, "dir_offset") as usize;
     let dir_len = superblock_field(&bytes, "dir_len") as usize;
     assert!(dir_offset >= 4096 && dir_len > 0, "directory is present after the superblock page");
     let fence_count = u16::from_le_bytes(bytes[dir_offset + 8..dir_offset + 10].try_into().unwrap());
     assert!(fence_count >= 8, "directory lists one fence per data block, got {fence_count}");
+    // The engine does not wire a bloom until 08d-2b: the bloom section is absent,
+    // and `Tile::open` reads any such tile as "no bloom".
+    assert_eq!(superblock_field(&bytes, "bloom_len"), 0, "no bloom is written by this slice");
+    assert_eq!(superblock_field(&bytes, "bloom_offset"), dir_offset as u64, "a bloomless tile starts its directory where the bloom would have been");
+    assert_eq!(superblock_field(&bytes, "bloom_crc32c"), 0);
+    assert_eq!(superblock_field(&bytes, "bits_per_key"), 0);
+    assert_eq!(superblock_field(&bytes, "hash_count"), 0);
 
     let reopened = Engine::open_with_tile(&files.wal, &files.tile).unwrap();
     assert_eq!(reopened.serving_memtable_entries(), 0);
     assert_eq!(reopened.get(b"E", 600).unwrap(), Some(b"v".to_vec()));
+}
+
+/// The enlarged superblock CRC covers the new FDBTILE3 bloom fields: corrupting
+/// one of them (without touching any other structure) is rejected at open.
+#[test]
+fn new_superblock_fields_are_covered_by_the_superblock_crc() {
+    let files = Files::new();
+    let mut e = Engine::create(&files.wal).unwrap();
+    e.commit_block(b"b1", &[doc(1, b"a")]).unwrap();
+    e.build_tile(&files.tile, 1).unwrap();
+    drop(e);
+    let mut bytes = fs::read(&files.tile).unwrap();
+    bytes[96] ^= 1; // bits_per_key, one of the added fields
+    fs::write(&files.tile, &bytes).unwrap();
+    assert_eq!(Engine::open_with_tile(&files.wal, &files.tile).err().unwrap().kind(), ErrorKind::InvalidData);
 }
 
 #[test]

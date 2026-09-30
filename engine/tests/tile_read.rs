@@ -203,9 +203,12 @@ fn crc32c(bytes: &[u8]) -> u32 {
     !crc
 }
 
-// FDBTILE2 layout: the first data block starts at the superblock page boundary,
+// FDBTILE3 layout: the first data block starts at the superblock page boundary,
 // with [block_len u32][block_crc u32][first_key_len u32][entry_count u16] then
 // the first key and the first entry [key_len u32][value_len u32][key][value].
+// (FDBTILE3 adds an optional bloom section between the data blocks and the
+// directory; the engine writes none until 08d-2b, so the data offsets are
+// unchanged from FDBTILE2.)
 const TILE_PAGE: usize = 4096;
 
 /// Byte range of the first data block's first entry key.
@@ -306,6 +309,24 @@ fn point_read_checks_traversed_records_not_unrelated_later_entries() {
     assert_eq!(e.get(b"E", 1).unwrap_err().kind(), ErrorKind::InvalidData,
         "any tile corruption fails closed without process crash");
     assert_eq!(e.get(b"E", 2).unwrap_err().kind(), ErrorKind::InvalidData);
+}
+
+#[test]
+fn tile_superblock_magic_pins_the_fdbtile3_format() {
+    // A valid tile carrying the superseded FDBTILE2 magic is rejected outright:
+    // the bloom-bearing format cannot be served by an old reader by accident.
+    let files = Files::new();
+    let mut e = Engine::create(&files.wal).unwrap();
+    e.commit_block(b"one", &[doc(1, b"v")]).unwrap();
+    e.build_tile(&files.tile, 1).unwrap();
+    drop(e);
+    let mut bytes = fs::read(&files.tile).unwrap();
+    bytes[..8].copy_from_slice(b"FDBTILE2");
+    // Repair the superblock CRC so only the magic differs.
+    let crc = crc32c(&bytes[..104]);
+    bytes[104..108].copy_from_slice(&crc.to_le_bytes());
+    fs::write(&files.tile, &bytes).unwrap();
+    assert_eq!(Engine::open_with_tile(&files.wal, &files.tile).err().unwrap().kind(), ErrorKind::InvalidData);
 }
 
 #[test]

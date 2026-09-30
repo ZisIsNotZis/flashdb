@@ -1,5 +1,10 @@
 # FDBTILE2 tile file format
 
+> **SUPERSEDED by [FDBTILE3.md](FDBTILE3.md) (slice 08d-2a).** FDBTILE3 adds a
+> CRC-protected bloom section between the data blocks and the directory and
+> enlarges the superblock; it keeps this document's data-block, directory and
+> trailer structures byte-identical. This file is retained for history only.
+
 Slice 08a replaces the flat, single-record-stream `FDBTILE1` layout with a
 page-structured, directory-indexed `FDBTILE2`. The public surface of
 `engine/src/tile.rs` (`Tile::write`, `Tile::open`, `cutoff`, `digest`, `count`,

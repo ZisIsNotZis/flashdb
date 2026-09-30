@@ -2,12 +2,14 @@
 //! The file is validated before it can displace any serving memtable entries. Reads use
 //! owned, checksum-verified block buffers; this is not a bounded-recovery claim.
 //!
-//! On-disk layout is FDBTILE2 (see `.scratch/08-tile-pages/FDBTILE2.md`):
-//! a padded superblock at offset 0, then variable-length 4 KiB data blocks, a
-//! CRC-protected directory of fence records, and a fixed trailer. `Tile::open`
-//! validates the superblock, trailer, directory structure and block headers but
-//! deliberately does not read data blocks; `entries()` streams blocks in key
-//! order, verifying each block's CRC on the way.
+//! On-disk layout is FDBTILE3 (see `.scratch/08-tile-pages/FDBTILE3.md`):
+//! FDBTILE2 plus a CRC-protected bloom section between the data blocks and the
+//! directory. A padded superblock sits at offset 0, then variable-length 4 KiB
+//! data blocks, an optional bloom section, a CRC-protected directory of fence
+//! records, and a fixed trailer. `Tile::open` validates the superblock, trailer,
+//! directory structure, block headers and (when present) the bloom's bounds, CRC
+//! and structure but deliberately does not read data blocks; `entries()` streams
+//! blocks in key order, verifying each block's CRC on the way.
 //!
 //! The directory stays on disk as the authoritative index. RAM holds only a
 //! sparse index with one [`DirBlockRef`] per *directory block* (its file offset,
@@ -24,18 +26,26 @@ use std::io::{self, ErrorKind, Seek, SeekFrom, Write};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 
+use crate::bloom::Bloom;
 use crate::crc::crc32c;
 use crate::keys;
 use crate::memtable::Memtable;
 
-const MAGIC: &[u8; 8] = b"FDBTILE2";
-// The trailer magic is exactly these nine bytes (F D B T I L E 2 E); there is
-// no 8-byte variant and no separate length prefix.
+const MAGIC: &[u8; 8] = b"FDBTILE3";
+// The trailer is byte-identical to FDBTILE2's, including its magic, so every
+// non-superblock structure stays unchanged across the format bump.
 const TRAILER_MAGIC: &[u8; 9] = b"FDBTILE2E";
 const PAGE_SIZE: u32 = 4096;
-// magic(8) + cutoff(8) + digest(32) + count(8) + dir_offset(8) + dir_len(8) + page_size(4) + crc(4)
-const SUPERBLOCK: usize = 80;
-const SUPERBLOCK_CRC: usize = 76;
+// magic(8) + cutoff(8) + digest(32) + count(8) + dir_offset(8) + dir_len(8)
+// + page_size(4) + bloom_offset(8) + bloom_len(8) + bloom_crc32c(4)
+// + bits_per_key(4) + hash_count(1) + reserved(3) + crc(4)
+const SUPERBLOCK: usize = 108;
+const SUPERBLOCK_CRC: usize = 104;
+const BLOOM_OFFSET_AT: usize = 76;
+const BLOOM_LEN_AT: usize = 84;
+const BLOOM_CRC_AT: usize = 92;
+const BITS_PER_KEY_AT: usize = 96;
+const HASH_COUNT_AT: usize = 100;
 // magic(9) + dir_offset(8) + dir_len(8) + crc(4)
 const TRAILER: usize = 29;
 const TRAILER_CRC: usize = 25;
@@ -122,7 +132,19 @@ fn dir_search(dir: &[Fence], key: &[u8]) -> usize {
     if lo == 0 { 0 } else { lo - 1 }
 }
 
-fn superblock_bytes(cutoff: u64, digest: &[u8; 32], count: u64, dir_offset: u64, dir_len: u64) -> [u8; SUPERBLOCK] {
+#[allow(clippy::too_many_arguments)]
+fn superblock_bytes(
+    cutoff: u64,
+    digest: &[u8; 32],
+    count: u64,
+    dir_offset: u64,
+    dir_len: u64,
+    bloom_offset: u64,
+    bloom_len: u64,
+    bloom_crc32c: u32,
+    bits_per_key: u32,
+    hash_count: u8,
+) -> [u8; SUPERBLOCK] {
     let mut h = [0; SUPERBLOCK];
     h[..8].copy_from_slice(MAGIC);
     h[8..16].copy_from_slice(&cutoff.to_le_bytes());
@@ -131,6 +153,11 @@ fn superblock_bytes(cutoff: u64, digest: &[u8; 32], count: u64, dir_offset: u64,
     h[56..64].copy_from_slice(&dir_offset.to_le_bytes());
     h[64..72].copy_from_slice(&dir_len.to_le_bytes());
     h[72..76].copy_from_slice(&PAGE_SIZE.to_le_bytes());
+    h[BLOOM_OFFSET_AT..BLOOM_LEN_AT].copy_from_slice(&bloom_offset.to_le_bytes());
+    h[BLOOM_LEN_AT..BLOOM_CRC_AT].copy_from_slice(&bloom_len.to_le_bytes());
+    h[BLOOM_CRC_AT..BITS_PER_KEY_AT].copy_from_slice(&bloom_crc32c.to_le_bytes());
+    h[BITS_PER_KEY_AT..HASH_COUNT_AT].copy_from_slice(&bits_per_key.to_le_bytes());
+    h[HASH_COUNT_AT] = hash_count;
     let sum = crc32c(&h[..SUPERBLOCK_CRC]);
     h[SUPERBLOCK_CRC..].copy_from_slice(&sum.to_le_bytes());
     h
@@ -230,6 +257,19 @@ fn read_range(file: &File, offset: u64, len: u64) -> io::Result<Vec<u8>> {
     Ok(buf)
 }
 
+/// Bloom over exactly the keys a `Tile::write` of `mt` at `cutoff` would store
+/// (same `csn <= cutoff` filter). Test-only helper shared by the whole-memtable
+/// and streaming sides of the byte-identity test so both build the same filter.
+#[cfg(test)]
+fn bloom_for_memtable(mt: &Memtable, cutoff: u64, bits_per_key: u32) -> Bloom {
+    let mut bloom = crate::bloom::BloomBuilder::new(mt.len() as u64, bits_per_key);
+    for (key, _) in mt.entries() {
+        if keys::key_csn(key).is_none_or(|csn| csn > cutoff) { continue; }
+        bloom.insert(key);
+    }
+    bloom.finish()
+}
+
 pub(crate) struct Tile {
     file: File,
     superblock: [u8; SUPERBLOCK],
@@ -255,6 +295,11 @@ pub(crate) struct Tile {
     /// are still CRC-verified when actually read, so a corrupt tile still fails
     /// closed on any read that reaches it.
     last_key: Option<Vec<u8>>,
+    /// The tile's persisted bloom filter, loaded and structurally validated at
+    /// open. `None` means the tile has no bloom (`bloom_len == 0`), in which case
+    /// [`Tile::might_contain_unique_prefix`] answers `true` for every prefix.
+    #[allow(dead_code)] // Read by `might_contain_unique_prefix`, wired into probes in 08d-2b.
+    bloom: Option<Bloom>,
 }
 
 /// Smallest key strictly greater than every key that starts with `prefix`:
@@ -483,13 +528,14 @@ impl Iterator for Entries<'_> {
     }
 }
 
-/// Streaming FDBTILE2 encoder: buffers only the in-progress block, so a tile can be
+/// Streaming FDBTILE3 encoder: buffers only the in-progress block, so a tile can be
 /// produced from a key-ordered iterator without materializing its entries. `push`
 /// requires strictly increasing keys (the memtable used to provide that ordering
-/// implicitly); `finish` writes the directory, the trailer and - last, so a torn file
-/// cannot have a valid magic - the superblock, then syncs and reopens for the same
-/// self-check `Tile::write` performs. `Tile::write` is implemented on top of this so
-/// there is exactly one encoder.
+/// implicitly); [`TileWriter::set_bloom`] optionally attaches a filter that `finish`
+/// writes between the data blocks and the directory; `finish` writes the directory,
+/// the trailer and - last, so a torn file cannot have a valid magic - the superblock,
+/// then syncs and reopens for the same self-check `Tile::write` performs. `Tile::write`
+/// is implemented on top of this so there is exactly one encoder.
 pub(crate) struct TileWriter {
     file: File,
     path: PathBuf,
@@ -504,6 +550,7 @@ pub(crate) struct TileWriter {
     last_key: Vec<u8>,
     started: bool,
     finished: bool,
+    bloom: Option<Bloom>,
 }
 
 impl TileWriter {
@@ -530,6 +577,7 @@ impl TileWriter {
             last_key: Vec::new(),
             started: false,
             finished: false,
+            bloom: None,
         })
     }
 
@@ -560,6 +608,18 @@ impl TileWriter {
         self.last_key.clear();
         self.last_key.extend_from_slice(key);
         self.started = true;
+        Ok(())
+    }
+
+    /// Attach the persisted bloom filter this tile will carry. Must be called
+    /// before `finish`; calling it twice (or on an already-finished writer) is an
+    /// error so a tile can never silently carry the wrong filter. The filter is
+    /// independent of the entry stream, so it may be set before or after `push`.
+    #[allow(dead_code)] // Available to the engine's publish path; wired into probes in 08d-2b.
+    pub(crate) fn set_bloom(&mut self, bloom: Bloom) -> io::Result<()> {
+        if self.finished { return Err(invalid("tile writer already finished")); }
+        if self.bloom.is_some() { return Err(invalid("tile bloom already set")); }
+        self.bloom = Some(bloom);
         Ok(())
     }
 
@@ -608,10 +668,33 @@ impl TileWriter {
         if self.finished { return Err(invalid("tile writer already finished")); }
         self.finished = true;
         self.flush_block()?;
+        // Bloom section, when present: between the data blocks and the directory.
+        // Absent (`bloom_len == 0`) is canonical and means "no bloom".
+        let (bloom_offset, bloom_len, bloom_crc32c, bits_per_key, hash_count) = match &self.bloom {
+            Some(bloom) => {
+                let bytes = bloom.to_bytes();
+                let offset = self.offset;
+                self.file.write_all(&bytes)?;
+                self.offset = self.offset.checked_add(bytes.len() as u64).ok_or_else(|| invalid("tile offset overflow"))?;
+                (offset, bytes.len() as u64, crc32c(&bytes), bloom.bits_per_key(), bloom.hash_count())
+            }
+            None => (self.offset, 0, 0, 0, 0),
+        };
         let (dir_len, dir_offset) = self.write_directory()?;
         self.file.write_all(&trailer_bytes(dir_offset, dir_len))?;
         self.file.seek(SeekFrom::Start(0))?;
-        self.file.write_all(&superblock_bytes(self.cutoff, &self.digest, self.count, dir_offset, dir_len))?;
+        self.file.write_all(&superblock_bytes(
+            self.cutoff,
+            &self.digest,
+            self.count,
+            dir_offset,
+            dir_len,
+            bloom_offset,
+            bloom_len,
+            bloom_crc32c,
+            bits_per_key,
+            hash_count,
+        ))?;
         self.file.sync_data()?; // No parent-directory durability claim.
         let tile = Tile::open(&self.path)?;
         if tile.cutoff != self.cutoff || tile.digest != self.digest || tile.count() != self.count {
@@ -635,6 +718,21 @@ impl Tile {
         writer.finish()
     }
 
+    /// Whole-memtable writer that also attaches a bloom over each stored key. The
+    /// test-facing counterpart of streaming `TileWriter` + [`TileWriter::set_bloom`];
+    /// the byte-identity test drives both so a change to either encoder fails it.
+    #[cfg(test)]
+    pub(crate) fn write_with_bloom(path: &Path, cutoff: u64, digest: &[u8; 32], mt: &Memtable, bits_per_key: u32) -> io::Result<Self> {
+        let bloom = bloom_for_memtable(mt, cutoff, bits_per_key);
+        let mut writer = TileWriter::new(path, cutoff, digest)?;
+        for (key, value) in mt.entries() {
+            if keys::key_csn(key).is_none_or(|csn| csn > cutoff) { continue; }
+            writer.push(key, value)?;
+        }
+        writer.set_bloom(bloom)?;
+        writer.finish()
+    }
+
     pub(crate) fn open(path: &Path) -> io::Result<Self> {
         let file = File::open(path)?;
         let size = file.metadata()?.len();
@@ -651,6 +749,11 @@ impl Tile {
         let dir_offset = u64::from_le_bytes(sb[56..64].try_into().unwrap());
         let dir_len = u64::from_le_bytes(sb[64..72].try_into().unwrap());
         if u32::from_le_bytes(sb[72..76].try_into().unwrap()) != PAGE_SIZE { return Err(invalid("tile page size")); }
+        let bloom_offset = u64::from_le_bytes(sb[BLOOM_OFFSET_AT..BLOOM_LEN_AT].try_into().unwrap());
+        let bloom_len = u64::from_le_bytes(sb[BLOOM_LEN_AT..BLOOM_CRC_AT].try_into().unwrap());
+        let bloom_crc32c = u32::from_le_bytes(sb[BLOOM_CRC_AT..BITS_PER_KEY_AT].try_into().unwrap());
+        let bloom_bits_per_key = u32::from_le_bytes(sb[BITS_PER_KEY_AT..HASH_COUNT_AT].try_into().unwrap());
+        let bloom_hash_count = sb[HASH_COUNT_AT];
         let mut tr = [0u8; TRAILER];
         read_exact_at(&file, &mut tr, size - TRAILER as u64)?;
         if &tr[..9] != TRAILER_MAGIC { return Err(invalid("tile trailer magic")); }
@@ -745,6 +848,32 @@ impl Tile {
             return Err(invalid("tile directory missing for nonempty tile"));
         }
         if total != count { return Err(invalid("tile block entry count disagrees")); }
+        // Bloom section: between the data blocks and the directory. `bloom_len == 0`
+        // is the canonical "no bloom" case (the empty tile and any tile whose writer
+        // never called `set_bloom`). When present, open validates its bounds (it must
+        // start at or after the last data block and end at or before the directory, so
+        // it can neither overlap a data block nor hide inside the directory), its CRC,
+        // and its structure via `Bloom::from_bytes`, all without reading data blocks.
+        let bloom = if bloom_len == 0 {
+            None
+        } else {
+            let bloom_end = bloom_offset.checked_add(bloom_len).ok_or_else(|| invalid("tile bloom bounds"))?;
+            if bloom_offset < PAGE_SIZE as u64 || bloom_end > dir_offset {
+                return Err(invalid("tile bloom bounds"));
+            }
+            let data_end = match last_fence {
+                Some((offset, len)) => offset.checked_add(len as u64).ok_or_else(|| invalid("tile block overflow"))?,
+                None => PAGE_SIZE as u64,
+            };
+            if bloom_offset < data_end { return Err(invalid("tile bloom overlaps data blocks")); }
+            let bytes = read_range(&file, bloom_offset, bloom_len)?;
+            if crc32c(&bytes) != bloom_crc32c { return Err(invalid("tile bloom checksum")); }
+            let bloom = Bloom::from_bytes(&bytes)?;
+            if bloom.bits_per_key() != bloom_bits_per_key || bloom.hash_count() != bloom_hash_count {
+                return Err(invalid("tile bloom header disagrees with superblock"));
+            }
+            Some(bloom)
+        };
         let first_key = dir.first().map(|r| r.first_key.clone()).unwrap_or_default();
         let last_key = match (count, last_fence) {
             (0, _) | (_, None) => None,
@@ -752,7 +881,7 @@ impl Tile {
         };
         Ok(Tile {
             file, superblock: sb, trailer: tr, cutoff, digest, count, size, dir, data_blocks,
-            first_key, last_key,
+            first_key, last_key, bloom,
         })
     }
 
@@ -858,6 +987,24 @@ impl Tile {
         }
         true
     }
+
+    /// Bloom fast-reject for a unique-index prefix: `false` ONLY when the tile's
+    /// persisted bloom is certain no key with this exact byte string was inserted,
+    /// so a `false` never hides a match (a false negative would be a correctness
+    /// bug; a false positive only costs the work the filter exists to avoid). A
+    /// tile with no bloom (`bloom_len == 0`) answers `true` for every prefix.
+    ///
+    /// The bloom is keyed by whatever strings its builder inserted; the caller
+    /// must query with those same strings (08d-2b builds it over the unique
+    /// prefixes it will probe). It is orthogonal to [`Tile::could_contain_prefix`]:
+    /// that one is a range proof over the tile's key span, this one is membership.
+    #[allow(dead_code)] // Consumed by the probe path in 08d-2b; tests cover it now.
+    pub(crate) fn might_contain_unique_prefix(&self, prefix: &[u8]) -> bool {
+        match &self.bloom {
+            None => true,
+            Some(bloom) => bloom.might_contain(prefix),
+        }
+    }
     pub(crate) fn entries(&self) -> impl Iterator<Item = io::Result<(Vec<u8>, Vec<u8>)>> + '_ {
         Entries { cursor: TileCursor::new(self, None, 0), done: false }
     }
@@ -910,6 +1057,7 @@ impl Tile {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bloom::BloomBuilder;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -929,6 +1077,21 @@ mod tests {
     fn write_tile(name: &str, cutoff: u64, mt: &Memtable) -> (PathBuf, Tile) {
         let path = tmp(name);
         let tile = Tile::write(&path, cutoff, &[9u8; 32], mt).unwrap();
+        (path, tile)
+    }
+
+    /// Recompute the superblock CRC after a test edits the header in place, so
+    /// only the rule under test can reject the file.
+    fn repair_superblock_crc(bytes: &mut [u8]) {
+        let crc = crc32c(&bytes[..SUPERBLOCK_CRC]);
+        bytes[SUPERBLOCK_CRC..SUPERBLOCK].copy_from_slice(&crc.to_le_bytes());
+    }
+
+    fn superblock_u64(bytes: &[u8], at: usize) -> u64 { u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap()) }
+
+    fn write_bloomed_tile(name: &str, cutoff: u64, mt: &Memtable, bits_per_key: u32) -> (PathBuf, Tile) {
+        let path = tmp(name);
+        let tile = Tile::write_with_bloom(&path, cutoff, &[7u8; 32], mt, bits_per_key).unwrap();
         (path, tile)
     }
 
@@ -1418,5 +1581,186 @@ mod tests {
         assert!(tile.entries().next().unwrap().unwrap_err().kind() == ErrorKind::InvalidData,
             "the corruption is still detected on the read that reaches it");
         std::fs::remove_file(path).unwrap();
+    }
+
+    /// A bloomed tile round-trips, and the reopen path finds every stored key in
+    /// the filter: no false negatives, the correctness invariant. A tile written
+    /// without a bloom answers `true` ("no bloom") for every prefix.
+    #[test]
+    fn bloomed_tile_roundtrips_with_no_false_negatives_and_no_bloom_answers_true() {
+        let mut mt = Memtable::new();
+        let mut keys = Vec::new();
+        for handle in 1..=500u64 {
+            let key = pkey(handle, 1);
+            mt.apply(key.clone(), b"v".to_vec());
+            keys.push(key);
+        }
+        let (path, tile) = write_bloomed_tile("bloomed.tile", 100, &mt, 12);
+        assert!(tile.bloom.is_some(), "the writer attached a bloom");
+        for key in &keys { assert!(tile.might_contain_unique_prefix(key), "stored key must never be rejected"); }
+
+        let reopened = Tile::open(&path).unwrap();
+        let bloom = reopened.bloom.as_ref().expect("the bloom survives the round trip");
+        assert_eq!(bloom.entry_count(), 500);
+        assert_eq!(bloom.bits_per_key(), 12);
+        for key in &keys { assert!(reopened.might_contain_unique_prefix(key), "reopened filter must not reject a stored key"); }
+        std::fs::remove_file(path).unwrap();
+
+        // An empty tile and a tile written without `set_bloom` carry no filter and
+        // therefore cannot reject anything.
+        let empty = Memtable::new();
+        let (epath, etile) = write_tile("bloomless-empty.tile", 0, &empty);
+        assert!(etile.bloom.is_none());
+        assert!(etile.might_contain_unique_prefix(b"anything"));
+        std::fs::remove_file(epath).unwrap();
+        let mut one = Memtable::new();
+        put(&mut one, 1, 1, b"v");
+        let (npath, ntile) = write_tile("bloomless.tile", 1, &one);
+        assert!(ntile.bloom.is_none());
+        assert!(ntile.might_contain_unique_prefix(b"never inserted"), "no bloom means always maybe");
+        std::fs::remove_file(npath).unwrap();
+    }
+
+    /// Only the CRC can catch a flipped bit in the bloom's bit array: the structure
+    /// is still valid, so open must reject on the checksum.
+    #[test]
+    fn bloom_bad_crc_rejected_at_open() {
+        let mut mt = Memtable::new();
+        for handle in 1..=200u64 { put(&mut mt, handle, 1, b"v"); }
+        let (path, _) = write_bloomed_tile("bloom-crc.tile", 100, &mt, 10);
+        let mut bytes = std::fs::read(&path).unwrap();
+        let bloom_offset = superblock_u64(&bytes, BLOOM_OFFSET_AT) as usize;
+        let bloom_len = superblock_u64(&bytes, BLOOM_LEN_AT) as usize;
+        assert!(bloom_len > 0, "a bloom section is present");
+        bytes[bloom_offset + bloom_len - 1] ^= 1;
+        std::fs::write(&path, &bytes).unwrap();
+        assert_eq!(Tile::open(&path).err().unwrap().kind(), ErrorKind::InvalidData);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    /// The bloom cannot overlap the data blocks: moving its start into the data
+    /// region is rejected (with a repaired superblock CRC, so the bounds rule is
+    /// what fires).
+    #[test]
+    fn bloom_overlapping_data_region_rejected_at_open() {
+        let mut mt = Memtable::new();
+        for handle in 1..=200u64 { put(&mut mt, handle, 1, b"v"); }
+        let (path, _) = write_bloomed_tile("bloom-over-data.tile", 100, &mt, 10);
+        let mut bytes = std::fs::read(&path).unwrap();
+        assert!(superblock_u64(&bytes, BLOOM_OFFSET_AT) > PAGE_SIZE as u64, "the bloom starts after the data blocks");
+        bytes[BLOOM_OFFSET_AT..BLOOM_LEN_AT].copy_from_slice(&(PAGE_SIZE as u64).to_le_bytes());
+        repair_superblock_crc(&mut bytes);
+        std::fs::write(&path, &bytes).unwrap();
+        assert_eq!(Tile::open(&path).err().unwrap().kind(), ErrorKind::InvalidData);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    /// The bloom cannot reach past the directory: a section that starts at or after
+    /// the directory is rejected.
+    #[test]
+    fn bloom_past_directory_rejected_at_open() {
+        let mut mt = Memtable::new();
+        for handle in 1..=200u64 { put(&mut mt, handle, 1, b"v"); }
+        let (path, _) = write_bloomed_tile("bloom-past-dir.tile", 100, &mt, 10);
+        let mut bytes = std::fs::read(&path).unwrap();
+        let dir_offset = superblock_u64(&bytes, 56);
+        // Start exactly at the directory with a one-byte section: its end is > dir_offset.
+        bytes[BLOOM_OFFSET_AT..BLOOM_LEN_AT].copy_from_slice(&dir_offset.to_le_bytes());
+        bytes[BLOOM_LEN_AT..BLOOM_CRC_AT].copy_from_slice(&1u64.to_le_bytes());
+        repair_superblock_crc(&mut bytes);
+        std::fs::write(&path, &bytes).unwrap();
+        assert_eq!(Tile::open(&path).err().unwrap().kind(), ErrorKind::InvalidData);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    /// `Tile::open` runs `Bloom::from_bytes` on the section: a truncated section, an
+    /// impossible `hash_count`, a header whose length disagrees with its bit count,
+    /// and a header that disagrees with the superblock are each rejected even when
+    /// the frame CRC is repaired to match.
+    #[test]
+    fn bloom_structure_rejected_at_open() {
+        let mut mt = Memtable::new();
+        for handle in 1..=200u64 { put(&mut mt, handle, 1, b"v"); }
+        let (path, _) = write_bloomed_tile("bloom-structure.tile", 100, &mt, 10);
+        let pristine = std::fs::read(&path).unwrap();
+        let bloom_offset = superblock_u64(&pristine, BLOOM_OFFSET_AT) as usize;
+        let bloom_len = superblock_u64(&pristine, BLOOM_LEN_AT) as usize;
+        // Assistants edit the section, then refresh both CRCs so each case reaches from_bytes.
+        let reframe = |bytes: &mut Vec<u8>| {
+            let crc = crc32c(&bytes[bloom_offset..bloom_offset + bloom_len]);
+            bytes[BLOOM_CRC_AT..BITS_PER_KEY_AT].copy_from_slice(&crc.to_le_bytes());
+            repair_superblock_crc(bytes);
+        };
+
+        // Truncated section: a valid frame CRC over a sub-header-length slice.
+        let mut truncated = pristine.clone();
+        truncated[BLOOM_LEN_AT..BLOOM_CRC_AT].copy_from_slice(&10u64.to_le_bytes());
+        let crc = crc32c(&truncated[bloom_offset..bloom_offset + 10]);
+        truncated[BLOOM_CRC_AT..BITS_PER_KEY_AT].copy_from_slice(&crc.to_le_bytes());
+        repair_superblock_crc(&mut truncated);
+        std::fs::write(&path, &truncated).unwrap();
+        assert_eq!(Tile::open(&path).err().unwrap().kind(), ErrorKind::InvalidData, "truncated section");
+
+        // Impossible hash_count inside the section.
+        let mut bad_hash = pristine.clone();
+        bad_hash[bloom_offset + 20] = 0;
+        reframe(&mut bad_hash);
+        std::fs::write(&path, &bad_hash).unwrap();
+        assert_eq!(Tile::open(&path).err().unwrap().kind(), ErrorKind::InvalidData, "hash_count 0");
+
+        // Header length disagrees with the bit array.
+        let mut bad_len = pristine.clone();
+        let bit_count = superblock_u64(&bad_len, bloom_offset) + 8;
+        bad_len[bloom_offset..bloom_offset + 8].copy_from_slice(&bit_count.to_le_bytes());
+        reframe(&mut bad_len);
+        std::fs::write(&path, &bad_len).unwrap();
+        assert_eq!(Tile::open(&path).err().unwrap().kind(), ErrorKind::InvalidData, "header length mismatch");
+
+        // Superblock disagrees with the (valid) bloom header.
+        let mut bad_super = pristine.clone();
+        bad_super[BITS_PER_KEY_AT..HASH_COUNT_AT].copy_from_slice(&11u32.to_le_bytes());
+        repair_superblock_crc(&mut bad_super);
+        std::fs::write(&path, &bad_super).unwrap();
+        assert_eq!(Tile::open(&path).err().unwrap().kind(), ErrorKind::InvalidData, "superblock disagrees with bloom");
+
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn set_bloom_twice_is_rejected() {
+        let path = tmp("bloom-twice");
+        let mut writer = TileWriter::new(&path, 1, &[9u8; 32]).unwrap();
+        writer.set_bloom(BloomBuilder::new(4, 10).finish()).unwrap();
+        assert_eq!(writer.set_bloom(BloomBuilder::new(4, 10).finish()).unwrap_err().kind(), ErrorKind::InvalidData);
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    /// The streaming writer and the whole-memtable writer stay byte-identical both
+    /// without a bloom and with the same bloom attached to both.
+    #[test]
+    fn streaming_writer_matches_memtable_write_with_and_without_bloom() {
+        let mut mt = Memtable::new();
+        for handle in 1..=3000u64 { put(&mut mt, handle, 1, &vec![b'v'; 300]); }
+
+        let (path_mt, _) = write_tile("bloom-ident-mt-none", 1, &mt);
+        let path_stream = tmp("bloom-ident-stream-none");
+        let mut writer = TileWriter::new(&path_stream, 1, &[9u8; 32]).unwrap();
+        for (key, value) in mt.entries() { writer.push(key, value).unwrap(); }
+        assert_eq!(writer.finish().unwrap().count(), 3000);
+        assert_eq!(std::fs::read(&path_mt).unwrap(), std::fs::read(&path_stream).unwrap(), "no-bloom byte identity");
+
+        let path_mt_bloom = tmp("bloom-ident-mt");
+        let tile_mt_bloom = Tile::write_with_bloom(&path_mt_bloom, 1, &[9u8; 32], &mt, 10).unwrap();
+        let path_stream_bloom = tmp("bloom-ident-stream");
+        let mut writer = TileWriter::new(&path_stream_bloom, 1, &[9u8; 32]).unwrap();
+        for (key, value) in mt.entries() { writer.push(key, value).unwrap(); }
+        writer.set_bloom(bloom_for_memtable(&mt, 1, 10)).unwrap();
+        assert_eq!(writer.finish().unwrap().count(), 3000);
+        let bloomed = std::fs::read(&path_mt_bloom).unwrap();
+        assert_eq!(bloomed, std::fs::read(&path_stream_bloom).unwrap(), "bloom byte identity");
+        assert!(tile_mt_bloom.bloom.is_some());
+        assert_ne!(bloomed, std::fs::read(&path_mt).unwrap(), "a bloom changes the file bytes");
+
+        for path in [path_mt, path_stream, path_mt_bloom, path_stream_bloom] { std::fs::remove_file(path).unwrap(); }
     }
 }

@@ -5,5 +5,6 @@ mod manifest;
 pub mod memtable;
 pub mod request;
 pub mod replay;
+mod bloom;
 mod tile;
 pub mod wal;
