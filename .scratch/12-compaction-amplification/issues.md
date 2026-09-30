@@ -235,3 +235,23 @@ Acceptance for the follow-up: measure all three at 2 M and 5 M docs (write_amp, 
 docs/s) and make the winner the default, with the losing numbers recorded rather than deleted.
 The tile CAP (12, page-bound) is the other half of tier headroom and needs multi-page manifests;
 that is a separate, larger decision.
+
+## Measurement caveat: the machine is shared (2026-09-30)
+
+While comparing compaction policies I found that this box runs other work in parallel (another
+project's sweeps, and at one point two policy seeds side by side). The consequence is visible in
+the numbers already recorded: the SAME 1 M-doc x 1 KiB workload measured **6137**, **15060** and
+**16264 docs/s** in different runs. That spread is load, not policy.
+
+Therefore, for every comparison in this ticket and in the paper:
+
+- **Primary metrics are the deterministic ones** - `write_amplification`, compaction count,
+  `tile_bytes_publish` / `tile_bytes_compact`, `payload_bytes`, `wal_written_bytes`,
+  `rss_peak_kb`, probe microseconds. These reproduced byte-for-byte across repeated runs
+  (the budget sweep produced identical byte counts three times) and are safe to compare.
+- **Wall-clock and docs/s are indicative only** unless (a) runs are sequential, (b) no other
+  workload is active, and (c) the run is long enough to amortise cache warmth. Any timing claim
+  must state the concurrency conditions it was taken under.
+- The design docs already demand a pre-registered measurement protocol; this is a concrete
+  instance of why: a docs/s table taken on this box without that control would have been noise
+  presented as a policy effect.
