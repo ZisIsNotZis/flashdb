@@ -118,8 +118,9 @@ fn interrupted_build_and_corrupt_or_missing_tile_fail_closed_wal_rebuild_explici
     assert_eq!(from_wal.serving_memtable_entries(), 0);
     drop(from_wal);
     let bytes = fs::read(&files.tile).unwrap();
+    let block_len = u32::from_le_bytes(bytes[TILE_PAGE..TILE_PAGE + 4].try_into().unwrap()) as usize;
     for damaged in [bytes[..bytes.len() - 1].to_vec(), {
-        let mut b = bytes.clone(); b[68 + 12 + 18] ^= 0x80; b
+        let mut b = bytes.clone(); b[TILE_PAGE + block_len - 1] ^= 0x80; b
     }, {
         let mut b = bytes.clone(); b[64] ^= 0x80; b
     }] {
@@ -202,6 +203,35 @@ fn crc32c(bytes: &[u8]) -> u32 {
     !crc
 }
 
+// FDBTILE2 layout: the first data block starts at the superblock page boundary,
+// with [block_len u32][block_crc u32][first_key_len u32][entry_count u16] then
+// the first key and the first entry [key_len u32][value_len u32][key][value].
+const TILE_PAGE: usize = 4096;
+
+/// Byte range of the first data block's first entry key.
+fn first_entry_key_range(bytes: &[u8]) -> (usize, usize) {
+    let first_key_len = u32::from_le_bytes(bytes[TILE_PAGE + 8..TILE_PAGE + 12].try_into().unwrap()) as usize;
+    let entry = TILE_PAGE + 14 + first_key_len;
+    let key_len = u32::from_le_bytes(bytes[entry..entry + 4].try_into().unwrap()) as usize;
+    (entry + 8, key_len)
+}
+
+/// Byte range of the first data block's first entry value.
+fn first_entry_value_range(bytes: &[u8]) -> (usize, usize) {
+    let (key_at, key_len) = first_entry_key_range(bytes);
+    let value_len = u32::from_le_bytes(bytes[key_at - 4..key_at].try_into().unwrap()) as usize;
+    let value_at = key_at + key_len;
+    (value_at, value_len)
+}
+
+/// Recompute the first data block's CRC after an in-place edit, so an edited
+/// entry is CRC-valid and only the WAL comparison can reject it.
+fn repair_first_block_crc(bytes: &mut [u8]) {
+    let block_len = u32::from_le_bytes(bytes[TILE_PAGE..TILE_PAGE + 4].try_into().unwrap()) as usize;
+    let crc = crc32c(&bytes[TILE_PAGE + 8..TILE_PAGE + block_len]);
+    bytes[TILE_PAGE + 4..TILE_PAGE + 8].copy_from_slice(&crc.to_le_bytes());
+}
+
 #[test]
 fn tile_value_with_recomputed_crc_disagrees_with_retained_wal() {
     let files = Files::new();
@@ -210,12 +240,9 @@ fn tile_value_with_recomputed_crc_disagrees_with_retained_wal() {
     e.build_tile(&files.tile, 1).unwrap();
     drop(e);
     let mut tile = fs::read(&files.tile).unwrap();
-    let key_len = u32::from_le_bytes(tile[68..72].try_into().unwrap()) as usize;
-    let value_len = u32::from_le_bytes(tile[72..76].try_into().unwrap()) as usize;
-    let start = 80;
-    tile[start + key_len] ^= 1;
-    let crc = crc32c(&tile[start..start + key_len + value_len]);
-    tile[76..80].copy_from_slice(&crc.to_le_bytes());
+    let (value_at, _) = first_entry_value_range(&tile);
+    tile[value_at] ^= 1;
+    repair_first_block_crc(&mut tile);
     fs::write(&files.tile, tile).unwrap();
     let err = Engine::open_with_tile(&files.wal, &files.tile).err().unwrap();
     assert_eq!(err.kind(), ErrorKind::InvalidData);
@@ -231,14 +258,11 @@ fn tile_malformed_key_with_valid_crc_returns_error_not_panic() {
     e.build_tile(&files.tile, 1).unwrap();
     drop(e);
     let mut tile = fs::read(&files.tile).unwrap();
-    let key_len = u32::from_le_bytes(tile[68..72].try_into().unwrap()) as usize;
-    let value_len = u32::from_le_bytes(tile[72..76].try_into().unwrap()) as usize;
-    let start = 80;
-    tile[start..start + key_len].fill(b'x');
-    tile[start] = b'U';
-    tile[start + key_len - 1] = 0;
-    let crc = crc32c(&tile[start..start + key_len + value_len]);
-    tile[76..80].copy_from_slice(&crc.to_le_bytes());
+    let (key_at, key_len) = first_entry_key_range(&tile);
+    tile[key_at..key_at + key_len].fill(b'x');
+    tile[key_at] = b'U';
+    tile[key_at + key_len - 1] = 0;
+    repair_first_block_crc(&mut tile);
     fs::write(&files.tile, tile).unwrap();
     assert_eq!(Engine::open_with_tile(&files.wal, &files.tile).err().unwrap().kind(), ErrorKind::InvalidData);
 }
@@ -272,11 +296,8 @@ fn point_read_checks_traversed_records_not_unrelated_later_entries() {
     e.commit_block(b"one", &[doc(1, b"first"), doc(2, b"second")]).unwrap();
     e.build_tile(&files.tile, 1).unwrap();
     let mut bytes = fs::read(&files.tile).unwrap();
-    let first_key = u32::from_le_bytes(bytes[68..72].try_into().unwrap()) as usize;
-    let first_value = u32::from_le_bytes(bytes[72..76].try_into().unwrap()) as usize;
-    let second = 68 + 12 + first_key + first_value;
-    let second_key = u32::from_le_bytes(bytes[second..second + 4].try_into().unwrap()) as usize;
-    bytes[second + 12 + second_key] ^= 1;
+    let block_len = u32::from_le_bytes(bytes[TILE_PAGE..TILE_PAGE + 4].try_into().unwrap()) as usize;
+    bytes[TILE_PAGE + block_len - 1] ^= 1; // corrupt the block's last entry (the second record)
     fs::write(&files.tile, bytes).unwrap();
     // Multi-tile merge pre-advances every tile to its first matching key, so a
     // corrupted record anywhere in a published tile fails every read closed:

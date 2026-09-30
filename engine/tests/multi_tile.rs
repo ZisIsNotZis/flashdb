@@ -375,8 +375,13 @@ fn tiles_and_compaction_keep_only_the_newest_version_per_logical_key() {
 }
 
 fn tile_entry_count(path: &PathBuf) -> u64 {
-    // Tile header: magic(8) cutoff(8) wal-digest(32) count(8) ...
+    // FDBTILE2 superblock: magic(8) cutoff(8) wal-digest(32) entry-count(8)
+    // dir-offset(8) dir-length(8) page-size(4) superblock-crc(4). Parse the
+    // superblock structure (magic + CRC) so the count is read from a verified
+    // header rather than an assumed byte offset alone.
     let bytes = fs::read(path).unwrap();
+    assert_eq!(&bytes[..8], b"FDBTILE2", "FDBTILE2 superblock magic");
+    assert_eq!(crc32c(&bytes[..76]), u32::from_le_bytes(bytes[76..80].try_into().unwrap()), "superblock checksum");
     u64::from_le_bytes(bytes[48..56].try_into().unwrap())
 }
 

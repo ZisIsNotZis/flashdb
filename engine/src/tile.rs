@@ -1,6 +1,13 @@
 //! Explicit, WAL-retained immutable tile prototype. No manifest, checkpoint, or WAL retirement.
 //! The file is validated before it can displace any serving memtable entries. Reads use
-//! owned, checksum-verified record buffers; this is not a bounded-recovery claim.
+//! owned, checksum-verified block buffers; this is not a bounded-recovery claim.
+//!
+//! On-disk layout is FDBTILE2 (see `.scratch/08-tile-pages/FDBTILE2.md`):
+//! a padded superblock at offset 0, then variable-length 4 KiB data blocks, a
+//! CRC-protected directory of fence records, and a fixed trailer. `Tile::open`
+//! validates the superblock, trailer, directory structure and block headers but
+//! deliberately does not read data blocks; `entries()` streams blocks in key
+//! order, verifying each block's CRC on the way.
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, ErrorKind, Seek, SeekFrom, Write};
@@ -11,11 +18,29 @@ use std::sync::LazyLock;
 use crate::keys;
 use crate::memtable::Memtable;
 
-const MAGIC: &[u8; 8] = b"FDBTILE1";
-const HEADER: usize = 8 + 8 + 32 + 8 + 8 + 4; // magic, cutoff, WAL digest, count, size, crc
-const RECORD: usize = 12; // key len, value len, crc32c(key || value)
+const MAGIC: &[u8; 8] = b"FDBTILE2";
+// The trailer magic is exactly these nine bytes (F D B T I L E 2 E); there is
+// no 8-byte variant and no separate length prefix.
+const TRAILER_MAGIC: &[u8; 9] = b"FDBTILE2E";
+const PAGE_SIZE: u32 = 4096;
+// magic(8) + cutoff(8) + digest(32) + count(8) + dir_offset(8) + dir_len(8) + page_size(4) + crc(4)
+const SUPERBLOCK: usize = 80;
+const SUPERBLOCK_CRC: usize = 76;
+// magic(9) + dir_offset(8) + dir_len(8) + crc(4)
+const TRAILER: usize = 29;
+const TRAILER_CRC: usize = 25;
+// block_len(4) + block_crc(4) + first_key_len(4) + entry_count(2)
+const BLOCK_HEADER: usize = 14;
+// dir_len(4) + dir_crc(4) + fence_count(2)
+const DIR_HEADER: usize = 10;
+// Mutable target size for both data and directory blocks.
+const BLOCK_TARGET: usize = PAGE_SIZE as usize;
 const MAX_KEY: usize = 1 << 24;
 const MAX_VALUE: usize = 1 << 26;
+// One entry's length prefixes plus the widest legal key and value. The block
+// encoder additionally checks the fully framed block fits the u32 `block_len`.
+const MAX_ENTRY: usize = 8 + MAX_KEY + MAX_VALUE;
+const _: () = assert!(MAX_ENTRY <= u32::MAX as usize);
 
 fn invalid(message: &'static str) -> io::Error { io::Error::new(ErrorKind::InvalidData, message) }
 
@@ -34,7 +59,6 @@ fn crc(mut state: u32, bytes: &[u8]) -> u32 {
     state
 }
 fn checksum(bytes: &[u8]) -> u32 { !crc(!0, bytes) }
-fn entry_checksum(key: &[u8], value: &[u8]) -> u32 { !crc(crc(!0, key), value) }
 
 fn valid_key(key: &[u8]) -> bool {
     if key.len() < 18 { return false; }
@@ -57,23 +81,84 @@ fn valid_key(key: &[u8]) -> bool {
     }
 }
 
-fn header(cutoff: u64, digest: &[u8; 32], count: u64, size: u64) -> [u8; HEADER] {
-    let mut h = [0; HEADER];
+/// One directory entry: the first key of a data block and where that block lives.
+struct Fence {
+    first_key: Vec<u8>,
+    offset: u64,
+    len: u32,
+}
+
+/// Candidate data block for `key`: the greatest fence whose first key is `<= key`,
+/// or 0 when every fence is greater (and for an empty directory). The caller
+/// still verifies the block it reads, so a wrong candidate only ever costs work,
+/// never a wrong answer.
+fn dir_search(dir: &[Fence], key: &[u8]) -> usize {
+    let mut lo = 0usize;
+    let mut hi = dir.len();
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        if dir[mid].first_key.as_slice() <= key { lo = mid + 1; } else { hi = mid; }
+    }
+    if lo == 0 { 0 } else { lo - 1 }
+}
+
+fn superblock_bytes(cutoff: u64, digest: &[u8; 32], count: u64, dir_offset: u64, dir_len: u64) -> [u8; SUPERBLOCK] {
+    let mut h = [0; SUPERBLOCK];
     h[..8].copy_from_slice(MAGIC);
     h[8..16].copy_from_slice(&cutoff.to_le_bytes());
     h[16..48].copy_from_slice(digest);
     h[48..56].copy_from_slice(&count.to_le_bytes());
-    h[56..64].copy_from_slice(&size.to_le_bytes());
-    let sum = checksum(&h[..64]);
-    h[64..].copy_from_slice(&sum.to_le_bytes());
+    h[56..64].copy_from_slice(&dir_offset.to_le_bytes());
+    h[64..72].copy_from_slice(&dir_len.to_le_bytes());
+    h[72..76].copy_from_slice(&PAGE_SIZE.to_le_bytes());
+    let sum = checksum(&h[..SUPERBLOCK_CRC]);
+    h[SUPERBLOCK_CRC..].copy_from_slice(&sum.to_le_bytes());
     h
 }
 
+fn trailer_bytes(dir_offset: u64, dir_len: u64) -> [u8; TRAILER] {
+    let mut t = [0; TRAILER];
+    t[..9].copy_from_slice(TRAILER_MAGIC);
+    t[9..17].copy_from_slice(&dir_offset.to_le_bytes());
+    t[17..25].copy_from_slice(&dir_len.to_le_bytes());
+    let sum = checksum(&t[..TRAILER_CRC]);
+    t[TRAILER_CRC..].copy_from_slice(&sum.to_le_bytes());
+    t
+}
+
+fn encode_block(first_key: &[u8], entries: &[u8], entry_count: u16) -> io::Result<Vec<u8>> {
+    let total = BLOCK_HEADER as u64 + first_key.len() as u64 + entries.len() as u64;
+    if total > u32::MAX as u64 { return Err(invalid("tile block exceeds u32 length")); }
+    let mut b = vec![0u8; total as usize];
+    b[..4].copy_from_slice(&(total as u32).to_le_bytes());
+    b[8..12].copy_from_slice(&(first_key.len() as u32).to_le_bytes());
+    b[12..14].copy_from_slice(&entry_count.to_le_bytes());
+    b[BLOCK_HEADER..BLOCK_HEADER + first_key.len()].copy_from_slice(first_key);
+    b[BLOCK_HEADER + first_key.len()..].copy_from_slice(entries);
+    let sum = checksum(&b[8..]);
+    b[4..8].copy_from_slice(&sum.to_le_bytes());
+    Ok(b)
+}
+
+fn encode_dir_block(records: &[u8], fence_count: u16) -> io::Result<Vec<u8>> {
+    let total = DIR_HEADER as u64 + records.len() as u64;
+    if total > u32::MAX as u64 { return Err(invalid("tile directory block exceeds u32 length")); }
+    let mut b = vec![0u8; total as usize];
+    b[..4].copy_from_slice(&(total as u32).to_le_bytes());
+    b[8..10].copy_from_slice(&fence_count.to_le_bytes());
+    b[DIR_HEADER..].copy_from_slice(records);
+    let sum = checksum(&b[8..]);
+    b[4..8].copy_from_slice(&sum.to_le_bytes());
+    Ok(b)
+}
+
 // Positional reads never expose borrowed file-backed bytes. Truncation and
-// corruption yield io::Error, never SIGBUS/panic. Open verifies every stored
-// record; at read time the multi-tile merge pre-advances every published tile
-// so corruption reached by any read fails closed - though a read that stops
-// before a corrupt record still does not detect it (no eager whole-file recheck).
+// corruption yield io::Error, never SIGBUS/panic. Open validates the file's
+// structure (superblock, trailer, directory, block headers) without touching
+// data blocks; `entries()` verifies each data block's CRC as it is read, so a
+// corrupt block fails the read that reaches it (the multi-tile merge
+// pre-advances every published tile, so corruption reached by any read fails
+// closed).
 fn read_exact_at(file: &File, mut bytes: &mut [u8], mut offset: u64) -> io::Result<()> {
     while !bytes.is_empty() {
         match file.read_at(bytes, offset) {
@@ -89,46 +174,90 @@ fn read_exact_at(file: &File, mut bytes: &mut [u8], mut offset: u64) -> io::Resu
     Ok(())
 }
 
-pub(crate) struct Tile { file: File, header: [u8; HEADER], cutoff: u64, digest: [u8; 32], count: u64, size: u64 }
+fn read_range(file: &File, offset: u64, len: u64) -> io::Result<Vec<u8>> {
+    let len = usize::try_from(len).map_err(|_| invalid("tile range too large"))?;
+    let mut buf = vec![0u8; len];
+    read_exact_at(file, &mut buf, offset)?;
+    Ok(buf)
+}
 
-struct Entries<'a> { tile: &'a Tile, pos: u64, left: u64, checked: bool, done: bool }
+pub(crate) struct Tile {
+    file: File,
+    superblock: [u8; SUPERBLOCK],
+    trailer: [u8; TRAILER],
+    cutoff: u64,
+    digest: [u8; 32],
+    count: u64,
+    size: u64,
+    fences: Vec<Fence>,
+}
+
+struct Entries<'a> {
+    tile: &'a Tile,
+    checked: bool,
+    block: usize,
+    buffer: Vec<u8>,
+    pos: usize,
+    left: u16,
+    done: bool,
+}
+
+impl Entries<'_> {
+    fn load_block(&mut self) -> io::Result<()> {
+        let fence = &self.tile.fences[self.block];
+        self.buffer.resize(fence.len as usize, 0);
+        read_exact_at(&self.tile.file, &mut self.buffer, fence.offset)?;
+        if self.buffer.len() < BLOCK_HEADER { return Err(invalid("tile block truncated")); }
+        let blen = u32::from_le_bytes(self.buffer[..4].try_into().unwrap()) as usize;
+        let block_crc = u32::from_le_bytes(self.buffer[4..8].try_into().unwrap());
+        if blen != self.buffer.len() { return Err(invalid("tile block length changed")); }
+        if checksum(&self.buffer[8..]) != block_crc { return Err(invalid("tile block checksum")); }
+        let first_key_len = u32::from_le_bytes(self.buffer[8..12].try_into().unwrap()) as usize;
+        if BLOCK_HEADER + first_key_len > blen { return Err(invalid("tile block first key out of bounds")); }
+        self.pos = BLOCK_HEADER + first_key_len;
+        self.left = u16::from_le_bytes(self.buffer[12..14].try_into().unwrap());
+        Ok(())
+    }
+
+    fn advance(&mut self) -> io::Result<Option<(Vec<u8>, Vec<u8>)>> {
+        if !self.checked {
+            self.checked = true;
+            if self.tile.file.metadata()?.len() != self.tile.size { return Err(invalid("tile size changed")); }
+            let mut sb = [0u8; SUPERBLOCK];
+            read_exact_at(&self.tile.file, &mut sb, 0)?;
+            if sb != self.tile.superblock { return Err(invalid("tile superblock changed")); }
+            let mut tr = [0u8; TRAILER];
+            read_exact_at(&self.tile.file, &mut tr, self.tile.size - TRAILER as u64)?;
+            if tr != self.tile.trailer { return Err(invalid("tile trailer changed")); }
+        }
+        while self.left == 0 {
+            if self.block >= self.tile.fences.len() { return Ok(None); }
+            self.load_block()?;
+            if self.left == 0 { return Err(invalid("tile block declares no entries")); }
+        }
+        let buf = &self.buffer;
+        if self.pos + 8 > buf.len() { return Err(invalid("tile entry header truncated")); }
+        let k = u32::from_le_bytes(buf[self.pos..self.pos + 4].try_into().unwrap()) as usize;
+        let v = u32::from_le_bytes(buf[self.pos + 4..self.pos + 8].try_into().unwrap()) as usize;
+        if !(18..=MAX_KEY).contains(&k) || v > MAX_VALUE { return Err(invalid("tile entry length out of bounds")); }
+        let start = self.pos + 8;
+        let mid = start.checked_add(k).ok_or_else(|| invalid("tile key size overflow"))?;
+        let end = mid.checked_add(v).ok_or_else(|| invalid("tile value size overflow"))?;
+        if end > buf.len() { return Err(invalid("tile entry exceeds block")); }
+        let key = buf[start..mid].to_vec();
+        let value = buf[mid..end].to_vec();
+        self.pos = end;
+        self.left -= 1;
+        if self.left == 0 { self.block += 1; self.buffer.clear(); self.pos = 0; }
+        Ok(Some((key, value)))
+    }
+}
+
 impl Iterator for Entries<'_> {
     type Item = io::Result<(Vec<u8>, Vec<u8>)>;
     fn next(&mut self) -> Option<Self::Item> {
         if self.done { return None; }
-        let result = (|| {
-            if !self.checked {
-                self.checked = true;
-                if self.tile.file.metadata()?.len() != self.tile.size { return Err(invalid("tile size changed")); }
-                let mut h = [0; HEADER];
-                read_exact_at(&self.tile.file, &mut h, 0)?;
-                if h != self.tile.header { return Err(invalid("tile header changed")); }
-            }
-            if self.left == 0 {
-                if self.pos != self.tile.size { return Err(invalid("tile trailing bytes")); }
-                return Ok(None);
-            }
-            let mut hdr = [0; RECORD];
-            read_exact_at(&self.tile.file, &mut hdr, self.pos)?;
-            let k = u32::from_le_bytes(hdr[..4].try_into().unwrap()) as usize;
-            let v = u32::from_le_bytes(hdr[4..8].try_into().unwrap()) as usize;
-            if !(18..=MAX_KEY).contains(&k) || v > MAX_VALUE { return Err(invalid("tile entry length out of bounds")); }
-            let start = self.pos.checked_add(RECORD as u64).ok_or_else(|| invalid("tile offset overflow"))?;
-            let mid = start.checked_add(k as u64).ok_or_else(|| invalid("tile key size overflow"))?;
-            let end = mid.checked_add(v as u64).ok_or_else(|| invalid("tile value size overflow"))?;
-            if end > self.tile.size { return Err(invalid("tile entry exceeds file")); }
-            let mut key = vec![0; k];
-            let mut value = vec![0; v];
-            read_exact_at(&self.tile.file, &mut key, start)?;
-            read_exact_at(&self.tile.file, &mut value, mid)?;
-            if entry_checksum(&key, &value) != u32::from_le_bytes(hdr[8..12].try_into().unwrap()) {
-                return Err(invalid("tile record checksum"));
-            }
-            self.pos = end;
-            self.left -= 1;
-            Ok(Some((key, value)))
-        })();
-        match result {
+        match self.advance() {
             Ok(Some(entry)) => Some(Ok(entry)),
             Ok(None) => { self.done = true; None }
             Err(e) => { self.done = true; Some(Err(e)) }
@@ -141,64 +270,189 @@ impl Tile {
         // create_new never replaces a verified tile. A failed/crashed build leaves a partial
         // candidate, but cannot change the Engine's serving state; caller may remove it explicitly.
         let mut f = OpenOptions::new().write(true).create_new(true).open(path)?;
-        f.write_all(&header(cutoff, digest, 0, HEADER as u64))?;
+        // Reserve the superblock page; the real superblock is written last, once
+        // the directory offset/length are known. This puts the first data block
+        // on the 4096-byte boundary.
+        f.write_all(&[0u8; PAGE_SIZE as usize])?;
+        let mut offset = PAGE_SIZE as u64;
         let mut count = 0u64;
-        let mut size = HEADER as u64;
+        let mut fences: Vec<Fence> = Vec::new();
+        let mut first_key: Vec<u8> = Vec::new();
+        let mut entries: Vec<u8> = Vec::new();
+        let mut block_entries: u16 = 0;
         for (key, value) in mt.entries() {
             if keys::key_csn(key).is_none_or(|csn| csn > cutoff) { continue; }
             if !valid_key(key) || key.len() > MAX_KEY || value.len() > MAX_VALUE {
                 return Err(invalid("unsupported tile entry; memtable unchanged"));
             }
-            let entry_size = RECORD as u64 + key.len() as u64 + value.len() as u64;
-            size = size.checked_add(entry_size).ok_or_else(|| invalid("tile size overflow"))?;
+            let entry_size = 8u64 + key.len() as u64 + value.len() as u64;
+            if entry_size > MAX_ENTRY as u64 { return Err(invalid("tile entry size overflow")); }
+            // Whole entries only: start a new block when the next one would not fit.
+            if !entries.is_empty() && entries.len() as u64 + entry_size > BLOCK_TARGET as u64 {
+                let block = encode_block(&first_key, &entries, block_entries)?;
+                fences.push(Fence { first_key: std::mem::take(&mut first_key), offset, len: block.len() as u32 });
+                f.write_all(&block)?;
+                offset = offset.checked_add(block.len() as u64).ok_or_else(|| invalid("tile offset overflow"))?;
+                entries.clear();
+                block_entries = 0;
+            }
+            if block_entries == u16::MAX { return Err(invalid("tile block entry count overflow")); }
+            if block_entries == 0 { first_key = key.to_vec(); }
+            entries.extend_from_slice(&(key.len() as u32).to_le_bytes());
+            entries.extend_from_slice(&(value.len() as u32).to_le_bytes());
+            entries.extend_from_slice(key);
+            entries.extend_from_slice(value);
+            block_entries += 1;
             count = count.checked_add(1).ok_or_else(|| invalid("tile count overflow"))?;
-            f.write_all(&(key.len() as u32).to_le_bytes())?;
-            f.write_all(&(value.len() as u32).to_le_bytes())?;
-            f.write_all(&entry_checksum(key, value).to_le_bytes())?;
-            f.write_all(key)?;
-            f.write_all(value)?;
         }
+        if !entries.is_empty() {
+            let block = encode_block(&first_key, &entries, block_entries)?;
+            fences.push(Fence { first_key: std::mem::take(&mut first_key), offset, len: block.len() as u32 });
+            f.write_all(&block)?;
+            offset = offset.checked_add(block.len() as u64).ok_or_else(|| invalid("tile offset overflow"))?;
+            entries.clear();
+        }
+        // Directory: one fence record per data block, chunked into CRC-protected blocks.
+        let dir_offset = offset;
+        let mut dir_len = 0u64;
+        let mut records: Vec<u8> = Vec::new();
+        let mut rec_count: u16 = 0;
+        for fence in &fences {
+            let rec_len = 16usize + fence.first_key.len();
+            if !records.is_empty() && DIR_HEADER + records.len() + rec_len > BLOCK_TARGET {
+                let block = encode_dir_block(&records, rec_count)?;
+                f.write_all(&block)?;
+                dir_len = dir_len.checked_add(block.len() as u64).ok_or_else(|| invalid("tile directory size overflow"))?;
+                records.clear();
+                rec_count = 0;
+            }
+            if rec_count == u16::MAX { return Err(invalid("tile directory fence count overflow")); }
+            records.extend_from_slice(&(fence.first_key.len() as u32).to_le_bytes());
+            records.extend_from_slice(&fence.offset.to_le_bytes());
+            records.extend_from_slice(&fence.len.to_le_bytes());
+            records.extend_from_slice(&fence.first_key);
+            rec_count += 1;
+        }
+        if !records.is_empty() {
+            let block = encode_dir_block(&records, rec_count)?;
+            f.write_all(&block)?;
+            dir_len = dir_len.checked_add(block.len() as u64).ok_or_else(|| invalid("tile directory size overflow"))?;
+        }
+        f.write_all(&trailer_bytes(dir_offset, dir_len))?;
         f.seek(SeekFrom::Start(0))?;
-        f.write_all(&header(cutoff, digest, count, size))?;
+        f.write_all(&superblock_bytes(cutoff, digest, count, dir_offset, dir_len))?;
         f.sync_data()?; // No parent-directory durability claim.
         drop(f);
         let tile = Self::open(path)?;
-        if tile.cutoff != cutoff || tile.digest != *digest { return Err(invalid("tile verification mismatch")); }
+        if tile.cutoff != cutoff || tile.digest != *digest || tile.count() != count {
+            return Err(invalid("tile verification mismatch"));
+        }
         Ok(tile)
     }
 
     pub(crate) fn open(path: &Path) -> io::Result<Self> {
         let file = File::open(path)?;
         let size = file.metadata()?.len();
-        if size < HEADER as u64 { return Err(invalid("tile header truncated")); }
-        let mut h = [0; HEADER];
-        read_exact_at(&file, &mut h, 0)?;
-        if &h[..8] != MAGIC || checksum(&h[..64]) != u32::from_le_bytes(h[64..68].try_into().unwrap()) {
-            return Err(invalid("tile header checksum/magic"));
+        if size < PAGE_SIZE as u64 + TRAILER as u64 { return Err(invalid("tile too small")); }
+        let mut sb = [0u8; SUPERBLOCK];
+        read_exact_at(&file, &mut sb, 0)?;
+        if &sb[..8] != MAGIC { return Err(invalid("tile superblock magic")); }
+        if checksum(&sb[..SUPERBLOCK_CRC]) != u32::from_le_bytes(sb[SUPERBLOCK_CRC..].try_into().unwrap()) {
+            return Err(invalid("tile superblock checksum"));
         }
-        let cutoff = u64::from_le_bytes(h[8..16].try_into().unwrap());
-        let digest = h[16..48].try_into().unwrap();
-        let count = u64::from_le_bytes(h[48..56].try_into().unwrap());
-        if u64::from_le_bytes(h[56..64].try_into().unwrap()) != size
-            || count > (size - HEADER as u64) / (RECORD as u64 + 18) {
-            return Err(invalid("tile size/count invalid"));
+        let cutoff = u64::from_le_bytes(sb[8..16].try_into().unwrap());
+        let digest: [u8; 32] = sb[16..48].try_into().unwrap();
+        let count = u64::from_le_bytes(sb[48..56].try_into().unwrap());
+        let dir_offset = u64::from_le_bytes(sb[56..64].try_into().unwrap());
+        let dir_len = u64::from_le_bytes(sb[64..72].try_into().unwrap());
+        if u32::from_le_bytes(sb[72..76].try_into().unwrap()) != PAGE_SIZE { return Err(invalid("tile page size")); }
+        let mut tr = [0u8; TRAILER];
+        read_exact_at(&file, &mut tr, size - TRAILER as u64)?;
+        if &tr[..9] != TRAILER_MAGIC { return Err(invalid("tile trailer magic")); }
+        if checksum(&tr[..TRAILER_CRC]) != u32::from_le_bytes(tr[TRAILER_CRC..].try_into().unwrap()) {
+            return Err(invalid("tile trailer checksum"));
         }
-        let tile = Self { file, header: h, cutoff, digest, count, size };
-        let mut previous: Option<Vec<u8>> = None;
-        for entry in tile.entries() {
-            let (key, _) = entry?;
-            if !valid_key(&key) || keys::key_csn(&key).is_none_or(|csn| csn > cutoff)
-                || previous.as_ref().is_some_and(|prev| prev >= &key) {
-                return Err(invalid("tile key order/encoding/cutoff"));
+        if u64::from_le_bytes(tr[9..17].try_into().unwrap()) != dir_offset
+            || u64::from_le_bytes(tr[17..25].try_into().unwrap()) != dir_len {
+            return Err(invalid("tile trailer disagrees with superblock"));
+        }
+        // The directory must end exactly at the trailer, and start after the
+        // superblock page, so no gap or overlap can hide data blocks.
+        if dir_offset < PAGE_SIZE as u64 || dir_offset.checked_add(dir_len) != Some(size - TRAILER as u64) {
+            return Err(invalid("tile directory bounds"));
+        }
+        let mut fences: Vec<Fence> = Vec::new();
+        if dir_len > 0 {
+            let dir = read_range(&file, dir_offset, dir_len)?;
+            let mut pos = 0usize;
+            while pos < dir.len() {
+                if dir.len() - pos < DIR_HEADER { return Err(invalid("tile directory block truncated")); }
+                let blen = u32::from_le_bytes(dir[pos..pos + 4].try_into().unwrap()) as usize;
+                if blen < DIR_HEADER || blen > dir.len() - pos { return Err(invalid("tile directory block length")); }
+                let block_crc = u32::from_le_bytes(dir[pos + 4..pos + 8].try_into().unwrap());
+                if checksum(&dir[pos + 8..pos + blen]) != block_crc { return Err(invalid("tile directory checksum")); }
+                let fence_count = u16::from_le_bytes(dir[pos + 8..pos + 10].try_into().unwrap()) as usize;
+                let mut q = pos + DIR_HEADER;
+                for _ in 0..fence_count {
+                    if blen - (q - pos) < 16 { return Err(invalid("tile fence record truncated")); }
+                    let first_key_len = u32::from_le_bytes(dir[q..q + 4].try_into().unwrap()) as usize;
+                    let block_offset = u64::from_le_bytes(dir[q + 4..q + 12].try_into().unwrap());
+                    let block_len = u32::from_le_bytes(dir[q + 12..q + 16].try_into().unwrap());
+                    q += 16;
+                    if first_key_len < 1 || first_key_len > MAX_KEY || blen - (q - pos) < first_key_len {
+                        return Err(invalid("tile fence key length"));
+                    }
+                    fences.push(Fence {
+                        first_key: dir[q..q + first_key_len].to_vec(),
+                        offset: block_offset,
+                        len: block_len,
+                    });
+                    q += first_key_len;
+                }
+                if q != pos + blen { return Err(invalid("tile directory block trailing bytes")); }
+                pos += blen;
             }
-            previous = Some(key);
+        } else if count != 0 {
+            return Err(invalid("tile directory missing for nonempty tile"));
         }
-        Ok(tile)
+        let mut previous: Option<&[u8]> = None;
+        let mut total: u64 = 0;
+        for (index, fence) in fences.iter().enumerate() {
+            if fence.offset < PAGE_SIZE as u64 || (fence.len as usize) < BLOCK_HEADER {
+                return Err(invalid("tile block offset/length"));
+            }
+            let end = fence.offset.checked_add(fence.len as u64).ok_or_else(|| invalid("tile block overflow"))?;
+            if end > dir_offset { return Err(invalid("tile block outside data region")); }
+            if previous.is_some_and(|prev| prev >= fence.first_key.as_slice()) {
+                return Err(invalid("tile fence keys not strictly increasing"));
+            }
+            previous = Some(&fence.first_key);
+            // Block header consistency: the header's length, first key and entry
+            // count must agree with the directory (data CRC is checked on read).
+            let mut hdr = [0u8; BLOCK_HEADER];
+            read_exact_at(&file, &mut hdr, fence.offset)?;
+            let blen = u32::from_le_bytes(hdr[..4].try_into().unwrap());
+            let first_key_len = u32::from_le_bytes(hdr[8..12].try_into().unwrap()) as usize;
+            let entry_count = u16::from_le_bytes(hdr[12..14].try_into().unwrap());
+            if blen != fence.len { return Err(invalid("tile block length mismatch")); }
+            if first_key_len != fence.first_key.len() { return Err(invalid("tile block first key length mismatch")); }
+            if BLOCK_HEADER + first_key_len > fence.len as usize { return Err(invalid("tile block first key out of bounds")); }
+            if entry_count == 0 { return Err(invalid("tile block declares no entries")); }
+            let mut first = vec![0u8; first_key_len];
+            read_exact_at(&file, &mut first, fence.offset + BLOCK_HEADER as u64)?;
+            if first != fence.first_key { return Err(invalid("tile block first key mismatch")); }
+            total = total.checked_add(entry_count as u64).ok_or_else(|| invalid("tile entry count overflow"))?;
+            debug_assert_eq!(dir_search(&fences, &fences[index].first_key), index);
+        }
+        if total != count { return Err(invalid("tile block entry count disagrees")); }
+        Ok(Tile { file, superblock: sb, trailer: tr, cutoff, digest, count, size, fences })
     }
+
     pub(crate) fn cutoff(&self) -> u64 { self.cutoff }
     pub(crate) fn digest(&self) -> &[u8; 32] { &self.digest }
+    pub(crate) fn count(&self) -> u64 { self.count }
     pub(crate) fn entries(&self) -> impl Iterator<Item = io::Result<(Vec<u8>, Vec<u8>)>> + '_ {
-        Entries { tile: self, pos: HEADER as u64, left: self.count, checked: false, done: false }
+        Entries { tile: self, checked: false, block: 0, buffer: Vec::new(), pos: 0, left: 0, done: false }
     }
 
     /// Exact comparison against the WAL projection in the CSN range
@@ -232,5 +486,168 @@ impl Tile {
         }
         if !expect.is_empty() { return Err(invalid("tile missing WAL entry")); }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+
+    fn tmp(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("flashdb-tile-unit-{}-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed), name))
+    }
+    fn fence(key: &[u8]) -> Fence { Fence { first_key: key.to_vec(), offset: 0, len: 0 } }
+    fn put(mt: &mut Memtable, handle: u64, csn: u64, value: &[u8]) {
+        mt.apply(keys::primary_key(b"E", handle, csn).unwrap(), value.to_vec());
+    }
+    fn pkey(handle: u64, csn: u64) -> Vec<u8> { keys::primary_key(b"E", handle, csn).unwrap() }
+    fn collect(tile: &Tile) -> Vec<(Vec<u8>, Vec<u8>)> {
+        tile.entries().collect::<io::Result<Vec<_>>>().unwrap()
+    }
+    fn write_tile(name: &str, cutoff: u64, mt: &Memtable) -> (PathBuf, Tile) {
+        let path = tmp(name);
+        let tile = Tile::write(&path, cutoff, &[9u8; 32], mt).unwrap();
+        (path, tile)
+    }
+
+    #[test]
+    fn dir_search_first_middle_last_and_absent() {
+        let dir = [fence(b"b"), fence(b"d"), fence(b"f")];
+        assert_eq!(dir_search(&dir, b"b"), 0, "exact first fence");
+        assert_eq!(dir_search(&dir, b"d"), 1, "exact middle fence");
+        assert_eq!(dir_search(&dir, b"f"), 2, "exact last fence");
+        assert_eq!(dir_search(&dir, b"a"), 0, "absent below first -> first candidate");
+        assert_eq!(dir_search(&dir, b"e"), 1, "absent between -> lower fence");
+        assert_eq!(dir_search(&dir, b"g"), 2, "absent above last -> last fence");
+        assert_eq!(dir_search(&[], b"a"), 0, "empty directory -> 0");
+    }
+
+    #[test]
+    fn empty_tile_roundtrips() {
+        let mt = Memtable::new();
+        let (path, tile) = write_tile("empty.tile", 5, &mt);
+        assert_eq!(tile.count(), 0);
+        assert_eq!(tile.fences.len(), 0, "no data blocks means no fences");
+        assert!(collect(&tile).is_empty());
+        let reopened = Tile::open(&path).unwrap();
+        assert_eq!(reopened.count(), 0);
+        assert!(collect(&reopened).is_empty());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn single_entry_roundtrips() {
+        let mut mt = Memtable::new();
+        put(&mut mt, 1, 1, b"value");
+        let (path, tile) = write_tile("one.tile", 5, &mt);
+        assert_eq!(tile.count(), 1);
+        assert_eq!(tile.fences.len(), 1);
+        let reopened = Tile::open(&path).unwrap();
+        assert_eq!(collect(&reopened), vec![(pkey(1, 1), b"value".to_vec())]);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn many_entries_form_at_least_eight_blocks() {
+        let mut mt = Memtable::new();
+        let n = 1400u64;
+        for handle in 1..=n { put(&mut mt, handle, 1, b"v"); }
+        let (path, tile) = write_tile("many.tile", 100, &mt);
+        assert_eq!(tile.count(), n);
+        assert!(tile.fences.len() >= 8, "4 KiB target yields multiple blocks: {}", tile.fences.len());
+        let entries = collect(&tile);
+        assert_eq!(entries.len() as u64, n);
+        assert!(entries.windows(2).all(|w| w[0].0 < w[1].0), "entries stream in key order");
+        let reopened = Tile::open(&path).unwrap();
+        assert_eq!(collect(&reopened), entries);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn oversized_entry_gets_its_own_block() {
+        let mut mt = Memtable::new();
+        let big = vec![b'x'; 3 * BLOCK_TARGET];
+        put(&mut mt, 1, 1, &big);
+        put(&mut mt, 2, 1, b"small");
+        let (path, tile) = write_tile("oversized.tile", 100, &mt);
+        assert_eq!(tile.count(), 2);
+        assert_eq!(tile.fences.len(), 2, "the oversized entry occupies its own block");
+        let entries = collect(&tile);
+        assert_eq!(entries[0].1, big);
+        assert_eq!(entries[1].1, b"small".to_vec());
+        let reopened = Tile::open(&path).unwrap();
+        assert_eq!(collect(&reopened), entries);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn flip_inside_data_block_detected_when_read_not_at_open() {
+        let mut mt = Memtable::new();
+        put(&mut mt, 1, 1, b"payload");
+        let (path, _) = write_tile("flip-data.tile", 5, &mt);
+        let mut bytes = std::fs::read(&path).unwrap();
+        let start = PAGE_SIZE as usize;
+        let block_len = u32::from_le_bytes(bytes[start..start + 4].try_into().unwrap()) as usize;
+        bytes[start + block_len - 1] ^= 1; // value tail: block CRC now wrong, header intact
+        std::fs::write(&path, &bytes).unwrap();
+        // Open must succeed: it deliberately does not read data blocks.
+        let tile = Tile::open(&path).unwrap();
+        let err = tile.entries().next().unwrap().unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn flip_inside_directory_detected_at_open() {
+        let mut mt = Memtable::new();
+        for handle in 1..=200 { put(&mut mt, handle, 1, b"v"); }
+        let (path, _) = write_tile("flip-dir.tile", 5, &mt);
+        let mut bytes = std::fs::read(&path).unwrap();
+        let dir_offset = u64::from_le_bytes(bytes[56..64].try_into().unwrap()) as usize;
+        assert!(u64::from_le_bytes(bytes[64..72].try_into().unwrap()) > 0, "directory is nonempty");
+        bytes[dir_offset + 12] ^= 1; // inside the first fence record
+        std::fs::write(&path, &bytes).unwrap();
+        assert_eq!(Tile::open(&path).err().unwrap().kind(), ErrorKind::InvalidData);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn truncated_file_detected_at_open() {
+        let mut mt = Memtable::new();
+        put(&mut mt, 1, 1, b"v");
+        let (path, _) = write_tile("truncated.tile", 5, &mt);
+        let bytes = std::fs::read(&path).unwrap();
+        std::fs::write(&path, &bytes[..bytes.len() - 1]).unwrap();
+        assert_eq!(Tile::open(&path).err().unwrap().kind(), ErrorKind::InvalidData);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn out_of_order_fence_keys_detected_at_open() {
+        let mut mt = Memtable::new();
+        for handle in 1..=600 { put(&mut mt, handle, 1, b"v"); }
+        let (path, tile) = write_tile("order.tile", 5, &mt);
+        assert!(tile.fences.len() >= 2, "need two fences to reorder");
+        drop(tile);
+        let mut bytes = std::fs::read(&path).unwrap();
+        let dir_offset = u64::from_le_bytes(bytes[56..64].try_into().unwrap()) as usize;
+        let blen = u32::from_le_bytes(bytes[dir_offset..dir_offset + 4].try_into().unwrap()) as usize;
+        let key0_len = u32::from_le_bytes(bytes[dir_offset + DIR_HEADER..dir_offset + DIR_HEADER + 4].try_into().unwrap()) as usize;
+        let key0 = dir_offset + DIR_HEADER + 16;
+        let rec0 = 16 + key0_len;
+        let key1_len = u32::from_le_bytes(bytes[dir_offset + DIR_HEADER + rec0..dir_offset + DIR_HEADER + rec0 + 4].try_into().unwrap()) as usize;
+        let key1 = dir_offset + DIR_HEADER + rec0 + 16;
+        assert_eq!(key0_len, key1_len, "equal-length P keys make the swap clean");
+        for i in 0..key0_len { bytes.swap(key0 + i, key1 + i); }
+        // Repair the directory block CRC so only the ordering rule can reject it.
+        let crc = checksum(&bytes[dir_offset + 8..dir_offset + blen]);
+        bytes[dir_offset + 4..dir_offset + 8].copy_from_slice(&crc.to_le_bytes());
+        std::fs::write(&path, &bytes).unwrap();
+        assert_eq!(Tile::open(&path).err().unwrap().kind(), ErrorKind::InvalidData);
+        std::fs::remove_file(path).unwrap();
     }
 }
