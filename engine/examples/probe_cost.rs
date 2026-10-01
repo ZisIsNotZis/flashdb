@@ -22,6 +22,12 @@
 use flashdb_engine::engine::{Engine, LayoutPolicy, Op, Outcome};
 use std::time::Instant;
 
+/// Telemetry is on by default; `FLASHDB_METRICS=0` disables it so the per-call
+/// overhead of the instrumented read paths can be compared in one configuration.
+fn metrics_enabled() -> bool {
+    !matches!(std::env::var("FLASHDB_METRICS").as_deref(), Ok("0") | Ok("off") | Ok("false"))
+}
+
 const SCAN_ITERS: usize = 3;
 const DOCS_PER_TILE: u64 = 5_000;
 const TILE_PROBES: usize = 200;
@@ -40,6 +46,7 @@ fn run(docs: u64, probes: usize, measure_scan: bool) -> std::io::Result<()> {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir)?;
     let mut e = engine_with_env_layout(&dir)?;
+    e.set_metrics_enabled(metrics_enabled());
 
     let payload = vec![b'x'; 200];
     let mut csn_line = 0u64;
@@ -95,6 +102,7 @@ fn run_multi_tile(tiles: usize, docs_per_tile: u64, probes: usize) -> std::io::R
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir)?;
     let mut e = engine_with_env_layout(&dir)?;
+    e.set_metrics_enabled(metrics_enabled());
     let payload = vec![b'x'; 200];
     let mut docs = 0u64;
     for tile in 0..tiles {
@@ -142,6 +150,7 @@ fn run_spread(tiles: usize, docs_per_tile: u64, probes: usize) -> std::io::Resul
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir)?;
     let mut e = engine_with_env_layout(&dir)?;
+    e.set_metrics_enabled(metrics_enabled());
     let payload = vec![b'x'; 200];
     let mut handles = 0u64;
     for tile in 0..tiles {

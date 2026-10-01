@@ -12,10 +12,12 @@
 //! [`Outcome::Conflict`] 由调用方重试。反向唯一（`reverse: "unique"`）的
 //! 强制执行本切片未实现，已记录在 ticket 04/03。
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use sha2::{Digest, Sha256};
 
@@ -23,6 +25,7 @@ use crate::bloom::BloomBuilder;
 use crate::keys::{self, check_name};
 use crate::manifest::{self, Checkpoint, Manifest, SegmentRef, TileRef};
 use crate::memtable::Memtable;
+use crate::metrics::{self, Metrics};
 use crate::tile::{Tile, TileCursor, TileWriter, DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE, MIN_PAGE_SIZE};
 use crate::wal::{self, Wal};
 
@@ -263,6 +266,11 @@ pub struct Engine {
     /// Provisional per-region layout the two tile write paths consult. Never
     /// persisted; the per-tile parameters live in each tile's superblock.
     layout: LayoutPolicy,
+    /// Per-pattern latency telemetry (slice 16). Observational only: never
+    /// persisted, never read on the correctness path. `RefCell` is required
+    /// because read paths take `&self`; it is the only interior mutability here.
+    /// Disabled via [`Engine::set_metrics_enabled`].
+    metrics: RefCell<Metrics>,
 }
 
 /// An open tile plus the plain filename under which the manifest references it
@@ -277,6 +285,22 @@ impl TileHandle {
 
     fn tile_ref(&self) -> TileRef {
         TileRef { name: self.name.clone(), cutoff: self.tile.cutoff(), digest: *self.tile.digest() }
+    }
+}
+
+/// RAII latency sample: records on drop, so every exit path (including `?`) is
+/// observed. A no-op with no clock read when telemetry is disabled.
+struct MetricsSample<'a> {
+    metrics: &'a RefCell<Metrics>,
+    id: usize,
+    started: Option<Instant>,
+}
+
+impl Drop for MetricsSample<'_> {
+    fn drop(&mut self) {
+        if let Some(t0) = self.started {
+            self.metrics.borrow_mut().record(self.id, t0.elapsed());
+        }
     }
 }
 
@@ -297,6 +321,7 @@ impl Engine {
             dedup: HashMap::new(),
             max_handle: 0,
             layout: LayoutPolicy::declared_default(),
+            metrics: RefCell::new(Metrics::new()),
         })
     }
 
@@ -444,7 +469,7 @@ impl Engine {
             t.tile.verify_projection(&newest_projection(&covered, lower, t.cutoff()), lower, t.cutoff())?;
             lower = t.cutoff();
         }
-        Ok(Engine { wal, mt, tiles, wal_path: wal_path.to_path_buf(), dir: parent_dir(wal_path), manifest: None, segment: None, segment_suffix_csn: csn, wal_detached: false, csn, dedup, max_handle, layout: LayoutPolicy::declared_default() })
+        Ok(Engine { wal, mt, tiles, wal_path: wal_path.to_path_buf(), dir: parent_dir(wal_path), manifest: None, segment: None, segment_suffix_csn: csn, wal_detached: false, csn, dedup, max_handle, layout: LayoutPolicy::declared_default(), metrics: RefCell::new(Metrics::new()) })
     }
 
     /// The CSN floor below which the active WAL file holds no records: the
@@ -1383,6 +1408,43 @@ impl Engine {
         self.max_handle.checked_add(1).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "handles exhausted"))
     }
 
+    /// Enable or disable per-pattern latency telemetry. Disabled is a true no-op
+    /// on every read path and on `commit_block`, so it is the baseline for
+    /// measuring the telemetry's overhead; nothing in the engine depends on
+    /// metrics either way.
+    pub fn set_metrics_enabled(&mut self, on: bool) {
+        self.metrics.borrow_mut().set_enabled(on);
+    }
+
+    /// Whether per-pattern latency telemetry is currently recording.
+    pub fn metrics_enabled(&self) -> bool {
+        self.metrics.borrow().enabled()
+    }
+
+    /// Plain, printable summary of the current observation window.
+    pub fn metrics_snapshot(&self) -> metrics::WindowSnapshot {
+        self.metrics.borrow().snapshot()
+    }
+
+    /// Roll the observation window: the finished window becomes the previous
+    /// window (at most one is retained) and every counter clears. Returns the
+    /// finished window. Off the request path; allocates only the snapshot.
+    pub fn metrics_rotate_window(&self) -> metrics::WindowSnapshot {
+        self.metrics.borrow_mut().rotate_window().clone()
+    }
+
+    /// The most recently rotated window, if any.
+    pub fn metrics_previous_window(&self) -> Option<metrics::WindowSnapshot> {
+        self.metrics.borrow().previous_window().cloned()
+    }
+
+    /// Start a latency sample only when telemetry is on, so the disabled path
+    /// pays no clock read.
+    #[inline]
+    fn timing(&self) -> Option<Instant> {
+        self.metrics.borrow().enabled().then(Instant::now)
+    }
+
     /// Whether a block was published (including after WAL recovery).
     pub fn committed_block_csn(&self, block_id: &[u8]) -> Option<u64> {
         self.dedup.get(block_id).copied()
@@ -1391,6 +1453,9 @@ impl Engine {
     /// 反向查找：当前指向 `target` 的全部 source 句柄（最新提交状态，无历史读）。
     /// tombstone（空 value）剔除。
     pub fn reverse_lookup(&self, entity: &[u8], field: &[u8], target: u64) -> io::Result<Vec<u64>> {
+        let t0 = self.timing();
+        let id = self.metrics.borrow_mut().resolve_reverse(entity, field);
+        let _sample = MetricsSample { metrics: &self.metrics, id, started: t0 };
         check_name(entity)?;
         check_name(field)?;
         let pfx = keys::reverse_prefix(entity, field, target)?;
@@ -1409,6 +1474,9 @@ impl Engine {
     /// 按已声明唯一字段解析句柄（最新提交状态，无历史读）。
     /// 如观察到多个活 owner，则索引已损坏，不能任意选一个。
     pub fn unique_lookup(&self, entity: &[u8], field: &[u8], value: &[u8]) -> io::Result<Option<u64>> {
+        let t0 = self.timing();
+        let id = self.metrics.borrow_mut().resolve_unique(entity, field);
+        let _sample = MetricsSample { metrics: &self.metrics, id, started: t0 };
         let pfx = keys::unique_prefix(entity, field, value)?;
         let mut seen = std::collections::HashSet::new();
         let mut owner = None;
@@ -1435,6 +1503,9 @@ impl Engine {
     /// 当前状态点读：只看最新提交版本（2026-09-29：不存在历史读），
     /// tombstone → 不存在。
     pub fn get(&self, entity: &[u8], handle: u64) -> io::Result<Option<Vec<u8>>> {
+        let t0 = self.timing();
+        let id = self.metrics.borrow_mut().resolve_primary(entity);
+        let _sample = MetricsSample { metrics: &self.metrics, id, started: t0 };
         check_name(entity)?;
         let pfx = keys::primary_prefix(entity, handle)?;
         let mut result = None;
@@ -1456,6 +1527,9 @@ impl Engine {
         entity: &[u8],
         mut visit: impl FnMut(u64, &[u8]) -> io::Result<()>,
     ) -> io::Result<()> {
+        let t0 = self.timing();
+        let id = self.metrics.borrow_mut().resolve_scan(entity);
+        let _sample = MetricsSample { metrics: &self.metrics, id, started: t0 };
         check_name(entity)?;
         let mut prefix = keys::primary_prefix(entity, 0)?;
         prefix.truncate(prefix.len() - 8);
@@ -1490,6 +1564,9 @@ impl Engine {
 
     /// 原子提交一个块。唯一约束冲突 → `Outcome::Conflict`（未写 WAL，调用方直接报业务错误）。
     pub fn commit_block(&mut self, block_id: &[u8], ops: &[Op]) -> io::Result<Outcome> {
+        let t0 = self.timing();
+        let id = self.metrics.borrow_mut().resolve_commit();
+        let _sample = MetricsSample { metrics: &self.metrics, id, started: t0 };
         self.ensure_attached()?;
         if block_id.is_empty() {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "empty block_id"));

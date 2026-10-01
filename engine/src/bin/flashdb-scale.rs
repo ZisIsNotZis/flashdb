@@ -143,6 +143,29 @@ fn emit(line: &str) {
     let _ = out.flush();
 }
 
+/// Telemetry is on by default in this measurement driver; `FLASHDB_METRICS=0`
+/// disables it, which is how the overhead of the instrumented call sites is
+/// measured by same-configuration comparison.
+fn metrics_enabled() -> bool {
+    !matches!(std::env::var("FLASHDB_METRICS").as_deref(), Ok("0") | Ok("off") | Ok("false"))
+}
+
+/// Print the finished observation window as one `metrics` line per pattern and
+/// roll it; `metrics_rotate_window` is the driver's one-window-per-line primitive.
+fn print_metrics(phase: &str, e: &Engine) {
+    let snap = e.metrics_rotate_window();
+    if snap.patterns.is_empty() {
+        emit(&format!("phase={phase} metrics=none"));
+        return;
+    }
+    for p in &snap.patterns {
+        emit(&format!(
+            "phase={phase} metrics pattern={} count={} p50_ns={:.0} p99_ns={:.0} mean_ns={:.0}",
+            p.pattern, p.count, p.p50_ns, p.p99_ns, p.mean_ns
+        ));
+    }
+}
+
 /// Current resident set in KiB from /proc/self/status; 0 when unavailable
 /// (non-Linux). Sampled, not a guaranteed peak — hence the separate peak
 /// tracking across sample points.
@@ -308,6 +331,7 @@ fn cmd_seed(
     let layout = layout_policy();
     e.set_layout_policy(layout.clone());
     let (layout_page_size, layout_bloom_bits) = layout.default_layout();
+    e.set_metrics_enabled(metrics_enabled());
     let docs_a = total_docs / 2;
     let docs_b = total_docs - docs_a;
     let total_blocks = total_docs.div_ceil(docs_per_commit);
@@ -436,6 +460,7 @@ fn cmd_seed(
     let wal_appended = wal_written + wal_bytes(dir)?;
     let tile_bytes = tile_bytes_publish + tile_bytes_compact;
     let write_amp = (wal_appended + tile_bytes) as f64 / payload_bytes.max(1) as f64;
+    print_metrics("seed", &e);
     emit(&format!(
         "phase=seed ok=true docs={total_docs} csn={} shape={} blocks={total_blocks} payload_bytes={payload_bytes} wal_bytes={} wal_written_bytes={wal_appended} tile_bytes_publish={tile_bytes_publish} tile_bytes_compact={tile_bytes_compact} tile_bytes_total={tile_bytes} compactions={compactions} write_amplification={write_amp:.3} docs_s_cumulative={:.0} rss_kb={} rss_peak_kb={rss_peak} elapsed_s={elapsed:.3} layout_page_size={layout_page_size} layout_bloom_bits={layout_bloom_bits}",
         e.csn(),
@@ -484,7 +509,8 @@ fn count_entity(e: &Engine, entity: &[u8]) -> io::Result<u64> {
 
 fn cmd_verify(dir: &Path, total_docs: u64) -> Result<(), Box<dyn std::error::Error>> {
     let meta = read_meta(dir, Some(total_docs))?;
-    let e = Engine::open_discover(dir)?;
+    let mut e = Engine::open_discover(dir)?;
+    e.set_metrics_enabled(metrics_enabled());
     let expected_csn = meta.total_docs.div_ceil(meta.docs_per_commit);
     if e.csn() != expected_csn {
         return Err(format!(
@@ -521,6 +547,25 @@ fn cmd_verify(dir: &Path, total_docs: u64) -> Result<(), Box<dyn std::error::Err
             probes += 1;
         }
     }
+    // Point reads of the same handles the unique probes resolved to, exercising
+    // the P pattern; a missing document is a real verify failure.
+    let mut gets = 0u64;
+    for k in 0..PROBES_PER_ENTITY {
+        if meta.docs_a > 0 {
+            let i = k * meta.docs_a / PROBES_PER_ENTITY;
+            if e.get(ENTITY_A, i + 1)?.is_none() {
+                return Err(format!("point get EntityA handle {} returned none", i + 1).into());
+            }
+            gets += 1;
+        }
+        if meta.docs_b > 0 {
+            let i = k * meta.docs_b / PROBES_PER_ENTITY;
+            if e.get(ENTITY_B, meta.docs_a + i + 1)?.is_none() {
+                return Err(format!("point get EntityB handle {} returned none", meta.docs_a + i + 1).into());
+            }
+            gets += 1;
+        }
+    }
     // Full scan passes are the prototype's strong path; three per entity must
     // each observe exactly the seeded live doc count.
     for pass in 1..=SCAN_PASSES {
@@ -533,8 +578,9 @@ fn cmd_verify(dir: &Path, total_docs: u64) -> Result<(), Box<dyn std::error::Err
             return Err(format!("scan pass {pass}: EntityB has {count_b} docs, expected {}", meta.docs_b).into());
         }
     }
+    print_metrics("verify", &e);
     emit(&format!(
-        "phase=verify ok=true csn={} docs_a={} docs_b={} probes={probes} scans={} rss_kb={}",
+        "phase=verify ok=true csn={} docs_a={} docs_b={} probes={probes} gets={gets} scans={} rss_kb={}",
         e.csn(),
         meta.docs_a,
         meta.docs_b,
@@ -551,7 +597,8 @@ fn cmd_scanbench(dir: &Path, passes: u64) -> Result<(), Box<dyn std::error::Erro
         return Err("passes must be >= 1".into());
     }
     let meta = read_meta(dir, None)?;
-    let e = Engine::open_discover(dir)?;
+    let mut e = Engine::open_discover(dir)?;
+    e.set_metrics_enabled(metrics_enabled());
     let started = Instant::now();
     let mut docs_total = 0u64;
     let mut bytes_total = 0u64;
@@ -573,6 +620,7 @@ fn cmd_scanbench(dir: &Path, passes: u64) -> Result<(), Box<dyn std::error::Erro
         ));
     }
     let elapsed = started.elapsed().as_secs_f64().max(1e-9);
+    print_metrics("scanbench", &e);
     emit(&format!(
         "phase=scanbench ok=true passes={passes} docs={docs_total} bytes={bytes_total} value_bytes={} elapsed_s={:.3} mib_s={:.2} rss_kb={}",
         meta.value_bytes,
