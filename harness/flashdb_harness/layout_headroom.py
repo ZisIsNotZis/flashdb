@@ -297,3 +297,34 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+# ---------------------------------------------------------------------------
+# KNOWN CALIBRATION GAP (2026-09-30, must be closed before any verdict is quoted)
+# ---------------------------------------------------------------------------
+# The model above prices the DEVICE regime: dependent reads as L_dep(page) from 0a-redo. Slice
+# 17 then measured the same layouts with a WARM page cache and found something the model does
+# not represent:
+#
+#   present-key probe, 1 tile : 19.3 us @4 KiB -> 88.9 us @64 KiB   (+69.6 us)
+#   present-key probe, 4 tiles: 24.12 us      -> 35.02 us
+#   sequential scan           : 1387 MiB/s    -> 2013 MiB/s  (probe_cost scan)
+#   scanbench (600k docs)     : 2231.7 MiB/s  -> 3154.9 MiB/s
+#
+# The probe penalty is ~1.16 us per extra KiB of block handled, i.e. these measurements are
+# CPU-bound (block read into a buffer, CRC-32C, entry parse), not device-bound. One constant
+# fitted from the probe delta cannot predict the scan numbers, because the scan path's
+# per-byte CPU cost is lower than the probe path's (scan predicts ~0.86 GB/s, measured
+# 1.4-2.0 GB/s). So:
+#
+#   - the device regime (cold cache) is what this model prices, and cold probes/scans at both
+#     page sizes have NOT been measured;
+#   - a warm/CPU term needs at least two path-specific constants (probe vs scan), and fitting
+#     both on the same points would make the check circular;
+#   - therefore review-01 F14's quantile-calibration error (the pre-registered 25% tolerance in
+#     doc 15) CANNOT be evaluated yet. Closing it needs a cold-cache measurement: a working set
+#     larger than RAM under a cgroup with the cache dropped, probes and scans at 4 KiB and
+#     64 KiB, from which the device terms and the CPU terms can be separated.
+#
+# The headroom conclusion (the safe knob set cannot reach 15%) is NOT sensitive to this gap: it
+# depends on the *ranking* of the layouts, and the warm measurements make larger pages look
+# worse for probes, not better - i.e. they strengthen it.

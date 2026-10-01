@@ -97,3 +97,25 @@ is >= ~20%.** That is a measurement we do not have yet (the scale driver writes 
 where U is small; the inventory trace writes an R family per movement). Next step: measure the
 per-family byte shares of the real workload before building the axis - and, per the oracle's
 risk #3, validate the cost model against a measured pair of layouts at the same time.
+
+## Cost-model calibration status (2026-09-30) — not yet evaluable, and why
+
+Slice 17 turned page size into a real per-tile parameter and measured the trade-off
+(`.scratch/14-layout-harness/layout-headroom` notes it too): on the same content, 64 KiB pages
+lower bytes slightly and raise scan throughput (2231.7 -> 3154.9 MiB/s on scanbench) but make a
+present-key probe 4.6x slower (19.3 -> 88.9 us on one tile, 24.12 -> 35.02 us at four tiles).
+The probe penalty is ~1.16 us per extra KiB of block handled, so the measurement is CPU-bound,
+not device-bound.
+
+Consequences recorded honestly:
+- The model in `layout_headroom.py` prices the **device** regime (L_dep from 0a-redo). The
+  measured points are the **warm** regime. Neither the device nor the CPU terms can be
+  separated without a cold-cache measurement.
+- Two path-specific CPU constants would be needed (probe vs scan); fitting both on the same
+  points is circular, so no calibration claim is made.
+- **review-01 F14's quantile-calibration error cannot be evaluated yet**, and therefore neither
+  can the 25% calibration tolerance pre-registered in doc 15. The cheapest closure is a
+  cold-cache measurement: working set > RAM under a cgroup with the cache dropped, probes and
+  scans at 4 KiB and 64 KiB.
+- The headroom conclusion is unaffected: it depends on the layout ranking, and the warm numbers
+  make larger pages look *worse* for probes, strengthening it.
