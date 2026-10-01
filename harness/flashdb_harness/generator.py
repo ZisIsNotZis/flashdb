@@ -18,6 +18,19 @@ from typing import Iterator
 
 MASK = (1 << 64) - 1
 
+# The single spelling of each dimension key. `seed.py` imports these so the
+# seeding trace and the flow's Zipfian lookups can never disagree on the names.
+def email_name(i: int) -> str:
+    return f"c{i:06d}@example.com"
+
+
+def sku_name(rank: int) -> str:
+    """Name of Zipf rank `rank` (1-based); rank 1 is the hottest sku."""
+    return f"S{rank:06d}"
+
+
+def loc_name(j: int) -> str:
+    return f"L{j:03d}"
 
 class Rng:
     """SplitMix64：自实现，字节级确定，跨平台跨版本稳定。"""
@@ -83,9 +96,9 @@ class Generator:
         self.n_requests = n_requests
         self.n_customers = n_customers
         self.n_loc = n_loc
-        self.emails = [f"c{i:06d}@example.com" for i in range(n_customers)]
+        self.emails = [email_name(i) for i in range(n_customers)]
         self.customer_no = [f"C{i:06d}" for i in range(n_customers)]
-        self.locs = [f"L{i:03d}" for i in range(n_loc)]
+        self.locs = [loc_name(i) for i in range(n_loc)]
         self.req_no = 0
         self.order_no = 0
 
@@ -94,7 +107,7 @@ class Generator:
         return f"r-{self.req_no:08d}"
 
     def _sku(self) -> str:
-        return f"S{self.zipf.draw():06d}"
+        return sku_name(self.zipf.draw())
 
     def order_flow(self) -> dict:
         self.order_no += 1

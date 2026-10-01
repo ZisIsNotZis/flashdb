@@ -1,4 +1,5 @@
-//! Scale benchmark driver for the flashdb v0 engine (seed / verify / scanbench).
+//! Scale benchmark driver for the flashdb v0 engine
+//! (seed / seed-inventory / verify / scanbench).
 //!
 //! All progress is emitted as machine-readable `key=value` lines on stdout so a
 //! supervisor can monitor a run. Failures print `phase=<cmd> ok=false
@@ -50,7 +51,7 @@
 
 use std::collections::HashMap;
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, BufRead, BufReader, Write};
 use std::path::Path;
 use std::time::Instant;
 
@@ -225,6 +226,7 @@ fn parse_num(text: &str, name: &str) -> Result<u64, Box<dyn std::error::Error>> 
 }
 
 const USAGE: &str = "usage: flashdb-scale seed <dir> <total_docs> <docs_per_commit> <value_bytes>\n\
+                     usage: flashdb-scale seed-inventory <dir> <seed-trace.jsonl>\n\
                      usage: flashdb-scale verify <dir> <total_docs>\n\
                      usage: flashdb-scale scanbench <dir> <passes>";
 
@@ -236,6 +238,9 @@ fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             parse_num(&args[4], "docs_per_commit")?,
             parse_num(&args[5], "value_bytes")?,
         ),
+        Some("seed-inventory") if args.len() == 4 => {
+            cmd_seed_inventory(Path::new(&args[2]), Path::new(&args[3]))
+        }
         Some("verify") if args.len() == 4 => {
             cmd_verify(Path::new(&args[2]), parse_num(&args[3], "total_docs")?)
         }
@@ -468,6 +473,162 @@ fn cmd_seed(
         wal_bytes(dir)?,
         total_docs as f64 / elapsed.max(1e-9),
         rss_kb(),
+    ));
+    Ok(())
+}
+
+// ---------- seed-inventory ----------
+// Apply a harness-produced dimension seeding trace (see
+// `harness/flashdb_harness/seed.py`) as raw engine P/U ops. The request adapter
+// has no create shape, so this is the established bootstrap path (the engine
+// tests and `seed` both use `Op::PutDoc` / `Op::PutUnique`).
+
+/// One declared unique per entity, mirroring `engine/src/request.rs`'s catalog.
+fn seed_unique_field(entity: &str) -> Option<&'static str> {
+    match entity {
+        "Customer" => Some("email"),
+        "Stock" => Some("sku_loc"),
+        _ => None,
+    }
+}
+
+#[derive(Deserialize)]
+struct SeedUnique {
+    field: String,
+    value: serde_json::Value,
+}
+
+#[derive(Deserialize)]
+struct SeedDoc {
+    entity: String,
+    doc: serde_json::Value,
+    unique: SeedUnique,
+}
+
+#[derive(Deserialize)]
+struct SeedBlock {
+    block: String,
+    docs: Vec<SeedDoc>,
+}
+
+/// Unique-value bytes for `entity`. Must equal the bytes the adapter's lookups
+/// probe: Customer.email is the raw UTF-8 email, Stock.sku_loc is
+/// `serde_json::to_vec(&[sku, loc])` (`request.rs::stock_key`). Also checks that
+/// the document carries the same fields, so P and U can never disagree.
+fn seed_unique_value(
+    entity: &str,
+    unique: &SeedUnique,
+    doc: &serde_json::Value,
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let field = seed_unique_field(entity).expect("caller checked the entity");
+    if unique.field != field {
+        return Err(format!(
+            "{entity} declares unique field {field:?}, trace gave {:?}",
+            unique.field
+        )
+        .into());
+    }
+    let object = doc
+        .as_object()
+        .ok_or_else(|| format!("{entity} doc must be a JSON object"))?;
+    match (entity, &unique.value) {
+        ("Customer", serde_json::Value::String(email)) => {
+            if object.get("email").and_then(serde_json::Value::as_str) != Some(email.as_str()) {
+                return Err("Customer doc email disagrees with its unique value".into());
+            }
+            Ok(email.as_bytes().to_vec())
+        }
+        ("Stock", serde_json::Value::Array(pair)) if pair.len() == 2 => {
+            let sku = pair[0].as_str();
+            let loc = pair[1].as_str();
+            if sku.is_none() || loc.is_none() {
+                return Err("Stock sku_loc entries must be strings".into());
+            }
+            if object.get("sku").and_then(serde_json::Value::as_str) != sku
+                || object.get("loc").and_then(serde_json::Value::as_str) != loc
+            {
+                return Err("Stock doc sku/loc disagree with the unique value".into());
+            }
+            if object.get("on_hand").and_then(serde_json::Value::as_i64).is_none() {
+                return Err("Stock doc on_hand must be an i64".into());
+            }
+            Ok(serde_json::to_vec(&unique.value)?)
+        }
+        ("Customer", _) => Err("Customer unique value must be the email string".into()),
+        ("Stock", _) => Err("Stock unique value must be a [sku, loc] array".into()),
+        _ => unreachable!("seed_unique_field rejects unknown entities"),
+    }
+}
+
+fn cmd_seed_inventory(dir: &Path, trace: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let wal = dir.join("data.wal");
+    let mut e = if wal.exists() {
+        Engine::open(&wal)?
+    } else {
+        fs::create_dir_all(dir)?;
+        Engine::create(&wal)?
+    };
+    e.set_metrics_enabled(metrics_enabled());
+    let file = fs::File::open(trace)
+        .map_err(|e| format!("seed trace {} unreadable ({e})", trace.display()))?;
+    let started = Instant::now();
+    let mut blocks = 0u64;
+    let mut docs = 0u64;
+    let mut customers = 0u64;
+    let mut stocks = 0u64;
+    for (index, line) in BufReader::new(file).lines().enumerate() {
+        let line = line.map_err(|e| format!("seed trace line {}: {e}", index + 1))?;
+        let parsed: SeedBlock = serde_json::from_str(&line)
+            .map_err(|e| format!("seed trace line {}: {e}", index + 1))?;
+        if parsed.block.is_empty() {
+            return Err(format!("seed trace line {}: empty block id", index + 1).into());
+        }
+        let mut ops = Vec::with_capacity(parsed.docs.len() * 2);
+        // `next_handle()` only advances when a block commits, so within one block
+        // the handles must be reserved with a local counter (as `cmd_seed` does).
+        let mut next_handle = e.next_handle()?;
+        for d in &parsed.docs {
+            if seed_unique_field(&d.entity).is_none() {
+                return Err(format!(
+                    "seed trace line {}: unsupported entity {:?}",
+                    index + 1,
+                    d.entity
+                )
+                .into());
+            }
+            let value = seed_unique_value(&d.entity, &d.unique, &d.doc)
+                .map_err(|e| format!("seed trace line {}: {e}", index + 1))?;
+            let handle = next_handle;
+            next_handle += 1;
+            let doc = serde_json::to_vec(&d.doc)?;
+            ops.push(Op::PutDoc { entity: d.entity.clone().into_bytes(), handle, doc });
+            ops.push(Op::PutUnique {
+                entity: d.entity.clone().into_bytes(),
+                field: d.unique.field.clone().into_bytes(),
+                value,
+                handle,
+            });
+            match d.entity.as_str() {
+                "Customer" => customers += 1,
+                "Stock" => stocks += 1,
+                _ => unreachable!(),
+            }
+            docs += 1;
+        }
+        match e.commit_block(parsed.block.as_bytes(), &ops)? {
+            Outcome::Committed { .. } | Outcome::AlreadyCommitted { .. } => {}
+            other => return Err(format!("block {blocks}: unexpected outcome {other:?}").into()),
+        }
+        if e.next_handle()? != next_handle {
+            return Err(format!("block {blocks}: handle watermark drifted").into());
+        }
+        blocks += 1;
+    }
+    emit(&format!(
+        "phase=seed-inventory ok=true blocks={blocks} docs={docs} customers={customers} stocks={stocks} csn={} dir={} elapsed_s={:.3}",
+        e.csn(),
+        dir.display(),
+        started.elapsed().as_secs_f64(),
     ));
     Ok(())
 }

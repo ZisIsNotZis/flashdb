@@ -141,3 +141,43 @@ Decision taken instead: a `seed-inventory` applier in the scale driver commits t
 trace as raw P/U/R ops, with the requirement that it derives keys by exactly the rules the
 adapter's lookups probe (same unique-prefix encoding, same x-ref reverse entries), proven by the
 flow's commit rate rather than asserted.
+
+## Slice 18 result: the workload runs, and the family-partitioning criterion is numerically met
+
+`harness/flashdb_harness/inventory_workload.py` now runs the first real inventory workload end to
+end - a seeding trace (5000 customers, 80000 stock rows) applied by `flashdb-scale seed-inventory`
+as raw P/U ops, then the Zipfian flow replayed by `flashdb-replay`:
+
+| | |
+|---|---|
+| flow requests | 60,000 (order_flow 41,958 + reads 18,042) |
+| block outcomes | 101,958 `ok`, **commit rate 1.0000**, no conflicts, no empty lookups |
+| seeding | 85 blocks / 85,000 docs in 1.1 s |
+
+This closes a real 0b prerequisite: before this slice the frozen corpora were acceptance
+fixtures whose lookups hit nothing, so **no workload in the repository produced write traffic**.
+
+**Family byte shares measured** (`family_bytes`, both written and live):
+
+| family | written entries | written bytes | written share | live share |
+|---|---|---|---|---|
+| P primary | 210,874 | 19,226,151 | **58.5%** | 54.4% |
+| U unique | 168,916 | 10,104,086 | **30.8%** | 33.8% |
+| R reverse | 83,916 | 3,524,472 | **10.7%** | 11.8% |
+
+P written > P live confirms the update pattern (stock patches supersede P entries); U and R are
+write-once per (order, movement, stock row).
+
+**Decision input, stated precisely.** My criterion was "the slow family must be >= ~20% of written
+bytes". Numerically it is met on the U family (30.8%) and on U+R together (41.5%), so family
+partitioning is worth *trying*. But the criterion's mechanism deserves a caveat rather than a
+verdict: the benefit does not come from the share alone, it comes from **differential tier rates** -
+a family that grows slowly ends up in fewer, larger tiers and is therefore rewritten less often.
+In this workload U and R receive new entries on every request (new order numbers, movement
+numbers, movement reverses), so their byte rate is 41.5% of P's-plus-theirs; they are not "cold".
+The only way to know whether that produces a >=15% total win is to implement the axis and measure
+the resulting write_amp, which is the next engineering step if the author wants it.
+
+Corollary: the *previous* headroom conclusion is unaffected (page size + bloom bits top out at
+~3%), so family partitioning remains the only correctness-preserving axis with a plausible path
+to the provisional threshold.
