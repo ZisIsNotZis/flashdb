@@ -66,3 +66,49 @@ def test_headroom_ranking_is_deterministic_and_base_scores_zero_gain():
     assert base == [pytest.approx(0.0)]
     # documented finding: the safe knob set cannot reach the 15% threshold
     assert max(g for _, _, g in rows) < 15.0
+
+
+# --- family partitioning: the write-side axis, simulated against the shipped policy ---------
+
+from flashdb_harness import partition_sim as psim  # noqa: E402
+
+
+def test_partition_simulation_reproduces_the_measured_write_amp():
+    """The simulation is only usable if it matches a real measurement.
+
+    Validated against slice 12d's measured write_amp of 3.920 at 5 M docs x 1 KiB with the
+    scale driver's composition; the acceptance is the pre-registered 25% calibration gate.
+    """
+    result = psim.simulate(psim.baseline_scale_driver())
+    assert result["write_amp"] == pytest.approx(3.920, rel=0.25)
+
+
+def test_family_partitioning_loses_at_the_current_tile_cap():
+    """The measured decision: partitioning is counterproductive with a 12-tile cap.
+
+    Partitioning multiplies the tile count against a fixed manifest cap, so each family
+    reaches the cap sooner and compacts its own smaller tiers more often. This is the finding
+    that closed the axis, so it is pinned as a test rather than left to prose.
+    """
+    saved = psim.TILE_CAP
+    try:
+        psim.TILE_CAP = 12
+        comp = psim.inventory_composition()
+        colocated = psim.simulate(psim.partitioned(comp))["write_amp"]
+        partitioned = psim.simulate_partitioned(comp)["write_amp"]
+    finally:
+        psim.TILE_CAP = saved
+    assert partitioned > colocated, "at cap 12 partitioning must be worse, per the measurement"
+
+
+def test_a_larger_tile_cap_reduces_write_amplification_substantially():
+    """The other half of the finding: cap headroom is the real writing lever."""
+    saved = psim.TILE_CAP
+    try:
+        amps = {}
+        for cap in (12, 96):
+            psim.TILE_CAP = cap
+            amps[cap] = psim.simulate(psim.inventory_composition())["write_amp"]
+    finally:
+        psim.TILE_CAP = saved
+    assert amps[96] < amps[12] * 0.6, f"cap headroom should cut writes by >40%: {amps}"
