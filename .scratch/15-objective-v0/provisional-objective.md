@@ -41,12 +41,17 @@ The reviewed sigmoid had a contradiction (`review-01` F13): it claimed a small p
 below the SLO while `σ(−a/s) ≈ 0.5` at `a = 0`, and near-zero only for `a/s ≳ 5`. Provisional fix,
 stated as a formula rather than prose:
 
-    penalty(x) = ε * (x / SLO)                                  for x <  SLO
-    penalty(x) = (σ((x - SLO) / s) - σ(0)) / (1 - σ(0))         for x >= SLO
+    penalty(x) = ε * (x / SLO)                                       for x <  SLO
+    penalty(x) = ε + (1 - ε) * (σ((x - SLO)/s) - σ(0)) / (1 - σ(0))  for x >= SLO
 
-with `ε = 0.05` (the "still buys headroom" gradient, now exactly bounded and non-zero at the SLO),
-`s = SLO / 2`, and the upper branch rescaled so `penalty(SLO) = 0` and `penalty(∞) → 1`. This
-keeps the intended severity ordering **and** has no ties at the SLO. The tail saturation problem
+with `ε = 0.05`, `s = SLO / 2`. The value at the SLO is exactly `ε` and the function is
+**continuous and strictly increasing everywhere**.
+
+*Corrected while implementing the model:* the first version put 0 at the SLO while the branch
+below it evaluated to `ε·(x/SLO)` ≈ 0.045 just underneath, i.e. a layout at 0.9·SLO would have
+scored *worse* than one exactly at the SLO. The model's own unit test caught it (this is the
+second time a formula-level contradiction in this objective was found by writing the arithmetic
+down; the first was `review-01` F13). The tail saturation problem
 (F6/F7) is acknowledged, not solved: a severity-sensitive alerting statistic is a separate need
 from a scoring penalty, and conflating them was the original error.
 

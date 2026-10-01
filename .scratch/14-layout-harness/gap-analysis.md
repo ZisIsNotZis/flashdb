@@ -56,3 +56,44 @@ best over a small published candidate set).
   exists and is exercised before any learned value is allowed.
 - Further efficiency work with measured payoffs (compaction tier capacity, bounded open,
   point-read probes) — none of it moves the 0b critical path.
+
+## Headroom measurement (2026-09-30): the safe layout space cannot win
+
+`harness/flashdb_harness/layout_headroom.py` scores the knobs that are safe to implement today
+(per-tile page size and bloom bits/key) with the measured constants and the provisional
+objective, over a documented inventory-shaped pattern mix at 12 probed tiles. Base = today
+(4 KiB blocks, 10 bloom bits) - note the engine's real block size is 4 KiB, which is also the
+**probe-optimal** page size (96.3 us vs 117.4 us at 16 KiB and 185.8 us at 64 KiB), so larger
+pages only help scans, which are a minority of the mix.
+
+| candidate | vs base |
+|---|---|
+| 4 KiB + 14 bloom bits | **+2.98%** (best) |
+| 4 KiB + 10 bits (base) | 0.00% |
+| 16 KiB + 14 bits | -14.8% |
+| 64 KiB + 14 bits | -72.3% |
+| 4 KiB, no bloom | -3150% |
+
+Sweeping the unmeasured scan-rate gain of large pages (1.0-1.5x per doubling) does not change the
+ranking. **So the maximum win available from the safe knob set is ~3%, far below the provisional
+15% threshold: 0b cannot be run on this space, and no learner should be written for it.**
+
+The space therefore needs an axis that can move more than 15%. The candidate that preserves
+correctness (per the orchestrator correction in the layout proposal: nothing may be *omitted*,
+because the v0 doc payload is opaque to the engine) is **family partitioning** - keeping the
+entries of different key families in different tiles so a slowly-changing family is not
+rewritten when a hot family compacts. Its headroom is on the write side, and the same model
+gives a usable criterion:
+
+| slow-family byte share | write_amp | total gain vs base (at 0.02 us/byte endurance weight) |
+|---|---|---|
+| 5% | 3.92 -> 3.72 | +4.5% |
+| 10% | 3.92 -> 3.53 | +8.3% |
+| **20%** | 3.92 -> 3.14 | **+15.9%** |
+| 40% | 3.92 -> 2.35 | +31.1% |
+
+**Decision rule: implement family partitioning only if a real workload's slow-family byte share
+is >= ~20%.** That is a measurement we do not have yet (the scale driver writes only P and U,
+where U is small; the inventory trace writes an R family per movement). Next step: measure the
+per-family byte shares of the real workload before building the axis - and, per the oracle's
+risk #3, validate the cost model against a measured pair of layouts at the same time.
