@@ -23,19 +23,124 @@ use crate::bloom::BloomBuilder;
 use crate::keys::{self, check_name};
 use crate::manifest::{self, Checkpoint, Manifest, SegmentRef, TileRef};
 use crate::memtable::Memtable;
-use crate::tile::{Tile, TileCursor, TileWriter};
+use crate::tile::{Tile, TileCursor, TileWriter, DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE, MIN_PAGE_SIZE};
 use crate::wal::{self, Wal};
 
 const MAGIC: &[u8; 4] = b"FDB1";
 
-/// Bits per *expected* entry for a tile's unique-prefix bloom. The tile stores
-/// this value in its superblock and bloom header; 10 implies 7 probes. The
-/// effective bits per *inserted* prefix is higher because the filter is sized
-/// from an upper bound on the tile's entry count (which also counts P/R keys)
-/// while only U-key prefixes are inserted, so the filter is over-provisioned and
-/// its false-positive rate is below the nominal one. The rate is measured in
-/// `bloom.rs`, never asserted.
+/// Bits per *expected* entry for a tile's unique-prefix bloom under
+/// [`LayoutPolicy::declared_default`]. The tile stores this value in its
+/// superblock and bloom header; 10 implies 7 probes. The effective bits per
+/// *inserted* prefix is higher because the filter is sized from an upper bound
+/// on the tile's entry count (which also counts P/R keys) while only U-key
+/// prefixes are inserted, so the filter is over-provisioned and its
+/// false-positive rate is below the nominal one. The rate is measured in
+/// `bloom.rs`, never asserted. A policy of 0 disables the bloom entirely (see
+/// [`crate::tile::Tile::might_contain_unique_prefix`]).
 const UNIQUE_BLOOM_BITS_PER_KEY: u32 = 10;
+
+/// Region name under which a v0 tile is written. A v0 tile is a CSN-window
+/// projection of the whole keyspace (every key family interleaved), so it spans
+/// every prefix-region; the engine therefore has exactly one write region today.
+/// Family partitioning (per-region tiles) is a later slice and will supply finer
+/// region keys.
+const TILE_LAYOUT_REGION: &str = "all";
+
+/// Provisional per-prefix-region layout declaration (slice 17).
+///
+/// A policy maps a prefix-region name to a tile's two already-safe physical
+/// parameters - page size and bloom bits per key - and returns a default for any
+/// region it does not name. It is deliberately **not persisted**: there is no
+/// policy table and no manifest field, and the reader never consults it. The
+/// only durable declaration is what each tile's superblock already records
+/// (`page_size`, `bits_per_key`), which is exactly what makes this safe to land
+/// now: a policy change affects only *new* tiles, and a reader honors the stored
+/// per-tile value, so a stale or bad layout is slow, never wrong (I2).
+///
+/// [`LayoutPolicy::declared_default`] reproduces today's behaviour exactly
+/// (4096-byte pages, 10 bloom bits/key everywhere). A durable declaration
+/// surface mapping regions to layouts - and the family partitioning that needs
+/// it - is a later slice.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LayoutPolicy {
+    default: (u32, u8),
+    regions: Vec<(String, u32, u8)>,
+}
+
+impl Default for LayoutPolicy {
+    fn default() -> Self { Self::declared_default() }
+}
+
+impl LayoutPolicy {
+    /// Today's values exactly: 4096-byte pages and 10 bloom bits/key for every
+    /// region.
+    pub fn declared_default() -> Self {
+        LayoutPolicy { default: (DEFAULT_PAGE_SIZE, UNIQUE_BLOOM_BITS_PER_KEY as u8), regions: Vec::new() }
+    }
+
+    /// A policy with a different default and no per-region overrides. `page_size`
+    /// must be in `4096..=65536`; the tile writer rejects anything else at build
+    /// time rather than writing a tile it cannot read back.
+    pub fn with_default(page_size: u32, bloom_bits_per_key: u8) -> Self {
+        LayoutPolicy { default: (page_size, bloom_bits_per_key), regions: Vec::new() }
+    }
+
+    /// The `(page_size, bloom_bits_per_key)` a tile in `region` is written with.
+    /// An unknown region returns the policy default, never an error: a missing
+    /// declaration is today's behavior (I2 - a bad layout is slow, never wrong).
+    pub fn for_region(&self, region: &str) -> (u32, u8) {
+        self.regions
+            .iter()
+            .find(|(name, _, _)| name == region)
+            .map(|(_, page_size, bits)| (*page_size, *bits))
+            .unwrap_or(self.default)
+    }
+
+    /// The policy-wide default, returned for every region without an override.
+    pub fn default_layout(&self) -> (u32, u8) { self.default }
+
+    /// Override one named prefix-region; returns the previous value when the
+    /// region was already declared. `page_size` is validated by the tile writer,
+    /// not here, so a bad override surfaces as a failed tile build (`InvalidData`).
+    pub fn set_region(&mut self, region: &str, page_size: u32, bloom_bits_per_key: u8) -> Option<(u32, u8)> {
+        if let Some(entry) = self.regions.iter_mut().find(|(name, _, _)| name == region) {
+            let previous = (entry.1, entry.2);
+            entry.1 = page_size;
+            entry.2 = bloom_bits_per_key;
+            return Some(previous);
+        }
+        self.regions.push((region.to_string(), page_size, bloom_bits_per_key));
+        None
+    }
+
+    /// Provisional benchmark override: read `FLASHDB_PAGE_SIZE` and
+    /// `FLASHDB_BLOOM_BITS`, falling back to [`LayoutPolicy::declared_default`]
+    /// for an unset or invalid value. Measurement scaffolding only: nothing here
+    /// is persisted and the reader never consults it. `FLASHDB_BLOOM_BITS=0`
+    /// disables the bloom; values above 64 are clamped by the bloom builder.
+    pub fn from_env() -> Self {
+        let mut policy = Self::declared_default();
+        if let Ok(raw) = std::env::var("FLASHDB_PAGE_SIZE") {
+            match raw.parse::<u32>() {
+                Ok(v) if (MIN_PAGE_SIZE..=MAX_PAGE_SIZE).contains(&v) => policy.default.0 = v,
+                _ => eprintln!(
+                    "FLASHDB_PAGE_SIZE={raw:?} is not in {MIN_PAGE_SIZE}..={MAX_PAGE_SIZE}; using {}",
+                    policy.default.0
+                ),
+            }
+        }
+        if let Ok(raw) = std::env::var("FLASHDB_BLOOM_BITS") {
+            match raw.parse::<u8>() {
+                Ok(v) => policy.default.1 = v,
+                Err(_) => eprintln!(
+                    "FLASHDB_BLOOM_BITS={raw:?} is not a small integer; using {}",
+                    policy.default.1
+                ),
+            }
+        }
+        policy
+    }
+}
 
 /// The largest active-tile list the manifest can hold. The real limit is the
 /// 4092-byte manifest payload ([`crate::manifest::MAX_TILES`]), not a policy
@@ -155,6 +260,9 @@ pub struct Engine {
     csn: u64,
     dedup: HashMap<Vec<u8>, u64>,
     max_handle: u64,
+    /// Provisional per-region layout the two tile write paths consult. Never
+    /// persisted; the per-tile parameters live in each tile's superblock.
+    layout: LayoutPolicy,
 }
 
 /// An open tile plus the plain filename under which the manifest references it
@@ -188,6 +296,7 @@ impl Engine {
             csn: 0,
             dedup: HashMap::new(),
             max_handle: 0,
+            layout: LayoutPolicy::declared_default(),
         })
     }
 
@@ -335,7 +444,7 @@ impl Engine {
             t.tile.verify_projection(&newest_projection(&covered, lower, t.cutoff()), lower, t.cutoff())?;
             lower = t.cutoff();
         }
-        Ok(Engine { wal, mt, tiles, wal_path: wal_path.to_path_buf(), dir: parent_dir(wal_path), manifest: None, segment: None, segment_suffix_csn: csn, wal_detached: false, csn, dedup, max_handle })
+        Ok(Engine { wal, mt, tiles, wal_path: wal_path.to_path_buf(), dir: parent_dir(wal_path), manifest: None, segment: None, segment_suffix_csn: csn, wal_detached: false, csn, dedup, max_handle, layout: LayoutPolicy::declared_default() })
     }
 
     /// The CSN floor below which the active WAL file holds no records: the
@@ -450,13 +559,17 @@ impl Engine {
         // exactly the versions above `lower`. Keep the newest version per
         // logical key (first of each group: keys sort CSN-descending) within
         // `(lower, cutoff]`, streamed straight into the encoder.
-        let mut writer = TileWriter::new(tile_path, cutoff, &digest)?;
+        let (page_size, bloom_bits_per_key) = self.layout.for_region(TILE_LAYOUT_REGION);
+        let mut writer = TileWriter::new(tile_path, cutoff, &digest, page_size)?;
         // Bloom over exactly the unique prefixes this pass stores, sized from a
         // known upper bound (the serving memtable's entry count) so the publish
         // pass stays single and streaming: no second read to count keys and no
         // entry retained. Only U keys are inserted, so the filter is
-        // over-provisioned relative to its stored `bits_per_key`.
-        let mut bloom = BloomBuilder::new(self.mt.len() as u64, UNIQUE_BLOOM_BITS_PER_KEY);
+        // over-provisioned relative to its stored `bits_per_key`. A policy of 0
+        // bits means "no bloom": the tile carries no bloom section and
+        // `might_contain_unique_prefix` answers `true` for every prefix.
+        let mut bloom = (bloom_bits_per_key > 0)
+            .then(|| BloomBuilder::new(self.mt.len() as u64, bloom_bits_per_key as u32));
         let mut last_logical: Option<Vec<u8>> = None;
         for (key, value) in self.mt.entries() {
             let Some(csn) = keys::key_csn(key) else { continue };
@@ -465,9 +578,11 @@ impl Engine {
             if last_logical.as_deref() == Some(logical) { continue; }
             last_logical = Some(logical.to_vec());
             writer.push(key, value)?;
-            if let Some(prefix) = unique_prefix_of(key) { bloom.insert(prefix); }
+            if let Some(bloom) = bloom.as_mut() {
+                if let Some(prefix) = unique_prefix_of(key) { bloom.insert(prefix); }
+            }
         }
-        writer.set_bloom(bloom.finish())?;
+        if let Some(bloom) = bloom { writer.set_bloom(bloom.finish())?; }
         let tile = writer.finish()?;
         // Source (b): the WAL-derived expectation map. Independent of the
         // memtable the tile was written from, so a divergence between the two
@@ -980,14 +1095,18 @@ impl Engine {
         let expected: u64 = tiles
             .iter()
             .fold(wal_entries.len() as u64, |acc, t| acc.saturating_add(t.tile.count()));
-        let mut bloom = BloomBuilder::new(expected, UNIQUE_BLOOM_BITS_PER_KEY);
-        let mut writer = TileWriter::new(tile_path, cutoff, &digest)?;
+        let (page_size, bloom_bits_per_key) = self.layout.for_region(TILE_LAYOUT_REGION);
+        let mut bloom = (bloom_bits_per_key > 0)
+            .then(|| BloomBuilder::new(expected, bloom_bits_per_key as u32));
+        let mut writer = TileWriter::new(tile_path, cutoff, &digest, page_size)?;
         self.stream_merged_reduction(tiles, lower, cutoff, &wal_entries, |key, value| {
             writer.push(key, value)?;
-            if let Some(prefix) = unique_prefix_of(key) { bloom.insert(prefix); }
+            if let Some(bloom) = bloom.as_mut() {
+                if let Some(prefix) = unique_prefix_of(key) { bloom.insert(prefix); }
+            }
             Ok(())
         })?;
-        writer.set_bloom(bloom.finish())?;
+        if let Some(bloom) = bloom { writer.set_bloom(bloom.finish())?; }
         let tile = writer.finish()?;
         // Fail closed: re-run the identical merge and compare it 1:1, streaming,
         // against the written tile. That catches encoder/streaming defects but is
@@ -1184,6 +1303,16 @@ impl Engine {
     /// Prototype inspection hook: proves tile-covered versions are no longer served
     /// from the memtable (not a bound on WAL recovery or total RAM).
     pub fn serving_memtable_entries(&self) -> usize { self.mt.len() }
+
+    /// Install the provisional layout policy the two tile write paths (publish and
+    /// compaction) consult. The default is [`LayoutPolicy::declared_default`].
+    /// Because the policy is not persisted, setting it affects only tiles written
+    /// after this call; every existing tile keeps the parameters in its own
+    /// superblock and is read on those terms.
+    pub fn set_layout_policy(&mut self, policy: LayoutPolicy) { self.layout = policy; }
+
+    /// The engine's current layout policy (inspection/measurement hook).
+    pub fn layout_policy(&self) -> &LayoutPolicy { &self.layout }
 
     // K-way merge of the serving memtable and every published tile, all
     // traversed in global key order. Keys encode CSN descending, so each logical
@@ -2328,6 +2457,73 @@ mod tests {
         let e = Engine::open_discover(&dir).unwrap();
         no_false_negatives(&e.tiles[0].tile, &[b"a1", b"a3", b"a5", b"b1", b"b3"]);
         assert!(rejects_absent(&e.tiles[0].tile, &absent), "the persisted bloom survives reopen");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn superblock_u32(bytes: &[u8], at: usize) -> u32 {
+        u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap())
+    }
+
+    /// The provisional layout policy: an unknown region gets the declared default,
+    /// a named region gets its override, and `declared_default` is today's pair.
+    #[test]
+    fn layout_policy_defaults_and_region_lookup() {
+        let policy = LayoutPolicy::declared_default();
+        assert_eq!(policy.default_layout(), (4096, 10));
+        assert_eq!(policy.for_region("anything"), (4096, 10), "an unknown region is today's behaviour");
+
+        let mut policy = LayoutPolicy::with_default(16384, 0);
+        assert_eq!(policy.for_region("still-unknown"), (16384, 0));
+        assert_eq!(policy.set_region("U|Order|no", 65536, 14), None);
+        assert_eq!(policy.for_region("U|Order|no"), (65536, 14));
+        assert_eq!(policy.set_region("U|Order|no", 8192, 7), Some((65536, 14)));
+        assert_eq!(policy.for_region("U|Order|no"), (8192, 7));
+        assert_eq!(policy.for_region("U|Order|other"), (16384, 0));
+    }
+
+    /// White-box proof that both write paths take their per-tile parameters from
+    /// the layout policy: a non-default page size lands in the tile superblock, a
+    /// 0-bit bloom means "no section", and `might_contain_unique_prefix` then
+    /// answers `true` (never a false negative) instead of rejecting an absent
+    /// prefix; a later compaction re-chooses the layout rather than inheriting it.
+    #[test]
+    fn write_paths_honor_the_layout_policy() {
+        let dir = tmp_dir("layout_policy");
+        let mut e = Engine::create(dir.join("data.wal")).unwrap();
+        e.set_layout_policy(LayoutPolicy::with_default(16384, 0));
+        e.commit_block(b"t1", &[
+            Op::PutDoc { entity: b"E".to_vec(), handle: 1, doc: b"d1".to_vec() },
+            Op::PutUnique { entity: b"E".to_vec(), field: b"u".to_vec(), value: b"a1".to_vec(), handle: 1 },
+        ]).unwrap();
+        e.publish_tile(dir.join("tile-1.tile"), 1).unwrap();
+        let bytes = fs::read(dir.join("tile-1.tile")).unwrap();
+        assert_eq!(superblock_u32(&bytes, 72), 16384, "the publish path stored the policy page size");
+        assert_eq!(superblock_u32(&bytes, 84), 0, "0 bloom bits writes no bloom length");
+        assert_eq!(superblock_u32(&bytes, 96), 0, "0 bloom bits stores a zero bits/key");
+        let stored = keys::unique_prefix(b"E", b"u", b"a1").unwrap();
+        assert!(e.tiles[0].tile.might_contain_unique_prefix(&stored),
+            "a tile with no bloom must answer true, never a false negative");
+
+        e.commit_block(b"t2", &[
+            Op::PutDoc { entity: b"E".to_vec(), handle: 11, doc: b"d11".to_vec() },
+            Op::PutUnique { entity: b"E".to_vec(), field: b"u".to_vec(), value: b"b1".to_vec(), handle: 11 },
+        ]).unwrap();
+        e.publish_tile(dir.join("tile-2.tile"), 2).unwrap();
+        e.set_layout_policy(LayoutPolicy::with_default(65536, 12));
+        e.compact().unwrap();
+        assert_eq!(e.tiles.len(), 1);
+        let name = e.tiles[0].name.clone();
+        let bytes = fs::read(dir.join(&name)).unwrap();
+        assert_eq!(superblock_u32(&bytes, 72), 65536, "the compaction path stored the policy page size");
+        assert!(superblock_u32(&bytes, 84) > 0, "a nonzero bloom policy attaches a section");
+        assert_eq!(superblock_u32(&bytes, 96), 12, "the bloom bits/key is the policy value");
+
+        // The mixed-layout directory reopens and answers every read path.
+        let reopened = Engine::open_discover(&dir).unwrap();
+        assert_eq!(get_ok(&reopened, "E", 1), Some(b"d1".to_vec()));
+        assert_eq!(get_ok(&reopened, "E", 11), Some(b"d11".to_vec()));
+        assert_eq!(reopened.unique_lookup(b"E", b"u", b"a1").unwrap(), Some(1));
+        assert_eq!(reopened.unique_lookup(b"E", b"u", b"b1").unwrap(), Some(11));
         let _ = fs::remove_dir_all(&dir);
     }
 

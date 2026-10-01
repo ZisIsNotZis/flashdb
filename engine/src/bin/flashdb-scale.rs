@@ -54,7 +54,7 @@ use std::io::{self, Write};
 use std::path::Path;
 use std::time::Instant;
 
-use flashdb_engine::engine::{CompactShape, Engine, Op, Outcome, MAX_ACTIVE_TILES};
+use flashdb_engine::engine::{CompactShape, Engine, LayoutPolicy, Op, Outcome, MAX_ACTIVE_TILES};
 use serde::{Deserialize, Serialize};
 
 const ENTITY_A: &[u8] = b"EntityA";
@@ -107,6 +107,14 @@ fn compact_shape() -> CompactShape {
         Err(_) => COMPACT_SHAPE,
     }
 }
+
+/// Provisional layout override for measurement: `FLASHDB_PAGE_SIZE` (bytes,
+/// 4096..=65536) and `FLASHDB_BLOOM_BITS` (0 disables the bloom) are read by
+/// [`LayoutPolicy::from_env`]; an unset or invalid value keeps the declared
+/// default, which reproduces today's behaviour exactly. The parameters land in
+/// each tile's superblock, so a directory written here reads back without the
+/// env set. Nothing about this is durable.
+fn layout_policy() -> LayoutPolicy { LayoutPolicy::from_env() }
 /// unique_lookup probes per entity in `verify`. Deliberately small: each probe
 /// is a full prefix scan over tiles + memtable (O(data)).
 const PROBES_PER_ENTITY: u64 = 20;
@@ -297,13 +305,16 @@ fn cmd_seed(
     }
     fs::create_dir_all(dir)?;
     let mut e = Engine::create(&wal)?;
+    let layout = layout_policy();
+    e.set_layout_policy(layout.clone());
+    let (layout_page_size, layout_bloom_bits) = layout.default_layout();
     let docs_a = total_docs / 2;
     let docs_b = total_docs - docs_a;
     let total_blocks = total_docs.div_ceil(docs_per_commit);
     let interval = (total_blocks / 10).clamp(1, 50);
     let shape = compact_shape();
     emit(&format!(
-        "phase=seed start shape={} merge_budget_bytes={} max_tiles={MAX_ACTIVE_TILES}",
+        "phase=seed start shape={} merge_budget_bytes={} max_tiles={MAX_ACTIVE_TILES} layout_page_size={layout_page_size} layout_bloom_bits={layout_bloom_bits}",
         shape.name(),
         compact_merge_budget(),
     ));
@@ -426,7 +437,7 @@ fn cmd_seed(
     let tile_bytes = tile_bytes_publish + tile_bytes_compact;
     let write_amp = (wal_appended + tile_bytes) as f64 / payload_bytes.max(1) as f64;
     emit(&format!(
-        "phase=seed ok=true docs={total_docs} csn={} shape={} blocks={total_blocks} payload_bytes={payload_bytes} wal_bytes={} wal_written_bytes={wal_appended} tile_bytes_publish={tile_bytes_publish} tile_bytes_compact={tile_bytes_compact} tile_bytes_total={tile_bytes} compactions={compactions} write_amplification={write_amp:.3} docs_s_cumulative={:.0} rss_kb={} rss_peak_kb={rss_peak} elapsed_s={elapsed:.3}",
+        "phase=seed ok=true docs={total_docs} csn={} shape={} blocks={total_blocks} payload_bytes={payload_bytes} wal_bytes={} wal_written_bytes={wal_appended} tile_bytes_publish={tile_bytes_publish} tile_bytes_compact={tile_bytes_compact} tile_bytes_total={tile_bytes} compactions={compactions} write_amplification={write_amp:.3} docs_s_cumulative={:.0} rss_kb={} rss_peak_kb={rss_peak} elapsed_s={elapsed:.3} layout_page_size={layout_page_size} layout_bloom_bits={layout_bloom_bits}",
         e.csn(),
         shape.name(),
         wal_bytes(dir)?,

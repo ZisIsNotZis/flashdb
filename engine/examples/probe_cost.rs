@@ -19,18 +19,27 @@
 //! `spread` at both this revision and its pre-bloom parent to get the
 //! with/without-bloom comparison.
 
-use flashdb_engine::engine::{Engine, Op, Outcome};
+use flashdb_engine::engine::{Engine, LayoutPolicy, Op, Outcome};
 use std::time::Instant;
 
 const SCAN_ITERS: usize = 3;
 const DOCS_PER_TILE: u64 = 5_000;
 const TILE_PROBES: usize = 200;
 
+/// Build an engine whose per-tile layout comes from the same provisional env
+/// override the scale driver uses (`FLASHDB_PAGE_SIZE`, `FLASHDB_BLOOM_BITS`).
+/// Unset means the declared default (4096, 10), so a no-env run is unchanged.
+fn engine_with_env_layout(dir: &std::path::Path) -> std::io::Result<Engine> {
+    let mut e = Engine::create(dir.join("data.wal"))?;
+    e.set_layout_policy(LayoutPolicy::from_env());
+    Ok(e)
+}
+
 fn run(docs: u64, probes: usize, measure_scan: bool) -> std::io::Result<()> {
     let dir = std::env::temp_dir().join(format!("flashdb-probe-cost-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir)?;
-    let mut e = Engine::create(dir.join("data.wal"))?;
+    let mut e = engine_with_env_layout(&dir)?;
 
     let payload = vec![b'x'; 200];
     let mut csn_line = 0u64;
@@ -60,13 +69,15 @@ fn run(docs: u64, probes: usize, measure_scan: bool) -> std::io::Result<()> {
 
     if measure_scan {
         let scan_mib_s = time_scan(&e, tile_bytes)?;
+        let (layout_page_size, layout_bloom_bits) = e.layout_policy().default_layout();
         println!(
-            "docs={docs} tile_bytes={tile_bytes} memtable_probe_us={mem_us:.1} tile_probe_us={tile_us:.1} \
+            "docs={docs} layout_page_size={layout_page_size} layout_bloom_bits={layout_bloom_bits} tile_bytes={tile_bytes} memtable_probe_us={mem_us:.1} tile_probe_us={tile_us:.1} \
              scan_mib_s={scan_mib_s:.0}"
         );
     } else {
+        let (layout_page_size, layout_bloom_bits) = e.layout_policy().default_layout();
         println!(
-            "docs={docs} tile_bytes={tile_bytes} memtable_probe_us={mem_us:.1} tile_probe_us={tile_us:.1} \
+            "docs={docs} layout_page_size={layout_page_size} layout_bloom_bits={layout_bloom_bits} tile_bytes={tile_bytes} memtable_probe_us={mem_us:.1} tile_probe_us={tile_us:.1} \
              slowdown={:.0}x",
             tile_us / mem_us.max(0.01)
         );
@@ -83,7 +94,7 @@ fn run_multi_tile(tiles: usize, docs_per_tile: u64, probes: usize) -> std::io::R
     let dir = std::env::temp_dir().join(format!("flashdb-probe-cost-{}-t{tiles}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir)?;
-    let mut e = Engine::create(dir.join("data.wal"))?;
+    let mut e = engine_with_env_layout(&dir)?;
     let payload = vec![b'x'; 200];
     let mut docs = 0u64;
     for tile in 0..tiles {
@@ -112,7 +123,8 @@ fn run_multi_tile(tiles: usize, docs_per_tile: u64, probes: usize) -> std::io::R
     // filter rejects all existing tiles in RAM).
     let existing_us = time_probes(&e, docs, probes)?;
     let append_us = time_lookup(&e, format!("u{}", docs + 1).as_bytes(), probes)?;
-    println!("tiles={tiles} docs={docs} probe_existing_us={existing_us:.2} probe_append_us={append_us:.2}");
+    let (layout_page_size, layout_bloom_bits) = e.layout_policy().default_layout();
+    println!("tiles={tiles} docs={docs} layout_page_size={layout_page_size} layout_bloom_bits={layout_bloom_bits} probe_existing_us={existing_us:.2} probe_append_us={append_us:.2}");
     let _ = std::fs::remove_dir_all(&dir);
     Ok(())
 }
@@ -129,7 +141,7 @@ fn run_spread(tiles: usize, docs_per_tile: u64, probes: usize) -> std::io::Resul
     let dir = std::env::temp_dir().join(format!("flashdb-probe-cost-spread-{}-t{tiles}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir)?;
-    let mut e = Engine::create(dir.join("data.wal"))?;
+    let mut e = engine_with_env_layout(&dir)?;
     let payload = vec![b'x'; 200];
     let mut handles = 0u64;
     for tile in 0..tiles {
@@ -163,7 +175,8 @@ fn run_spread(tiles: usize, docs_per_tile: u64, probes: usize) -> std::io::Resul
         debug_assert!(got.is_none(), "spread probes are absent by construction");
     }
     let us = total / probes.max(1) as f64;
-    println!("mode=spread tiles={tiles} docs_per_tile={docs_per_tile} probe_absent_us={us:.2}");
+    let (layout_page_size, layout_bloom_bits) = e.layout_policy().default_layout();
+    println!("mode=spread tiles={tiles} docs_per_tile={docs_per_tile} layout_page_size={layout_page_size} layout_bloom_bits={layout_bloom_bits} probe_absent_us={us:.2}");
     let _ = std::fs::remove_dir_all(&dir);
     Ok(())
 }

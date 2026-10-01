@@ -35,7 +35,16 @@ const MAGIC: &[u8; 8] = b"FDBTILE3";
 // The trailer is byte-identical to FDBTILE2's, including its magic, so every
 // non-superblock structure stays unchanged across the format bump.
 const TRAILER_MAGIC: &[u8; 9] = b"FDBTILE2E";
-const PAGE_SIZE: u32 = 4096;
+/// Default page size in bytes. A default-layout tile stores this in its
+/// superblock; a stored page-size field of 0 (absent/unknown, e.g. from a writer
+/// that predates the field) is also read as this value, so a bad or absent layout
+/// value is slow, never wrong (I2).
+pub(crate) const DEFAULT_PAGE_SIZE: u32 = 4096;
+/// Allowed per-tile page-size range. The value is both the superblock page and
+/// the data/directory block target. A stored value outside this range is
+/// rejected at open (`InvalidData`); a stored 0 is read as [`DEFAULT_PAGE_SIZE`].
+pub(crate) const MIN_PAGE_SIZE: u32 = 4096;
+pub(crate) const MAX_PAGE_SIZE: u32 = 65536;
 // magic(8) + cutoff(8) + digest(32) + count(8) + dir_offset(8) + dir_len(8)
 // + page_size(4) + bloom_offset(8) + bloom_len(8) + bloom_crc32c(4)
 // + bits_per_key(4) + hash_count(1) + reserved(3) + crc(4)
@@ -53,8 +62,6 @@ const TRAILER_CRC: usize = 25;
 const BLOCK_HEADER: usize = 14;
 // dir_len(4) + dir_crc(4) + fence_count(2)
 const DIR_HEADER: usize = 10;
-// Mutable target size for both data and directory blocks.
-const BLOCK_TARGET: usize = PAGE_SIZE as usize;
 const MAX_KEY: usize = 1 << 24;
 const MAX_VALUE: usize = 1 << 26;
 // One entry's length prefixes plus the widest legal key and value. The block
@@ -139,6 +146,7 @@ fn superblock_bytes(
     count: u64,
     dir_offset: u64,
     dir_len: u64,
+    page_size: u32,
     bloom_offset: u64,
     bloom_len: u64,
     bloom_crc32c: u32,
@@ -152,7 +160,7 @@ fn superblock_bytes(
     h[48..56].copy_from_slice(&count.to_le_bytes());
     h[56..64].copy_from_slice(&dir_offset.to_le_bytes());
     h[64..72].copy_from_slice(&dir_len.to_le_bytes());
-    h[72..76].copy_from_slice(&PAGE_SIZE.to_le_bytes());
+    h[72..76].copy_from_slice(&page_size.to_le_bytes());
     h[BLOOM_OFFSET_AT..BLOOM_LEN_AT].copy_from_slice(&bloom_offset.to_le_bytes());
     h[BLOOM_LEN_AT..BLOOM_CRC_AT].copy_from_slice(&bloom_len.to_le_bytes());
     h[BLOOM_CRC_AT..BITS_PER_KEY_AT].copy_from_slice(&bloom_crc32c.to_le_bytes());
@@ -540,6 +548,9 @@ pub(crate) struct TileWriter {
     path: PathBuf,
     cutoff: u64,
     digest: [u8; 32],
+    /// The tile's page size: the reserved superblock page and the data/directory
+    /// block target. Validated at construction; written into the superblock.
+    page_size: u32,
     offset: u64,
     count: u64,
     fences: Vec<Fence>,
@@ -555,19 +566,25 @@ pub(crate) struct TileWriter {
 impl TileWriter {
     /// `create_new` never replaces an existing tile. A failed or crashed build leaves a
     /// partial candidate that cannot change the engine's serving state; the caller may
-    /// remove it explicitly.
-    pub(crate) fn new(path: &Path, cutoff: u64, digest: &[u8; 32]) -> io::Result<Self> {
+    /// remove it explicitly. `page_size` is the per-tile block target and superblock
+    /// page; it must be in [`MIN_PAGE_SIZE`]..=[`MAX_PAGE_SIZE`] or the build is
+    /// rejected (`InvalidData`).
+    pub(crate) fn new(path: &Path, cutoff: u64, digest: &[u8; 32], page_size: u32) -> io::Result<Self> {
+        if !(MIN_PAGE_SIZE..=MAX_PAGE_SIZE).contains(&page_size) {
+            return Err(invalid("tile page size out of range"));
+        }
         let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
         // Reserve the superblock page; the real superblock is written last, once the
         // directory offset/length are known. This puts the first data block on the
-        // 4096-byte boundary.
-        file.write_all(&[0u8; PAGE_SIZE as usize])?;
+        // page-size boundary.
+        file.write_all(&vec![0u8; page_size as usize])?;
         Ok(Self {
             file,
             path: path.to_path_buf(),
             cutoff,
             digest: *digest,
-            offset: PAGE_SIZE as u64,
+            page_size,
+            offset: page_size as u64,
             count: 0,
             fences: Vec::new(),
             first_key: Vec::new(),
@@ -593,7 +610,7 @@ impl TileWriter {
         let entry_size = 8u64 + key.len() as u64 + value.len() as u64;
         if entry_size > MAX_ENTRY as u64 { return Err(invalid("tile entry size overflow")); }
         // Whole entries only: start a new block when the next one would not fit.
-        if !self.entries.is_empty() && self.entries.len() as u64 + entry_size > BLOCK_TARGET as u64 {
+        if !self.entries.is_empty() && self.entries.len() as u64 + entry_size > self.page_size as u64 {
             self.flush_block()?;
         }
         if self.block_entries == u16::MAX { return Err(invalid("tile block entry count overflow")); }
@@ -640,7 +657,7 @@ impl TileWriter {
         let mut rec_count: u16 = 0;
         for fence in &self.fences {
             let rec_len = 16usize + fence.first_key.len();
-            if !records.is_empty() && DIR_HEADER + records.len() + rec_len > BLOCK_TARGET {
+            if !records.is_empty() && DIR_HEADER + records.len() + rec_len > self.page_size as usize {
                 let block = encode_dir_block(&records, rec_count)?;
                 self.file.write_all(&block)?;
                 dir_len = dir_len.checked_add(block.len() as u64).ok_or_else(|| invalid("tile directory size overflow"))?;
@@ -687,6 +704,7 @@ impl TileWriter {
             self.count,
             dir_offset,
             dir_len,
+            self.page_size,
             bloom_offset,
             bloom_len,
             bloom_crc32c,
@@ -708,7 +726,7 @@ impl Tile {
     /// the byte-identity test compares the streaming API against.
     #[cfg(test)]
     pub(crate) fn write(path: &Path, cutoff: u64, digest: &[u8; 32], mt: &Memtable) -> io::Result<Self> {
-        let mut writer = TileWriter::new(path, cutoff, digest)?;
+        let mut writer = TileWriter::new(path, cutoff, digest, DEFAULT_PAGE_SIZE)?;
         for (key, value) in mt.entries() {
             if keys::key_csn(key).is_none_or(|csn| csn > cutoff) { continue; }
             writer.push(key, value)?;
@@ -722,7 +740,7 @@ impl Tile {
     #[cfg(test)]
     pub(crate) fn write_with_bloom(path: &Path, cutoff: u64, digest: &[u8; 32], mt: &Memtable, bits_per_key: u32) -> io::Result<Self> {
         let bloom = bloom_for_memtable(mt, cutoff, bits_per_key);
-        let mut writer = TileWriter::new(path, cutoff, digest)?;
+        let mut writer = TileWriter::new(path, cutoff, digest, DEFAULT_PAGE_SIZE)?;
         for (key, value) in mt.entries() {
             if keys::key_csn(key).is_none_or(|csn| csn > cutoff) { continue; }
             writer.push(key, value)?;
@@ -734,7 +752,7 @@ impl Tile {
     pub(crate) fn open(path: &Path) -> io::Result<Self> {
         let file = File::open(path)?;
         let size = file.metadata()?.len();
-        if size < PAGE_SIZE as u64 + TRAILER as u64 { return Err(invalid("tile too small")); }
+        if size < SUPERBLOCK as u64 { return Err(invalid("tile too small")); }
         let mut sb = [0u8; SUPERBLOCK];
         read_exact_at(&file, &mut sb, 0)?;
         if &sb[..8] != MAGIC { return Err(invalid("tile superblock magic")); }
@@ -746,7 +764,19 @@ impl Tile {
         let count = u64::from_le_bytes(sb[48..56].try_into().unwrap());
         let dir_offset = u64::from_le_bytes(sb[56..64].try_into().unwrap());
         let dir_len = u64::from_le_bytes(sb[64..72].try_into().unwrap());
-        if u32::from_le_bytes(sb[72..76].try_into().unwrap()) != PAGE_SIZE { return Err(invalid("tile page size")); }
+        // A layout value must never make a read wrong (I2): a stored 0 means
+        // "absent/unknown" and is read as the default page size, while a nonzero
+        // value outside the allowed range fails closed. The value is honored as
+        // the data region's lower bound (the superblock page) below.
+        let stored_page_size = u32::from_le_bytes(sb[72..76].try_into().unwrap());
+        let page_size = if stored_page_size == 0 {
+            DEFAULT_PAGE_SIZE
+        } else if (MIN_PAGE_SIZE..=MAX_PAGE_SIZE).contains(&stored_page_size) {
+            stored_page_size
+        } else {
+            return Err(invalid("tile page size out of range"));
+        };
+        if size < page_size as u64 + TRAILER as u64 { return Err(invalid("tile too small")); }
         let bloom_offset = u64::from_le_bytes(sb[BLOOM_OFFSET_AT..BLOOM_LEN_AT].try_into().unwrap());
         let bloom_len = u64::from_le_bytes(sb[BLOOM_LEN_AT..BLOOM_CRC_AT].try_into().unwrap());
         let bloom_crc32c = u32::from_le_bytes(sb[BLOOM_CRC_AT..BITS_PER_KEY_AT].try_into().unwrap());
@@ -764,7 +794,7 @@ impl Tile {
         }
         // The directory must end exactly at the trailer, and start after the
         // superblock page, so no gap or overlap can hide data blocks.
-        if dir_offset < PAGE_SIZE as u64 || dir_offset.checked_add(dir_len) != Some(size - TRAILER as u64) {
+        if dir_offset < page_size as u64 || dir_offset.checked_add(dir_len) != Some(size - TRAILER as u64) {
             return Err(invalid("tile directory bounds"));
         }
         // Stream the directory: one block at a time, validating and then dropping
@@ -803,7 +833,7 @@ impl Tile {
                 });
                 for i in 0..block_fences.len() {
                     let fence = &block_fences[i];
-                    if fence.offset < PAGE_SIZE as u64 || (fence.len as usize) < BLOCK_HEADER {
+                    if fence.offset < page_size as u64 || (fence.len as usize) < BLOCK_HEADER {
                         return Err(invalid("tile block offset/length"));
                     }
                     let end = fence.offset.checked_add(fence.len as u64).ok_or_else(|| invalid("tile block overflow"))?;
@@ -856,12 +886,12 @@ impl Tile {
             None
         } else {
             let bloom_end = bloom_offset.checked_add(bloom_len).ok_or_else(|| invalid("tile bloom bounds"))?;
-            if bloom_offset < PAGE_SIZE as u64 || bloom_end > dir_offset {
+            if bloom_offset < page_size as u64 || bloom_end > dir_offset {
                 return Err(invalid("tile bloom bounds"));
             }
             let data_end = match last_fence {
                 Some((offset, len)) => offset.checked_add(len as u64).ok_or_else(|| invalid("tile block overflow"))?,
-                None => PAGE_SIZE as u64,
+                None => page_size as u64,
             };
             if bloom_offset < data_end { return Err(invalid("tile bloom overlaps data blocks")); }
             let bytes = read_range(&file, bloom_offset, bloom_len)?;
@@ -1150,7 +1180,7 @@ mod tests {
     #[test]
     fn oversized_entry_gets_its_own_block() {
         let mut mt = Memtable::new();
-        let big = vec![b'x'; 3 * BLOCK_TARGET];
+        let big = vec![b'x'; 3 * DEFAULT_PAGE_SIZE as usize];
         put(&mut mt, 1, 1, &big);
         put(&mut mt, 2, 1, b"small");
         let (path, tile) = write_tile("oversized.tile", 100, &mt);
@@ -1164,13 +1194,83 @@ mod tests {
         std::fs::remove_file(path).unwrap();
     }
 
+    /// A tile written at a non-default page size is self-describing: the superblock
+    /// records the value, larger pages pack the same entries into fewer blocks, and
+    /// reopening honors the stored value.
+    #[test]
+    fn custom_page_size_roundtrips_and_packs_larger_blocks() {
+        let mut mt = Memtable::new();
+        for handle in 1..=1400u64 { put(&mut mt, handle, 1, &vec![b'v'; 200]); }
+        let default_path = tmp("page-size-default.tile");
+        let default_tile = Tile::write(&default_path, 100, &[9u8; 32], &mt).unwrap();
+
+        let path = tmp("page-size-64k.tile");
+        let mut writer = TileWriter::new(&path, 100, &[9u8; 32], 65536).unwrap();
+        for (key, value) in mt.entries() { writer.push(key, value).unwrap(); }
+        let tile = writer.finish().unwrap();
+        assert_eq!(tile.count(), 1400);
+        assert!(tile.data_blocks < default_tile.data_blocks,
+            "64 KiB pages pack fewer blocks than 4 KiB pages: {} vs {}",
+            tile.data_blocks, default_tile.data_blocks);
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(u32::from_le_bytes(bytes[72..76].try_into().unwrap()), 65536,
+            "the superblock records the page size");
+        let reopened = Tile::open(&path).unwrap();
+        assert_eq!(collect(&reopened), collect(&tile));
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_file(default_path).unwrap();
+    }
+
+    /// A page size outside the allowed range is rejected at build time, before a
+    /// candidate file is created.
+    #[test]
+    fn writer_rejects_out_of_range_page_size() {
+        let path = tmp("page-size-bad-writer.tile");
+        for bad in [0u32, 1, 4095, 65537, u32::MAX] {
+            let err = TileWriter::new(&path, 1, &[9u8; 32], bad).err().expect("out-of-range page size must be rejected");
+            assert_eq!(err.kind(), ErrorKind::InvalidData, "page size {bad}");
+        }
+        assert!(!path.exists(), "a rejected build leaves no candidate file");
+    }
+
+    /// A stored page size outside the allowed range fails closed at open (`InvalidData`).
+    #[test]
+    fn out_of_range_stored_page_size_rejected_at_open() {
+        let mut mt = Memtable::new();
+        put(&mut mt, 1, 1, b"v");
+        let (path, _) = write_tile("page-size-bad.tile", 5, &mt);
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[72..76].copy_from_slice(&4095u32.to_le_bytes());
+        repair_superblock_crc(&mut bytes);
+        std::fs::write(&path, &bytes).unwrap();
+        assert_eq!(Tile::open(&path).err().unwrap().kind(), ErrorKind::InvalidData);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    /// A stored page-size field of 0 means "absent/unknown" and is read as the
+    /// default, so an older or partially zeroed header never fails closed on a
+    /// layout value (I2).
+    #[test]
+    fn absent_page_size_field_is_read_as_default() {
+        let mut mt = Memtable::new();
+        put(&mut mt, 1, 1, b"v");
+        let (path, _) = write_tile("page-size-absent.tile", 5, &mt);
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[72..76].copy_from_slice(&0u32.to_le_bytes());
+        repair_superblock_crc(&mut bytes);
+        std::fs::write(&path, &bytes).unwrap();
+        let tile = Tile::open(&path).unwrap();
+        assert_eq!(collect(&tile), vec![(pkey(1, 1), b"v".to_vec())]);
+        std::fs::remove_file(path).unwrap();
+    }
+
     #[test]
     fn flip_inside_data_block_detected_when_read_not_at_open() {
         let mut mt = Memtable::new();
         put(&mut mt, 1, 1, b"payload");
         let (path, _) = write_tile("flip-data.tile", 5, &mt);
         let mut bytes = std::fs::read(&path).unwrap();
-        let start = PAGE_SIZE as usize;
+        let start = DEFAULT_PAGE_SIZE as usize;
         let block_len = u32::from_le_bytes(bytes[start..start + 4].try_into().unwrap()) as usize;
         bytes[start + block_len - 1] ^= 1; // value tail: block CRC now wrong, header intact
         std::fs::write(&path, &bytes).unwrap();
@@ -1271,7 +1371,7 @@ mod tests {
         put(&mut mt, 3, 1, b"v");
         let (path, _) = write_tile("reorder-data.tile", 5, &mt);
         let mut bytes = std::fs::read(&path).unwrap();
-        let start = PAGE_SIZE as usize;
+        let start = DEFAULT_PAGE_SIZE as usize;
         let blen = u32::from_le_bytes(bytes[start..start + 4].try_into().unwrap()) as usize;
         let first_key_len = u32::from_le_bytes(bytes[start + 8..start + 12].try_into().unwrap()) as usize;
         let entry_count = u16::from_le_bytes(bytes[start + 12..start + 14].try_into().unwrap()) as usize;
@@ -1333,7 +1433,7 @@ mod tests {
         for handle in 1..=3000u64 { put(&mut mt, handle, 1, &vec![b'v'; 300]); }
         let (path_mt, tile_mt) = write_tile("writer-identical-mt", 1, &mt);
         let path_stream = tmp("writer-identical-stream");
-        let mut w = TileWriter::new(&path_stream, 1, &[9u8; 32]).unwrap();
+        let mut w = TileWriter::new(&path_stream, 1, &[9u8; 32], DEFAULT_PAGE_SIZE).unwrap();
         for (key, value) in mt.entries() { w.push(key, value).unwrap(); }
         let tile_stream = w.finish().unwrap();
         assert_eq!(tile_mt.count(), 3000);
@@ -1352,7 +1452,7 @@ mod tests {
         let empty = Memtable::new();
         let (path_mt, tile_mt) = write_tile("writer-empty-mt", 0, &empty);
         let path_stream = tmp("writer-empty-stream");
-        let tile_stream = TileWriter::new(&path_stream, 0, &[9u8; 32]).unwrap().finish().unwrap();
+        let tile_stream = TileWriter::new(&path_stream, 0, &[9u8; 32], DEFAULT_PAGE_SIZE).unwrap().finish().unwrap();
         assert_eq!(tile_mt.count(), 0);
         assert_eq!(tile_stream.count(), 0);
         assert_eq!(std::fs::read(&path_mt).unwrap(), std::fs::read(&path_stream).unwrap());
@@ -1367,7 +1467,7 @@ mod tests {
         let (path_mt, tile_mt) = write_tile("writer-exact-mt", 1, &mt);
         assert_eq!(tile_mt.data_blocks, 2, "exact fill then spill");
         let path_stream = tmp("writer-exact-stream");
-        let mut w = TileWriter::new(&path_stream, 1, &[9u8; 32]).unwrap();
+        let mut w = TileWriter::new(&path_stream, 1, &[9u8; 32], DEFAULT_PAGE_SIZE).unwrap();
         for (key, val) in mt.entries() { w.push(key, val).unwrap(); }
         let tile_stream = w.finish().unwrap();
         assert_eq!(tile_stream.count(), 9);
@@ -1385,7 +1485,7 @@ mod tests {
         let (path_mt, tile_mt) = write_tile("writer-big-mt", 1, &mt);
         assert_eq!(tile_mt.data_blocks, 3, "oversized entry alone in its block");
         let path_stream = tmp("writer-big-stream");
-        let mut w = TileWriter::new(&path_stream, 1, &[9u8; 32]).unwrap();
+        let mut w = TileWriter::new(&path_stream, 1, &[9u8; 32], DEFAULT_PAGE_SIZE).unwrap();
         for (key, val) in mt.entries() { w.push(key, val).unwrap(); }
         assert_eq!(w.finish().unwrap().count(), 3);
         assert_eq!(std::fs::read(&path_mt).unwrap(), std::fs::read(&path_stream).unwrap());
@@ -1396,7 +1496,7 @@ mod tests {
     #[test]
     fn streaming_writer_rejects_out_of_order_and_duplicate_keys() {
         let path = tmp("writer-order");
-        let mut w = TileWriter::new(&path, 1, &[9u8; 32]).unwrap();
+        let mut w = TileWriter::new(&path, 1, &[9u8; 32], DEFAULT_PAGE_SIZE).unwrap();
         w.push(&pkey(2, 1), b"x").unwrap();
         assert_eq!(w.push(&pkey(1, 1), b"y").unwrap_err().kind(), ErrorKind::InvalidData);
         assert_eq!(w.push(&pkey(2, 1), b"z").unwrap_err().kind(), ErrorKind::InvalidData);
@@ -1567,7 +1667,7 @@ mod tests {
         put(&mut mt, 1, 1, b"payload");
         let (path, _) = write_tile("untrusted-last.tile", 5, &mt);
         let mut bytes = std::fs::read(&path).unwrap();
-        let start = PAGE_SIZE as usize;
+        let start = DEFAULT_PAGE_SIZE as usize;
         let block_len = u32::from_le_bytes(bytes[start..start + 4].try_into().unwrap()) as usize;
         bytes[start + block_len - 1] ^= 1; // value tail: block CRC now wrong, header intact
         std::fs::write(&path, &bytes).unwrap();
@@ -1644,8 +1744,8 @@ mod tests {
         for handle in 1..=200u64 { put(&mut mt, handle, 1, b"v"); }
         let (path, _) = write_bloomed_tile("bloom-over-data.tile", 100, &mt, 10);
         let mut bytes = std::fs::read(&path).unwrap();
-        assert!(superblock_u64(&bytes, BLOOM_OFFSET_AT) > PAGE_SIZE as u64, "the bloom starts after the data blocks");
-        bytes[BLOOM_OFFSET_AT..BLOOM_LEN_AT].copy_from_slice(&(PAGE_SIZE as u64).to_le_bytes());
+        assert!(superblock_u64(&bytes, BLOOM_OFFSET_AT) > DEFAULT_PAGE_SIZE as u64, "the bloom starts after the data blocks");
+        bytes[BLOOM_OFFSET_AT..BLOOM_LEN_AT].copy_from_slice(&(DEFAULT_PAGE_SIZE as u64).to_le_bytes());
         repair_superblock_crc(&mut bytes);
         std::fs::write(&path, &bytes).unwrap();
         assert_eq!(Tile::open(&path).err().unwrap().kind(), ErrorKind::InvalidData);
@@ -1726,7 +1826,7 @@ mod tests {
     #[test]
     fn set_bloom_twice_is_rejected() {
         let path = tmp("bloom-twice");
-        let mut writer = TileWriter::new(&path, 1, &[9u8; 32]).unwrap();
+        let mut writer = TileWriter::new(&path, 1, &[9u8; 32], DEFAULT_PAGE_SIZE).unwrap();
         writer.set_bloom(BloomBuilder::new(4, 10).finish()).unwrap();
         assert_eq!(writer.set_bloom(BloomBuilder::new(4, 10).finish()).unwrap_err().kind(), ErrorKind::InvalidData);
         std::fs::remove_file(&path).unwrap();
@@ -1741,7 +1841,7 @@ mod tests {
 
         let (path_mt, _) = write_tile("bloom-ident-mt-none", 1, &mt);
         let path_stream = tmp("bloom-ident-stream-none");
-        let mut writer = TileWriter::new(&path_stream, 1, &[9u8; 32]).unwrap();
+        let mut writer = TileWriter::new(&path_stream, 1, &[9u8; 32], DEFAULT_PAGE_SIZE).unwrap();
         for (key, value) in mt.entries() { writer.push(key, value).unwrap(); }
         assert_eq!(writer.finish().unwrap().count(), 3000);
         assert_eq!(std::fs::read(&path_mt).unwrap(), std::fs::read(&path_stream).unwrap(), "no-bloom byte identity");
@@ -1749,7 +1849,7 @@ mod tests {
         let path_mt_bloom = tmp("bloom-ident-mt");
         let tile_mt_bloom = Tile::write_with_bloom(&path_mt_bloom, 1, &[9u8; 32], &mt, 10).unwrap();
         let path_stream_bloom = tmp("bloom-ident-stream");
-        let mut writer = TileWriter::new(&path_stream_bloom, 1, &[9u8; 32]).unwrap();
+        let mut writer = TileWriter::new(&path_stream_bloom, 1, &[9u8; 32], DEFAULT_PAGE_SIZE).unwrap();
         for (key, value) in mt.entries() { writer.push(key, value).unwrap(); }
         writer.set_bloom(bloom_for_memtable(&mt, 1, 10)).unwrap();
         assert_eq!(writer.finish().unwrap().count(), 3000);
