@@ -119,3 +119,25 @@ Consequences recorded honestly:
   scans at 4 KiB and 64 KiB.
 - The headroom conclusion is unaffected: it depends on the layout ranking, and the warm numbers
   make larger pages look *worse* for probes, strengthening it.
+
+## Finding (slice 18): the request surface cannot create dimension rows
+
+While building the first runnable inventory workload the worker found - and I verified from the
+adapter - that `engine/src/request.rs` accepts only four request templates (`order_flow` with its
+`cust` -> `take` guard, a `Stock` get, a `Customer` find, a `StockMovement` scan). There is **no
+create/seed shape**: the header itself says dimension rows must be seeded as P/U pairs at the
+engine level. So dimensions are creatable only through engine ops, never through the documented
+request grammar.
+
+Consequences:
+- Any workload that needs pre-existing dimensions (which is the whole inventory scenario, and
+  therefore every 0b workload) must be seeded out-of-band, which is what the harness will now do.
+- The gap is a grammar/contract question, not an engine one: `docs/contracts.md` already carries
+  open decisions about the request surface (L-04, L-07, the expression grammar, and the
+  "one intent must not be expressible two ways" rule). Widening the grammar is the author's call,
+  so I deliberately did NOT add an ad-hoc `put` shape. It is recorded here for them.
+
+Decision taken instead: a `seed-inventory` applier in the scale driver commits the harness seeding
+trace as raw P/U/R ops, with the requirement that it derives keys by exactly the rules the
+adapter's lookups probe (same unique-prefix encoding, same x-ref reverse entries), proven by the
+flow's commit rate rather than asserted.
