@@ -1093,9 +1093,12 @@ impl Tile {
         // entity)` region: its first and last stored keys share a region prefix.
         // Such a tile is only obligated for that region's projection - its
         // sibling tiles at the same cutoff carry the other regions - so the
-        // leftover check below is restricted to the region it covers. A
-        // whole-keyspace tile (first and last region differ, or an empty tile)
-        // stays exactly checked, preserving the pre-partitioning guarantee.
+        // leftover check below is restricted to the region it covers, and any
+        // entry from another region is a hard error: the `(cutoff, region)`
+        // ordering and the disjoint per-region ranges assume no tile spans two
+        // regions. A whole-keyspace tile (first and last region differ, or an
+        // empty tile) stays exactly checked, preserving the pre-partitioning
+        // guarantee.
         let first_region = self.first_key().and_then(keys::region_prefix);
         let single = first_region.is_some()
             && first_region == self.last_key().and_then(keys::region_prefix);
@@ -1105,6 +1108,9 @@ impl Tile {
                 None => break,
                 Some(entry) => entry?,
             };
+            if single && keys::region_prefix(&key) != first_region {
+                return Err(invalid("tile contains a key outside its region"));
+            }
             let csn = keys::key_csn(&key).ok_or_else(|| invalid("tile entry without CSN"))?;
             if csn <= lower { continue; }
             if csn > cutoff { return Err(invalid("tile entry above cutoff")); }

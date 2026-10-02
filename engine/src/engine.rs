@@ -1511,7 +1511,7 @@ impl Engine {
         // 1. Build + verify the merged tile for the run's union range against the
         //    retained WAL projection, exactly as publish verifies one tile.
         let inputs: Vec<&TileHandle> = self.tiles[start..end].iter().collect();
-        let tile = match self.write_compacted_tile(&path, &inputs, lower, cutoff) {
+        let tile = match self.write_compacted_tile(&path, &inputs, lower, cutoff, None) {
             Ok(t) => t,
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
                 return Err(io::Error::new(io::ErrorKind::AlreadyExists, format!(
@@ -1569,8 +1569,14 @@ impl Engine {
     /// other region's tiles untouched, so compaction never merges across regions.
     /// The manifest is rewritten as the full `(cutoff, region)`-ordered list with
     /// the selected tiles retired and the replacement inserted at its
-    /// `(cutoff, region)` position; the durable protocol and cleanup mirror
-    /// [`Engine::merge_run`].
+    /// `(cutoff, region)` position; the durable protocol mirrors
+    /// [`Engine::merge_run`]. The WAL suffix is restricted to this run's region (a
+    /// region run must not adopt another region's keys), and the retired input
+    /// files are unlinked only after the manifest flip, exactly as `merge_run`
+    /// does. An unlink failure is reported, not returned: the manifest is already
+    /// durable and correct, so the only residue is an on-disk orphan that
+    /// discovery ignores and never adopts (the directory then holds the correct
+    /// active set plus that unreferenced file).
     fn merge_region_run(&mut self, indices: &[usize]) -> io::Result<u64> {
         debug_assert!(indices.len() >= 2 && indices.windows(2).all(|w| w[0] < w[1]));
         let newest = *indices.last().unwrap();
@@ -1584,7 +1590,7 @@ impl Engine {
         let name = self.unique_compaction_name(cutoff)?;
         let path = self.dir.join(&name);
         let inputs: Vec<&TileHandle> = indices.iter().map(|&i| &self.tiles[i]).collect();
-        let tile = match self.write_compacted_tile(&path, &inputs, lower, cutoff) {
+        let tile = match self.write_compacted_tile(&path, &inputs, lower, cutoff, region.as_deref()) {
             Ok(t) => t,
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
                 return Err(io::Error::new(io::ErrorKind::AlreadyExists, format!(
@@ -1595,6 +1601,7 @@ impl Engine {
         let out_size = fs::metadata(&path)?.len();
         File::open(&self.dir)?.sync_all()?;
         let retired: HashSet<usize> = indices.iter().copied().collect();
+        let retired_names: Vec<String> = indices.iter().map(|&i| self.tiles[i].name.clone()).collect();
         let replacement = TileRef { name: name.clone(), cutoff, digest: *tile.digest() };
         let checkpoint = Checkpoint { csn: self.tiles.last().unwrap().cutoff(), handle_watermark: self.max_handle };
         let segment = self.segment.clone();
@@ -1622,6 +1629,18 @@ impl Engine {
         }
         if let Some(t) = new_tile { kept.push(TileHandle { tile: t, name }); }
         self.tiles = kept;
+        // Only now drop the retired input files: the durable flip already removed
+        // them from the root, so a leftover can never be adopted, only ignored.
+        // Report a failure rather than swallow it - `merge_run`'s silent best-effort
+        // is fine for a whole-dataset merge, but a per-region compaction should say
+        // when it leaves an orphan and what the directory then is.
+        for old in &retired_names {
+            if let Err(e) = fs::remove_file(self.dir.join(old)) {
+                if e.kind() != io::ErrorKind::NotFound {
+                    eprintln!("flashdb: region compaction retired {old} from the manifest but could not unlink it: {e}; the file is now an orphan discovery ignores");
+                }
+            }
+        }
         Ok(out_size)
     }
 
@@ -1679,13 +1698,25 @@ impl Engine {
     /// suffix map holds only records above `lower`, so a version outside the
     /// run's range is never pulled into the output.
     ///
+    /// `region` restricts the WAL-suffix map to one `(family, entity)` region and
+    /// is `Some` exactly when the run is region-partitioned. Without it the map is
+    /// the GLOBAL `(lower, cutoff]` window, which is correct for a whole-keyspace
+    /// run but would inject every other region's ops into a region run whose
+    /// `lower` reaches that region's oldest tile (`lower = 0` or the floor). The
+    /// running tiles are not region-filtered: they are the run's own input and a
+    /// floor-spanning one legitimately carries below-floor entries. The filter is
+    /// applied only to the WAL suffix (which the rotation window keeps above the
+    /// floor), so the below-floor part of the projection is preserved unchanged; it
+    /// merely must belong to `region`, as the tiles do. The digest stays global: it
+    /// binds `(floor, cutoff]` regardless of region, matching a publish at `cutoff`.
+    ///
     /// Nothing here materializes the union: the tiles are streamed by one
     /// [`TileCursor`] each (borrowing a single 4 KiB block apiece) and only the
     /// WAL suffix - already bounded by the rotation window - is copied into a
     /// key-ordered map. [`Engine::stream_merged_reduction`] merges both sources
     /// and pushes the reduced stream straight into the streaming writer, so peak
     /// compaction RAM tracks the WAL window, not the total tile bytes.
-    fn write_compacted_tile(&self, tile_path: &Path, tiles: &[&TileHandle], lower: u64, cutoff: u64) -> io::Result<Tile> {
+    fn write_compacted_tile(&self, tile_path: &Path, tiles: &[&TileHandle], lower: u64, cutoff: u64, region: Option<&[u8]>) -> io::Result<Tile> {
         let (records, _) = wal::replay(&self.wal_path)?;
         self.verify_wal_matches_state(&records)?;
         let digest = wal_digest(&records, cutoff, self.wal_floor())?;
@@ -1693,13 +1724,17 @@ impl Engine {
         // by construction. A later op overwrites an earlier one for the exact same
         // key, matching `Memtable::apply`. Records at or below `lower` are carried
         // by the run's own tiles (or an earlier, still-active tile) and must not be
-        // merged here, or they would escape the run's range.
+        // merged here, or they would escape the run's range. A region run keeps only
+        // its own region's records so the output is EXACTLY that region's
+        // projection: another region's key has no tile in this run to carry it and
+        // must not be adopted here.
         let mut wal_entries: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
         for payload in &records {
             let (csn, _, ops) = decode_payload(payload)?;
             if csn > lower && csn <= cutoff {
                 for op in &ops {
                     let (key, value) = op_kv(op, csn);
+                    if region.is_some_and(|r| keys::region_prefix(&key) != Some(r)) { continue; }
                     wal_entries.insert(key, value);
                 }
             }
@@ -3737,6 +3772,145 @@ mod tests {
         e.manifest.as_mut().unwrap().publish(refs, Checkpoint { csn: 1, handle_watermark: e.max_handle }, None).unwrap();
         drop(e);
         assert!(Engine::open_discover(&dir).is_err(), "reopen enforces (cutoff, region)");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Count the `*.tile` files a directory holds. Only tiles are counted:
+    /// `data.wal`/`data-N.wal` and `manifest` are expected non-tile files, and a
+    /// failed rotation's leftover segment is unrelated to a region merge.
+    fn tile_file_count(dir: &Path) -> usize {
+        fs::read_dir(dir).unwrap()
+            .filter_map(|d| d.ok())
+            .filter(|d| d.file_name().to_string_lossy().ends_with(".tile"))
+            .count()
+    }
+
+    /// DEFECT 1, white-box: a region merge output must hold EXACTLY the run
+    /// region's keys. `P|Order` is written first and again at cutoff 3, so its
+    /// run starts at its oldest tile (`lower = 0`) and the global WAL suffix
+    /// `(0, 3]` also holds the `P|Stock` op from cutoff 2; before the fix that op
+    /// landed in the `P|Order` output.
+    #[test]
+    fn region_compaction_output_holds_only_its_region() {
+        let dir = tmp_dir("region-only-keys");
+        let mut e = Engine::create(&dir.join("data.wal")).unwrap();
+        e.set_region_mode(RegionMode::PerRegion);
+        e.commit_block(b"b1", &[Op::PutDoc { entity: b"Order".to_vec(), handle: 1, doc: b"o1".to_vec() }]).unwrap();
+        e.publish_tile(dir.join("t1.tile"), 1).unwrap();
+        e.commit_block(b"b2", &[Op::PutDoc { entity: b"Stock".to_vec(), handle: 1, doc: b"s1".to_vec() }]).unwrap();
+        e.publish_tile(dir.join("t2.tile"), 2).unwrap();
+        e.commit_block(b"b3", &[Op::PutDoc { entity: b"Order".to_vec(), handle: 1, doc: b"o3".to_vec() }]).unwrap();
+        e.publish_tile(dir.join("t3.tile"), 3).unwrap();
+        assert_eq!(e.tiles.len(), 3, "P|Order at 1 and 3, P|Stock at 2");
+
+        assert!(e.maybe_compact(u64::MAX, 2).unwrap().is_some(), "P|Order is eligible at two tiles");
+        // Scan the emitted tile entry by entry, not just its first/last key: the
+        // newest version of Order/1 (cutoff 3) is the only entry it may hold.
+        let newest_order_key = keys::primary_key(b"Order", 1, 3).unwrap();
+        let order_region = keys::region_prefix(&newest_order_key).unwrap();
+        let order = e.tiles.iter()
+            .find(|t| tile_single_region(t) == Some(order_region))
+            .expect("the merged P|Order tile exists");
+        let keys_in_tile: Vec<Vec<u8>> = order.tile.entries()
+            .map(|entry| entry.unwrap().0)
+            .collect();
+        assert_eq!(keys_in_tile.len(), 1, "one newest version per logical key");
+        for key in &keys_in_tile {
+            assert_eq!(keys::region_prefix(key), Some(order_region),
+                "a P|Order merge output holds only P|Order keys");
+        }
+        assert_eq!(keys_in_tile[0], keys::primary_key(b"Order", 1, 3).unwrap());
+        // Both regions still read correctly, and the directory reopens.
+        assert_eq!(get_ok(&e, "Order", 1), Some(b"o3".to_vec()));
+        assert_eq!(get_ok(&e, "Stock", 1), Some(b"s1".to_vec()));
+        drop(e);
+        let e = Engine::open_discover(&dir).unwrap();
+        assert_eq!(get_ok(&e, "Order", 1), Some(b"o3".to_vec()));
+        assert_eq!(get_ok(&e, "Stock", 1), Some(b"s1".to_vec()));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// DEFECT 2: a region merge retires its inputs from the manifest and then
+    /// unlinks their files, exactly like `merge_run`, so no orphan accumulates.
+    #[test]
+    fn region_compaction_unlinks_retired_inputs_after_the_flip() {
+        let dir = tmp_dir("region-unlink");
+        let mut e = Engine::create(&dir.join("data.wal")).unwrap();
+        e.set_region_mode(RegionMode::PerRegion);
+        for csn in 1..=3u64 {
+            e.commit_block(format!("b{csn}").as_bytes(), &[
+                Op::PutDoc { entity: b"Order".to_vec(), handle: 1, doc: format!("v{csn}").into_bytes() },
+            ]).unwrap();
+            e.publish_tile(dir.join(format!("t{csn}.tile")), csn).unwrap();
+        }
+        assert_eq!(e.tiles.len(), 3);
+        assert_eq!(tile_file_count(&dir), 3);
+
+        assert!(e.maybe_compact(u64::MAX, 2).unwrap().is_some(), "two P|Order tiles merge");
+        assert_eq!(e.tiles.len(), 2, "three tiles became two");
+        // No other path ran, so every `.tile` on disk is manifest-referenced: the
+        // two retired inputs are gone, not merely unreferenced.
+        assert_eq!(tile_file_count(&dir), e.tiles.len(), "retired inputs are unlinked, no orphan");
+        assert!(!dir.join("t1.tile").exists() && !dir.join("t2.tile").exists(),
+            "the merged run's input files are removed");
+        assert_eq!(get_ok(&e, "Order", 1), Some(b"v3".to_vec()));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Slice 24 recorded "a crafted tile whose middle keys belong to another region
+    /// would pass" as unreachable; slice 27 reached it through the WAL suffix. The
+    /// region path no longer writes such a tile, and this fault-injects one directly
+    /// to prove reopen rejects it rather than treating it as whole-keyspace.
+    #[test]
+    fn reopen_rejects_a_single_region_tile_holding_a_foreign_key() {
+        let dir = tmp_dir("region-foreign-key");
+        let wal = dir.join("data.wal");
+        let mut e = Engine::create(&wal).unwrap();
+        e.set_region_mode(RegionMode::PerRegion);
+        // Enough P|Order docs to span TWO data blocks, plus one real P|Stock doc.
+        // The splice lands in block 0 while the cached last key (from block 1)
+        // stays a trusted P|Order key, so `tile_single_region` still calls the tile
+        // single-region and only the region check can reject it.
+        let mut ops: Vec<Op> = (1..=200u64).map(|h| Op::PutDoc {
+            entity: b"Order".to_vec(), handle: h, doc: b"o".to_vec(),
+        }).collect();
+        ops.push(Op::PutDoc { entity: b"Stock".to_vec(), handle: 1, doc: b"s".to_vec() });
+        e.commit_block(b"b1", &ops).unwrap();
+        e.publish_tile(dir.join("t.tile"), 1).unwrap();
+        let order_key = keys::primary_key(b"Order", 1, 1).unwrap();
+        let order_region = keys::region_prefix(&order_key).unwrap();
+        let order_name = e.tiles.iter()
+            .find(|t| tile_single_region(t) == Some(order_region))
+            .expect("the P|Order tile exists").name.clone();
+        drop(e);
+
+        // Splice the P|Stock key over block 0's SECOND entry. Both keys are 23
+        // bytes, so the block layout is unchanged; repairing block 0's CRC leaves
+        // only the foreign key as the defect. Block 1 (the last block, whose key is
+        // the tile's cached last key) is untouched, so the tile still starts and
+        // ends in P|Order.
+        let stock_key = keys::primary_key(b"Stock", 1, 1).unwrap();
+        let mut bytes = fs::read(dir.join(&order_name)).unwrap();
+        let page = DEFAULT_PAGE_SIZE as usize;
+        let block_len = u32::from_le_bytes(bytes[page..page + 4].try_into().unwrap()) as usize;
+        let first_key_len = u32::from_le_bytes(bytes[page + 8..page + 12].try_into().unwrap()) as usize;
+        let mut at = page + 14 + first_key_len;
+        let klen0 = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
+        let vlen0 = u32::from_le_bytes(bytes[at + 4..at + 8].try_into().unwrap()) as usize;
+        at += 8 + klen0 + vlen0; // skip entry 0 (Order/1), landing on entry 1
+        let klen1 = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
+        assert_eq!(klen1, stock_key.len(), "the spliced key keeps the entry size");
+        bytes[at + 8..at + 8 + klen1].copy_from_slice(&stock_key);
+        let crc = crate::crc::crc32c(&bytes[page + 8..page + block_len]);
+        bytes[page + 4..page + 8].copy_from_slice(&crc.to_le_bytes());
+        fs::write(dir.join(&order_name), &bytes).unwrap();
+
+        let err = match Engine::open_with_tile(&wal, dir.join(&order_name)) {
+            Ok(_) => panic!("a single-region tile carrying another region's key must fail closed"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("outside its region"),
+            "a single-region tile carrying another region's key must fail closed: {err}");
         let _ = fs::remove_dir_all(&dir);
     }
 
