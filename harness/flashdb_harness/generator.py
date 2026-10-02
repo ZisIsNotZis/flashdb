@@ -80,6 +80,16 @@ MIX_TOTAL = MIX_CUM[-1]
 MIX_NAMES = list(MIX)
 
 
+def pick_kind(rng: "Rng", mix: dict[str, int], cum: list[int], total: int) -> str:
+    """Draw a request-shape name from integer weights (the single selection rule).
+
+    `Generator.requests` and the load-profile generator both use this so the shape
+    selection can never disagree. Integers only: no float accumulation.
+    """
+    u = rng.next_u64() % total
+    return next(k for k, c in zip(mix, cum) if u < c)
+
+
 class Generator:
     def __init__(
         self,
@@ -101,13 +111,33 @@ class Generator:
         self.locs = [loc_name(i) for i in range(n_loc)]
         self.req_no = 0
         self.order_no = 0
+        # Optional deterministic "flash sale": a fraction of sku draws in the
+        # selected shape are replaced by one hot sku. Inactive by default, so the
+        # rng stream and the frozen corpora are unchanged unless a profile sets it.
+        self.spike_sku: str | None = None
+        self.spike_num = 0
+        self.spike_denom = 100
+
+    def set_key_spike(self, sku_rank: int | None, spike_pct: int = 0) -> None:
+        """Spike `sku_rank` (1-based) in `spike_pct`% of sku draws, or clear it."""
+        if sku_rank is None or spike_pct <= 0:
+            self.spike_sku = None
+            self.spike_num = 0
+            return
+        assert sku_rank >= 1, "sku rank is 1-based"
+        assert 0 < spike_pct <= 100
+        self.spike_sku = sku_name(sku_rank)
+        self.spike_num = spike_pct
 
     def _next_req_id(self) -> str:
         self.req_no += 1
         return f"r-{self.req_no:08d}"
 
     def _sku(self) -> str:
-        return sku_name(self.zipf.draw())
+        rank = self.zipf.draw()
+        if self.spike_sku is not None and self.rng.below(self.spike_denom) < self.spike_num:
+            return self.spike_sku
+        return sku_name(rank)
 
     def order_flow(self) -> dict:
         self.order_no += 1
@@ -200,16 +230,13 @@ class Generator:
             },
         }
 
+    def shape(self, kind: str) -> dict:
+        """Build one request of the named shape; shape name == method name."""
+        return getattr(self, kind)()
+
     def requests(self) -> Iterator[dict]:
         for _ in range(self.n_requests):
-            u = self.rng.next_u64() % MIX_TOTAL
-            kind = MIX_NAMES[next(i for i, c in enumerate(MIX_CUM) if u < c)]
-            yield {
-                "order_flow": self.order_flow,
-                "stock_lookup": self.stock_lookup,
-                "customer_lookup": self.customer_lookup,
-                "movements_scan": self.movements_scan,
-            }[kind]()
+            yield self.shape(pick_kind(self.rng, MIX, MIX_CUM, MIX_TOTAL))
 
 
 def render(reqs: Iterator[dict]) -> Iterator[str]:
