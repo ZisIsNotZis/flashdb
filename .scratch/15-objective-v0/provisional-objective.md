@@ -1,5 +1,10 @@
 # 15 — provisional objective and falsification contract (for the harness to be buildable)
 
+> **SUPERSEDED on the estimand by [`objective-v1.md`](objective-v1.md)** (author decision,
+> 2026-10-01: score sustained throughput under offered load with a latency ceiling; latency is a
+> constraint, not the scored quantity). The measurement discipline, the calibration-gap analysis
+> and the pre-registration skeleton here are still in force.
+
 Status: **PROVISIONAL**, written 2026-09-30 while the author was away, under their instruction to
 proceed with my recommendation. `docs/objective.md` marks F1–F5 Open; this document does not
 claim to close them. Its purpose is narrower and honest: **the harness (simulator, cost model,
