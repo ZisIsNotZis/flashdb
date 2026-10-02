@@ -359,7 +359,14 @@ fn result(status: &'static str, csn: Option<u64>, row: Option<Value>) -> BlockRe
 }
 
 fn publish(engine: &mut Engine, id: &[u8], ops: &[Op]) -> io::Result<BlockResult> {
-    match engine.commit_block(id, ops)? {
+    // Inside a deferred-barrier group the request's block shares the group's one
+    // WAL barrier; outside it, the single-block path syncs per block as before.
+    let outcome = if engine.group_open() {
+        engine.commit_block_grouped(id, ops)?
+    } else {
+        engine.commit_block(id, ops)?
+    };
+    match outcome {
         Outcome::Committed { csn } | Outcome::AlreadyCommitted { csn } => Ok(result("ok", Some(csn), None)),
         // Only a false stock guard means "backorder". x-unique is a business
         // constraint violation, not a timing conflict and never an else trigger.

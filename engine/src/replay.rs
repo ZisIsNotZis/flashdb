@@ -129,3 +129,35 @@ pub fn replay_jsonl(
     }
     Ok(ReplaySummary { requests: count, sha256: format!("{:x}", hash.finalize()) })
 }
+
+/// Execute a batch of requests as ONE deferred-barrier group (slice 23).
+///
+/// The requests run in input order inside a single [`Engine::begin_group`] /
+/// [`Engine::end_group`] window: each request's blocks are WAL-appended and
+/// applied to the serving state IMMEDIATELY, so a later request's probe or guard
+/// sees every earlier request's effects exactly as sequential commits would -
+/// the in-order visibility the guard semantics require (two stock decrements in
+/// one group must not both pass a guard sequential execution would fail on the
+/// second). The whole group shares one `fdatasync`; see [`Engine::begin_group`]
+/// for the durability rule - the group becomes durable only when the barrier
+/// returns `Ok`, and a crash before it can lose the whole group, none of which
+/// was acknowledged.
+///
+/// The returned vector has one entry per input request, in order. A per-request
+/// error (a unique conflict, a malformed request) is reported at its own index
+/// and does NOT abort the group: every later request still executes against the
+/// earlier effects. The outer `io::Result` is the group's own failure - opening
+/// the group or taking the barrier - and on that error nothing in the group is
+/// durable, so no partial result may be served.
+pub fn execute_requests_grouped(
+    engine: &mut Engine,
+    requests: &[Value],
+) -> io::Result<Vec<io::Result<RequestResult>>> {
+    engine.begin_group()?;
+    let mut results = Vec::with_capacity(requests.len());
+    for request in requests {
+        results.push(execute_request(engine, request));
+    }
+    engine.end_group()?;
+    Ok(results)
+}

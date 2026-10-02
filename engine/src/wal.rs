@@ -122,6 +122,14 @@ impl Wal {
     pub fn valid_len(&self) -> u64 {
         self.valid_len
     }
+
+    /// Test-only: arm the injected partial-append fault, so an engine-level test
+    /// can exercise a failed append. Compiled only under `cfg(test)` and
+    /// `pub(crate)`, so it is unreachable from the shipping API.
+    #[cfg(test)]
+    pub(crate) fn arm_partial_append_fault(&mut self) {
+        self.inject_partial_append = true;
+    }
 }
 
 /// 顺序扫描 WAL，返回（完整记录, 有效字节数）。

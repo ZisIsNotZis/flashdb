@@ -290,6 +290,19 @@ pub struct Engine {
     csn: u64,
     dedup: HashMap<Vec<u8>, u64>,
     max_handle: u64,
+    /// True while a deferred-barrier commit group is open (slice 23). Inside a
+    /// group every commit is WAL-appended and applied to the memtable
+    /// IMMEDIATELY, so a later probe/guard in the group sees it exactly as a
+    /// sequential commit would, but it is NOT `fdatasync`ed; the single barrier
+    /// is taken by [`Engine::end_group`]. Every other mutating entry point
+    /// refuses while a group is open, so a caller that forgets to end one fails
+    /// closed instead of silently committing through a path the group's barrier
+    /// never covered.
+    group_open: bool,
+    /// True once a grouped commit has run in the open group, so
+    /// [`Engine::end_group`] knows a barrier is owed. An empty group takes no
+    /// `sync` (nothing was appended). Reset by `begin_group`/`end_group`.
+    group_pending: bool,
     /// Provisional per-region layout the two tile write paths consult. Never
     /// persisted; the per-tile parameters live in each tile's superblock.
     layout: LayoutPolicy,
@@ -347,6 +360,8 @@ impl Engine {
             csn: 0,
             dedup: HashMap::new(),
             max_handle: 0,
+            group_open: false,
+            group_pending: false,
             layout: LayoutPolicy::declared_default(),
             metrics: RefCell::new(Metrics::new()),
         })
@@ -496,7 +511,7 @@ impl Engine {
             t.tile.verify_projection(&newest_projection(&covered, lower, t.cutoff()), lower, t.cutoff())?;
             lower = t.cutoff();
         }
-        Ok(Engine { wal, mt, tiles, wal_path: wal_path.to_path_buf(), dir: parent_dir(wal_path), manifest: None, segment: None, segment_suffix_csn: csn, wal_detached: false, csn, dedup, max_handle, layout: LayoutPolicy::declared_default(), metrics: RefCell::new(Metrics::new()) })
+        Ok(Engine { wal, mt, tiles, wal_path: wal_path.to_path_buf(), dir: parent_dir(wal_path), manifest: None, segment: None, segment_suffix_csn: csn, wal_detached: false, csn, dedup, max_handle, group_open: false, group_pending: false, layout: LayoutPolicy::declared_default(), metrics: RefCell::new(Metrics::new()) })
     }
 
     /// The CSN floor below which the active WAL file holds no records: the
@@ -514,6 +529,19 @@ impl Engine {
     fn ensure_attached(&self) -> io::Result<()> {
         if self.wal_detached {
             return Err(io::Error::new(io::ErrorKind::Other, "engine WAL binding detached from the durable segment by a failed rotation; reopen to recover"));
+        }
+        Ok(())
+    }
+
+    /// Refuse a mutating operation that must not race an open deferred-barrier
+    /// group. While a group is open its records are appended but not yet
+    /// synced, so republishing a tile, rotating, compacting, or taking the
+    /// single-block path could bind durable state to bytes the group's barrier
+    /// has not yet covered. Refusing keeps a forgotten `end_group` fail-closed.
+    fn ensure_no_group(&self, op: &str) -> io::Result<()> {
+        if self.group_open {
+            return Err(io::Error::new(io::ErrorKind::Other, format!(
+                "cannot {op} while a commit group is open; end_group first")));
         }
         Ok(())
     }
@@ -546,6 +574,7 @@ impl Engine {
     /// serving memtable intact; a successful build evicts covered versions only
     /// after the file is synced and verified.
     pub fn build_tile(&mut self, tile_path: impl AsRef<Path>, cutoff: u64) -> io::Result<()> {
+        self.ensure_no_group("build_tile")?;
         self.ensure_attached()?;
         if cutoff > self.csn {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "cutoff exceeds CSN"));
@@ -658,6 +687,7 @@ impl Engine {
     /// [`Engine::open_discover`]); republishing over it surfaces a clear
     /// `AlreadyExists` error instead of silently reusing the leftover file.
     pub fn publish_tile(&mut self, tile_path: impl AsRef<Path>, cutoff: u64) -> io::Result<()> {
+        self.ensure_no_group("publish_tile")?;
         if self.manifest.as_ref().is_some_and(|m| m.poisoned()) {
             return Err(io::Error::new(io::ErrorKind::Other, "manifest writer poisoned; reopen to recover"));
         }
@@ -752,6 +782,7 @@ impl Engine {
     /// Fail-closed: a target-name collision, or any post-flip rebinding failure
     /// (detached WAL), requires reopen; commits are refused while detached.
     pub fn rotate_wal(&mut self, max_wal_bytes: u64) -> io::Result<bool> {
+        self.ensure_no_group("rotate_wal")?;
         if self.manifest.as_ref().is_some_and(|m| m.poisoned()) {
             return Err(io::Error::new(io::ErrorKind::Other, "manifest writer poisoned; reopen to recover"));
         }
@@ -844,6 +875,7 @@ impl Engine {
     /// ignore both kinds: unreferenced files are never adopted; they are leaked
     /// until manually removed.
     pub fn compact(&mut self) -> io::Result<()> {
+        self.ensure_no_group("compact")?;
         if self.manifest.as_ref().is_some_and(|m| m.poisoned()) {
             return Err(io::Error::new(io::ErrorKind::Other, "manifest writer poisoned; reopen to recover"));
         }
@@ -893,6 +925,7 @@ impl Engine {
         if self.tiles.len() < max_tiles || self.tiles.len() < 2 {
             return Ok(None);
         }
+        self.ensure_no_group("maybe_compact_shape")?;
         if self.manifest.as_ref().is_some_and(|m| m.poisoned()) {
             return Err(io::Error::new(io::ErrorKind::Other, "manifest writer poisoned; reopen to recover"));
         }
@@ -1591,6 +1624,88 @@ impl Engine {
 
     /// 原子提交一个块。唯一约束冲突 → `Outcome::Conflict`（未写 WAL，调用方直接报业务错误）。
     pub fn commit_block(&mut self, block_id: &[u8], ops: &[Op]) -> io::Result<Outcome> {
+        self.ensure_no_group("commit_block")?;
+        self.commit_block_inner(block_id, ops, true)
+    }
+
+    /// Whether a deferred-barrier commit group is currently open (slice 23).
+    /// The request executor routes a block through
+    /// [`Engine::commit_block_grouped`] when this is true, so a request executed
+    /// inside a group shares the group's single barrier; every other caller of
+    /// [`Engine::commit_block`] still fails closed during a group.
+    pub fn group_open(&self) -> bool { self.group_open }
+
+    /// Open a deferred-barrier commit group (slice 23).
+    ///
+    /// Inside the group [`Engine::commit_block_grouped`] validates, WAL-appends
+    /// and applies each block in order, so every later probe/guard sees every
+    /// earlier member exactly as a sequence of single commits would; the single
+    /// `fdatasync` for the whole group is taken by [`Engine::end_group`].
+    ///
+    /// Durability rule, stated plainly: the barrier in `end_group` is the
+    /// group's ONLY durability point. Before it returns `Ok` nothing in the
+    /// group is acknowledged, and a crash before the barrier can lose the whole
+    /// group - the group is one durability unit, coarser than the per-block
+    /// durability of [`Engine::commit_block`]. Because no member was acked, no
+    /// acknowledged work is lost. A conflict inside the group is per-block (like
+    /// a single commit), never a whole-group rejection: the conflicting block
+    /// returns [`Outcome::Conflict`], is not appended, and later grouped commits
+    /// continue.
+    ///
+    /// While a group is open every other mutating entry point (`commit_block`,
+    /// `commit_batch`, `build_tile`, `publish_tile`, `rotate_wal`, `compact`,
+    /// `maybe_compact_shape`) refuses; `begin_group` twice also refuses. A
+    /// caller that forgets `end_group` therefore fails closed instead of
+    /// silently committing through a path its barrier never covered.
+    pub fn begin_group(&mut self) -> io::Result<()> {
+        self.ensure_attached()?;
+        if self.group_open {
+            return Err(io::Error::new(io::ErrorKind::Other, "a commit group is already open"));
+        }
+        self.group_open = true;
+        self.group_pending = false;
+        Ok(())
+    }
+
+    /// Commit one block inside an open group: identical to [`Engine::commit_block`]
+    /// except the WAL `fdatasync` is deferred to [`Engine::end_group`]. Uniqueness
+    /// is still evaluated against the current (already group-updated) state, so a
+    /// conflict is a per-block [`Outcome::Conflict`] and nothing was appended.
+    /// Fails closed when no group is open.
+    pub fn commit_block_grouped(&mut self, block_id: &[u8], ops: &[Op]) -> io::Result<Outcome> {
+        if !self.group_open {
+            return Err(io::Error::new(io::ErrorKind::Other, "no commit group is open; begin_group first"));
+        }
+        // Any attempt owes a barrier: a failed append poisons the WAL and must
+        // surface in `end_group`'s sync, not be silently skipped as empty.
+        self.group_pending = true;
+        self.commit_block_inner(block_id, ops, false)
+    }
+
+    /// Take the group's single WAL barrier and make the whole group durable.
+    ///
+    /// On a partial append failure inside the group the WAL writer is poisoned
+    /// exactly as in the single-block path, so this `sync` fails and the group is
+    /// never acknowledged; the caller must reopen to recover (the group's
+    /// complete prefix, if the OS kept it, replays; nothing acked is lost).
+    /// Fails closed when no group is open (so `end_group` twice fails). Clears
+    /// the group even when the barrier fails, because the group is over and the
+    /// poisoned writer already refuses further commits until reopen.
+    pub fn end_group(&mut self) -> io::Result<()> {
+        if !self.group_open {
+            return Err(io::Error::new(io::ErrorKind::Other, "no commit group is open; begin_group first"));
+        }
+        let result = if self.group_pending { self.wal.sync() } else { Ok(()) };
+        self.group_open = false;
+        self.group_pending = false;
+        result
+    }
+
+    /// Shared single-block commit core. `barrier` selects whether the WAL
+    /// `fdatasync` is taken before the block is published: the single-block path
+    /// passes `true` (unchanged observable behaviour), the deferred-barrier group
+    /// path passes `false` and relies on [`Engine::end_group`] for the one sync.
+    fn commit_block_inner(&mut self, block_id: &[u8], ops: &[Op], barrier: bool) -> io::Result<Outcome> {
         let t0 = self.timing();
         let id = self.metrics.borrow_mut().resolve_commit();
         let _sample = MetricsSample { metrics: &self.metrics, id, started: t0 };
@@ -1648,7 +1763,9 @@ impl Engine {
 
         let payload = encode_payload(csn, block_id, ops);
         self.wal.append(&payload)?;
-        self.wal.sync()?;
+        if barrier {
+            self.wal.sync()?;
+        }
 
         for op in ops {
             apply_op(&mut self.mt, op, csn);
@@ -1691,6 +1808,7 @@ impl Engine {
     /// handle watermark advance exactly as a sequence of single commits would. An
     /// empty batch is a no-op.
     pub fn commit_batch(&mut self, blocks: &[(Vec<u8>, Vec<Op>)]) -> io::Result<BatchOutcome> {
+        self.ensure_no_group("commit_batch")?;
         let t0 = self.timing();
         let id = self.metrics.borrow_mut().resolve_commit();
         let _sample = MetricsSample { metrics: &self.metrics, id, started: t0 };
@@ -2171,6 +2289,29 @@ mod tests {
         assert_eq!(out, Outcome::Committed { csn: 1 });
         let doc = get_ok(&e, "Stock", 11).unwrap();
         assert_eq!(doc, br#"{"sku":"P-42","loc":"L1","on_hand":6}"#);
+        remove(&p);
+    }
+
+    /// A partial append inside a group poisons the WAL writer exactly as it does
+    /// on the single-block path, so the group's one barrier (`end_group`) fails
+    /// instead of acking a torn frame, and recovery truncates it.
+    #[test]
+    fn end_group_after_a_failed_append_poisons_like_the_single_block_path() {
+        let p = tmp("group_poison.wal");
+        let mut e = Engine::create(&p).unwrap();
+        e.commit_block(b"base", &[Op::PutDoc { entity: b"E".to_vec(), handle: 1, doc: b"doc1".to_vec() }]).unwrap();
+        e.begin_group().unwrap();
+        e.wal.arm_partial_append_fault();
+        assert!(e.commit_block_grouped(b"bad", &[Op::PutDoc { entity: b"E".to_vec(), handle: 2, doc: b"doc2".to_vec() }]).is_err(),
+            "the injected partial append fails");
+        assert!(e.end_group().is_err(), "the group's barrier surfaces the poisoned writer");
+        assert!(e.commit_block(b"after", &[Op::PutDoc { entity: b"E".to_vec(), handle: 3, doc: b"doc3".to_vec() }]).is_err(),
+            "the writer stays poisoned until reopen");
+        drop(e);
+        let e = Engine::open(&p).unwrap();
+        assert_eq!(e.csn(), 1, "recovery truncates the torn frame; the acknowledged base survives");
+        assert_eq!(get_ok(&e, "E", 1), Some(b"doc1".to_vec()));
+        assert_eq!(get_ok(&e, "E", 2), None);
         remove(&p);
     }
 

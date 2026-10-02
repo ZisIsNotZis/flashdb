@@ -13,6 +13,7 @@
 //! usage:
 //!   flashdb-load <existing-wal> <trace.jsonl> --rate-rps R[,R...] [--segment-requests N]
 //!                [--window-ms 1000] [--ceiling-us N] [--patterns] [--commit-batch B]
+//!                [--group-requests B]
 //!
 //! Exit status is 0 even when the engine is saturated: saturation is data, not an error. A
 //! trace/parse failure is an error (non-zero), because it means the measurement is invalid.
@@ -23,6 +24,7 @@ use std::io::{self, BufRead, BufReader, Write};
 use std::time::{Duration, Instant};
 
 use flashdb_engine::engine::{BatchOutcome, Engine, Op, Outcome};
+use flashdb_engine::replay::execute_requests_grouped;
 use flashdb_engine::request::execute_request;
 use serde_json::Value;
 
@@ -40,11 +42,12 @@ struct Args {
     ceiling_us: Option<u64>,
     patterns: bool,
     commit_batch: Option<u64>,
+    group_requests: Option<u64>,
 }
 
 fn parse_args(argv: Vec<String>) -> Result<Args, String> {
     if argv.len() < 3 {
-        return Err("usage: flashdb-load <existing-wal> <trace.jsonl> --rate-rps R[,R...] [--segment-requests N] [--window-ms N] [--ceiling-us N] [--patterns] [--commit-batch B]".into());
+        return Err("usage: flashdb-load <existing-wal> <trace.jsonl> --rate-rps R[,R...] [--segment-requests N] [--window-ms N] [--ceiling-us N] [--patterns] [--commit-batch B] [--group-requests B]".into());
     }
     let mut args = Args {
         wal: argv[1].clone(),
@@ -55,6 +58,7 @@ fn parse_args(argv: Vec<String>) -> Result<Args, String> {
         ceiling_us: None,
         patterns: false,
         commit_batch: None,
+        group_requests: None,
     };
     let mut i = 3;
     while i < argv.len() {
@@ -88,6 +92,13 @@ fn parse_args(argv: Vec<String>) -> Result<Args, String> {
                 args.commit_batch = Some(n);
                 i += 2;
             }
+            "--group-requests" => {
+                let n: u64 = argv.get(i + 1).ok_or("--group-requests needs a value")?
+                    .parse().map_err(|_| "--group-requests must be a positive integer")?;
+                if n == 0 { return Err("--group-requests must be a positive integer".into()); }
+                args.group_requests = Some(n);
+                i += 2;
+            }
             "--patterns" => { args.patterns = true; i += 1; }
             other => return Err(format!("unknown argument {other:?}")),
         }
@@ -97,6 +108,9 @@ fn parse_args(argv: Vec<String>) -> Result<Args, String> {
         return Err("every rate must be finite and positive".into());
     }
     if args.window_ms == 0 { return Err("--window-ms must be positive".into()); }
+    if args.commit_batch.is_some() && args.group_requests.is_some() {
+        return Err("--commit-batch and --group-requests are different workloads; pick one".into());
+    }
     Ok(args)
 }
 
@@ -221,6 +235,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut late_total: u64 = 0;
     let mut completed: u64 = 0;
     let mut errors: u64 = 0;
+    let mut else_used: u64 = 0;
     let mut first_error: Option<String> = None;
     let mut latencies: Vec<u64> = Vec::new();
     // schedule lag = how late a request was issued relative to its due time. The burst pacer
@@ -240,11 +255,46 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         let errors_before = errors;
         let now_us = t0.elapsed().as_secs_f64() * 1e6;
         if due_us <= now_us {
-            let size = args.commit_batch.unwrap_or(1).max(1);
+            let size = args.group_requests.or(args.commit_batch).unwrap_or(1).max(1);
             let end = (index + size).min(total);
             window_rate = rate_for(index, total, &args.rates, args.segment_requests);
             let started = Instant::now();
-            if args.commit_batch.is_none() {
+            if args.group_requests.is_some() {
+                // Grouped request mode: the real adapter flow (`cust -> take` with its stock
+                // guard, plus the read shapes) executed in order inside ONE deferred-barrier
+                // group, so guards see earlier requests' effects and the group shares one fsync.
+                let mut requests: Vec<Value> = Vec::with_capacity((end - index) as usize);
+                for i in index..end {
+                    requests.push(serde_json::from_str(&lines[i as usize])?);
+                }
+                match execute_requests_grouped(&mut engine, &requests) {
+                    Ok(results) => {
+                        for result in results {
+                            match result {
+                                Ok(blocks) => {
+                                    completed += 1;
+                                    // `take: failed` is the stock guard's else branch: proof the
+                                    // workload exercised the in-order guard semantics, not puts.
+                                    if blocks.get("take").is_some_and(|b| b.status == "failed") {
+                                        else_used += 1;
+                                    }
+                                }
+                                Err(e) => {
+                                    errors += 1;
+                                    if first_error.is_none() {
+                                        first_error = Some(format!("request group at {index}: {e}"));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        // The group's own failure (open or barrier): nothing in it is durable.
+                        errors += requests.len() as u64;
+                        if first_error.is_none() { first_error = Some(format!("request group at {index}: {e}")); }
+                    }
+                }
+            } else if args.commit_batch.is_none() {
                 let request: Value = serde_json::from_str(&lines[index as usize])?;
                 match execute_request(&mut engine, &request) {
                     Ok(_) => completed += 1,
@@ -387,11 +437,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let elapsed_ms = elapsed.as_millis();
     let achieved_rps = if elapsed.as_secs_f64() > 0.0 { completed as f64 / elapsed.as_secs_f64() } else { 0.0 };
     writeln!(out, "load_summary requests={total} completed={completed} errors={errors} \
-        late_total={late_total} windows={window_index} invalid_windows={invalid_windows} \
-        last_valid_rate_rps={last_valid_rate:.0} saturated_at_rps={} commit_batch={} \
+        else_used={else_used} late_total={late_total} windows={window_index} invalid_windows={invalid_windows} \
+        last_valid_rate_rps={last_valid_rate:.0} saturated_at_rps={} commit_batch={} group_requests={} \
         elapsed_ms={elapsed_ms} achieved_rps={achieved_rps:.0} first_error={:?}",
         saturated_at.map(|r| format!("{r:.0}")).unwrap_or_else(|| "none".into()),
         args.commit_batch.unwrap_or(1),
+        args.group_requests.map(|g| g.to_string()).unwrap_or_else(|| "none".into()),
         first_error.unwrap_or_else(|| "none".into()))?;
     Ok(())
 }
@@ -443,5 +494,15 @@ mod tests {
         assert!(parse_args(vec!["b".into(), "wal".into(), "t.jsonl".into(),
                                 "--rate-rps".into(), "10".into(), "--commit-batch".into(), "0".into()]).is_err(),
             "a zero batch size is rejected");
+        let grouped = parse_args(vec!["b".into(), "wal".into(), "t.jsonl".into(),
+                                      "--rate-rps".into(), "10".into(), "--group-requests".into(), "64".into()])
+            .expect("valid group args");
+        assert_eq!(grouped.group_requests, Some(64));
+        assert!(parse_args(vec!["b".into(), "wal".into(), "t.jsonl".into(), "--rate-rps".into(), "10".into(),
+                                "--commit-batch".into(), "8".into(), "--group-requests".into(), "8".into()]).is_err(),
+            "the two grouping modes are mutually exclusive");
+        assert!(parse_args(vec!["b".into(), "wal".into(), "t.jsonl".into(), "--rate-rps".into(), "10".into(),
+                                "--group-requests".into(), "0".into()]).is_err(),
+            "a zero group size is rejected");
     }
 }
