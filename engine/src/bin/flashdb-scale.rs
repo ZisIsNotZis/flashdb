@@ -191,6 +191,17 @@ fn seed_checkpoint_bytes() -> Option<u64> {
         .and_then(|v| v.parse::<u64>().ok())
 }
 
+/// `seed-inventory` WAL rotation cadence (measurement knob). The generic `seed`
+/// path rotates its WAL so recovery replays only the post-rotation suffix; this
+/// opt-in gives the inventory bootstrap the same property, which is what lets a
+/// multi-GB dimension instance open with bounded RAM/time. Unset (the default)
+/// keeps the pre-existing behaviour: one growing WAL retained in full.
+fn seed_rotate_bytes() -> Option<u64> {
+    std::env::var("FLASHDB_SEED_ROTATE_BYTES")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+}
+
 /// Every `*.tile` file in the engine directory as `(plain name, bytes)`, sorted.
 /// Used by the seed/checkpoint/tileinfo reporting; unreferenced leftovers from a
 /// failed publish would be included, so a caller that needs the active set must
@@ -686,6 +697,8 @@ fn cmd_seed_inventory(dir: &Path, trace: &Path) -> Result<(), Box<dyn std::error
     emit_policy("seed-inventory", &layout);
     let (layout_page_size, layout_bloom_bits) = layout.default_layout();
     let checkpoint_bytes = seed_checkpoint_bytes();
+    let rotate_bytes = seed_rotate_bytes();
+    let mut rotations = 0u64;
     let file = fs::File::open(trace)
         .map_err(|e| format!("seed trace {} unreadable ({e})", trace.display()))?;
     let started = Instant::now();
@@ -748,6 +761,15 @@ fn cmd_seed_inventory(dir: &Path, trace: &Path) -> Result<(), Box<dyn std::error
                 last_published_csn = e.csn();
             }
         }
+        // Rotation is only legal once every committed block is published and the
+        // memtable is empty; it retires the covered segment so a later
+        // `open_discover` replays only the post-rotation suffix (the generic
+        // `seed` cadence does exactly this). Opt-in via the env knob.
+        if let Some(max_wal_bytes) = rotate_bytes {
+            if e.rotate_wal(max_wal_bytes)? {
+                rotations += 1;
+            }
+        }
     }
     // Guarantee at least one tile when checkpointing is on, even if the trace is
     // smaller than the cadence: publish the unpublished tail through the same
@@ -757,7 +779,7 @@ fn cmd_seed_inventory(dir: &Path, trace: &Path) -> Result<(), Box<dyn std::error
         publishes += 1;
     }
     emit(&format!(
-        "phase=seed-inventory ok=true blocks={blocks} docs={docs} customers={customers} stocks={stocks} csn={} publishes={publishes} tiles={} serving_memtable_entries={} region_mode={} layout_page_size={layout_page_size} layout_bloom_bits={layout_bloom_bits} dir={} elapsed_s={:.3}",
+        "phase=seed-inventory ok=true blocks={blocks} docs={docs} customers={customers} stocks={stocks} csn={} publishes={publishes} rotations={rotations} tiles={} serving_memtable_entries={} region_mode={} layout_page_size={layout_page_size} layout_bloom_bits={layout_bloom_bits} dir={} elapsed_s={:.3}",
         e.csn(),
         tile_files(dir)?.len(),
         e.serving_memtable_entries(),
