@@ -150,3 +150,62 @@ cgroup). Consequences and evidence:
 
 Next: isolate the load footprint (probes-only / scans-only / writes-only; pacer streaming), fix or
 bound it (streaming scan results is the likely fix), and only then run the >=10x cold comparison.
+
+## Load-path footprint ISOLATED (slice 32): it is the OPEN replay, not the load; the scan hypothesis is false
+
+The follow-up hypothesis ("the scan path materialises a whole-entity result set", 243 MB / 3 M rows
+~= 80 B/row) is **falsified**. The ~243 MB peak is the **open-time replay of the retained WAL
+suffix**, and the read/write load adds ~1 MB.
+
+Measured on the slice-30 runner's `global-4k` build (`/tmp/cold30/global-4k`): 766,633,551 bytes of
+tiles across 36 active tiles, `serving_memtable_entries=0`, retained WAL suffix `data-2465.wal` =
+47,079,969 bytes. Offered 300 rps on each split trace, `/usr/bin/time -v`, plus a new
+`flashdb-load --peak-report` that reads `VmHWM` (a) after open and (b) after resetting the kernel's
+high-water mark (`/proc/self/clear_refs=5`), so the second read measures only the LOAD.
+
+| arm | trace | open peak VmHWM | load-only peak (post-reset) | time -v max | delta over live floor |
+|---|---|---:|---:|---:|---:|
+| (open only, no load) | — | 242,268 KiB | 85,148 KiB live | 242,268 KiB | — |
+| probes only | 6000 Stock lookups | 243,244 KiB | 86,460 KiB | 86,228 KiB | +1.3 MiB |
+| scans only | 1000 `movements_scan` | 242,308 KiB | 85,568 KiB | 85,328 KiB | +0.4 MiB |
+| writes only | 1000 committed `order_flow` | 242,400 KiB | 86,232 KiB | 85,396 KiB | +1.1 MiB |
+
+Attribution:
+
+* **The peak is `open_discover` -> `open_impl`.** It replays the 47 MB suffix into `records`, the
+  `covered` memtable, the `dedup` block-id map and the per-tile projection/`expect` maps, and peaks
+  at **5.15x the suffix bytes** (47 MB -> 242 MB). The shape split is irrelevant: all three loads
+  peak at 242-243 MB, and `openinfo` with no load at all already reports 242,268 KiB.
+* **The request path adds ~1 MB and is shape-independent.** The post-open floor (~86 MB) equals the
+  engine's live RSS after open (~85 MB); probes, scans and writes all land on it. A movements scan
+  does **not** materialise its result set: `engine/src/request.rs::execute_request` streams through
+  `Engine::scan_primary` into a top-100 `BTreeMap` bounded by `101 x 64 KiB`, and `reverse_lookup`'s
+  collected `Vec` is not on the inventory read path at all.
+* Holding the trace is not a factor: the 6000-request trace is 0.9 MB and the full 30k `read.jsonl`
+  is 6.3 MB, three orders below the 243 MB peak.
+* The ~85 MB live floor (slice 31 measured ~5 MB on a 114 MB / 22-tile instance) is suffix-derived,
+  not tile-derived: rotating away the suffix drops live RSS to 15,884 KiB with the same 36 tiles.
+
+## Bound (slice 32): bound the retained suffix by rotating the write load, not the scan
+
+The 47 MB suffix exists because the cold runner's write phase (`flashdb-load --group-requests`)
+appends to ONE growing WAL and never checkpoints/rotates. `flashdb-load` now has opt-in
+`--checkpoint-bytes N` / `--rotate-bytes N` (the same tested `maybe_checkpoint` / `rotate_wal`
+protocol `seed-inventory` already uses on the seed phase), and `cold_axis_compare.py` passes them to
+the write phase with an 8 MiB cadence. Measured on a copy of the same instance, rotate-only:
+
+| instance | retained suffix | open peak VmHWM | live RSS |
+|---|---:|---:|---:|
+| pre-fix `/tmp/cold30/global-4k` | 47,079,969 B | 242,268 KiB | 85,148 KiB |
+| post-rotate (new empty segment) | 0 B | **16,048 KiB** | 15,884 KiB |
+
+A ~15x cut in the open peak and ~5.4x in live RSS, with **no** on-disk format, read, write or
+durability change: it publishes/retires the WAL through the existing protocol, and with both flags
+absent the write path is byte-identical to before (the extra call is not even made). With an 8 MiB
+cadence the suffix stays bounded, so the open peak stays ~16-45 MB and a 192 MiB cgroup cap is
+comfortably affordable. The >= 10x cold comparison is therefore no longer blocked by the load path:
+the load path never was the blocker, the open path was.
+
+**Scan-materialisation verdict:** no change needed. Scans already stream (bounded visitor + top-100
+BTreeMap); there is no whole-entity result `Vec` to stream, and `reverse_lookup` is not on the read
+path. The `--peak-report` diagnostic and the checkpoint/rotate flags are the only engine changes.

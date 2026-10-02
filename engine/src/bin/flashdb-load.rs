@@ -14,7 +14,8 @@
 //!   flashdb-load <dir-or-wal> <trace.jsonl> --rate-rps R[,R...] [--segment-requests N]
 //!                [--window-ms 1000] [--ceiling-us N] [--patterns] [--metrics-json]
 //!                [--commit-batch B] [--group-requests B] [--no-tiles]
-//!                [--policy-file PATH] [--policy-reload]
+//!                [--policy-file PATH] [--policy-reload] [--peak-report]
+//!                [--checkpoint-bytes N] [--rotate-bytes N] [--region-mode global|per_region]
 //!
 //! External policy control (slice 27): `--policy-file PATH` (or the
 //! `FLASHDB_POLICY_FILE` env var) points the driver at the frozen JSON policy
@@ -31,6 +32,16 @@
 //! counters without parsing text. Its frozen schema is documented on
 //! `metrics_json_line`.
 //!
+//! WAL maintenance (Slice 32): `--checkpoint-bytes N` publishes the serving
+//! memtable as tiles once the retained WAL exceeds N, and `--rotate-bytes N`
+//! retires the published WAL onto a fresh segment once it exceeds N (it requires
+//! `--checkpoint-bytes`). Both mirror `flashdb-scale seed-inventory`'s env knobs,
+//! so a long write load leaves a bounded WAL suffix rather than one that grows
+//! with the offered work. They are opt-in: without them the write load appends to
+//! one growing WAL exactly as before, which is what made a many-GB instance open
+//! by replaying a multi-tens-of-MB suffix. Off the read path: with neither flag,
+//! no extra engine call is made.
+//!
 //! Opening: a **directory** is opened tile-aware with `Engine::open_discover`, so a published
 //! tile is consulted before the memtable and the measured flow exercises the real tile read path;
 //! a **WAL file** (or `--no-tiles`) keeps the historical `Engine::open` behaviour (full WAL replay
@@ -45,7 +56,7 @@ use std::path::Path;
 use std::io::{self, BufRead, BufReader, Write};
 use std::time::{Duration, Instant};
 
-use flashdb_engine::engine::{BatchOutcome, Engine, LayoutPolicy, Op, Outcome};
+use flashdb_engine::engine::{BatchOutcome, Engine, LayoutPolicy, Op, Outcome, RegionMode};
 use flashdb_engine::metrics::WindowSnapshot;
 use flashdb_engine::replay::execute_requests_grouped;
 use flashdb_engine::request::execute_request;
@@ -70,6 +81,10 @@ struct Args {
     discover: bool,
     policy_file: Option<String>,
     policy_reload: bool,
+    peak_report: bool,
+    checkpoint_bytes: Option<u64>,
+    rotate_bytes: Option<u64>,
+    region_mode: Option<RegionMode>,
 }
 
 fn parse_args(argv: Vec<String>) -> Result<Args, String> {
@@ -90,6 +105,10 @@ fn parse_args(argv: Vec<String>) -> Result<Args, String> {
         discover: true,
         policy_file: None,
         policy_reload: false,
+        peak_report: false,
+        checkpoint_bytes: None,
+        rotate_bytes: None,
+        region_mode: None,
     };
     let mut i = 3;
     while i < argv.len() {
@@ -137,6 +156,27 @@ fn parse_args(argv: Vec<String>) -> Result<Args, String> {
                 i += 2;
             }
             "--policy-reload" => { args.policy_reload = true; i += 1; }
+            "--peak-report" => { args.peak_report = true; i += 1; }
+            "--checkpoint-bytes" => {
+                let n: u64 = argv.get(i + 1).ok_or("--checkpoint-bytes needs a value")?
+                    .parse().map_err(|_| "--checkpoint-bytes must be a positive integer")?;
+                if n == 0 { return Err("--checkpoint-bytes must be a positive integer".into()); }
+                args.checkpoint_bytes = Some(n);
+                i += 2;
+            }
+            "--rotate-bytes" => {
+                let n: u64 = argv.get(i + 1).ok_or("--rotate-bytes needs a value")?
+                    .parse().map_err(|_| "--rotate-bytes must be a positive integer")?;
+                if n == 0 { return Err("--rotate-bytes must be a positive integer".into()); }
+                args.rotate_bytes = Some(n);
+                i += 2;
+            }
+            "--region-mode" => {
+                let name = argv.get(i + 1).ok_or("--region-mode needs a value")?;
+                args.region_mode = Some(RegionMode::from_name(name)
+                    .ok_or_else(|| format!("unknown region mode {name:?} (global|per_region)"))?);
+                i += 2;
+            }
             "--no-tiles" => { args.discover = false; i += 1; }
             other => return Err(format!("unknown argument {other:?}")),
         }
@@ -152,6 +192,9 @@ fn parse_args(argv: Vec<String>) -> Result<Args, String> {
     if args.policy_reload && args.policy_file.is_none() {
         return Err("--policy-reload needs --policy-file (or FLASHDB_POLICY_FILE)".into());
     }
+    // Rotation retires only a fully published, empty memtable (`Engine::rotate_wal`); with
+    // `--checkpoint-bytes` the pair is a self-maintaining write load, and alone it only
+    // succeeds on an instance that is already fully published (otherwise it fails closed).
     Ok(args)
 }
 
@@ -304,6 +347,37 @@ fn batch_write_block(req: &Value, handle: u64) -> io::Result<(Vec<u8>, Vec<Op>)>
     Ok((id.as_bytes().to_vec(), ops))
 }
 
+/// Read the kernel's recorded peak resident set (`VmHWM`) from `/proc/self/status`, in KiB.
+/// Diagnostic only (see `--peak-report`): separates the open-time replay peak from the load's own.
+fn peak_rss_kb() -> Option<u64> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    status.lines().find_map(|l| l.strip_prefix("VmHWM:").map(str::trim))
+        .and_then(|v| v.split_whitespace().next())
+        .and_then(|v| v.parse().ok())
+}
+
+/// Reset the kernel's `VmHWM` high-water mark (`clear_refs=5`), so a later `peak_rss_kb()` read
+/// measures only the load that follows. Diagnostic only; a no-op where the file is absent.
+fn reset_peak_rss() {
+    let _ = std::fs::write("/proc/self/clear_refs", "5\n");
+}
+
+/// Bounded-WAL maintenance for a sustained write load: publish the serving memtable once the
+/// retained WAL exceeds `checkpoint_bytes`, then retire the published segment onto a fresh one
+/// once it exceeds `rotate_bytes`. Both mirror `cmd_seed_inventory`'s cadence; the effect is that a
+/// multi-hour (or multi-thousand-request) write load leaves a bounded suffix, so a later
+/// `open_discover` replays only that suffix instead of everything written since the last rotation.
+/// `rotate_bytes` requires `checkpoint_bytes` (checked at parse time) because rotation is only
+/// legal on a fully published, empty memtable. No format, read, write or durability change: this
+/// is the same tested `maybe_checkpoint`/`rotate_wal` protocol the seeder already uses.
+fn maintain_wal(engine: &mut Engine, checkpoint_bytes: Option<u64>, rotate_bytes: Option<u64>)
+    -> io::Result<()>
+{
+    if let Some(n) = checkpoint_bytes { engine.maybe_checkpoint(n)?; }
+    if let Some(n) = rotate_bytes { engine.rotate_wal(n)?; }
+    Ok(())
+}
+
 /// Return already-freed heap pages to the OS. The load path streams large transient buffers (each
 /// `movements_scan` result is hundreds of KB), and glibc keeps the freed arena pages, which showed
 /// up as a ~243 MB process peak on a 760 MB working set - enough to OOM under the small memory caps
@@ -356,6 +430,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             .map_err(|e| io::Error::new(e.kind(), format!("policy file {path}: {e}")))?;
         engine.set_layout_policy(policy);
     }
+    // Tile write mode: not persisted, so a runner that builds a per-region arm must set it on the
+    // write load too, or every publish is a whole-keyspace tile (slice 24/32).
+    if let Some(mode) = args.region_mode {
+        engine.set_region_mode(mode);
+    }
     let stdout = io::stdout();
     let mut out = stdout.lock();
     writeln!(out, "device_fsync_p50_us={} device_fsync_p99_us={}",
@@ -366,6 +445,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     writeln!(out, "engine_open target={} discover={} active_tiles={} serving_memtable_entries={}",
         args.target, args.discover, engine.active_tile_cutoffs().len(), engine.serving_memtable_entries())?;
     writeln!(out, "engine_policy policy={}", engine.layout_policy().to_json())?;
+    // Memory attribution diagnostic (off by default): report the peak RSS reached by open, then
+    // reset the kernel's high-water mark so the summary line measures the LOAD's own peak. This
+    // separates the open-time WAL-replay footprint from anything the request path retains.
+    if args.peak_report {
+        writeln!(out, "load_peak stage=open hwm_kb={}",
+            peak_rss_kb().map(|v| v.to_string()).unwrap_or_else(|| "none".into()))?;
+        reset_peak_rss();
+    }
 
     let t0 = Instant::now();
     // `due_us` is ALWAYS the due time of the next request to issue, so an unissued request never
@@ -509,6 +596,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
             }
+            // Bounded-WAL maintenance (opt-in): publish then rotate once the write load has grown
+            // the suffix past the configured thresholds, exactly as `seed-inventory` does. With
+            // neither flag set this is not called, so read runs pay nothing.
+            if args.checkpoint_bytes.is_some() || args.rotate_bytes.is_some() {
+                maintain_wal(&mut engine, args.checkpoint_bytes, args.rotate_bytes)?;
+            }
             // One latency sample per request of the group: in batch mode every request in the
             // group shares the single commit barrier, so their latencies are the same value.
             let group_us = started.elapsed().as_micros() as u64;
@@ -607,6 +700,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         device_end.0.map(|v| v.to_string()).unwrap_or_else(|| "none".into()),
         device_end.1.map(|v| v.to_string()).unwrap_or_else(|| "none".into()))?;
     let elapsed_ms = elapsed.as_millis();
+    if args.peak_report {
+        writeln!(out, "load_peak stage=end hwm_kb={}",
+            peak_rss_kb().map(|v| v.to_string()).unwrap_or_else(|| "none".into()))?;
+    }
     let achieved_rps = if elapsed.as_secs_f64() > 0.0 { completed as f64 / elapsed.as_secs_f64() } else { 0.0 };
     writeln!(out, "load_summary requests={total} completed={completed} errors={errors} \
         else_used={else_used} late_total={late_total} windows={window_index} invalid_windows={invalid_windows} \
@@ -655,6 +752,51 @@ mod tests {
         assert!(!parse_args(argv.clone()).expect("valid args").metrics_json);
         argv.push("--metrics-json".into());
         assert!(parse_args(argv).expect("valid args").metrics_json);
+    }
+
+    #[test]
+    fn peak_report_flag_is_parsed_off_by_default() {
+        let mut argv = vec!["b".into(), "wal".into(), "t.jsonl".into(), "--rate-rps".into(), "10".into()];
+        assert!(!parse_args(argv.clone()).expect("valid args").peak_report);
+        argv.push("--peak-report".into());
+        assert!(parse_args(argv).expect("valid args").peak_report);
+    }
+
+    #[test]
+    fn wal_maintenance_flags_are_parsed() {
+        let argv = vec!["b".into(), "dir".into(), "t.jsonl".into(), "--rate-rps".into(), "10".into(),
+                        "--checkpoint-bytes".into(), "8388608".into(),
+                        "--rotate-bytes".into(), "8388608".into()];
+        let args = parse_args(argv).expect("valid maintenance args");
+        assert_eq!(args.checkpoint_bytes, Some(8_388_608));
+        assert_eq!(args.rotate_bytes, Some(8_388_608));
+        let plain = parse_args(vec!["b".into(), "dir".into(), "t.jsonl".into(),
+                                     "--rate-rps".into(), "10".into()]).expect("valid args");
+        assert_eq!(plain.checkpoint_bytes, None);
+        assert_eq!(plain.rotate_bytes, None);
+        // Rotate alone is legal: it bounds an already-published instance.
+        assert_eq!(parse_args(vec!["b".into(), "dir".into(), "t.jsonl".into(), "--rate-rps".into(), "10".into(),
+                                    "--rotate-bytes".into(), "8388608".into()]).expect("rotate-only args").rotate_bytes,
+            Some(8_388_608));
+        assert!(parse_args(vec!["b".into(), "dir".into(), "t.jsonl".into(), "--rate-rps".into(), "10".into(),
+                                "--checkpoint-bytes".into(), "0".into()]).is_err(),
+            "a zero checkpoint threshold is rejected");
+        assert!(parse_args(vec!["b".into(), "dir".into(), "t.jsonl".into(), "--rate-rps".into(), "10".into(),
+                                "--rotate-bytes".into(), "0".into()]).is_err(),
+            "a zero rotate threshold is rejected");
+    }
+
+    #[test]
+    fn region_mode_flag_selects_and_rejects() {
+        let per = parse_args(vec!["b".into(), "dir".into(), "t.jsonl".into(), "--rate-rps".into(), "10".into(),
+                                  "--region-mode".into(), "per_region".into()]).expect("valid region mode");
+        assert_eq!(per.region_mode, Some(RegionMode::PerRegion));
+        let global = parse_args(vec!["b".into(), "dir".into(), "t.jsonl".into(), "--rate-rps".into(), "10".into(),
+                                      "--region-mode".into(), "global".into()]).expect("valid region mode");
+        assert_eq!(global.region_mode, Some(RegionMode::Global));
+        assert!(parse_args(vec!["b".into(), "dir".into(), "t.jsonl".into(), "--rate-rps".into(), "10".into(),
+                                "--region-mode".into(), "nonsense".into()]).is_err(),
+            "an unknown region mode is rejected");
     }
 
     #[test]

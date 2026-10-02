@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sys
 import types
 from pathlib import Path
@@ -51,6 +52,20 @@ def test_parse_load_output_reads_metrics_json_regions():
     assert parsed["regions"]["P|Stock"]["bytes_read"] == 95
     assert parsed["regions"]["U|Stock"]["p50_us"] == 216.0
     assert parsed["regions"]["U|Stock"]["bytes_read"] == 113500000
+
+
+def test_parse_load_output_reads_peak_report_lines():
+    text = (
+        "engine_open target=/tmp/x discover=true active_tiles=36 serving_memtable_entries=0\n"
+        "load_peak stage=open hwm_kb=243244\n"
+        "load_peak stage=end hwm_kb=86460\n"
+        "load_summary requests=6000 completed=6000 errors=0 else_used=0 late_total=0 "
+        "windows=19 invalid_windows=0 last_valid_rate_rps=300 saturated_at_rps=none "
+        "commit_batch=1 group_requests=none elapsed_ms=20000 achieved_rps=300 first_error=\"none\"\n"
+    )
+    parsed = cac.parse_load_output(text)
+    assert parsed["open_peak_kb"] == 243244
+    assert parsed["load_peak_kb"] == 86460
 
 
 def test_parse_rss_peak_takes_max_across_blocks():
@@ -110,10 +125,14 @@ def test_read_trace_mix_is_deterministic_and_forces_else(tmp_path):
     assert m1["counts"] == {"stock_lookup": 5, "customer_lookup": 2,
                             "movements_scan": 2, "order_flow": 1}
     assert p1.read_bytes() == p2.read_bytes()
-    # The single order_flow request must carry qty above on_hand so the guard's else fires.
+    # The single order_flow request must carry qty above on_hand so the guard's else fires, and
+    # its order_no must sit above the build's committed range (write_requests) so it is new work.
     for line in p1.read_text().splitlines():
         if '"take"' in line:
             assert f'"qty":{args.on_hand + 1}' in line
+            cfg = json.loads(line)
+            order_no = cfg["params"]["order_no"]
+            assert int(order_no[1:]) > args.write_requests, order_no
 
 
 def test_write_trace_is_all_order_flow(tmp_path):

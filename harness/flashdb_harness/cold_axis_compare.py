@@ -17,7 +17,12 @@ This harness builds that instance and re-runs the two axes cold:
   rotation knob; without it the un-rotated WAL is replayed in full at open, which made a
   few-hundred-MB instance open with ~1.4 GB RSS and ~70 s of CPU), then a flow-driven
   ``order_flow`` write phase applied through the adapter (``--group-requests``) and
-  checkpointed as tiles;
+  checkpointed as tiles. Slice 32 gave the write phase the same checkpoint+rotate cadence
+  (``--checkpoint-bytes``/``--rotate-bytes`` on ``flashdb-load``): without it the write load
+  grows ONE WAL with no rotation, so a later open replays the whole multi-tens-of-MB suffix
+  and peaks at ~5x it (measured 47 MB suffix -> 242 MB open peak on this box), which is what
+  OOM-killed the load under a 192 MiB cap. With rotation the suffix is bounded by the cadence
+  and the open peak is ~16-45 MB;
 * every phase runs under ``systemd-run --user --scope -p MemoryMax=<cap> -p MemorySwapMax=0``,
   so the cgroup - which counts page cache - caps and evicts the working set. Both views are
   reported: the process ``rss_peak`` (``/usr/bin/time -v``) and the scope's own
@@ -38,7 +43,12 @@ actually reached the cold regime and whether an axis moved.
 
 Usage (from the harness directory)::
 
-    uv run python -m flashdb_harness.cold_axis_compare --release
+    uv run python -m flashdb_harness.cold_axis_compare --release --cap-mib 192
+
+With the bounded suffix the open peak is ~16-45 MB, so the smaller >= 10x pair is a 192 MiB
+cap over the default ~2.6 GB instance (13.6x); raise ``--cap-mib`` and the dimension counts
+together for the 256 MiB / >= 2.7 GB or 384 MiB / >= 4 GB pairs. The ``ratio`` line prints the
+achieved value and warns when it is below the pre-registration 10x floor.
 
 The long run is meant to be started with ``nohup`` and polled; it prints one machine-readable
 line per phase. See ``harness/cold_axis_report.md`` for the captured run.
@@ -106,12 +116,18 @@ def parse_load_output(text: str) -> dict:
         "commit_rate": None,
         "invalid_windows": None,
         "late_total": None,
+        "open_peak_kb": None,
+        "load_peak_kb": None,
     }
     for line in text.splitlines():
         line = line.strip()
         if line.startswith("device_fsync_p50_us="):
             out["device_fsync_p50_us"] = int(_kv(line, "device_fsync_p50_us"))
             out["device_fsync_p99_us"] = int(_kv(line, "device_fsync_p99_us"))
+        elif line.startswith("load_peak "):
+            stage = _kv(line, "stage")
+            if stage in ("open", "end"):
+                out["open_peak_kb" if stage == "open" else "load_peak_kb"] = int(_kv(line, "hwm_kb"))
         elif line.startswith("engine_open "):
             out["discover"] = _kv(line, "discover")
             out["active_tiles"] = int(_kv(line, "active_tiles"))
@@ -291,6 +307,11 @@ def emit_read_trace(path: Path, args: argparse.Namespace) -> dict:
         }, sort_keys=True, separators=(",", ":")))
     counts = {"stock_lookup": n_stock, "customer_lookup": n_customer,
               "movements_scan": n_scan, "order_flow": 0}
+    # The write phase already committed order_no O1..O<write_requests>; start the read trace's
+    # order_flows above that range so their backorders are new work (a fresh order), not an
+    # "order number already used" conflict that never reaches the guard's else branch. The
+    # movement scans above deliberately address the build's commitment range O1..O<write_requests>.
+    gen.order_no = args.write_requests
     for i in range(n_write):
         req = gen.order_flow()
         # Force the stock guard's `on_hand >= qty` predicate false without touching stock:
@@ -381,7 +402,9 @@ def build_inventory(name: str, mode: str, region_layout: str | None, bins: dict,
     script = " && ".join([
         f"/usr/bin/time -v {bins['scale']} seed-inventory {d} {traces['seed']}",
         (f"/usr/bin/time -v {bins['load']} {d} {traces['write']} --rate-rps {args.write_rate} "
-         f"--window-ms 1000 --group-requests {args.group_requests}"),
+         f"--window-ms 1000 --group-requests {args.group_requests} "
+         f"--checkpoint-bytes {args.checkpoint_bytes} --rotate-bytes {args.rotate_bytes} "
+         f"--region-mode {mode}"),
         f"/usr/bin/time -v {bins['scale']} checkpoint {d}",
     ])
     return scope(cap, script, env2, f"build-{name}")
@@ -395,14 +418,15 @@ def copy_and_compact(src: Path, dst: Path, policy: dict, bins: dict, env: dict,
         f"cp -a {src} {dst}",
         f"/usr/bin/time -v {bins['scale']} compact {dst}",
     ])
-    res = scope(cap, script, {**env, "FLASHDB_POLICY_FILE": str(policy_path)}, f"compact-{name}")
+    res = scope(cap, script, {**env, "FLASHDB_POLICY_FILE": str(policy_path),
+                              "FLASHDB_REGION_MODE": "per_region"}, f"compact-{name}")
     return res, parse_compact(res.stdout)
 
 
 def load_dir(d: Path, trace: Path, bins: dict, env: dict, args: argparse.Namespace,
              cap: int, name: str) -> "ScopeResult":
     cmd = (f"/usr/bin/time -v {bins['load']} {d} {trace} --rate-rps {args.rate} "
-           f"--window-ms {args.window_ms} --metrics-json")
+           f"--window-ms {args.window_ms} --metrics-json --peak-report")
     return scope(cap, cmd, env, f"load-{name}")
 
 
@@ -429,6 +453,8 @@ def format_report(results: dict, traces: dict, args: argparse.Namespace, cap_byt
           f"regions={sorted(ti['regions'])}")
     w(f"data_bytes={data_bytes} cap_bytes={cap_bytes} ratio={ratio(data_bytes, cap_bytes):.2f}x "
       f"(pre-registration target 10x)")
+    if ratio(data_bytes, cap_bytes) < 10.0:
+        w("WARNING: data:cap is below the pre-registration 10x floor; raise --customers/--skus or lower --cap-mib")
     w(f"read_trace requests={traces['read']['total']} mix={traces['read']['counts']} "
       f"offered_rate_rps={args.rate}")
     w(f"device 4 KiB O_DIRECT random read p50 = {DEVICE_4K_READ_P50_US} us (cold read cost)")
@@ -473,11 +499,13 @@ def format_report(results: dict, traces: dict, args: argparse.Namespace, cap_byt
 
     w("")
     w("=== scope peaks (rss_peak from the process, memory.peak from the cgroup) ===")
+    w(f"{'config':<16} {'open_hwm_kb':>11} {'load_hwm_kb':>11} {'rss_peak_b':>12} "
+      f"{'cgroup_peak_b':>13} load_rc")
     for name in ("global-4k", "per_region-mixed", "eager", "defer"):
         r = results[name]
-        w(f"{name:<16} rss_peak_bytes={r.get('rss_peak_bytes')!s:>12} "
-          f"cgroup_peak_bytes={r.get('cgroup_peak_bytes')!s:>12} "
-          f"load_rc={r['load_rc']}")
+        p = r.get("load", {})
+        w(f"{name:<16} {p.get('open_peak_kb')!s:>11} {p.get('load_peak_kb')!s:>11} "
+          f"{r.get('rss_peak_bytes')!s:>12} {r.get('cgroup_peak_bytes')!s:>13} {r['load_rc']}")
     return "\n".join(lines)
 
 
@@ -490,8 +518,10 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--release", action="store_true")
     ap.add_argument("--cap-mib", type=int, default=192,
                     help="cgroup MemoryMax; page cache is counted, so it must cover process RSS")
-    ap.add_argument("--checkpoint-bytes", type=int, default=16 << 20)
-    ap.add_argument("--rotate-bytes", type=int, default=16 << 20)
+    ap.add_argument("--checkpoint-bytes", type=int, default=8 << 20,
+                    help="publish a tile once the retained WAL exceeds this during seed AND the write load")
+    ap.add_argument("--rotate-bytes", type=int, default=8 << 20,
+                    help="retire the published WAL once it exceeds this, bounding the suffix a later open replays")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--customers", type=int, default=2_000_000)
     ap.add_argument("--skus", type=int, default=750_000)
