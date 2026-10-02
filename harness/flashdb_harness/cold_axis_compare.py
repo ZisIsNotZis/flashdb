@@ -455,8 +455,13 @@ def format_report(results: dict, traces: dict, args: argparse.Namespace, cap_byt
       f"(pre-registration target 10x)")
     if ratio(data_bytes, cap_bytes) < 10.0:
         w("WARNING: data:cap is below the pre-registration 10x floor; raise --customers/--skus or lower --cap-mib")
-    w(f"read_trace requests={traces['read']['total']} mix={traces['read']['counts']} "
-      f"offered_rate_rps={args.rate}")
+    # `traces` holds PATHS for the trace files; the counts live in the separate `trace_stats`
+    # dict. An earlier version indexed the path dict and crashed at report time, after the whole
+    # run had succeeded - which is the worst moment to lose the numbers.
+    stats = traces.get("stats", {}) if isinstance(traces, dict) else {}
+    read_stats = stats.get("read", {}) if isinstance(stats, dict) else {}
+    w(f"read_trace requests={read_stats.get('total', 'unknown')} "
+      f"mix={read_stats.get('counts', 'unknown')} offered_rate_rps={args.rate}")
     w(f"device 4 KiB O_DIRECT random read p50 = {DEVICE_4K_READ_P50_US} us (cold read cost)")
     w(f"warm reference ({warm['source']}): P|Stock p50~{warm['p_stock_p50_us']}us "
       f"P|Customer p50~{warm['p_customer_p50_us']}us device_fsync_p50~"
@@ -548,11 +553,15 @@ def main(argv: list[str]) -> int:
         "seed": workroot / "seed.jsonl",
         "write": workroot / "write.jsonl",
         "read": workroot / "read.jsonl",
+        # the counts are kept alongside the paths: the report needs them, and an earlier version
+        # indexed the path at report time and crashed AFTER the run had succeeded
+        "stats": {},
     }
     print(f"workdir={workroot} cap_mib={a.cap_mib}", flush=True)
     n_seed = emit_seed_trace(traces["seed"], a)
     n_write = emit_write_trace(traces["write"], a)
     read_meta = emit_read_trace(traces["read"], a)
+    traces["stats"]["read"] = read_meta
     print(f"traces seed_blocks={n_seed} write_requests={n_write} "
           f"read={read_meta['total']} mix={read_meta['counts']}", flush=True)
 
