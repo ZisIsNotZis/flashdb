@@ -231,6 +231,33 @@ pub enum Outcome {
     Conflict(Conflict),
 }
 
+/// Result of [`Engine::commit_batch`].
+///
+/// A batch is all-or-nothing: a unique conflict anywhere rejects the *whole*
+/// batch before a record is appended, so a `Conflict` here means the WAL did
+/// not grow and no CSN was consumed. `Committed` carries one [`Outcome`] per
+/// input block, in input order (each `Committed { csn }` is that block's own
+/// CSN; an idempotent retry is `AlreadyCommitted { csn }`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BatchOutcome {
+    Committed(Vec<Outcome>),
+    /// `index` is the highest-index input block that contributed a unique op
+    /// under the conflicted prefix, i.e. the block whose op leaves more than one
+    /// live owner in the batch's projected post-state.
+    Conflict { index: usize, conflict: Conflict },
+}
+
+/// One touched unique prefix inside a batch: the constraint identity, the
+/// batch's per-handle net effect (later ops win, exactly as [`Memtable::apply`]
+/// leaves them), and the highest-index input block that contributed to it.
+struct BatchUnique {
+    entity: Vec<u8>,
+    field: Vec<u8>,
+    value: Vec<u8>,
+    owners: HashMap<u64, bool>,
+    last_block: usize,
+}
+
 pub struct Engine {
     wal: Wal,
     mt: Memtable,
@@ -1634,6 +1661,140 @@ impl Engine {
         self.max_handle = self.max_handle.max(ops.iter().map(op_handle).max().unwrap_or(0));
         self.dedup.insert(block_id.to_vec(), csn);
         Ok(Outcome::Committed { csn })
+    }
+
+    /// Atomically commit many blocks with ONE WAL barrier.
+    ///
+    /// Uniqueness is validated against the batch's **projected post-state**: one
+    /// overlay collects the net unique effect of every new block in input order
+    /// (later ops win, exactly as [`Memtable::apply`] leaves them), and is merged
+    /// once per touched unique prefix over the published owners. At most one live
+    /// owner per prefix is required, so "block A releases value v and block B
+    /// takes it" inside one batch is legal, exactly as inside one block today;
+    /// two blocks leaving two live owners for one prefix is a conflict.
+    ///
+    /// **Conflict rule: whole-batch rejection.** Any conflict rejects the entire
+    /// batch before a record is appended, so [`BatchOutcome::Conflict`] means
+    /// nothing durable (the WAL did not grow and no CSN advanced). This is chosen
+    /// over "skip the conflicting block while the rest commit" because a unique
+    /// violation is a terminal business error for its block, not an `else`: the
+    /// batch is a single durability unit, and silently absorbing one member would
+    /// make the durable set depend on which block lost, i.e. on evaluation order.
+    ///
+    /// The durable bytes are byte-for-byte what committing the same new blocks
+    /// one at a time would leave: one record per block in input order, each with
+    /// its own CSN and the same framing, taking ONE `fdatasync` instead of one per
+    /// block. A block already in `dedup` (an idempotent retry) returns its existing
+    /// CSN, is not re-appended, and contributes no overlay entry - its effect is
+    /// already in the published state, so re-including it could only reject a batch
+    /// the sequential order accepts. CSN, `segment_suffix_csn`, `dedup` and the
+    /// handle watermark advance exactly as a sequence of single commits would. An
+    /// empty batch is a no-op.
+    pub fn commit_batch(&mut self, blocks: &[(Vec<u8>, Vec<Op>)]) -> io::Result<BatchOutcome> {
+        let t0 = self.timing();
+        let id = self.metrics.borrow_mut().resolve_commit();
+        let _sample = MetricsSample { metrics: &self.metrics, id, started: t0 };
+        self.ensure_attached()?;
+
+        let mut overlay: HashMap<Vec<u8>, BatchUnique> = HashMap::new();
+        let mut outcomes: Vec<Outcome> = Vec::with_capacity(blocks.len());
+        // block_id -> CSN for blocks newly committed within this batch, so a
+        // block_id repeated inside the batch replays its first occurrence.
+        let mut seen: HashMap<&[u8], u64> = HashMap::new();
+        // (csn, block_id, ops) of the blocks that will be appended, in order.
+        let mut pending: Vec<(u64, &[u8], &[Op])> = Vec::new();
+        let mut last_csn = self.csn;
+        for (index, (block_id, ops)) in blocks.iter().enumerate() {
+            if block_id.is_empty() {
+                return Err(io::Error::new(io::ErrorKind::InvalidInput, "empty block_id"));
+            }
+            if let Some(&csn) = self.dedup.get(block_id).or_else(|| seen.get(block_id.as_slice())) {
+                outcomes.push(Outcome::AlreadyCommitted { csn });
+                continue;
+            }
+            // Validate every key name before the barrier (so `apply_op`'s unwraps
+            // can never fire after a successful sync) and build the batch overlay.
+            for op in ops {
+                match op {
+                    Op::PutDoc { entity, doc, .. } => {
+                        check_name(entity)?;
+                        if doc.is_empty() {
+                            return Err(io::Error::new(io::ErrorKind::InvalidInput, "empty document"));
+                        }
+                    }
+                    Op::DelDoc { entity, .. } => { check_name(entity)?; }
+                    Op::PutReverse { entity, field, .. } | Op::DelReverse { entity, field, .. } => {
+                        check_name(entity)?;
+                        check_name(field)?;
+                    }
+                    Op::PutUnique { entity, field, value, handle }
+                    | Op::DelUnique { entity, field, value, handle } => {
+                        let pfx = keys::unique_prefix(entity, field, value)?;
+                        let entry = overlay.entry(pfx).or_insert_with(|| BatchUnique {
+                            entity: entity.clone(),
+                            field: field.clone(),
+                            value: value.clone(),
+                            owners: HashMap::new(),
+                            last_block: index,
+                        });
+                        entry.owners.insert(*handle, matches!(op, Op::PutUnique { .. }));
+                        entry.last_block = index;
+                    }
+                }
+            }
+            let csn = last_csn.checked_add(1).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "CSN exhausted"))?;
+            last_csn = csn;
+            seen.insert(block_id.as_slice(), csn);
+            pending.push((csn, block_id.as_slice(), ops.as_slice()));
+            outcomes.push(Outcome::Committed { csn });
+        }
+
+        // Uniqueness against the projected post-state: the published owners of
+        // each touched prefix, overlaid with the batch's own net effect, must
+        // leave at most one live owner.
+        for (pfx, entry) in overlay {
+            let mut live: HashMap<u64, bool> = HashMap::new();
+            self.scan_merged(&pfx, |key, val| {
+                if key.len() != pfx.len() + 16 {
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, "malformed unique key in merged view"));
+                }
+                let handle = u64::from_be_bytes(key[pfx.len()..pfx.len() + 8].try_into().unwrap());
+                live.entry(handle).or_insert(!val.is_empty());
+                Ok(true)
+            })?;
+            live.extend(entry.owners);
+            if live.values().filter(|&&alive| alive).take(2).count() > 1 {
+                return Ok(BatchOutcome::Conflict {
+                    index: entry.last_block,
+                    conflict: Conflict { kind: "x_unique", entity: entry.entity, field: entry.field, value: entry.value },
+                });
+            }
+        }
+
+        if pending.is_empty() {
+            // Every block was an idempotent retry: nothing to append or sync.
+            return Ok(BatchOutcome::Committed(outcomes));
+        }
+        // Append every record, take the single barrier, then publish.
+        for &(csn, block_id, ops) in &pending {
+            let payload = encode_payload(csn, block_id, ops);
+            self.wal.append(&payload)?;
+        }
+        self.wal.sync()?;
+        for &(csn, _block_id, ops) in &pending {
+            for op in ops {
+                apply_op(&mut self.mt, op, csn);
+            }
+            self.max_handle = self.max_handle.max(ops.iter().map(op_handle).max().unwrap_or(0));
+        }
+        self.csn = last_csn;
+        // The last synced record is the active WAL file's newest content (segment
+        // mode too), keeping the republish guard's comparison target in lockstep.
+        self.segment_suffix_csn = last_csn;
+        for &(csn, block_id, _) in &pending {
+            self.dedup.insert(block_id.to_vec(), csn);
+        }
+        Ok(BatchOutcome::Committed(outcomes))
     }
 }
 

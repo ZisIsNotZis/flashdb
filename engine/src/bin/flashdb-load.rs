@@ -12,7 +12,7 @@
 //!
 //! usage:
 //!   flashdb-load <existing-wal> <trace.jsonl> --rate-rps R[,R...] [--segment-requests N]
-//!                [--window-ms 1000] [--ceiling-us N] [--patterns]
+//!                [--window-ms 1000] [--ceiling-us N] [--patterns] [--commit-batch B]
 //!
 //! Exit status is 0 even when the engine is saturated: saturation is data, not an error. A
 //! trace/parse failure is an error (non-zero), because it means the measurement is invalid.
@@ -22,7 +22,7 @@ use std::path::Path;
 use std::io::{self, BufRead, BufReader, Write};
 use std::time::{Duration, Instant};
 
-use flashdb_engine::engine::Engine;
+use flashdb_engine::engine::{BatchOutcome, Engine, Op, Outcome};
 use flashdb_engine::request::execute_request;
 use serde_json::Value;
 
@@ -39,11 +39,12 @@ struct Args {
     window_ms: u64,
     ceiling_us: Option<u64>,
     patterns: bool,
+    commit_batch: Option<u64>,
 }
 
 fn parse_args(argv: Vec<String>) -> Result<Args, String> {
     if argv.len() < 3 {
-        return Err("usage: flashdb-load <existing-wal> <trace.jsonl> --rate-rps R[,R...] [--segment-requests N] [--window-ms N] [--ceiling-us N] [--patterns]".into());
+        return Err("usage: flashdb-load <existing-wal> <trace.jsonl> --rate-rps R[,R...] [--segment-requests N] [--window-ms N] [--ceiling-us N] [--patterns] [--commit-batch B]".into());
     }
     let mut args = Args {
         wal: argv[1].clone(),
@@ -53,6 +54,7 @@ fn parse_args(argv: Vec<String>) -> Result<Args, String> {
         window_ms: 1000,
         ceiling_us: None,
         patterns: false,
+        commit_batch: None,
     };
     let mut i = 3;
     while i < argv.len() {
@@ -77,6 +79,13 @@ fn parse_args(argv: Vec<String>) -> Result<Args, String> {
             "--ceiling-us" => {
                 args.ceiling_us = Some(argv.get(i + 1).ok_or("--ceiling-us needs a value")?
                     .parse().map_err(|_| "--ceiling-us must be an integer")?);
+                i += 2;
+            }
+            "--commit-batch" => {
+                let n: u64 = argv.get(i + 1).ok_or("--commit-batch needs a value")?
+                    .parse().map_err(|_| "--commit-batch must be a positive integer")?;
+                if n == 0 { return Err("--commit-batch must be a positive integer".into()); }
+                args.commit_batch = Some(n);
                 i += 2;
             }
             "--patterns" => { args.patterns = true; i += 1; }
@@ -132,6 +141,41 @@ fn probe_device(dir: &Path, n: usize) -> (Option<u64>, Option<u64>) {
     let _ = std::fs::remove_file(&path);
     samples.sort_unstable();
     (percentile_us(&samples, 0.50), percentile_us(&samples, 0.99))
+}
+
+/// One pacer-side write block for the `--commit-batch` workload: the trace's Order write (a P
+/// doc plus its U `order_no`) built without the flow's read/guard phase, so B requests can be
+/// planned before one commit barrier. This is a measurement workload, not the adapter's order
+/// flow: `order_no` is unique per generated request, so a batch never conflicts and the block
+/// is the same shape (P+U together) the adapter produces. `handle` must be unique across the
+/// batch; the caller reserves a contiguous run from `next_handle`.
+fn batch_write_block(req: &Value, handle: u64) -> io::Result<(Vec<u8>, Vec<Op>)> {
+    let id = req["id"].as_str().filter(|s| !s.is_empty())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "request id must be a nonempty string"))?;
+    let params = &req["params"];
+    let order_no = params["order_no"].as_str()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "the batch workload needs params.order_no"))?;
+    let doc = serde_json::json!({
+        "order_no": order_no,
+        "sku": params["sku"],
+        "loc": params["loc"],
+        "qty": params["qty"],
+        "status": "open",
+    });
+    let ops = vec![
+        Op::PutDoc {
+            entity: b"Order".to_vec(),
+            handle,
+            doc: serde_json::to_vec(&doc).map_err(io::Error::other)?,
+        },
+        Op::PutUnique {
+            entity: b"Order".to_vec(),
+            field: b"order_no".to_vec(),
+            value: order_no.as_bytes().to_vec(),
+            handle,
+        },
+    ];
+    Ok((id.as_bytes().to_vec(), ops))
 }
 
 fn main() {
@@ -196,29 +240,99 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         let errors_before = errors;
         let now_us = t0.elapsed().as_secs_f64() * 1e6;
         if due_us <= now_us {
+            let size = args.commit_batch.unwrap_or(1).max(1);
+            let end = (index + size).min(total);
             window_rate = rate_for(index, total, &args.rates, args.segment_requests);
-            let request: Value = serde_json::from_str(&lines[index as usize])?;
             let started = Instant::now();
-            match execute_request(&mut engine, &request) {
-                Ok(_) => completed += 1,
-                Err(e) => {
-                    errors += 1;
-                    if first_error.is_none() {
-                        // Diagnosability matters: a load that rejects requests must never be
-                        // reported as sustained throughput, and the reason must be visible.
-                        first_error = Some(format!("request {}: {e}", index));
+            if args.commit_batch.is_none() {
+                let request: Value = serde_json::from_str(&lines[index as usize])?;
+                match execute_request(&mut engine, &request) {
+                    Ok(_) => completed += 1,
+                    Err(e) => {
+                        errors += 1;
+                        if first_error.is_none() {
+                            // Diagnosability matters: a load that rejects requests must never be
+                            // reported as sustained throughput, and the reason must be visible.
+                            first_error = Some(format!("request {}: {e}", index));
+                        }
+                    }
+                }
+            } else {
+                // Batch mode: plan every write block in the group first (reads see pre-batch
+                // state), then make the whole group durable with ONE barrier. Read-shaped
+                // requests still execute immediately and commit nothing.
+                let base = engine.next_handle()?;
+                let mut blocks: Vec<(Vec<u8>, Vec<Op>)> = Vec::new();
+                for i in index..end {
+                    let request: Value = serde_json::from_str(&lines[i as usize])?;
+                    let order_flow = request.get("blocks").and_then(Value::as_object)
+                        .is_some_and(|b| b.contains_key("take"));
+                    if order_flow {
+                        match batch_write_block(&request, base + blocks.len() as u64) {
+                            Ok(block) => blocks.push(block),
+                            Err(e) => {
+                                errors += 1;
+                                if first_error.is_none() { first_error = Some(format!("request {i}: {e}")); }
+                            }
+                        }
+                    } else {
+                        match execute_request(&mut engine, &request) {
+                            Ok(_) => completed += 1,
+                            Err(e) => {
+                                errors += 1;
+                                if first_error.is_none() { first_error = Some(format!("request {i}: {e}")); }
+                            }
+                        }
+                    }
+                }
+                if !blocks.is_empty() {
+                    match engine.commit_batch(&blocks) {
+                        Ok(BatchOutcome::Committed(outcomes)) => {
+                            for outcome in outcomes {
+                                match outcome {
+                                    Outcome::Committed { .. } | Outcome::AlreadyCommitted { .. } => completed += 1,
+                                    Outcome::Conflict(_) => {
+                                        errors += 1;
+                                        if first_error.is_none() {
+                                            first_error = Some(format!("request group at {index}: commit_batch conflict"));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Ok(BatchOutcome::Conflict { index: bad, conflict }) => {
+                            errors += blocks.len() as u64;
+                            if first_error.is_none() {
+                                first_error = Some(format!("request group at {index}: block {bad} {} conflict", conflict.kind));
+                            }
+                        }
+                        Err(e) => {
+                            errors += blocks.len() as u64;
+                            if first_error.is_none() { first_error = Some(format!("request group at {index}: {e}")); }
+                        }
                     }
                 }
             }
-            latencies.push(started.elapsed().as_micros() as u64);
+            // One latency sample per request of the group: in batch mode every request in the
+            // group shares the single commit barrier, so their latencies are the same value.
+            let group_us = started.elapsed().as_micros() as u64;
             let issue_us = started.duration_since(t0).as_secs_f64() * 1e6;
             let lag = (issue_us - due_us).max(0.0) as u64;
-            lags.push(lag);
-            if lag > LAG_SATURATION_US { late_total += 1; }
-            index += 1;
-            if index < total {
-                due_us += 1_000_000.0 / rate_for(index, total, &args.rates, args.segment_requests);
+            for _ in index..end {
+                latencies.push(group_us);
+                lags.push(lag);
             }
+            if lag > LAG_SATURATION_US { late_total += end - index; }
+            // Advance the open-loop schedule by every request in the group (the group's first
+            // request was due at `due_us`; the next group starts one interval later per request).
+            let mut i = index;
+            while i < end {
+                if i + 1 < total {
+                    due_us += 1_000_000.0 / rate_for(i + 1, total, &args.rates, args.segment_requests);
+                }
+                i += 1;
+            }
+            index = end;
         } else {
             // burst pacing: bounded chunks, never a per-request sleep whose granularity would
             // masquerade as engine saturation (measured: 41 us service time vs a ~1 ms timer)
@@ -265,14 +379,19 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    let elapsed = t0.elapsed();
     let device_end = probe_device(Path::new(&args.wal).parent().unwrap_or(Path::new(".")), 50);
     writeln!(out, "device_fsync_end_p50_us={} device_fsync_end_p99_us={}",
         device_end.0.map(|v| v.to_string()).unwrap_or_else(|| "none".into()),
         device_end.1.map(|v| v.to_string()).unwrap_or_else(|| "none".into()))?;
+    let elapsed_ms = elapsed.as_millis();
+    let achieved_rps = if elapsed.as_secs_f64() > 0.0 { completed as f64 / elapsed.as_secs_f64() } else { 0.0 };
     writeln!(out, "load_summary requests={total} completed={completed} errors={errors} \
         late_total={late_total} windows={window_index} invalid_windows={invalid_windows} \
-        last_valid_rate_rps={last_valid_rate:.0} saturated_at_rps={} first_error={:?}",
+        last_valid_rate_rps={last_valid_rate:.0} saturated_at_rps={} commit_batch={} \
+        elapsed_ms={elapsed_ms} achieved_rps={achieved_rps:.0} first_error={:?}",
         saturated_at.map(|r| format!("{r:.0}")).unwrap_or_else(|| "none".into()),
+        args.commit_batch.unwrap_or(1),
         first_error.unwrap_or_else(|| "none".into()))?;
     Ok(())
 }
@@ -317,5 +436,12 @@ mod tests {
         assert!(parse_args(vec!["b".into(), "wal".into(), "t.jsonl".into()]).is_err(), "rate is required");
         assert!(parse_args(vec!["b".into(), "wal".into(), "t.jsonl".into(), "--rate-rps".into(), "0".into()]).is_err(), "zero rate rejected");
         assert!(parse_args(vec!["b".into(), "wal".into(), "t.jsonl".into(), "--rate-rps".into(), "10".into(), "--nope".into()]).is_err());
+        let batched = parse_args(vec!["b".into(), "wal".into(), "t.jsonl".into(),
+                                      "--rate-rps".into(), "10".into(), "--commit-batch".into(), "64".into()])
+            .expect("valid batch args");
+        assert_eq!(batched.commit_batch, Some(64));
+        assert!(parse_args(vec!["b".into(), "wal".into(), "t.jsonl".into(),
+                                "--rate-rps".into(), "10".into(), "--commit-batch".into(), "0".into()]).is_err(),
+            "a zero batch size is rejected");
     }
 }

@@ -53,3 +53,75 @@ Constraints:
 - Also required: the pacer must be able to offer a *batch* workload (the trace already groups
   requests; the harness can mark which requests form one commit batch) so the comparison is
   apples-to-apples.
+
+## Result (implementation, 2026-10-02)
+
+Landed `Engine::commit_batch(&[(block_id, ops)])` (one WAL barrier for many blocks) and a
+`--commit-batch B` mode on the pacer. Conflict rule: **whole-batch rejection** - any unique
+conflict rejects the whole batch before a record is appended, so `BatchOutcome::Conflict`
+means nothing durable (WAL unchanged, no CSN advance). Justification: a unique violation is a
+terminal business error, not an `else`, and the batch is one durability unit, so absorbing the
+losing block would make the durable set depend on evaluation order. A batch is byte-equivalent
+in the WAL to the same blocks committed one at a time (same records, order, framing); only the
+barrier count differs.
+
+Measurement: 3,762-request write-only trace (order_flow mix), fresh engine per run, fixed
+offered 6,400 rps, device fsync probed in the same dir/session.
+
+| B | device fsync p50 | achieved rps | commit p50 (one barrier) | late (lag > 10 ms) |
+|---|---|---|---|---|
+| 1 | 5,061 us | **143** | 5,057 us | 3,760 / 3,762 |
+| 8 | 5,664 us | **1,199** | ~5.6 ms | 3,746 / 3,762 |
+| 64 | 5,089 us | **6,378** | 7.18 ms | 0 / 3,762 |
+
+B=1 reproduces the prior one-fsync ~150 rps ceiling. Per-batch latency stays ~one device
+fsync (5-7 ms) at every B, so B=64's 64-blocks-per-barrier is ~64x cheaper than 64 serial
+barriers; achieved write throughput scales 143 -> 1,199 -> 6,378 rps (x44.6). What binds next:
+at the fixed 6,400 rps offer, B>=64 is offered-rate-bound (`late_total=0`); raising the offer to
+25,600 rps on a 20,000-request write trace shows the device barrier is still the binder at
+B=64 (7,813 rps) and B=256 (21,396 rps), while B=1024 holds 25,902 rps with no lag - so the
+barrier is amortized but not yet displaced, and CPU/pacer scheduling has not been reached.
+Bytes per block are unchanged (the batch appends exactly the records a sequence of single
+commits would).
+
+## Result (2026-10-01, slice 22)
+
+`Engine::commit_batch(&[(block_id, ops)]) -> BatchOutcome` with **whole-batch conflict rejection**
+(nothing durable on a conflict; a unique violation is a terminal business error, and absorbing only
+the losing block would make the durable set depend on evaluation order). Validation runs over the
+batch's projected post-state, so intra-batch release+reuse is legal and an intra-batch duplicate is
+a conflict. Dedup blocks are excluded from the overlay so a retry cannot wrongly reject a batch.
+Per-block CSN/dedup/watermark advance exactly as single commits.
+
+**Durable bytes are byte-identical to the same blocks committed one at a time** (tested for N=1 and
+N=4): same records, same order, same framing, one barrier. So nothing about durability was relaxed
+to win the throughput.
+
+Measured (3,762-request write-only trace, fresh engine per run, offered 6,400 rps, device fsync
+probed in the same directory/session):
+
+| batch B | device fsync p50 | achieved rps | per-batch p50 | lag>10 ms |
+|---|---|---|---|---|
+| 1 | 5,061 us | **143** | 5,057 us | 3,760 |
+| 8 | 5,664 us | **1,199** | ~5.6 ms | 3,746 |
+| 64 | 5,089 us | **6,378** | 7.18 ms | 0 |
+
+Per-batch latency stays ~one device fsync (5-7 ms) at every B, versus B x fsync if serialized
+(64 blocks would be ~326 ms). At a 25,600 rps offer, B=64 gives 7,813, B=256 gives 21,396 and
+B=1024 holds 25,902 rps with no lag, i.e. the barrier is amortized but not yet displaced and no
+CPU ceiling has been isolated.
+
+## Guard semantics under batching (must not be relaxed)
+
+The batch path above validates UNIQUENESS over the batch post-state. But a request's *guards* (e.g.
+`where on_hand >= qty` on a stock decrement) are evaluated before the commit, against the published
+state. If several requests are batched and every guard is evaluated pre-batch, two requests could
+each pass a guard that a sequential execution would have failed on the second one - i.e. batching
+would introduce oversell. Sequential execution is the reference semantics: a guard sees everything
+committed before it, including earlier requests.
+
+So wiring batching into the request path requires: requests within a batch are evaluated **in
+order against the batch's projected state** (published + earlier requests in the batch), exactly as
+sequential commits would, with the barrier deferred. Any relaxation of that is a product-semantics
+change the author must decide, not an implementation detail. Until then, batch throughput numbers
+describe the engine's commit path, not the request path's semantics.
