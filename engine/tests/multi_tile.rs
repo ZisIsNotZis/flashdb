@@ -3,17 +3,24 @@
 //! [`Engine::maybe_checkpoint`] trigger. The WAL stays the sole recovery
 //! authority and is never rotated or truncated here.
 
-use flashdb_engine::engine::{CompactShape, Engine, Op, Outcome};
+use flashdb_engine::engine::{CompactShape, Engine, Op, Outcome, MAX_ACTIVE_TILES};
 use std::fs;
 use std::io::ErrorKind;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT: AtomicU64 = AtomicU64::new(0);
+/// Test scratch root. The cap-boundary tests create thousands of small files and
+/// the wall time is dominated by per-file fsync, so prefer a tmpfs when one is
+/// available; fall back to the platform temp dir.
+fn test_root() -> PathBuf {
+    let shm = PathBuf::from("/dev/shm");
+    if shm.is_dir() { shm } else { std::env::temp_dir() }
+}
 struct Files { dir: PathBuf, wal: PathBuf }
 impl Files {
     fn new() -> Self {
-        let dir = std::env::temp_dir().join(format!("flashdb-multi-tile-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
+        let dir = test_root().join(format!("flashdb-multi-tile-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
         fs::create_dir(&dir).unwrap();
         Self { wal: dir.join("data.wal"), dir }
     }
@@ -203,22 +210,24 @@ fn compaction_name_owned_by_live_tile_fails_closed_without_hint_to_delete() {
 fn manifest_refuses_more_than_max_tiles() {
     let files = Files::new();
     let mut e = Engine::create(&files.wal).unwrap();
-    // manifest::MAX_TILES = 12: twelve worst-case 299-byte entries plus the
-    // count/checkpoint/segment fields fill the 4092-byte page payload.
-    for i in 1..=12u64 {
+    // manifest::MAX_TILES is now a policy constant (1024) backed by a chained
+    // multi-page root, not the capacity of one 4 KiB page: publish one-doc tiles
+    // until the bound is reached.
+    for i in 1..=MAX_ACTIVE_TILES as u64 {
         e.commit_block(&format!("b{i}").into_bytes(), &[doc(i, b"d")]).unwrap();
         e.publish_tile(&files.dir.join(format!("tile-{i}.tile")), i).unwrap();
     }
-    e.commit_block(b"b13", &[doc(13, b"d")]).unwrap();
-    let err = e.publish_tile(&files.dir.join("tile-13.tile"), 13).unwrap_err();
+    let over = MAX_ACTIVE_TILES as u64 + 1;
+    e.commit_block(b"over", &[doc(over, b"d")]).unwrap();
+    let err = e.publish_tile(&files.dir.join("tile-over.tile"), over).unwrap_err();
     assert_eq!(err.kind(), ErrorKind::InvalidInput, "the tile list is bounded, and a full list is InvalidInput on publish, not corruption");
     assert_eq!(e.serving_memtable_entries(), 1, "refused publish left the memtable serving");
     drop(e);
     let e = Engine::open_discover(&files.dir).unwrap();
-    assert_eq!(e.csn(), 13);
-    assert_eq!(e.serving_memtable_entries(), 1, "all twelve tiles re-verified against the WAL at open");
+    assert_eq!(e.csn(), over);
+    assert_eq!(e.serving_memtable_entries(), 1, "all MAX_ACTIVE_TILES tiles re-verified against the WAL at open");
     assert_eq!(e.get(b"E", 1).unwrap(), Some(b"d".to_vec()));
-    assert_eq!(e.get(b"E", 12).unwrap(), Some(b"d".to_vec()));
+    assert_eq!(e.get(b"E", MAX_ACTIVE_TILES as u64).unwrap(), Some(b"d".to_vec()));
 }
 
 #[test]
@@ -366,27 +375,28 @@ fn compact_refuses_under_two_tiles_and_leftover_candidates() {
 fn compact_releases_the_max_tiles_bound() {
     let files = Files::new();
     let mut e = Engine::create(&files.wal).unwrap();
-    // Fill the manifest page: twelve tiles is manifest::MAX_TILES.
-    for i in 1..=12u64 {
+    // Fill the manifest to its policy bound (MAX_ACTIVE_TILES).
+    for i in 1..=MAX_ACTIVE_TILES as u64 {
         e.commit_block(&format!("b{i}").into_bytes(), &[doc(i, b"d")]).unwrap();
         e.publish_tile(&files.dir.join(format!("tile-{i}.tile")), i).unwrap();
     }
-    e.commit_block(b"b13", &[doc(13, b"d")]).unwrap();
-    assert_eq!(e.publish_tile(&files.dir.join("tile-13.tile"), 13).unwrap_err().kind(), ErrorKind::InvalidInput);
+    let over = MAX_ACTIVE_TILES as u64 + 1;
+    e.commit_block(b"over", &[doc(over, b"d")]).unwrap();
+    assert_eq!(e.publish_tile(&files.dir.join("tile-over.tile"), over).unwrap_err().kind(), ErrorKind::InvalidInput);
     assert_eq!(e.serving_memtable_entries(), 1, "refused publish left the memtable serving");
     e.compact().unwrap();
-    assert!(files.dir.join("compact-12.tile").exists());
+    assert!(files.dir.join(format!("compact-{MAX_ACTIVE_TILES}.tile")).exists());
     assert!(!files.dir.join("tile-1.tile").exists());
-    assert!(!files.dir.join("tile-12.tile").exists());
+    assert!(!files.dir.join(format!("tile-{MAX_ACTIVE_TILES}.tile")).exists());
     assert_eq!(e.serving_memtable_entries(), 1, "compaction still never touches the memtable");
-    // The freed page slot accepts new tiles again.
-    e.publish_tile(&files.dir.join("tile-13.tile"), 13).unwrap();
+    // The freed slots accept new tiles again.
+    e.publish_tile(&files.dir.join("tile-over.tile"), over).unwrap();
     assert_eq!(e.serving_memtable_entries(), 0);
     drop(e);
     let e = Engine::open_discover(&files.dir).unwrap();
     assert_eq!(e.get(b"E", 1).unwrap(), Some(b"d".to_vec()));
-    assert_eq!(e.get(b"E", 12).unwrap(), Some(b"d".to_vec()));
-    assert_eq!(e.get(b"E", 13).unwrap(), Some(b"d".to_vec()));
+    assert_eq!(e.get(b"E", MAX_ACTIVE_TILES as u64).unwrap(), Some(b"d".to_vec()));
+    assert_eq!(e.get(b"E", over).unwrap(), Some(b"d".to_vec()));
     assert_eq!(e.serving_memtable_entries(), 0);
 }
 
@@ -734,7 +744,8 @@ fn bounded_compaction_keeps_cutoffs_disjoint_and_reopens_across_rounds() {
     let files = Files::new();
     let mut e = Engine::create(&files.wal).unwrap();
     let cap = 12u64;
-    // Fill the manifest page (manifest::MAX_TILES = 12) with one doc per cutoff;
+    // Fill a local 12-tile list with one doc per cutoff; 12 keeps each round's
+    // reopen cost small (the manifest's real bound is MAX_ACTIVE_TILES, not 12).
     // the newest version of handle 1 is always v<cap>.
     for i in 1..=cap {
         e.commit_block(&format!("b{i}").into_bytes(), &[doc(1, format!("v{i}").as_bytes())]).unwrap();

@@ -26,6 +26,9 @@ use flashdb_engine::request::execute_request;
 use serde_json::Value;
 
 const MAX_LINE: u64 = 1 << 20;
+/// A request issued more than this long after its scheduled time means the engine is not keeping
+/// up with the offered rate. Well above the burst pacer's own <= 1 ms chunking floor.
+const LAG_SATURATION_US: u64 = 10_000;
 
 struct Args {
     wal: String,
@@ -136,63 +139,95 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut out = stdout.lock();
 
     let t0 = Instant::now();
-    let mut due_us: f64 = 0.0;               // cumulative schedule, open-loop
+    // `due_us` is ALWAYS the due time of the next request to issue, so an unissued request never
+    // advances the schedule (an earlier version mutated it on the skip path and raced away).
+    let mut index: u64 = 0;
+    let mut due_us: f64 = 1_000_000.0 / rate_for(0, total, &args.rates, args.segment_requests);
     let mut late_total: u64 = 0;
     let mut completed: u64 = 0;
     let mut errors: u64 = 0;
+    let mut first_error: Option<String> = None;
     let mut latencies: Vec<u64> = Vec::new();
+    // schedule lag = how late a request was issued relative to its due time. The burst pacer
+    // allows a bounded chunk (<= 1 ms), so a small floor is expected and is NOT saturation;
+    // saturation is when the lag distribution runs away, which is what the growth rule detects.
+    let mut lags: Vec<u64> = Vec::new();
     let mut window_index: u64 = 0;
     let mut window_start = Instant::now();
     let mut window_late_start: u64 = 0;
+    let mut window_rate: f64 = rate_for(0, total, &args.rates, args.segment_requests);
     let mut late_growth_windows: u32 = 0;
     let mut invalid_windows: u64 = 0;
-    // the highest rate at which a window stayed valid, and the rate that first saturated
     let mut last_valid_rate: f64 = 0.0;
     let mut saturated_at: Option<f64> = None;
 
-    for (index, line) in lines.iter().enumerate() {
-        let rate = rate_for(index as u64, total, &args.rates, args.segment_requests);
-        due_us += 1_000_000.0 / rate;
+    while index < total {
+        let errors_before = errors;
         let now_us = t0.elapsed().as_secs_f64() * 1e6;
-        if now_us < due_us {
-            std::thread::sleep(Duration::from_secs_f64((due_us - now_us) / 1e6));
+        if due_us <= now_us {
+            window_rate = rate_for(index, total, &args.rates, args.segment_requests);
+            let request: Value = serde_json::from_str(&lines[index as usize])?;
+            let started = Instant::now();
+            match execute_request(&mut engine, &request) {
+                Ok(_) => completed += 1,
+                Err(e) => {
+                    errors += 1;
+                    if first_error.is_none() {
+                        // Diagnosability matters: a load that rejects requests must never be
+                        // reported as sustained throughput, and the reason must be visible.
+                        first_error = Some(format!("request {}: {e}", index));
+                    }
+                }
+            }
+            latencies.push(started.elapsed().as_micros() as u64);
+            let issue_us = started.duration_since(t0).as_secs_f64() * 1e6;
+            let lag = (issue_us - due_us).max(0.0) as u64;
+            lags.push(lag);
+            if lag > LAG_SATURATION_US { late_total += 1; }
+            index += 1;
+            if index < total {
+                due_us += 1_000_000.0 / rate_for(index, total, &args.rates, args.segment_requests);
+            }
         } else {
-            late_total += 1;
+            // burst pacing: bounded chunks, never a per-request sleep whose granularity would
+            // masquerade as engine saturation (measured: 41 us service time vs a ~1 ms timer)
+            let chunk = (due_us - now_us).min(1000.0);
+            std::thread::sleep(Duration::from_secs_f64(chunk / 1e6));
         }
-        let request: Value = serde_json::from_str(line)?;
-        let started = Instant::now();
-        match execute_request(&mut engine, &request) {
-            Ok(_) => completed += 1,
-            Err(_) => errors += 1,
-        }
-        latencies.push(started.elapsed().as_micros() as u64);
 
         if window_start.elapsed() >= Duration::from_millis(args.window_ms) {
             latencies.sort_unstable();
             let p50 = percentile_us(&latencies, 0.50).unwrap_or(0);
             let p99 = percentile_us(&latencies, 0.99).unwrap_or(0);
+            let mut sorted_lags = lags.clone();
+            sorted_lags.sort_unstable();
+            let lag_p50 = percentile_us(&sorted_lags, 0.50).unwrap_or(0);
+            let lag_p99 = percentile_us(&sorted_lags, 0.99).unwrap_or(0);
+            let behind = lag_p99 > LAG_SATURATION_US;
             let window_late = late_total - window_late_start;
-            let overdue = p99;
-            let ceiling_breached = args.ceiling_us.is_some_and(|c| overdue > c);
-            let lag_grew = window_late > 0;
-            if lag_grew { late_growth_windows += 1 } else { late_growth_windows = 0 }
+            let ceiling_breached = args.ceiling_us.is_some_and(|c| p99 > c);
+            if behind || window_late > 0 { late_growth_windows += 1 } else { late_growth_windows = 0 }
             let saturated = late_growth_windows >= 3;
-            let invalid = ceiling_breached || saturated;
-            if invalid { invalid_windows += 1 } else { last_valid_rate = last_valid_rate.max(rate) }
-            if saturated && saturated_at.is_none() { saturated_at = Some(rate) }
-            writeln!(out, "window={window_index} rate_rps={rate:.0} requests={} completed={completed} \
-                errors={errors} late_window={window_late} late_total={late_total} p50_us={p50} \
-                p99_us={p99} invalid={invalid} ceiling_us={}",
-                latencies.len(),
+            let window_error_count = errors - errors_before;
+            let rejected = window_error_count > 0;
+            let invalid = ceiling_breached || saturated || rejected;
+            if invalid { invalid_windows += 1 } else { last_valid_rate = last_valid_rate.max(window_rate) }
+            if saturated && saturated_at.is_none() { saturated_at = Some(window_rate) }
+            writeln!(out, "window={window_index} rate_rps={:.0} requests={} completed={completed} \
+                errors={errors} lag_p50_us={lag_p50} lag_p99_us={lag_p99} behind={behind} \
+                late_total={late_total} errors_window={window_error_count} p50_us={p50} p99_us={p99} \
+                invalid={invalid} ceiling_us={}",
+                window_rate, latencies.len(),
                 args.ceiling_us.map(|c| c.to_string()).unwrap_or_else(|| "none".into()))?;
             if args.patterns {
                 let snap = engine.metrics_rotate_window();
                 write!(out, "{snap}")?;
-                out.flush()?;
             } else {
                 engine.metrics_rotate_window();
             }
+            out.flush()?;
             latencies.clear();
+            lags.clear();
             window_index += 1;
             window_start = Instant::now();
             window_late_start = late_total;
@@ -201,8 +236,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     writeln!(out, "load_summary requests={total} completed={completed} errors={errors} \
         late_total={late_total} windows={window_index} invalid_windows={invalid_windows} \
-        last_valid_rate_rps={last_valid_rate:.0} saturated_at_rps={}",
-        saturated_at.map(|r| format!("{r:.0}")).unwrap_or_else(|| "none".into()))?;
+        last_valid_rate_rps={last_valid_rate:.0} saturated_at_rps={} first_error={:?}",
+        saturated_at.map(|r| format!("{r:.0}")).unwrap_or_else(|| "none".into()),
+        first_error.unwrap_or_else(|| "none".into()))?;
     Ok(())
 }
 

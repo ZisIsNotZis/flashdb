@@ -26,8 +26,9 @@
 //! Compaction is bounded and policy-driven, not "merge everything every N
 //! checkpoints". After each successful checkpoint the driver calls
 //! `Engine::maybe_compact_shape(COMPACT_MERGE_BUDGET, MAX_ACTIVE_TILES, shape)`:
-//! the trigger is the engine's real active-tile cap (`MAX_ACTIVE_TILES`, the
-//! manifest-page bound — not a hard-coded 8/12), the shape is the runtime
+//! the trigger is the engine's active-tile cap (`MAX_ACTIVE_TILES`, a policy
+//! constant of 1024 backed by a chained multi-page manifest — not a hard-coded
+//! 8/12 and no longer one 4 KiB page), the shape is the runtime
 //! `FLASHDB_COMPACT_SHAPE` policy, and the driver asks the merge to cap each
 //! merge at eight 64 MiB rotation windows of tile bytes. Whether a merge
 //! actually stays bounded — and therefore whether write amplification stays
@@ -467,7 +468,7 @@ fn cmd_seed(
     let write_amp = (wal_appended + tile_bytes) as f64 / payload_bytes.max(1) as f64;
     print_metrics("seed", &e);
     emit(&format!(
-        "phase=seed ok=true docs={total_docs} csn={} shape={} blocks={total_blocks} payload_bytes={payload_bytes} wal_bytes={} wal_written_bytes={wal_appended} tile_bytes_publish={tile_bytes_publish} tile_bytes_compact={tile_bytes_compact} tile_bytes_total={tile_bytes} compactions={compactions} write_amplification={write_amp:.3} docs_s_cumulative={:.0} rss_kb={} rss_peak_kb={rss_peak} elapsed_s={elapsed:.3} layout_page_size={layout_page_size} layout_bloom_bits={layout_bloom_bits}",
+        "phase=seed ok=true docs={total_docs} csn={} shape={} max_tiles={MAX_ACTIVE_TILES} blocks={total_blocks} payload_bytes={payload_bytes} wal_bytes={} wal_written_bytes={wal_appended} tile_bytes_publish={tile_bytes_publish} tile_bytes_compact={tile_bytes_compact} tile_bytes_total={tile_bytes} compactions={compactions} write_amplification={write_amp:.3} docs_s_cumulative={:.0} rss_kb={} rss_peak_kb={rss_peak} elapsed_s={elapsed:.3} layout_page_size={layout_page_size} layout_bloom_bits={layout_bloom_bits}",
         e.csn(),
         shape.name(),
         wal_bytes(dir)?,

@@ -145,10 +145,10 @@ impl LayoutPolicy {
     }
 }
 
-/// The largest active-tile list the manifest can hold. The real limit is the
-/// 4092-byte manifest payload ([`crate::manifest::MAX_TILES`]), not a policy
-/// knob; this exposes that cap so callers size their compaction trigger from
-/// the engine's real bound instead of a hard-coded count.
+/// The largest active-tile list the engine will hold, re-exported from
+/// [`crate::manifest::MAX_TILES`]. It is a **policy constant**, not a page
+/// artefact: the manifest chains continuation pages, so this is the caller's
+/// compaction-trigger knob rather than the size of one 4 KiB root.
 pub const MAX_ACTIVE_TILES: usize = manifest::MAX_TILES;
 
 /// Which contiguous run [`Engine::maybe_compact_shape`] merges. All three
