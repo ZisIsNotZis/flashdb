@@ -1665,6 +1665,15 @@ impl Engine {
         }
         if let Some(t) = new_tile { kept.push(TileHandle { tile: t, name }); }
         self.tiles = kept;
+        // Observability only (slice 34): attribute this region merge's output tile
+        // bytes and the merge itself to the region that was merged, so the learner
+        // can derive the per-region rewrite factor (`metrics.rs` module docs).
+        // Nothing reads these counters to make a decision; disabled mode and a
+        // failed merge record nothing (this runs after the durable flip).
+        if let Some(region) = &region {
+            let id = self.metrics.borrow_mut().resolve_region(region);
+            self.metrics.borrow_mut().region_compaction(id, out_size);
+        }
         // Only now drop the retired input files: the durable flip already removed
         // them from the root, so a leftover can never be adopted, only ignored.
         // Report a failure rather than swallow it - `merge_run`'s silent best-effort

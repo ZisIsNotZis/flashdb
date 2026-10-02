@@ -54,6 +54,21 @@ the default ``DEFAULT_LAMBDA_NS_PER_BYTE = 1.0`` prices a byte at roughly the
 raw device write cost (831 MiB/s ~ 1.15 ns/byte). The reported numbers are
 comparable only within one lambda; it is stated with every result.
 
+The **write side the merge threshold actually moves** is now observable per
+region: slice 34 added ``compaction_bytes`` (the merged output tile size written
+for the region) and ``compaction_merges`` to the per-region telemetry, and
+:class:`RegionStats` parses both. The **per-region rewrite factor** is defined,
+and must be reported, as::
+
+    rewrite_factor(region) = compaction_bytes(region) / bytes_written(region)
+
+over the same window(s) -- compaction output divided by the region's ingested
+(WAL op) bytes. It is the per-region form of ``flashdb-scale compact``'s
+run-level ``compaction_bytes / tile_bytes_before``. This slice keeps the priced
+endurance term at ``bytes_written`` (WAL ingest, close to constant on a real
+engine); the compaction counters are exposed so a report can quote the rewrite
+factor and a later slice can price it directly.
+
 The bandit
 ----------
 :class:`LayoutLearner` is **UCB1**, in its minimisation form (a lower confidence
@@ -83,13 +98,38 @@ Three guards sit on top of the bandit:
   proven to violate a ceiling a candidate stays out, even across drift restarts.
 
 Non-stationarity (drift) is what makes the learner adapt and the
-``flashdb-static-derived`` control not. The learner watches the incumbent's own
-cost against a reference set when the gate opened; a sustained deviation beyond
-``drift_margin`` over ``drift_windows`` windows (the pre-registration's drift
-workload changes the access shape, so the active region's cost moves) triggers a
-new burn-in epoch. With no gradient and no drift the incumbent's cost is
-stationary, no restart fires, and the learner **picks once and stays** -- the
-anti-overfitting property whose test is the point of the whole exercise.
+``flashdb-static-derived`` control not. **Drift trigger (per region):** the
+active candidate's window cost deviates from the region's reference cost (set
+when the gate first opened) by more than ``drift_margin`` (default ``0.5`` =
+50% relative) for ``drift_windows`` (default 2) consecutive windows (the
+pre-registration's drift workload changes the access shape, so the active
+region's cost moves).
+
+The response is **targeted**. First, it is scoped to the region that triggered:
+only that region re-explores, and every other region keeps its committed
+candidate and all of its evidence untouched. Second, the re-exploration within
+the region is **capped** at ``drift_reexplore_candidates`` (default 2): the
+incumbent plus the best ``K - 1`` challengers by recorded cost are re-sampled to
+``min_samples`` each, so the response costs ``K * min_samples`` windows rather
+than ``candidates * min_samples``, while the remaining candidates keep their
+committed evidence. ``drift_reexplore_candidates=None`` restores the full
+re-exploration, which is required when a candidate that was *worse* than the
+incumbent before the drift becomes the best after it (the targeted set is chosen
+from pre-drift evidence and cannot see that). ``recovery_windows()`` reports the
+windows each region's last re-exploration needed, and ``reexploring_regions()``
+the regions currently re-exploring. With no gradient and no drift no restart
+fires and the learner **picks once and stays** -- the anti-overfitting property
+whose test is the point of the whole exercise.
+
+**Pre-registration gap (stated, not hidden).** Even the targeted response cannot
+meet the pre-registration's *2-window* recovery target with the published grid:
+the response needs ``drift_reexplore_candidates * min_samples`` windows (6 with
+the defaults: 2 candidates x 3 samples) before the gate can even compare arms,
+plus ``stability_window`` for the hysteresis to commit. The binding term is
+``min_samples x candidates-re-explored``: to recover in 2 windows the author must
+relax ``min_samples`` (or ``drift_reexplore_candidates``), not the learner. The
+full re-exploration is ``candidates * min_samples`` = 18 windows at the defaults,
+so the targeted response is a 3x reduction, not a solution.
 
 Controls
 --------
@@ -107,14 +147,14 @@ What the learner CANNOT do here
   cost of a window is attributed to the candidate that was active for it, so a
   freshly switched-to page size is credited with a window it only partly
   affected. This is a stated bias, not compensated.
-* It sees only **``bytes_written``**, which the engine attributes as the exact
-  encoded WAL op bytes for the region's keys -- i.e. the *ingested* volume, not
-  the region's **compaction output**. The compaction-output gradient that
-  ``merge_min_tiles`` actually moves is therefore not directly observable in the
-  per-region telemetry; the write term is a WAL-write proxy. (The synthetic
-  tests make ``bytes_written`` vary by candidate so the lambda mechanism itself
-  is exercised; on a real engine that term is close to constant, and the merge
-  choice is driven mostly by the read-cost term plus the p99 constraint.)
+* It prices the endurance term with **``bytes_written``** (the region's ingested
+  WAL op bytes, close to constant on a real engine), not with the region's
+  **compaction output** that ``merge_min_tiles`` actually moves. Slice 34 now
+  exposes ``compaction_bytes``/``compaction_merges`` and the rewrite factor is
+  derivable (:func:`region_rewrite_factor`), but the reward proxy does not price
+  that quantity yet, so the merge choice is still driven mostly by the read-cost
+  term plus the p99 constraint. (The synthetic tests make ``bytes_written`` vary
+  by candidate so the lambda mechanism itself is exercised.)
 * It does **not price memory**, CPU per op, or reorganisation payback windows.
 * It does not take effect immediately: the driver re-reads the policy once per
   window, and a merge threshold only gates *future* automatic merges.
@@ -193,6 +233,10 @@ class RegionStats:
     mean_ns: float
     p50_ns: float
     p99_ns: float
+    # Slice 34: the write side of the merge threshold (merged output tile bytes
+    # and the merge count). Absent from a pre-slice-34 dump, so defaulted to 0.
+    compaction_bytes: int = 0
+    compaction_merges: int = 0
 
     @classmethod
     def from_json(cls, obj: Mapping) -> "RegionStats":
@@ -208,6 +252,8 @@ class RegionStats:
             mean_ns=float(obj.get("mean_ns", 0.0)),
             p50_ns=float(obj.get("p50_ns", 0.0)),
             p99_ns=float(obj.get("p99_ns", 0.0)),
+            compaction_bytes=int(obj.get("compaction_bytes", 0)),
+            compaction_merges=int(obj.get("compaction_merges", 0)),
         )
 
 
@@ -265,6 +311,22 @@ def region_cost_ns(stats: RegionStats, lambda_ns_per_byte: float = DEFAULT_LAMBD
     return stats.count * stats.mean_ns + lambda_ns_per_byte * stats.bytes_written
 
 
+def region_rewrite_factor(stats: RegionStats) -> float | None:
+    """The per-region rewrite factor of one window (``None`` when undefined).
+
+    ``compaction_bytes / bytes_written`` -- the compaction output attributed to
+    the region divided by its ingested (WAL op) bytes over the same window. Over
+    a run, sum both counters across windows first. A window with no ingest for
+    the region is undefined (division by zero) and returns ``None`` rather than
+    0, so a real rewrite factor is never reported as zero. This is the same
+    quantity `metrics.rs` defines and `flashdb-scale compact` reports at the run
+    level.
+    """
+    if stats.bytes_written <= 0:
+        return None
+    return stats.compaction_bytes / stats.bytes_written
+
+
 def policy_document(selections: Mapping[str, LayoutCandidate], *,
                     default: LayoutCandidate = DECLARED_DEFAULT) -> dict:
     """The engine's frozen JSON policy-file schema for a set of per-region selections.
@@ -319,6 +381,9 @@ class _RegionState:
     gated_switches: int = 0
     constraint_switches: int = 0
     restarts: int = 0
+    reexploring: bool = False
+    reexplore_start: int | None = None
+    recovery_windows: int | None = None
 
 
 @dataclass
@@ -339,6 +404,9 @@ class LayoutLearner:
     ceilings_ns: Mapping[str, float] = field(default_factory=dict)
     drift_margin: float = 0.5
     drift_windows: int = 2
+    # Targeted drift response: re-explore the incumbent plus the best K-1
+    # challengers (None = the full candidate set, the correctness fallback).
+    drift_reexplore_candidates: int | None = 2
     seed: int = 0
 
     def __post_init__(self) -> None:
@@ -351,6 +419,8 @@ class LayoutLearner:
             raise ValueError("stability_window must be >= 1")
         if self.drift_windows < 1:
             raise ValueError("drift_windows must be >= 1")
+        if self.drift_reexplore_candidates is not None and self.drift_reexplore_candidates < 1:
+            raise ValueError("drift_reexplore_candidates must be >= 1 or None")
         self.ceilings_ns = dict(self.ceilings_ns)
         self._tie = _seeded_order(self.candidates, self.seed)
         self._regions: dict[str, _RegionState] = {}
@@ -387,7 +457,23 @@ class LayoutLearner:
             st = self._region(name)
             if st.active is not None:
                 self.record(name, st.active, window.regions[name])
+            # A drift detected by `record` above starts the epoch in THIS window
+            # (the reset already happened and one arm may be re-sampled), so the
+            # response is counted from here, not from the next window.
+            if st.reexploring and st.reexplore_start is None:
+                st.reexplore_start = window.window
         self.step(regions)
+        # Close a re-exploration epoch once the min-sample gate has reopened (all
+        # targeted candidates re-sampled), and record how many windows it took.
+        # The normal hysteresis then decides the committed candidate; it can add
+        # up to `stability_window` windows, reported separately. Only regions that
+        # actually drifted ever enter here; unchanged regions are never touched.
+        for name in regions:
+            st = self._region(name)
+            if st.reexploring and st.reexplore_start is not None and self._in_exploitation(st):
+                st.recovery_windows = window.window - st.reexplore_start + 1
+                st.reexploring = False
+                st.reexplore_start = None
 
     def record(self, region: str, candidate: LayoutCandidate, stats: RegionStats) -> None:
         """Count one window's observation of ``candidate`` for ``region``.
@@ -523,14 +609,41 @@ class LayoutLearner:
             st.deviation_streak = 0
 
     def _restart(self, st: _RegionState) -> None:
-        """Open a new burn-in epoch after drift; the p99 disqualifications survive it."""
-        for arm in st.arms.values():
-            arm.n = 0
-            arm.sum_cost = 0.0
+        """Open a TARGETED re-exploration epoch after drift (slice 34).
+
+        Only ``drift_reexplore_candidates`` candidates are reset -- the incumbent
+        plus the best challengers by recorded cost -- so the response is capped
+        at ``K * min_samples`` windows and the remaining candidates keep their
+        committed evidence. The p99 disqualifications survive the epoch.
+        """
+        for candidate in self._reexplore_targets(st):
+            st.arms[candidate].n = 0
+            st.arms[candidate].sum_cost = 0.0
         self._reset_gate(st)
         st.reference_cost = None
         st.deviation_streak = 0
         st.restarts += 1
+        st.reexploring = True
+        st.reexplore_start = None
+
+    def _reexplore_targets(self, st: _RegionState) -> set[LayoutCandidate]:
+        """The candidates a drift epoch re-samples: the incumbent + the best K-1.
+
+        ``drift_reexplore_candidates=None`` (or ``K`` >= the available count)
+        re-samples every available candidate, the correctness-complete fallback.
+        """
+        available = self._available(st)
+        k = self.drift_reexplore_candidates
+        if k is None or k >= len(available):
+            return set(available)
+        ordered: list[LayoutCandidate] = []
+        if st.active is not None and st.active in available:
+            ordered.append(st.active)
+        ordered.extend(sorted(
+            (c for c in available if c != st.active),
+            key=lambda c: (st.arms[c].mean_cost, self._tie[c]),
+        ))
+        return set(ordered[:k])
 
     # -- readout ------------------------------------------------------------
     def selections(self) -> dict[str, LayoutCandidate]:
@@ -547,6 +660,19 @@ class LayoutLearner:
 
     def restarts(self) -> dict[str, int]:
         return {name: st.restarts for name, st in self._regions.items()}
+
+    def reexploring_regions(self) -> set[str]:
+        """Regions currently inside a drift re-exploration epoch."""
+        return {name for name, st in self._regions.items() if st.reexploring}
+
+    def recovery_windows(self) -> dict[str, int]:
+        """Re-exploration windows of the last drift response, per drifted region.
+
+        Counted from the trigger window until the min-sample gate reopens (all
+        targeted candidates re-sampled). The hysteresis that then commits the
+        candidate can add up to ``stability_window`` windows.
+        """
+        return {name: st.recovery_windows for name, st in self._regions.items() if st.recovery_windows is not None}
 
     def violating_candidates(self, region: str) -> set[LayoutCandidate]:
         st = self._regions.get(region)

@@ -304,6 +304,7 @@ fn disabled_mode_records_no_regions() {
     m.region_bytes_written(id, 100);
     m.region_commit_op(id);
     m.region_commit_block(id);
+    m.region_compaction(id, 2048);
     m.record_region_latency(id, Duration::from_nanos(1_000));
     m.region_probe(OTHER, false); // even a stale id is a no-op when off
     assert!(m.snapshot().regions.is_empty());
@@ -352,6 +353,7 @@ fn region_json_dump_is_deterministic_and_uses_frozen_field_names() {
         m.region_bytes_written(r, 100);
         m.region_commit_op(r);
         m.region_commit_block(r);
+        m.region_compaction(r, 2048);
         m.region_bytes_written(s, 7);
         m.snapshot().to_json().to_string()
     }
@@ -360,8 +362,51 @@ fn region_json_dump_is_deterministic_and_uses_frozen_field_names() {
     // The whole document is pinned, so a renamed field is a failing diff here.
     assert_eq!(
         a,
-        r#"{"patterns":[],"regions":[{"bytes_read":4096,"bytes_written":100,"commit_blocks":1,"commit_ops":1,"count":0,"mean_ns":0.0,"p50_ns":0.0,"p99_ns":0.0,"probe_misses":1,"probes":2,"region":"P|Stock"},{"bytes_read":0,"bytes_written":7,"commit_blocks":0,"commit_ops":0,"count":0,"mean_ns":0.0,"p50_ns":0.0,"p99_ns":0.0,"probe_misses":0,"probes":0,"region":"U|Stock"}]}"#
+        r#"{"patterns":[],"regions":[{"bytes_read":4096,"bytes_written":100,"commit_blocks":1,"commit_ops":1,"compaction_bytes":2048,"compaction_merges":1,"count":0,"mean_ns":0.0,"p50_ns":0.0,"p99_ns":0.0,"probe_misses":1,"probes":2,"region":"P|Stock"},{"bytes_read":0,"bytes_written":7,"commit_blocks":0,"commit_ops":0,"compaction_bytes":0,"compaction_merges":0,"count":0,"mean_ns":0.0,"p50_ns":0.0,"p99_ns":0.0,"probe_misses":0,"probes":0,"region":"U|Stock"}]}"#
     );
+}
+
+// ---------- slice 34: per-region compaction attribution ----------
+
+/// A small deterministic engine (no long load): `P|E` gets two tiles and is the
+/// only region eligible under the default `merge_min_tiles = 2`, while `P|F`
+/// holds one tile and is not. The merge's output byte count must land on `P|E`
+/// only. The dumped JSON is printed under `--nocapture`, which is the real
+/// measurement for the slice report.
+#[test]
+fn region_compaction_counters_attribute_the_merged_output_to_its_region() {
+    let d = dir();
+    let mut e = Engine::create(d.join("data.wal")).unwrap();
+    e.set_region_mode(RegionMode::PerRegion);
+    e.commit_block(b"b1", &[Op::PutDoc { entity: b"E".to_vec(), handle: 1, doc: b"a".to_vec() }]).unwrap();
+    e.publish_tile(d.join("t1.tile"), 1).unwrap();
+    e.commit_block(b"b2", &[Op::PutDoc { entity: b"E".to_vec(), handle: 2, doc: b"b".to_vec() }]).unwrap();
+    e.publish_tile(d.join("t2.tile"), 2).unwrap();
+    e.commit_block(b"b3", &[Op::PutDoc { entity: b"F".to_vec(), handle: 3, doc: b"c".to_vec() }]).unwrap();
+    e.publish_tile(d.join("t3.tile"), 3).unwrap();
+    assert_eq!(e.active_tile_cutoffs().len(), 3, "two P|E tiles and one P|F tile");
+
+    let out_bytes = e.maybe_compact(u64::MAX, 2).unwrap().expect("P|E has two tiles and merges");
+    let snap = e.metrics_snapshot();
+    println!("region_compaction_dump={}", snap.to_json());
+    let pe = region_of(&snap, "P|E").expect("P|E region row");
+    assert_eq!(pe.compaction_merges, 1, "exactly one region merge included P|E");
+    assert_eq!(pe.compaction_bytes, out_bytes, "the merged output tile's size is attributed to P|E");
+    assert!(pe.compaction_bytes > 0);
+    let pf = region_of(&snap, "P|F").expect("P|F saw a commit and is not idle");
+    assert_eq!(pf.compaction_merges, 0, "P|F had one tile and was not eligible");
+    assert_eq!(pf.compaction_bytes, 0, "no compaction bytes are attributed to a region that did not merge");
+    assert!(pe.compaction_bytes > pf.compaction_bytes);
+
+    // Disabled mode records nothing, including on the compaction hook.
+    e.set_metrics_enabled(false);
+    let mut m = Metrics::new();
+    m.set_enabled(false);
+    let id = m.resolve_region(b"PE\x00");
+    m.region_compaction(id, 4096);
+    assert!(m.snapshot().regions.is_empty(), "disabled region_compaction records nothing");
+
+    let _ = std::fs::remove_dir_all(&d);
 }
 
 #[test]

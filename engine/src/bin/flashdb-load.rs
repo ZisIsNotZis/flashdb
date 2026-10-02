@@ -814,6 +814,27 @@ mod tests {
             "--policy-file needs a value");
     }
 
+    /// Slice 34: the driver's JSON dump carries the per-region compaction
+    /// counters through unchanged, so a controller can read the region's rewrite
+    /// factor (`compaction_bytes / bytes_written`) straight from the window.
+    #[test]
+    fn metrics_json_line_carries_per_region_compaction_fields() {
+        let snap = WindowSnapshot {
+            patterns: Vec::new(),
+            regions: vec![flashdb_engine::metrics::RegionSummary {
+                region: "P|Stock".to_string(),
+                probes: 0, probe_misses: 0, bytes_read: 0, bytes_written: 40,
+                commit_blocks: 1, commit_ops: 1,
+                compaction_bytes: 4288, compaction_merges: 1,
+                count: 0, p50_ns: 0.0, p99_ns: 0.0, mean_ns: 0.0,
+            }],
+        };
+        let line = metrics_json_line(1, 100.0, 1, 1, 0, 10, 20,
+            LayoutPolicy::declared_default().to_json(), &snap, None);
+        assert!(line.contains(r#""compaction_bytes":4288,"compaction_merges":1"#), "got {line}");
+        assert!(line.contains(r#""bytes_written":40"#), "got {line}");
+    }
+
     #[test]
     fn metrics_json_line_freezes_the_wrapper_field_names() {
         let empty = WindowSnapshot::default();

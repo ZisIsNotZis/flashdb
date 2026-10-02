@@ -16,6 +16,8 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from flashdb_harness import layout_learner as ll  # noqa: E402
@@ -289,8 +291,12 @@ def test_static_derived_does_not_adapt_after_drift_while_learner_does():
     static.derive(sweep)
     assert static.selections()[region] == old_best
 
+    # Full re-exploration (None): the new best is not the pre-drift runner-up
+    # (all non-incumbents were tied), so the complete candidate set must be
+    # re-sampled. This pins the correctness fallback of the targeted response.
     learner = ll.LayoutLearner(min_samples=2, stability_window=2, margin=0.05,
-                               drift_margin=0.25, drift_windows=2, seed=1)
+                               drift_margin=0.25, drift_windows=2,
+                               drift_reexplore_candidates=None, seed=1)
     selection: dict = {}
     for i in range(80):
         table = pre if i < 30 else post
@@ -302,6 +308,88 @@ def test_static_derived_does_not_adapt_after_drift_while_learner_does():
     assert static.selections()[region] == old_best   # frozen: no adaptation, ever
     assert learner.selections()[region] == new_best  # the learner re-explored and moved
     assert learner.restarts().get(region, 0) >= 1
+
+
+# ---------------------------------------------------------------------------
+# Slice 34: the targeted drift response
+# ---------------------------------------------------------------------------
+def test_drift_reexplores_only_the_changed_regions():
+    """A drift in two of five regions re-explores only those two; the other
+    three keep their committed candidate untouched."""
+    regions = ["P|A", "P|B", "P|C", "P|D", "P|E"]
+    stable = {A: (1000.0, 0, 0.0), B: (5000.0, 0, 0.0)}
+    drifted = {A: (9000.0, 0, 0.0), B: (1000.0, 0, 0.0)}   # A worsens, B improves
+    learner = ll.LayoutLearner(candidates=(A, B), min_samples=2, stability_window=2,
+                               margin=0.05, drift_margin=0.25, drift_windows=2,
+                               drift_reexplore_candidates=2, seed=0)
+
+    drive(learner, {r: stable for r in regions}, windows=10)   # burn-in + commit A
+    committed = dict(learner.selections())
+    assert set(committed.values()) == {A}
+
+    post = {r: stable for r in regions}
+    post["P|A"] = drifted
+    post["P|B"] = drifted
+    drive(learner, post, windows=14, start=10)
+
+    changed = {"P|A", "P|B"}
+    restarts = learner.restarts()
+    assert {r for r in regions if restarts.get(r, 0) > 0} == changed, restarts
+    for r in ("P|C", "P|D", "P|E"):
+        assert learner.selections()[r] == committed[r] == A, f"unchanged region {r} moved"
+    # The two drifted regions were targeted and re-committed their new best.
+    assert learner.selections()["P|A"] == B and learner.selections()["P|B"] == B
+    assert learner.reexploring_regions() == set(), "every epoch closed"
+
+
+def test_targeted_drift_response_window_count_and_the_two_window_gap():
+    """The response window count is measured here, not asserted in prose.
+
+    With the published default (``drift_reexplore_candidates=2``, a 2-candidate
+    set) the targeted response costs ``K * min_samples`` windows; the full
+    re-exploration costs ``candidates * min_samples``. Both are reported by the
+    assertion so the pre-registration's 2-window target can be judged.
+    """
+    region = "P|Stock"
+
+    def measure(learner: ll.LayoutLearner, pre: dict, post: dict) -> int:
+        selection: dict = {}
+        for i in range(8):
+            learner.observe(window(i, {region: pre}, selection))
+            selection = learner.selections()
+        for i in range(8, 60):
+            learner.observe(window(i, {region: post}, selection))
+            selection = learner.selections()
+        assert region not in learner.reexploring_regions()
+        return learner.recovery_windows()[region]
+
+    min_samples = 2
+    targeted = ll.LayoutLearner(candidates=(A, B), min_samples=min_samples,
+                                stability_window=2, margin=0.05, drift_margin=0.25,
+                                drift_windows=2, drift_reexplore_candidates=2, seed=0)
+    targeted_windows = measure(targeted, {A: (1000.0, 0, 0.0), B: (5000.0, 0, 0.0)},
+                               {A: (9000.0, 0, 0.0), B: (1000.0, 0, 0.0)})
+    assert targeted_windows == 2 * min_samples, (
+        f"targeted drift response took {targeted_windows} windows "
+        f"(K=2 x min_samples={min_samples}); the pre-registration target is 2")
+
+    new_best = ll.LayoutCandidate(65536, 200)
+    full = ll.LayoutLearner(candidates=ll.DEFAULT_CANDIDATES, min_samples=min_samples,
+                            stability_window=2, margin=0.05, drift_margin=0.25,
+                            drift_windows=2, drift_reexplore_candidates=None, seed=0)
+    full_windows = measure(full, uniform_table(5000.0, A, 1000.0),
+                           uniform_table(5000.0, new_best, 1000.0))
+    assert full_windows == len(ll.DEFAULT_CANDIDATES) * min_samples, (
+        f"full re-exploration took {full_windows} windows "
+        f"({len(ll.DEFAULT_CANDIDATES)} candidates x min_samples={min_samples}); "
+        f"the targeted response ({targeted_windows}) must be shorter")
+    assert targeted_windows < full_windows
+
+
+def test_drift_reexplore_candidates_is_configurable_and_validated():
+    with pytest.raises(ValueError):
+        ll.LayoutLearner(drift_reexplore_candidates=0)
+    assert ll.LayoutLearner(drift_reexplore_candidates=None).drift_reexplore_candidates is None
 
 
 # ---------------------------------------------------------------------------
@@ -352,6 +440,21 @@ def test_parse_window_line_reads_the_slice26_schema():
     row = parsed.regions["P|Stock"]
     assert row.bytes_read == 796070 and row.bytes_written == 11109
     assert row.count == 191 and row.mean_ns == 190000.0 and row.p99_ns == 251000.0
+    # Slice 34 compaction fields parse from the frozen dump, and the rewrite
+    # factor is derivable only when the region ingested bytes in the window.
+    computed = ll.parse_window_line(json.dumps({
+        "window": 4, "rate_rps": 120.0,
+        "current": {"patterns": [], "regions": [
+            {"region": "P|Stock", "bytes_written": 40,
+             "compaction_bytes": 4288, "compaction_merges": 1},
+        ]},
+        "previous": None,
+    }))
+    c = computed.regions["P|Stock"]
+    assert c.compaction_bytes == 4288 and c.compaction_merges == 1
+    assert ll.region_rewrite_factor(c) == 4288 / 40
+    assert ll.region_rewrite_factor(row) == 0 / 11109
+    assert ll.region_rewrite_factor(stats("P|Stock", bytes_written=0)) is None
     # non-JSON header/summary lines are skipped, not errors
     assert ll.parse_window_line("window=3 rate_rps=120 p50_us=500") is None
     assert ll.parse_window_line("load_summary requests=3") is None
