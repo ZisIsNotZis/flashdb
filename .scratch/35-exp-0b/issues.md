@@ -1,0 +1,28 @@
+# 35 — experiment 0b: the runner exists, the run does not yet
+
+State on 2026-10-02: `harness/flashdb_harness/cold_0b.py` implements the arms, the lambda sweep, the
+drift segment and a per-threshold verdict table with three honesty guards (noise-band downgrade;
+"0 vs 0 compaction bytes" = NOT-MEASURABLE because the load driver never compacts; the 2-window drift
+target reported as unreachable with the default parameters). 90 Python tests pass.
+
+**No verdict has been produced.** The one partial run printed a T1 line whose configuration was a
+smoke run (both arms sustained the top of the ladder, which is impossible for the 45%-scan win mix
+cold, where the measured ceiling is 87-134 rps).
+
+Two defects to fix before the run is evidence:
+
+1. **Ladder under-power guard (must fix first).** The ladder is `reference_rate * (1,2,4,8)`. If
+   every arm sustains the top step, the "highest sustained load level" metric ties by construction
+   and a T1 tie says nothing. The runner must detect that case and emit
+   NOT-MEASURABLE (ladder under-powered) with the observed rates, and it must raise the top step
+   until at least one arm fails (or state that it cannot).
+2. **Coldness evidence per arm.** Every arm must report the cgroup peak and the data:cap ratio, so a
+   reader can see the run was actually cache-evicting. Warm runs on this box measured exactly the
+   opposite conclusion for the page-size axis (slice 25 flat vs slice 29 +54% cold), so "cold" is not
+   a detail - it is the difference between two contradictory results.
+
+Also to state in the report: the win mix is 45% scans / 30% stock / 10% customer / 15% writes (the
+scan share is what makes the layout axis matter); the instance is 1.65 GB at a 192 MiB cap = 8.17x
+(below the pre-registration's 10x, flagged); and the drift target of 2 windows is an author-owned
+threshold that the current parameters cannot reach (6 windows), so it must be reported as a failed
+threshold or renegotiated - not silently relaxed.
