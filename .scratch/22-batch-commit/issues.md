@@ -125,3 +125,24 @@ order against the batch's projected state** (published + earlier requests in the
 sequential commits would, with the barrier deferred. Any relaxation of that is a product-semantics
 change the author must decide, not an implementation detail. Until then, batch throughput numbers
 describe the engine's commit path, not the request path's semantics.
+
+## Correction (2026-10-01): the group is NOT atomic across a crash, and that is correct
+
+Slice 23's task text demanded that a crash before `end_group` lose the WHOLE group with no prefix
+surviving. The implementation does the opposite - recovery replays every complete, CRC-valid frame
+appended before the barrier - and the worker said so plainly rather than claiming the requirement
+was met.
+
+On review, **the requirement was wrong, not the implementation**. For the request path the group is
+a set of INDEPENDENT requests batched to share one barrier. A durable prefix after a crash is
+exactly what the sequential reference semantics produce: a sequence of single commits would also
+have made the earlier blocks durable and lost the later ones. Nothing in the group was acknowledged,
+so no acknowledged work is lost, and a client retry is idempotent through its business unique key
+(the author's idempotency contract). Forcing whole-group atomicity would have made the batched path
+*less* faithful to sequential execution, and it would have required a group-end marker that recovery
+must insist on.
+
+So the contract was corrected at the API (`end_group`'s doc comment now states the real semantics
+and explicitly disclaims whole-group atomicity), and the true statement is: each block is atomic,
+the group is not. A genuine atomic multi-block group remains a possible future feature with an
+explicit end marker, and nothing in the current design depends on it.

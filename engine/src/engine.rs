@@ -1949,15 +1949,24 @@ impl Engine {
         self.commit_block_inner(block_id, ops, false)
     }
 
-    /// Take the group's single WAL barrier and make the whole group durable.
+    /// Take the group's single WAL barrier.
     ///
-    /// On a partial append failure inside the group the WAL writer is poisoned
-    /// exactly as in the single-block path, so this `sync` fails and the group is
-    /// never acknowledged; the caller must reopen to recover (the group's
-    /// complete prefix, if the OS kept it, replays; nothing acked is lost).
-    /// Fails closed when no group is open (so `end_group` twice fails). Clears
-    /// the group even when the barrier fails, because the group is over and the
-    /// poisoned writer already refuses further commits until reopen.
+    /// **Durability semantics, stated precisely** (the earlier "the group is one durability unit"
+    /// wording was wrong): each grouped commit is appended and applied immediately, so a crash
+    /// before this barrier can leave a durable PREFIX of the group - recovery replays every
+    /// complete, CRC-valid frame. That is exactly the sequential reference semantics: a sequence
+    /// of single commits would also have made the earlier blocks durable and lost the later ones,
+    /// and nothing in the group was acknowledged, so no acknowledged work is lost and a client
+    /// retry is idempotent through its business unique key. What is NOT claimed: whole-group
+    /// atomicity across a crash. A true atomic multi-block group would need an explicit group-end
+    /// marker that recovery requires before admitting the group (a future feature; the request
+    /// path does not need it and would be *less* faithful to the sequential reference with it).
+    ///
+    /// On a partial append failure inside the group the WAL writer is poisoned exactly as in the
+    /// single-block path, so this `sync` fails and the group is never acknowledged; the caller
+    /// must reopen to recover. Fails closed when no group is open (so `end_group` twice fails).
+    /// Clears the group even when the barrier fails, because the group is over and the poisoned
+    /// writer already refuses further commits until reopen.
     pub fn end_group(&mut self) -> io::Result<()> {
         if !self.group_open {
             return Err(io::Error::new(io::ErrorKind::Other, "no commit group is open; begin_group first"));
