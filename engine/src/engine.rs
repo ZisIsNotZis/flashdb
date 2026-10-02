@@ -306,6 +306,9 @@ pub struct Engine {
     /// logical key within its range (2026-09-29: reads never see historical
     /// state, so superseded versions are unreadable garbage); the retained WAL
     /// keeps every version and stays the sole recovery authority.
+    /// Active tiles, ordered by `(cutoff, region)` strictly increasing. Cutoffs
+    /// alone are NON-decreasing: a region-partitioned publish emits one tile per
+    /// region at the same cutoff. The pair ordering is what keeps regions disjoint.
     tiles: Vec<TileHandle>,
     wal_path: PathBuf,
     dir: PathBuf,
@@ -689,6 +692,15 @@ impl Engine {
     /// materialized, so the publish peak is one memtable plus one WAL window.
     fn write_verified_tiles(&self, tile_path: &Path, cutoff: u64) -> io::Result<Vec<EmittedTile>> {
         let lower = self.tiles.last().map(|t| t.cutoff()).unwrap_or(0);
+        // Remaining manifest capacity. A partitioned publish emits one tile per region, so the
+        // cap must be checked BEFORE each region's file is created: otherwise a publish near the
+        // cap wrote its files, failed inside the manifest, and POISONED the writer (requiring a
+        // reopen) for a condition that is simply "not enough room". Global mode still costs one.
+        let capacity = manifest::MAX_TILES.saturating_sub(self.tiles.len());
+        if capacity == 0 {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput,
+                "active tile list is full; compact or rotate before publishing"));
+        }
         // Stream the retained WAL suffix once. Alongside the `(lower, cutoff]`
         // expectation map this reproduces exactly the two former preconditions:
         // the last record's CSN must match the serving state
@@ -741,6 +753,10 @@ impl Engine {
                     let region = current.take();
                     verify_tile_against_wal(&tile, &wal_entries, lower, cutoff, region.as_deref())?;
                     emitted.push(EmittedTile { name: tile_name(&region_tile_path(tile_path, emitted.len())), tile });
+                }
+                if emitted.len() >= capacity {
+                    return Err(io::Error::new(io::ErrorKind::InvalidInput,
+                        "active tile list is full for this publish: a partitioned publish emits one tile per region and the remaining capacity is smaller"));
                 }
                 current = region;
                 let path = region_tile_path(tile_path, emitted.len());
@@ -1375,8 +1391,10 @@ impl Engine {
         }
     }
 
-    /// Active tile cutoffs in order (inspection/benchmark hook). Strictly
-    /// increasing and disjoint while the engine is consistent.
+    /// Active tile cutoffs in order (inspection/benchmark hook). Non-decreasing
+    /// (a partitioned publish shares one cutoff across its region tiles); the
+    /// `(cutoff, region)` pair is strictly increasing, which is what makes the
+    /// regions disjoint.
     pub fn active_tile_cutoffs(&self) -> Vec<u64> {
         self.tiles.iter().map(|t| t.cutoff()).collect()
     }
@@ -2077,7 +2095,14 @@ impl Engine {
     /// The durable bytes are byte-for-byte what committing the same new blocks
     /// one at a time would leave: one record per block in input order, each with
     /// its own CSN and the same framing, taking ONE `fdatasync` instead of one per
-    /// block. A block already in `dedup` (an idempotent retry) returns its existing
+    /// block.
+    ///
+    /// The promise is bounded on purpose: a `Conflict` returns with nothing appended,
+    /// but like every append path, if the single `fdatasync` itself fails then complete
+    /// frames may already be in the filesystem, and recovery replays what is complete.
+    /// The caller gets `Err`, so nothing is acknowledged and a retry is idempotent
+    /// through the business unique key - the same rule the deferred-barrier group path
+    /// states. A block already in `dedup` (an idempotent retry) returns its existing
     /// CSN, is not re-appended, and contributes no overlay entry - its effect is
     /// already in the published state, so re-including it could only reject a batch
     /// the sequential order accepts. CSN, `segment_suffix_csn`, `dedup` and the

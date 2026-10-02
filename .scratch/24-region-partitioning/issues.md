@@ -142,3 +142,46 @@ So the axes left with MEASURED gradients are **bloom bits per region** (in-range
 cap headroom). Page size stays available but is documented as flat for these access shapes, and the
 axis reopens only with a block-bound scan workload (large-value sequential scan without per-document
 JSON decode).
+
+## Review outcome (2026-10-01, reviewer 34a8c2d5): BLOCK on the group contract, P2s fixed
+
+The reviewer blocked on the deferred-barrier group claiming to be an all-or-nothing durability unit
+while recovery replays any complete frame appended before the barrier. That was accurate against the
+HEAD it read (`d76a9f8`); it was **my slice-23 requirement that was wrong**, and the contract had
+already been corrected in `64dde22` (each block is atomic, the group is not; a crash persists the
+sequential prefix; nothing unacked is lost; retries are idempotent through the business key).
+
+The reviewer's substantive point that DID stand, and is now fixed: the test named
+`torn_tail_before_the_barrier_loses_the_whole_group` truncated the file INSIDE the first group frame,
+so it only ever proved that a torn first frame is dropped - it could not distinguish "whole group
+lost" from "prefix survives". It is rewritten as
+`a_crash_before_the_barrier_persists_exactly_the_complete_prefix`, asserting BOTH cases, including
+the one the old test never constructed (a complete first frame survives while the rest of the group
+does not).
+
+Other review findings and their dispositions:
+
+- **P2, fixed - region-publish cap overshoot.** `publish_tile` checked only the current count while a
+  partitioned publish emits one tile per region, so near the cap it wrote its files, failed inside
+  the manifest and **poisoned the writer** - for a condition that is merely "not enough room".
+  `write_verified_tiles` now computes the remaining capacity and refuses BEFORE creating the region
+  that would overflow, so the failure is a plain `InvalidInput` and the manifest is never touched.
+- **P2, fixed - doc drift.** The `tiles` field and `active_tile_cutoffs` said "strictly increasing";
+  the invariant is now `(cutoff, region)` strictly increasing with cutoffs merely non-decreasing.
+- **P2, documented - `commit_batch` shares the append-then-sync shape.** A failed `sync` can leave
+  complete frames that recovery replays even though the batch returned `Err`; the promise that
+  "nothing is durable" is bounded to `Conflict`, and the doc comment now says so (nothing acked, so
+  retries are idempotent, same rule as the group path).
+- **P2, recorded only - a mixed-region tile is not caught.** `tile_single_region` and the ordering
+  check look at the first/last key, so a crafted tile whose middle keys belong to another region
+  would pass. Not reachable from the writer (region prefix is a key prefix); recorded as hardening.
+- **P2, recorded only - a Global tile and a region tile at the same cutoff.** The manifest only
+  enforces non-decreasing cutoffs, so a crafted root could admit both; a Global tile does not update
+  `region_last`, and a following same-cutoff tile would get an overlapping `lower`. Crafted-only, and
+  same-cutoff groups cannot arise from publishes because the CSN advances per commit; recorded.
+
+Verified good by the review: the batch overlay is equivalent to sequential commits for the traced
+cases (tombstones, one handle in two blocks, dedup exclusion, whole-batch rejection); chained-root
+cross-slot reads are prevented and a half-written chain always fails its `seq`/CRC/index checks; the
+A/B selection validates the whole chain before serving; and every other mutating path refuses while a
+group is open.

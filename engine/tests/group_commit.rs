@@ -197,33 +197,79 @@ fn conflict_in_the_middle_of_a_group_is_per_block() {
 /// but never synced, so a torn tail at the group boundary recovers the pre-group
 /// state. Nothing in the group was acknowledged.
 #[test]
-fn torn_tail_before_the_barrier_loses_the_whole_group() {
+fn a_crash_before_the_barrier_persists_exactly_the_complete_prefix() {
+    // The contract (see `Engine::end_group`): the group is NOT atomic across a crash. Each
+    // grouped commit is appended and applied immediately, so recovery replays every complete,
+    // CRC-valid frame and the durable state after a crash is the SEQUENTIAL PREFIX. That is the
+    // sequential reference semantics and nothing in the group was acknowledged, so no acked work
+    // is lost and a retry is idempotent through the business key.
+    //
+    // The earlier version of this test was named "..._loses_the_whole_group" and truncated the
+    // file INSIDE the first group frame, so it only ever proved that a torn first frame is
+    // dropped - it could not distinguish "whole group lost" from "prefix survives". Both cases
+    // are asserted here instead.
     let files = Files::new();
     let base_len;
+    let after_first_frame;
     {
         let mut e = Engine::create(&files.wal).unwrap();
         e.commit_block(b"base", &[put_doc(1, "doc1")]).unwrap();
         base_len = fs::metadata(&files.wal).unwrap().len();
         e.begin_group().unwrap();
-        for n in 2..=4u64 {
+        let (id2, ops2) = block(2);
+        e.commit_block_grouped(&id2, &ops2).unwrap();
+        after_first_frame = fs::metadata(&files.wal).unwrap().len();
+        for n in 3..=4u64 {
             let (id, ops) = block(n);
             e.commit_block_grouped(&id, &ops).unwrap();
         }
-        // Crash BEFORE end_group. Simulate the unsynced group not surviving by
-        // leaving only a torn fragment of its first record on disk.
+        // Crash BEFORE end_group: no barrier was taken.
         drop(e);
     }
+
+    // Case 1: a torn FIRST frame (a strict prefix of one frame) is dropped with the rest.
     let f = fs::OpenOptions::new().write(true).open(&files.wal).unwrap();
     f.set_len(base_len + 3).unwrap();
     drop(f);
-
     let e = Engine::open(&files.wal).unwrap();
-    assert_eq!(e.csn(), 1, "the un-acknowledged group is gone");
+    assert_eq!(e.csn(), 1, "a torn frame is not replayed");
     assert_eq!(e.get(b"E", 1).unwrap(), Some(b"doc1".to_vec()));
     for n in 2..=4u64 {
         assert_eq!(e.committed_block_csn(format!("b{n}").as_bytes()), None);
         assert_eq!(e.get(b"E", n).unwrap(), None);
     }
+    drop(e);
+
+    // Case 2: a complete FIRST frame survives the same crash, so b2 is durable while b3/b4 are
+    // not. This is the case the old test never constructed, and it is the one that shows the
+    // semantics are prefix-based rather than all-or-nothing.
+    let files2 = Files::new();
+    let after_first;
+    {
+        let mut e = Engine::create(&files2.wal).unwrap();
+        e.commit_block(b"base", &[put_doc(1, "doc1")]).unwrap();
+        e.begin_group().unwrap();
+        let (id2, ops2) = block(2);
+        e.commit_block_grouped(&id2, &ops2).unwrap();
+        after_first = fs::metadata(&files2.wal).unwrap().len();
+        for n in 3..=4u64 {
+            let (id, ops) = block(n);
+            e.commit_block_grouped(&id, &ops).unwrap();
+        }
+        drop(e);
+    }
+    assert!(after_first > base_len);
+    let f = fs::OpenOptions::new().write(true).open(&files2.wal).unwrap();
+    f.set_len(after_first).unwrap();
+    drop(f);
+    let e = Engine::open(&files2.wal).unwrap();
+    assert_eq!(e.csn(), 2, "the complete first frame of the un-acknowledged group replays");
+    assert_eq!(e.get(b"E", 2).unwrap(), Some(b"doc2".to_vec()));
+    for n in 3..=4u64 {
+        assert_eq!(e.committed_block_csn(format!("b{n}").as_bytes()), None);
+        assert_eq!(e.get(b"E", n).unwrap(), None);
+    }
+    let _ = after_first_frame;
 }
 
 /// A complete barrier replays every member of the group after recovery.
