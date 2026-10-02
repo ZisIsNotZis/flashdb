@@ -1,0 +1,376 @@
+"""Tests for the per-region layout learner and its controls (Slice 33).
+
+Everything here runs against **simulated rewards** -- a region -> candidate ->
+``(mean_ns, bytes_written, p99_ns)`` table fed through the real
+:class:`WindowTelemetry` / :func:`run_controller` paths -- so there is no engine
+and no long run. The scored behaviours are: a genuine per-region gradient is
+found; a no-gradient workload is not churned; the min-sample gate and the
+hysteresis window gate switches; a p99-violating candidate is never selectable;
+``flashdb-static-derived`` does not adapt after drift while the learner does; and
+the whole thing is deterministic for a fixed seed.
+"""
+
+from __future__ import annotations
+
+import json
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from flashdb_harness import layout_learner as ll  # noqa: E402
+
+A = ll.DECLARED_DEFAULT                       # LayoutCandidate(4096, 2)
+B = ll.LayoutCandidate(4096, 8)
+C = ll.LayoutCandidate(4096, 200)
+
+
+def stats(region: str, *, count: int = 100, mean_ns: float = 1000.0,
+          bytes_written: int = 0, p99_ns: float = 0.0) -> ll.RegionStats:
+    return ll.RegionStats(
+        region=region, probes=count, probe_misses=0, bytes_read=0,
+        bytes_written=bytes_written, commit_blocks=count, commit_ops=count,
+        count=count, mean_ns=mean_ns, p50_ns=mean_ns, p99_ns=p99_ns,
+    )
+
+
+def window(index: int, tables: dict, selection: dict) -> ll.WindowTelemetry:
+    """One simulated metrics window: each region reports its active candidate's row."""
+    rows = {}
+    for region, table in tables.items():
+        candidate = selection.get(region, ll.DECLARED_DEFAULT)
+        mean_ns, bytes_written, p99_ns = table[candidate]
+        rows[region] = stats(region, mean_ns=mean_ns, bytes_written=bytes_written, p99_ns=p99_ns)
+    return ll.WindowTelemetry(window=index, rate_rps=1000.0, regions=rows)
+
+
+def uniform_table(base_mean: float, best: ll.LayoutCandidate | None = None,
+                  best_mean: float = 0.0, *, bytes_written: int = 0,
+                  p99_ns: float = 0.0) -> dict:
+    return {
+        c: (best_mean if c == best else base_mean, bytes_written, p99_ns)
+        for c in ll.DEFAULT_CANDIDATES
+    }
+
+
+def drive(controller, tables: dict, windows: int, *, start: int = 0) -> list[dict]:
+    """Feed ``windows`` simulated windows, respecting the last written policy."""
+    selection: dict = {}
+    trace = []
+    for i in range(start, start + windows):
+        w = window(i, tables, selection)
+        controller.observe(w)
+        selection = controller.selections()
+        trace.append(dict(selection))
+    return trace
+
+
+def selection_from_document(document: dict, regions) -> dict:
+    out = {}
+    for region in regions:
+        entry = document["regions"].get(region, document["default"])
+        out[region] = ll.LayoutCandidate(entry["page_size"], entry["merge_min_tiles"])
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Candidate set and reward proxy
+# ---------------------------------------------------------------------------
+def test_candidate_set_is_the_published_2x3_grid():
+    assert len(ll.DEFAULT_CANDIDATES) == 6
+    assert {c.page_size for c in ll.DEFAULT_CANDIDATES} == {4096, 65536}
+    assert {c.merge_min_tiles for c in ll.DEFAULT_CANDIDATES} == {2, 8, 200}
+    assert ll.DECLARED_DEFAULT in ll.DEFAULT_CANDIDATES
+
+
+def test_reward_proxy_is_service_time_plus_lambda_times_bytes():
+    row = stats("P|Stock", count=10, mean_ns=200.0, bytes_written=500)
+    assert ll.region_cost_ns(row, 1.0) == 10 * 200.0 + 500
+    # lambda prices endurance: a bigger lambda makes a write-heavy candidate costlier
+    assert ll.region_cost_ns(row, 4.0) == 10 * 200.0 + 4 * 500
+
+
+def test_candidate_set_is_configurable():
+    learner = ll.LayoutLearner(candidates=(A, B))
+    learner.observe(window(0, {"P|Stock": uniform_table(1.0)}, {}))
+    assert set(learner.pulls("P|Stock")) == {A, B}
+
+
+def test_folded_other_region_is_ignored():
+    learner = ll.LayoutLearner()
+    w = ll.WindowTelemetry(window=0, rate_rps=1.0,
+                           regions={"other": stats("other"), "P|Stock": stats("P|Stock")})
+    learner.observe(w)
+    assert "other" not in learner.selections()
+    assert "P|Stock" in learner.selections()
+
+
+# ---------------------------------------------------------------------------
+# The learner
+# ---------------------------------------------------------------------------
+def test_finds_the_best_candidate_in_a_synthetic_environment():
+    best_stock = ll.LayoutCandidate(65536, 8)
+    best_customer = ll.LayoutCandidate(4096, 200)
+    tables = {
+        "P|Stock": uniform_table(5000.0, best_stock, 1000.0),
+        "U|Customer": uniform_table(4000.0, best_customer, 900.0),
+    }
+    learner = ll.LayoutLearner(min_samples=2, stability_window=2, margin=0.05,
+                               drift_margin=10.0, seed=1)
+    drive(learner, tables, windows=40)
+    assert learner.selections()["P|Stock"] == best_stock
+    assert learner.selections()["U|Customer"] == best_customer
+
+
+def test_no_churn_when_all_candidates_are_equal():
+    tables = {"P|Stock": uniform_table(3000.0)}
+    learner = ll.LayoutLearner(min_samples=2, stability_window=2, margin=0.05,
+                               drift_margin=10.0, seed=3)
+    trace = drive(learner, tables, windows=60)
+    burn_in = len(ll.DEFAULT_CANDIDATES) * 2
+    # Exploration is a bounded, named burn-in; after it the committed policy never moves.
+    assert all(t == trace[-1] for t in trace[burn_in:])
+    assert sum(learner.gated_switches().values()) == 0
+    assert sum(learner.restarts().values()) == 0
+
+
+def test_min_sample_gate_delays_a_switch():
+    region = "P|Stock"
+    learner = ll.LayoutLearner(candidates=(A, B), min_samples=3, margin=0.05,
+                               stability_window=1, drift_margin=10.0, seed=0)
+    for _ in range(2):
+        learner.record(region, A, stats(region, mean_ns=5000.0))
+    for _ in range(2):
+        learner.record(region, B, stats(region, mean_ns=1000.0))
+    learner.step([region], explore=False)
+    assert learner.selections()[region] == A
+    assert learner.gated_switches().get(region, 0) == 0
+
+    learner.record(region, B, stats(region, mean_ns=1000.0))   # B reaches min_samples
+    learner.step([region], explore=False)
+    assert learner.selections()[region] == A                     # incumbent still short
+    assert learner.gated_switches().get(region, 0) == 0
+
+    learner.record(region, A, stats(region, mean_ns=5000.0))     # incumbent reaches too
+    learner.step([region], explore=False)
+    assert learner.selections()[region] == B
+    assert learner.gated_switches()[region] == 1
+
+
+def test_hysteresis_resists_a_one_window_noise_spike():
+    region = "P|Stock"
+
+    def cheap():
+        return stats(region, mean_ns=100.0)
+
+    def good():
+        return stats(region, mean_ns=1000.0)
+
+    def bad():
+        return stats(region, mean_ns=5000.0)
+
+    # One very cheap window among three expensive ones does not move the challenger's mean.
+    spiky = ll.LayoutLearner(candidates=(A, B), min_samples=3, margin=0.05,
+                             stability_window=2, drift_margin=10.0, seed=0)
+    for _ in range(3):
+        spiky.record(region, A, good())
+    spiky.record(region, B, cheap())
+    spiky.record(region, B, bad())
+    spiky.record(region, B, bad())
+    spiky.step([region], explore=False)
+    assert spiky.selections()[region] == A
+    assert spiky.gated_switches().get(region, 0) == 0
+
+    # A sustained improvement switches, but only after the stability window.
+    sustained = ll.LayoutLearner(candidates=(A, B), min_samples=3, margin=0.05,
+                                 stability_window=2, drift_margin=10.0, seed=0)
+    for _ in range(3):
+        sustained.record(region, A, bad())
+    for _ in range(3):
+        sustained.record(region, B, good())
+    sustained.step([region], explore=False)
+    assert sustained.selections()[region] == A
+    assert sustained.gated_switches().get(region, 0) == 0
+    sustained.step([region], explore=False)
+    assert sustained.selections()[region] == B
+    assert sustained.gated_switches()[region] == 1
+
+
+def test_p99_constraint_excludes_a_violating_candidate():
+    region = "P|Stock"
+    tempting = ll.LayoutCandidate(65536, 200)
+    ceiling = 2000.0
+    table = {}
+    for c in ll.DEFAULT_CANDIDATES:
+        table[c] = (100.0, 0, 9000.0) if c == tempting else (1000.0, 0, 500.0)
+    learner = ll.LayoutLearner(min_samples=1, margin=0.05, stability_window=1,
+                               drift_margin=10.0, ceilings_ns={region: ceiling}, seed=0)
+
+    selection: dict = {}
+    for i in range(40):
+        w = window(i, {region: table}, selection)
+        learner.observe(w)
+        selection = learner.selections()
+        # The engine must run a candidate once to learn it violates the ceiling; from
+        # that window on it is never selectable again (the hard constraint).
+        if tempting in learner.violating_candidates(region):
+            assert selection[region] != tempting, "a p99-violating candidate was selectable"
+    assert tempting in learner.violating_candidates(region)
+    assert learner.selections()[region] != tempting
+    assert learner.constraint_switches().get(region, 0) >= 1
+
+
+def test_learner_ignores_a_region_without_a_declared_ceiling():
+    # With no ceiling declared the constraint is inert: the cheapest candidate wins.
+    region = "P|Stock"
+    best = ll.LayoutCandidate(65536, 200)
+    tables = {region: uniform_table(5000.0, best, 100.0, p99_ns=99_000.0)}
+    learner = ll.LayoutLearner(min_samples=2, stability_window=2, margin=0.05,
+                               drift_margin=10.0, seed=1)
+    drive(learner, tables, windows=30)
+    assert learner.selections()[region] == best
+
+
+def test_determinism_same_seed_same_decisions():
+    tables = {"P|Stock": uniform_table(5000.0, C, 1000.0),
+              "U|Stock": uniform_table(3000.0)}
+    first = drive(ll.LayoutLearner(min_samples=2, seed=11), tables, windows=30)
+    second = drive(ll.LayoutLearner(min_samples=2, seed=11), tables, windows=30)
+    assert first == second
+
+
+def test_seed_only_orders_exact_ties():
+    # The seed is used nowhere but the tie-break permutation, and that permutation
+    # is stable for a fixed seed and a permutation of the candidate set.
+    learner = ll.LayoutLearner(seed=0)
+    assert learner.candidate_order == ll.LayoutLearner(seed=0).candidate_order
+    assert sorted(learner.candidate_order) == sorted(ll.DEFAULT_CANDIDATES)
+    seeds = {tuple(ll.LayoutLearner(seed=s).candidate_order) for s in range(8)}
+    assert len(seeds) > 1, "the seed must actually move the tie order"
+
+
+# ---------------------------------------------------------------------------
+# The controls
+# ---------------------------------------------------------------------------
+def test_declared_control_is_one_fixed_candidate_everywhere():
+    declared = ll.DeclaredController(candidate=C)
+    w = window(0, {"P|Stock": uniform_table(1.0)}, {})
+    declared.observe(w)
+    assert declared.selections() == {"P|Stock": C}
+    assert declared.policy_document()["default"] == {
+        "page_size": C.page_size, "bloom_bits_per_key": 10, "merge_min_tiles": C.merge_min_tiles}
+    # never adapts, even given the same window repeatedly
+    declared.observe(w)
+    assert declared.selections() == {"P|Stock": C}
+
+
+def test_static_derived_picks_the_cheapest_from_the_pre_drift_sweep():
+    region = "P|Stock"
+    sweep = {region: {
+        A: stats(region, mean_ns=5000.0),
+        B: stats(region, mean_ns=1000.0),
+        C: stats(region, mean_ns=9000.0),
+    }}
+    static = ll.StaticDerivedController(candidates=(A, B, C))
+    static.derive(sweep)
+    assert static.selections()[region] == B
+
+
+def test_static_derived_does_not_adapt_after_drift_while_learner_does():
+    region = "P|Stock"
+    old_best = ll.LayoutCandidate(4096, 2)     # A
+    new_best = ll.LayoutCandidate(65536, 200)  # best only after the drift
+    pre = uniform_table(5000.0, old_best, 1000.0)
+    post = uniform_table(5000.0, new_best, 1000.0)
+    post[old_best] = (6000.0, 0, 0.0)          # the old best degrades: the drift signal
+
+    sweep = {region: {c: stats(region, mean_ns=pre[c][0]) for c in pre}}
+    static = ll.StaticDerivedController()
+    static.derive(sweep)
+    assert static.selections()[region] == old_best
+
+    learner = ll.LayoutLearner(min_samples=2, stability_window=2, margin=0.05,
+                               drift_margin=0.25, drift_windows=2, seed=1)
+    selection: dict = {}
+    for i in range(80):
+        table = pre if i < 30 else post
+        w = window(i, {region: table}, selection)
+        learner.observe(w)
+        static.observe(w)
+        selection = learner.selections()
+
+    assert static.selections()[region] == old_best   # frozen: no adaptation, ever
+    assert learner.selections()[region] == new_best  # the learner re-explored and moved
+    assert learner.restarts().get(region, 0) >= 1
+
+
+# ---------------------------------------------------------------------------
+# The driver loop + telemetry parsing
+# ---------------------------------------------------------------------------
+def test_driver_loop_runs_against_simulated_rewards():
+    region = "P|Stock"
+    best = ll.LayoutCandidate(65536, 200)
+    tables = {region: uniform_table(1000.0, best, 100.0)}
+    learner = ll.LayoutLearner(min_samples=2, stability_window=2, margin=0.05,
+                               drift_margin=10.0, seed=1)
+
+    state = {"selection": {}, "written": [], "read": 0}
+
+    def read_telemetry():
+        if state["read"] >= 40:
+            return None
+        w = window(state["read"], tables, state["selection"])
+        state["read"] += 1
+        return w
+
+    def write_policy(document):
+        state["written"].append(document)
+        state["selection"] = selection_from_document(document, tables)
+
+    history = ll.run_controller(read_telemetry, write_policy, learner)
+    assert len(history) == 40
+    assert len(state["written"]) == 40
+    assert all(doc["default"]["page_size"] == 4096 for doc in state["written"])
+    assert learner.selections()[region] == best
+    # the last written policy matches the learner's final selection
+    assert state["written"][-1]["regions"][region] == best.entry()
+
+
+def test_parse_window_line_reads_the_slice26_schema():
+    line = json.dumps({
+        "window": 3, "rate_rps": 120.0, "p50_us": 500, "p99_us": 1500,
+        "current": {"patterns": [], "regions": [
+            {"region": "P|Stock", "probes": 191, "probe_misses": 0, "bytes_read": 796070,
+             "bytes_written": 11109, "commit_blocks": 161, "commit_ops": 161,
+             "count": 191, "mean_ns": 190000.0, "p50_ns": 180000.0, "p99_ns": 251000.0},
+        ]},
+        "previous": None,
+    })
+    parsed = ll.parse_window_line(line)
+    assert parsed is not None
+    assert parsed.window == 3 and parsed.rate_rps == 120.0
+    row = parsed.regions["P|Stock"]
+    assert row.bytes_read == 796070 and row.bytes_written == 11109
+    assert row.count == 191 and row.mean_ns == 190000.0 and row.p99_ns == 251000.0
+    # non-JSON header/summary lines are skipped, not errors
+    assert ll.parse_window_line("window=3 rate_rps=120 p50_us=500") is None
+    assert ll.parse_window_line("load_summary requests=3") is None
+    assert ll.parse_window_line("{not json") is None
+
+
+def test_policy_document_is_valid_engine_json():
+    learner = ll.LayoutLearner()
+    learner.observe(window(0, {"P|Stock": uniform_table(1.0)}, {}))
+    doc = learner.policy_document()
+    assert json.loads(json.dumps(doc)) == doc
+    entry = doc["regions"]["P|Stock"]
+    assert set(entry) == {"page_size", "merge_min_tiles"}
+    assert doc["default"]["bloom_bits_per_key"] == 10
+
+
+def test_write_policy_file_round_trips(tmp_path):
+    path = tmp_path / "policy.json"
+    learner = ll.LayoutLearner()
+    learner.observe(window(0, {"P|Stock": uniform_table(1.0)}, {}))
+    ll.write_policy_file(path, learner.policy_document())
+    assert json.loads(path.read_text(encoding="utf-8")) == learner.policy_document()
