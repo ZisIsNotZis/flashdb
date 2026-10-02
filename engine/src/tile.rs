@@ -991,6 +991,18 @@ impl Tile {
     pub(crate) fn digest(&self) -> &[u8; 32] { &self.digest }
     pub(crate) fn count(&self) -> u64 { self.count }
 
+    /// The tile's smallest stored key, or `None` for an empty tile. Cached in
+    /// RAM at open/write; used by recovery to derive the tile's region for the
+    /// `(cutoff, region)` ordering and per-region `lower` bound.
+    pub(crate) fn first_key(&self) -> Option<&[u8]> {
+        (!self.first_key.is_empty()).then_some(self.first_key.as_slice())
+    }
+
+    /// The tile's largest stored key, or `None` for an empty tile or a tile
+    /// whose final block was not trusted. A single-region tile has
+    /// `region_prefix(first) == region_prefix(last)`.
+    pub(crate) fn last_key(&self) -> Option<&[u8]> { self.last_key.as_deref() }
+
     /// Conservative prefix fast-reject: returns `false` ONLY when it is certain
     /// that no stored key starts with `prefix`, so a `false` never hides a match
     /// (a false NEGATIVE would be a correctness bug; a false positive only costs
@@ -1061,6 +1073,16 @@ impl Tile {
             .filter(|(key, _)| keys::key_csn(key).is_some_and(|csn| csn > lower && csn <= cutoff))
             .map(|(k, v)| (k.to_vec(), v.to_vec()))
             .collect();
+        // A region-partitioned tile (slice 24) holds exactly one `(family,
+        // entity)` region: its first and last stored keys share a region prefix.
+        // Such a tile is only obligated for that region's projection - its
+        // sibling tiles at the same cutoff carry the other regions - so the
+        // leftover check below is restricted to the region it covers. A
+        // whole-keyspace tile (first and last region differ, or an empty tile)
+        // stays exactly checked, preserving the pre-partitioning guarantee.
+        let first_region = self.first_key().and_then(keys::region_prefix);
+        let single = first_region.is_some()
+            && first_region == self.last_key().and_then(keys::region_prefix);
         let mut actual = self.entries();
         loop {
             let (key, value) = match actual.next() {
@@ -1076,7 +1098,11 @@ impl Tile {
                 None => return Err(invalid("tile contains extra WAL entry")),
             }
         }
-        if !expect.is_empty() { return Err(invalid("tile missing WAL entry")); }
+        let missing = match (single, first_region) {
+            (true, Some(region)) => expect.keys().any(|key| keys::region_prefix(key) == Some(region)),
+            _ => !expect.is_empty(),
+        };
+        if missing { return Err(invalid("tile missing WAL entry")); }
         Ok(())
     }
 }

@@ -187,8 +187,14 @@ pub(crate) struct Root {
     pub(crate) segment: Option<SegmentRef>,
 }
 
-fn cutoffs_strictly_increasing(tiles: &[TileRef]) -> bool {
-    tiles.windows(2).all(|w| w[0].cutoff < w[1].cutoff)
+/// Active tiles must be non-decreasing by cutoff. A region-partitioned publish
+/// (slice 24) emits one tile per `(entity, key family)` region that SHARE the
+/// publish cutoff, so the historical strictly-increasing rule is relaxed to
+/// non-decreasing; the engine owns the finer `(cutoff, region)` strict ordering
+/// and enforces it in `open_impl` by reading each tile's own region. On-disk
+/// format is unchanged.
+fn cutoffs_non_decreasing(tiles: &[TileRef]) -> bool {
+    tiles.windows(2).all(|w| w[0].cutoff <= w[1].cutoff)
 }
 
 /// Names a manifest entry may never take: they would collide with the manifest
@@ -201,13 +207,13 @@ pub(crate) fn valid_tile_name(name: &str) -> bool {
 }
 
 /// Structural rules shared by the encoder and the chained decoder: at most
-/// [`MAX_TILES`], strictly increasing cutoffs, plain unique names.
+/// [`MAX_TILES`], non-decreasing cutoffs, plain unique names.
 fn validate_tiles(tiles: &[TileRef]) -> io::Result<()> {
     if tiles.len() > MAX_TILES {
         return Err(invalid("manifest tile list exceeds the active-tile policy bound"));
     }
-    if !cutoffs_strictly_increasing(tiles) {
-        return Err(invalid("manifest tile cutoffs overlap or are not strictly increasing"));
+    if !cutoffs_non_decreasing(tiles) {
+        return Err(invalid("manifest tile cutoffs are not non-decreasing"));
     }
     let mut seen = HashSet::with_capacity(tiles.len());
     for t in tiles {
@@ -642,8 +648,8 @@ impl Manifest {
         if tiles.is_empty() || tiles.len() > MAX_TILES {
             return Err(invalid("publish requires one to MAX_TILES active tiles"));
         }
-        if !cutoffs_strictly_increasing(&tiles) {
-            return Err(invalid("manifest tile cutoffs overlap or are not strictly increasing"));
+        if !cutoffs_non_decreasing(&tiles) {
+            return Err(invalid("manifest tile cutoffs are not non-decreasing"));
         }
         if checkpoint.csn != tiles.last().unwrap().cutoff {
             return Err(invalid("manifest checkpoint CSN disagrees with newest tile cutoff"));
@@ -738,8 +744,8 @@ impl Manifest {
         let replacement_name = replacement.name.clone();
         tiles.push(replacement);
         tiles.extend_from_slice(&self.root.tiles[end..]);
-        if !cutoffs_strictly_increasing(&tiles) {
-            return Err(invalid("replacement would make tile cutoffs overlap or not strictly increase"));
+        if !cutoffs_non_decreasing(&tiles) {
+            return Err(invalid("replacement would make tile cutoffs decrease"));
         }
         // Defense in depth: the replacement name must not collide with a tile that
         // survives the replacement. The caller checks this against the live tile
@@ -850,9 +856,10 @@ mod tests {
         assert_eq!(decode_inline_payload(1, &p).unwrap_err().kind(), ErrorKind::InvalidData);
 
         // CRC-valid but structurally impossible tile lists are corruption:
-        // decreasing/equal cutoffs, a checkpoint that is not the newest cutoff,
-        // or a duplicated tile name. encode_root refuses to produce these, so the
-        // payloads are hand-assembled the way only corruption could write them.
+        // decreasing cutoffs, a checkpoint that is not the newest cutoff, or a
+        // duplicated tile name. Equal adjacent cutoffs are NOT corruption since
+        // slice 24 (region-partitioned tiles share the publish cutoff); the
+        // engine enforces `(cutoff, region)` strictness at open.
         let entry = |name: &[u8], cutoff: u64| {
             let mut e = Vec::new();
             e.extend_from_slice(&(name.len() as u32).to_le_bytes());
@@ -874,7 +881,8 @@ mod tests {
             p[i + 8..i + 16].copy_from_slice(&checkpoint.1.to_le_bytes());
             p
         };
-        assert_eq!(decode_inline_payload(3, &hand_built(&[(b"b.tile".to_vec(), 3), (b"a.tile".to_vec(), 3)], (3, 3))).unwrap_err().kind(), ErrorKind::InvalidData);
+        assert!(decode_inline_payload(3, &hand_built(&[(b"b.tile".to_vec(), 3), (b"a.tile".to_vec(), 3)], (3, 3))).is_ok(),
+            "equal cutoffs are legal: region-partitioned tiles share a cutoff");
         assert_eq!(decode_inline_payload(3, &hand_built(&[(b"b.tile".to_vec(), 3), (b"a.tile".to_vec(), 2)], (2, 3))).unwrap_err().kind(), ErrorKind::InvalidData);
         assert_eq!(decode_inline_payload(3, &hand_built(&[(b"a.tile".to_vec(), 2), (b"b.tile".to_vec(), 3)], (2, 3))).unwrap_err().to_string(),
             "manifest checkpoint CSN disagrees with newest tile cutoff");
@@ -1290,9 +1298,15 @@ mod tests {
         case("refuse-empty", Vec::new(), Checkpoint { csn: 0, handle_watermark: 0 });
         case("refuse-cutoff", vec![tile("a.tile", 5)], Checkpoint { csn: 4, handle_watermark: 0 });
         case("refuse-order", vec![tile("b.tile", 6), tile("a.tile", 5)], Checkpoint { csn: 6, handle_watermark: 0 });
-        case("refuse-overlap", vec![tile("a.tile", 5), tile("b.tile", 5)], Checkpoint { csn: 5, handle_watermark: 0 });
+        case("refuse-decreasing", vec![tile("a.tile", 5), tile("b.tile", 4)], Checkpoint { csn: 5, handle_watermark: 0 });
         case("refuse-duplicate", vec![tile("a.tile", 5), tile("a.tile", 6)], Checkpoint { csn: 6, handle_watermark: 0 });
         case("refuse-too-many", many_tiles(MAX_TILES + 1), Checkpoint { csn: MAX_TILES as u64 + 1, handle_watermark: 0 });
+        // Equal adjacent cutoffs are accepted since slice 24: a region-partitioned
+        // publish emits several tiles sharing the publish cutoff.
+        let path = tmp_dir("accept-equal").join(MANIFEST_NAME);
+        let mut m = Manifest::create(&path).unwrap();
+        m.publish(vec![tile("a.tile", 5), tile("b.tile", 5)], Checkpoint { csn: 5, handle_watermark: 0 }, None).unwrap();
+        assert_eq!(m.root().tiles.len(), 2);
     }
 
     #[test]

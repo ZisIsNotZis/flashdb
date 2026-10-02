@@ -174,6 +174,42 @@ pub fn decode_reverse(key: &[u8]) -> Option<(u64, u64, u64)> {
     Some((target, source, csn))
 }
 
+/// The key's **region prefix**: `MARKER | entity | 0` - the bytes that identify
+/// the region `(key family, entity)` of any `P`/`U`/`R` key. All three families
+/// spell the entity the same way (a 0-terminated name right after the marker),
+/// so this parse is family-independent. Returns `None` for an unknown marker or
+/// a key with no entity terminator.
+///
+/// This is the partitioning unit used by the region-partitioned write paths:
+/// keys whose region prefix is equal belong to the same tile. Because the
+/// prefix is a key prefix, byte order groups a region's keys contiguously and
+/// orders regions by `(marker, entity)`, which is exactly the secondary sort of
+/// the `(cutoff, region)` tile-list ordering.
+pub fn region_prefix(key: &[u8]) -> Option<&[u8]> {
+    let marker = *key.first()?;
+    if marker != P && marker != U && marker != R {
+        return None;
+    }
+    let rest = &key[1..];
+    let entity_end = rest.iter().position(|&b| b == 0)?;
+    Some(&key[..entity_end + 2])
+}
+
+/// The canonical `"<family>|<entity>"` region name for a [`region_prefix`] or a
+/// `(marker, entity)` pair, as consumed by [`crate::engine::LayoutPolicy`]. The
+/// entity is rendered lossily: the name is a policy-lookup key only, never an
+/// identity, so two entities that sanitize alike merely share a policy.
+pub fn region_name(prefix: &[u8]) -> String {
+    let marker = prefix.first().copied().unwrap_or(b'?');
+    let end = prefix.len().saturating_sub(1);
+    let entity = if prefix.len() >= 2 { &prefix[1..end] } else { &[][..] };
+    let mut name = String::with_capacity(2 + entity.len());
+    name.push(marker as char);
+    name.push('|');
+    name.push_str(&String::from_utf8_lossy(entity));
+    name
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -238,5 +274,35 @@ mod tests {
         assert!(check_name(b"a\x00b").is_err());
         assert!(primary_key(b"Bad\x00Name", 1, 1).is_err());
         assert!(unique_key(b"E", b"f\x00", b"v", 1, 1).is_err());
+    }
+
+    #[test]
+    fn region_prefix_groups_by_family_and_entity_only() {
+        // Same entity, same family, different field/handle/value/csn: one region.
+        let p1 = primary_key(b"Stock", 1, 1).unwrap();
+        let p2 = primary_key(b"Stock", 9, 7).unwrap();
+        assert_eq!(region_prefix(&p1), region_prefix(&p2));
+        let u1 = unique_key(b"Stock", b"sku", b"A", 1, 1).unwrap();
+        let u2 = unique_key(b"Stock", b"loc", b"B", 2, 2).unwrap();
+        assert_eq!(region_prefix(&u1), region_prefix(&u2), "fields share the (family, entity) region");
+        // Different family or entity: different region, and the prefix is the
+        // marker plus the 0-terminated entity.
+        assert_ne!(region_prefix(&p1), region_prefix(&u1));
+        assert_eq!(region_prefix(&p1), Some(&b"PStock\x00"[..]));
+        assert_eq!(region_prefix(&u1), Some(&b"UStock\x00"[..]));
+        let other = primary_key(b"Stockx", 1, 1).unwrap();
+        assert_ne!(region_prefix(&p1), region_prefix(&other));
+        // Region order is byte order of the prefix.
+        assert!(region_prefix(&p1) < region_prefix(&u1), "P regions sort before U regions");
+        assert!(region_prefix(&other) > region_prefix(&p1));
+    }
+
+    #[test]
+    fn region_name_is_family_pipe_entity() {
+        assert_eq!(region_name(b"PStock\x00"), "P|Stock");
+        assert_eq!(region_name(b"UOrder\x00"), "U|Order");
+        assert_eq!(region_name(b"R"), "R|");
+        assert!(region_prefix(b"Xwhatever\x00").is_none(), "an unknown family is not a region");
+        assert!(region_prefix(b"PNoTerminator").is_none());
     }
 }

@@ -56,7 +56,7 @@ use std::io::{self, BufRead, BufReader, Write};
 use std::path::Path;
 use std::time::Instant;
 
-use flashdb_engine::engine::{CompactShape, Engine, LayoutPolicy, Op, Outcome, MAX_ACTIVE_TILES};
+use flashdb_engine::engine::{CompactShape, Engine, LayoutPolicy, Op, Outcome, RegionMode, MAX_ACTIVE_TILES};
 use serde::{Deserialize, Serialize};
 
 const ENTITY_A: &[u8] = b"EntityA";
@@ -117,6 +117,41 @@ fn compact_shape() -> CompactShape {
 /// each tile's superblock, so a directory written here reads back without the
 /// env set. Nothing about this is durable.
 fn layout_policy() -> LayoutPolicy { LayoutPolicy::from_env() }
+
+/// `FLASHDB_REGION_MODE=global|per_region` selects the tile write mode (slice
+/// 24). Unset or unknown keeps the shipped default, [`RegionMode::Global`],
+/// which reproduces the pre-partitioning single-tile stream.
+fn region_mode() -> RegionMode {
+    match std::env::var("FLASHDB_REGION_MODE") {
+        Ok(name) => RegionMode::from_name(&name).unwrap_or_else(|| {
+            eprintln!("unknown FLASHDB_REGION_MODE={name:?}; using global");
+            RegionMode::Global
+        }),
+        Err(_) => RegionMode::Global,
+    }
+}
+
+/// Per-region layout overrides for measurement:
+/// `FLASHDB_REGION_LAYOUT="P|Movement=65536:4,U|Stock=4096:0"` (comma-separated
+/// `region=page_size:bloom_bits`, the region spelled as `LayoutPolicy` expects).
+/// Applied on top of [`layout_policy`]; each value lands in the emitted tile's
+/// superblock, so a directory written here reads back without the env set.
+fn region_layout_policy() -> LayoutPolicy {
+    let mut policy = layout_policy();
+    let Ok(spec) = std::env::var("FLASHDB_REGION_LAYOUT") else { return policy };
+    for entry in spec.split(',').filter(|s| !s.is_empty()) {
+        let Some((region, values)) = entry.split_once('=') else {
+            eprintln!("FLASHDB_REGION_LAYOUT entry {entry:?} is not region=page:bits; ignored");
+            continue;
+        };
+        let (page, bits) = values.split_once(':').unwrap_or((values, "10"));
+        match (page.parse::<u32>(), bits.parse::<u8>()) {
+            (Ok(page), Ok(bits)) => { policy.set_region(region, page, bits); }
+            _ => eprintln!("FLASHDB_REGION_LAYOUT entry {entry:?} has a bad page/bits; ignored"),
+        }
+    }
+    policy
+}
 /// unique_lookup probes per entity in `verify`. Deliberately small: each probe
 /// is a full prefix scan over tiles + memtable (O(data)).
 const PROBES_PER_ENTITY: u64 = 20;
@@ -204,7 +239,8 @@ fn count_published_tiles(
     dir: &Path,
     seen: &mut HashMap<String, u64>,
     total: &mut u64,
-) -> io::Result<()> {
+) -> io::Result<usize> {
+    let mut fresh = 0;
     for entry in fs::read_dir(dir)? {
         let path = entry?.path();
         let Some(name) = path.file_name().and_then(|n| n.to_str()) else { continue };
@@ -217,8 +253,9 @@ fn count_published_tiles(
         let len = fs::metadata(&path)?.len();
         seen.insert(name.to_string(), len);
         *total += len;
+        fresh += 1;
     }
-    Ok(())
+    Ok(fresh)
 }
 
 fn parse_num(text: &str, name: &str) -> Result<u64, Box<dyn std::error::Error>> {
@@ -334,8 +371,9 @@ fn cmd_seed(
     }
     fs::create_dir_all(dir)?;
     let mut e = Engine::create(&wal)?;
-    let layout = layout_policy();
+    let layout = region_layout_policy();
     e.set_layout_policy(layout.clone());
+    e.set_region_mode(region_mode());
     let (layout_page_size, layout_bloom_bits) = layout.default_layout();
     e.set_metrics_enabled(metrics_enabled());
     let docs_a = total_docs / 2;
@@ -344,9 +382,10 @@ fn cmd_seed(
     let interval = (total_blocks / 10).clamp(1, 50);
     let shape = compact_shape();
     emit(&format!(
-        "phase=seed start shape={} merge_budget_bytes={} max_tiles={MAX_ACTIVE_TILES} layout_page_size={layout_page_size} layout_bloom_bits={layout_bloom_bits}",
+        "phase=seed start shape={} merge_budget_bytes={} max_tiles={MAX_ACTIVE_TILES} region_mode={} layout_page_size={layout_page_size} layout_bloom_bits={layout_bloom_bits}",
         shape.name(),
         compact_merge_budget(),
+        region_mode().name(),
     ));
     let mut next_handle = e.next_handle()?;
     let mut rss_peak = rss_kb();
@@ -357,6 +396,8 @@ fn cmd_seed(
     let mut tile_bytes_publish: u64 = 0;
     let mut tile_bytes_compact: u64 = 0;
     let mut compactions: u64 = 0;
+    let mut publishes: u64 = 0;
+    let mut tiles_published: u64 = 0;
     let mut seen_publish_tiles: HashMap<String, u64> = HashMap::new();
     let mut last_progress = started;
     let mut last_progress_docs: u64 = 0;
@@ -415,7 +456,8 @@ fn cmd_seed(
         // work. Rotate last (only legal once a tile covers csn with an empty
         // memtable). All three are per-block calls, each a no-op below threshold.
         if e.maybe_checkpoint(CHECKPOINT_BYTES)? {
-            count_published_tiles(dir, &mut seen_publish_tiles, &mut tile_bytes_publish)?;
+            publishes += 1;
+            tiles_published += count_published_tiles(dir, &mut seen_publish_tiles, &mut tile_bytes_publish)? as u64;
             if let Some(merged) = e.maybe_compact_shape(compact_merge_budget(), MAX_ACTIVE_TILES, shape)? {
                 compactions += 1;
                 tile_bytes_compact += merged;
@@ -468,10 +510,12 @@ fn cmd_seed(
     let write_amp = (wal_appended + tile_bytes) as f64 / payload_bytes.max(1) as f64;
     print_metrics("seed", &e);
     emit(&format!(
-        "phase=seed ok=true docs={total_docs} csn={} shape={} max_tiles={MAX_ACTIVE_TILES} blocks={total_blocks} payload_bytes={payload_bytes} wal_bytes={} wal_written_bytes={wal_appended} tile_bytes_publish={tile_bytes_publish} tile_bytes_compact={tile_bytes_compact} tile_bytes_total={tile_bytes} compactions={compactions} write_amplification={write_amp:.3} docs_s_cumulative={:.0} rss_kb={} rss_peak_kb={rss_peak} elapsed_s={elapsed:.3} layout_page_size={layout_page_size} layout_bloom_bits={layout_bloom_bits}",
+        "phase=seed ok=true docs={total_docs} csn={} shape={} max_tiles={MAX_ACTIVE_TILES} region_mode={} blocks={total_blocks} payload_bytes={payload_bytes} wal_bytes={} wal_written_bytes={wal_appended} tile_bytes_publish={tile_bytes_publish} tile_bytes_compact={tile_bytes_compact} tile_bytes_total={tile_bytes} compactions={compactions} publishes={publishes} tiles_published={tiles_published} tiles_per_publish={:.2} write_amplification={write_amp:.3} docs_s_cumulative={:.0} rss_kb={} rss_peak_kb={rss_peak} elapsed_s={elapsed:.3} layout_page_size={layout_page_size} layout_bloom_bits={layout_bloom_bits}",
         e.csn(),
         shape.name(),
+        region_mode().name(),
         wal_bytes(dir)?,
+        tiles_published as f64 / publishes.max(1) as f64,
         total_docs as f64 / elapsed.max(1e-9),
         rss_kb(),
     ));

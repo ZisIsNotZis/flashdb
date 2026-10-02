@@ -63,3 +63,60 @@ mix - exactly the "learn access patterns" the author asked for, with a measured 
 Not a performance claim in itself. If the measurement shows partitioning costs write throughput
 without enabling a better per-region assignment, that result is worth recording and the axis gets
 closed - but the reachability argument means the alternative is having no per-region learner at all.
+
+## Implemented (branch slice 24)
+
+**Region rule.** A key's region is `(key family, entity)`: family = the first
+byte of the encoded key (`P`/`U`/`R`), entity = the 0-terminated name right
+after it. The region prefix is `MARKER | entity | 0` (`keys::region_prefix`),
+equal for every key of a region, so key order groups a region's keys and orders
+regions by `(marker, entity)`. Two `U` fields of the same entity are one region;
+`P|Stock` and `U|Stock` are different regions.
+
+**Ordering invariant.** The active tile list is ordered by `(cutoff, region)`
+strictly increasing, where region is the tile's region prefix. A whole-keyspace
+(Global) tile spans all regions, so for a legacy list this reduces to strictly
+increasing cutoffs. A region-partitioned publish emits one tile per region
+present in the `(previous cutoff, cutoff]` window, all sharing `cutoff`, ordered
+by region. Each tile covers exactly its region's newest-version-per-logical-key
+projection over `(lower, cutoff]`, where `lower` is that region's previous tile
+cutoff (or the rotation floor); a whole-keyspace tile keeps the global lower.
+Enforced in `open_impl` (region derived from each tile's first key), while
+`manifest.rs` was relaxed from strictly-increasing to non-decreasing cutoffs
+(on-disk format unchanged) because same-cutoff tiles are now legal.
+
+**Compaction** never spans regions: `select_region_run` groups the list by region
+and applies the same `CompactShape` policy to each region's own cutoff-ordered
+sizes; `merge_region_run` replaces the chosen run with one tile at the run's
+newest cutoff and inserts it at its `(cutoff, region)` position, rewriting the
+full ordered reference list. The range-preserving replacement and the disjoint
+per-region ranges are kept. `compact()` collapses each region's full sequence to
+one tile.
+
+**Mode.** `RegionMode::{Global (default), PerRegion}` (`Engine::set_region_mode`)
+is a non-durable measurement/rollout switch; recovery derives each tile's region
+from the tile itself, so both layouts reopen under either mode without the mode
+being persisted. Per-region policy is read per emitted tile via the tile's region
+name; the reader never consults the policy (each tile carries its own page size
+and bloom bits).
+
+**Measured (scale driver, 200k docs x 1 KiB, commit 5000, budget_prefix, cap
+1024; deterministic):**
+
+| mode | tiles/publish | write_amp | tile bytes total |
+|---|---|---|---|
+| Global, 4 KiB | 1.00 | 2.133 | 222,604,023 |
+| PerRegion, 4 KiB all | 2.67 | 2.137 | 223,437,382 |
+| PerRegion, 64 KiB P + 4 KiB U | 2.67 | 2.114 | 218,728,282 |
+
+Partitioning at cap 1024 is essentially write-neutral (+0.4% bytes, from the
+per-tile superblock/bloom overhead now duplicated per region); the mixed layout
+saves ~1.7% bytes. The offered-load pacer comparison was NOT run: `flashdb-load`
+opens with `Engine::open` (no tile discovery, no region/layout env) and
+`seed-inventory`/`flashdb-replay` do not publish tiles, so the inventory flow does
+not exercise tiles end-to-end in the current harness. The real inventory flow was
+run to confirm correctness (20k requests, commit_rate 1.0000, family shares P
+56.5% / U 37.2% / R 6.4%). The equal-load comparison needs a harness change:
+publish tiles from `seed-inventory` and open the replay/load drivers via
+`open_discover`, then run `flashdb-load` twice (global 4 KiB vs mixed per-region)
+at one offered rate.

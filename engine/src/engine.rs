@@ -13,7 +13,7 @@
 //! 强制执行本切片未实现，已记录在 ticket 04/03。
 
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -48,6 +48,45 @@ const UNIQUE_BLOOM_BITS_PER_KEY: u32 = 10;
 /// Family partitioning (per-region tiles) is a later slice and will supply finer
 /// region keys.
 const TILE_LAYOUT_REGION: &str = "all";
+
+/// Whether a tile write path emits one tile per `(entity, key family)` region
+/// (slice 24) or the historical single whole-keyspace tile.
+///
+/// [`RegionMode::Global`] is the shipped default and reproduces the pre-slice-24
+/// behaviour exactly: one tile holding every region's entries interleaved by
+/// encoded key, ordered by strictly increasing cutoff. [`RegionMode::PerRegion`]
+/// splits each publish/compaction output one tile per region; those tiles share
+/// the publish cutoff, so the active list is ordered by `(cutoff, region)` and
+/// each region's tiles partition that region's CSN range. The mode is a
+/// measurement/rollout switch, not durable state: recovery derives each tile's
+/// region from the tile itself (its first key), so it never needs the mode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RegionMode {
+    /// One whole-keyspace tile per publish (pre-slice-24 behaviour).
+    Global,
+    /// One tile per `(entity, key family)` region per publish/compaction output.
+    PerRegion,
+}
+
+impl RegionMode {
+    /// Parse the `FLASHDB_REGION_MODE` spelling; `None` for an unknown name so
+    /// the caller can warn and keep the shipped default.
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "global" => Some(Self::Global),
+            "per_region" | "per-region" => Some(Self::PerRegion),
+            _ => None,
+        }
+    }
+
+    /// The canonical `FLASHDB_REGION_MODE` spelling, for driver reporting.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Global => "global",
+            Self::PerRegion => "per_region",
+        }
+    }
+}
 
 /// Provisional per-prefix-region layout declaration (slice 17).
 ///
@@ -306,6 +345,11 @@ pub struct Engine {
     /// Provisional per-region layout the two tile write paths consult. Never
     /// persisted; the per-tile parameters live in each tile's superblock.
     layout: LayoutPolicy,
+    /// Whether a write path partitions its output one tile per `(entity, key
+    /// family)` region ([`RegionMode::PerRegion`]) or the historical single
+    /// whole-keyspace tile ([`RegionMode::Global`], the default). Not persisted:
+    /// recovery derives each tile's region from the tile's first key.
+    region_mode: RegionMode,
     /// Per-pattern latency telemetry (slice 16). Observational only: never
     /// persisted, never read on the correctness path. `RefCell` is required
     /// because read paths take `&self`; it is the only interior mutability here.
@@ -363,6 +407,7 @@ impl Engine {
             group_open: false,
             group_pending: false,
             layout: LayoutPolicy::declared_default(),
+            region_mode: RegionMode::Global,
             metrics: RefCell::new(Metrics::new()),
         })
     }
@@ -464,8 +509,16 @@ impl Engine {
     /// the suffix; tiles above the floor are verified against the above-floor
     /// suffix range exactly as in full replay.
     fn open_impl(wal_path: &Path, tiles: Vec<TileHandle>, floor: Option<u64>) -> io::Result<Engine> {
-        if !tiles.windows(2).all(|w| w[0].cutoff() < w[1].cutoff()) {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "tile cutoffs overlap or are not strictly increasing"));
+        // The active list is ordered by `(cutoff, region)` strictly increasing.
+        // A whole-keyspace tile spans every region, so for a legacy list the
+        // region is constant per tile and this reduces to strictly increasing
+        // cutoffs; a region-partitioned publish leaves several tiles sharing the
+        // cutoff, ordered by their region prefix. The secondary order also makes
+        // a same-cutoff group's regions distinct (no region is covered twice).
+        if !tiles.windows(2).all(|w| {
+            (w[0].cutoff(), tile_first_region(&w[0])) < (w[1].cutoff(), tile_first_region(&w[1]))
+        }) {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "tile list is not strictly increasing by (cutoff, region)"));
         }
         let (wal, records) = match Wal::open_or_recover(wal_path) {
             Ok(opened) => opened,
@@ -502,16 +555,29 @@ impl Engine {
             csn = csn.max(rec_csn);
             dedup.insert(block_id, rec_csn);
         }
-        let mut lower = floor.unwrap_or(0);
+        let floor_csn = floor.unwrap_or(0);
+        // `lower` is per region: a tile covers exactly its region's `(lower,
+        // cutoff]`, and its region's previous tile (or the rotation floor) sets
+        // that lower. A whole-keyspace tile covers every region in the range, so
+        // it uses the global previous cutoff and is still checked exactly.
+        let mut region_last: HashMap<Vec<u8>, u64> = HashMap::new();
+        let mut prev_cutoff = floor_csn;
         for t in &tiles {
             if floor.is_some_and(|f| t.cutoff() <= f) { continue; }
             // Tiles hold exactly the newest version per logical key within their
             // CSN range (same reduction the tile writers apply), so the WAL
             // projection is reduced the same way before the 1:1 comparison.
+            let lower = match tile_single_region(t) {
+                Some(region) => region_last.get(region).copied().unwrap_or(floor_csn),
+                None => prev_cutoff,
+            };
             t.tile.verify_projection(&newest_projection(&covered, lower, t.cutoff()), lower, t.cutoff())?;
-            lower = t.cutoff();
+            if let Some(region) = tile_single_region(t) {
+                region_last.insert(region.to_vec(), t.cutoff());
+            }
+            prev_cutoff = t.cutoff();
         }
-        Ok(Engine { wal, mt, tiles, wal_path: wal_path.to_path_buf(), dir: parent_dir(wal_path), manifest: None, segment: None, segment_suffix_csn: csn, wal_detached: false, csn, dedup, max_handle, group_open: false, group_pending: false, layout: LayoutPolicy::declared_default(), metrics: RefCell::new(Metrics::new()) })
+        Ok(Engine { wal, mt, tiles, wal_path: wal_path.to_path_buf(), dir: parent_dir(wal_path), manifest: None, segment: None, segment_suffix_csn: csn, wal_detached: false, csn, dedup, max_handle, group_open: false, group_pending: false, layout: LayoutPolicy::declared_default(), region_mode: RegionMode::Global, metrics: RefCell::new(Metrics::new()) })
     }
 
     /// The CSN floor below which the active WAL file holds no records: the
@@ -590,29 +656,38 @@ impl Engine {
         if self.tiles.last().is_some_and(|t| t.cutoff() >= cutoff) {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "tile cutoff must be strictly above the newest active tile cutoff"));
         }
-        let tile = self.write_verified_tile(tile_path, cutoff)?;
+        let emitted = self.write_verified_tiles(tile_path, cutoff)?;
         self.mt.evict_through(cutoff);
-        self.tiles.push(TileHandle {
-            tile,
-            name: tile_path.file_name().and_then(|n| n.to_str()).unwrap_or_default().to_string(),
-        });
+        for EmittedTile { name, tile } in emitted {
+            self.tiles.push(TileHandle { tile, name });
+        }
         Ok(())
     }
 
-    /// Create-new the tile file, sync it, reopen it and re-check its exact
-    /// newest-version-per-logical-key `(previous cutoff, cutoff]` P/U/R
+    /// Create-new the tile file(s), sync them, reopen each and re-check its
+    /// exact newest-version-per-logical-key `(previous cutoff, cutoff]` P/U/R
     /// projection against the active WAL file — the retained WAL before
     /// rotation, the live segment's `(segment start, cutoff]` suffix after it
     /// (the prefix below the segment floor is already verified state carried by
     /// the published tiles and the manifest checkpoint) — before any caller may
-    /// reference it.
+    /// reference them.
+    ///
+    /// Under [`RegionMode::Global`] this is the historical single tile over the
+    /// whole keyspace. Under [`RegionMode::PerRegion`] it is one tile per
+    /// `(entity, key family)` region present in the window: the memtable is
+    /// already key-ordered, so its keys of one region are contiguous and the
+    /// split is a single streaming pass, one [`TileWriter`] open at a time. Each
+    /// region tile is verified only against that region's WAL projection (its
+    /// sibling tiles carry the other regions); every emitted tile shares the
+    /// publish digest, which binds records by `(floor, cutoff]` and is
+    /// region-independent.
     ///
     /// One bounded WAL-side copy: the suffix in `(previous cutoff, cutoff]` is
     /// decoded once, in a single streaming pass, into a key-ordered
-    /// [`BTreeMap`]. The tile itself is written by streaming the serving
+    /// [`BTreeMap`]. The tile(s) themselves are written by streaming the serving
     /// memtable through [`TileWriter`]; no projection of either side is
     /// materialized, so the publish peak is one memtable plus one WAL window.
-    fn write_verified_tile(&self, tile_path: &Path, cutoff: u64) -> io::Result<Tile> {
+    fn write_verified_tiles(&self, tile_path: &Path, cutoff: u64) -> io::Result<Vec<EmittedTile>> {
         let lower = self.tiles.last().map(|t| t.cutoff()).unwrap_or(0);
         // Stream the retained WAL suffix once. Alongside the `(lower, cutoff]`
         // expectation map this reproduces exactly the two former preconditions:
@@ -636,12 +711,64 @@ impl Engine {
         })?;
         self.verify_wal_max(last_csn)?;
         let digest = wal_digest_finish(hash, last_csn, cutoff, self.wal_floor())?;
-        // Source (a): the serving memtable, already key-ordered and holding
-        // exactly the versions above `lower`. Keep the newest version per
-        // logical key (first of each group: keys sort CSN-descending) within
-        // `(lower, cutoff]`, streamed straight into the encoder.
-        let (page_size, bloom_bits_per_key) = self.layout.for_region(TILE_LAYOUT_REGION);
-        let mut writer = TileWriter::new(tile_path, cutoff, &digest, page_size)?;
+        if self.region_mode == RegionMode::Global {
+            let tile = self.write_one_tile(tile_path, cutoff, &digest, lower, TILE_LAYOUT_REGION)?;
+            // Source (b): the WAL-derived expectation map. Independent of the
+            // memtable the tile was written from, so a divergence between the two
+            // fails closed here - unlike compaction's self-referential re-merge.
+            verify_tile_against_wal(&tile, &wal_entries, lower, cutoff, None)?;
+            return Ok(vec![EmittedTile { name: tile_name(tile_path), tile }]);
+        }
+        // Partitioned: the memtable stream is key-ordered, so a region's keys
+        // are contiguous. Buffer nothing; keep exactly one writer open and
+        // finish it when the region prefix changes.
+        let mut emitted: Vec<EmittedTile> = Vec::new();
+        let mut writer: Option<TileWriter> = None;
+        let mut bloom: Option<BloomBuilder> = None;
+        let mut current: Option<Vec<u8>> = None;
+        let mut last_logical: Option<Vec<u8>> = None;
+        for (key, value) in self.mt.entries() {
+            let Some(csn) = keys::key_csn(key) else { continue };
+            if csn <= lower || csn > cutoff { continue; }
+            let logical = &key[..key.len() - 8];
+            if last_logical.as_deref() == Some(logical) { continue; }
+            last_logical = Some(logical.to_vec());
+            let region = keys::region_prefix(key).map(<[u8]>::to_vec);
+            if current.as_deref() != region.as_deref() {
+                if let Some(mut w) = writer.take() {
+                    if let Some(b) = bloom.take() { w.set_bloom(b.finish())?; }
+                    let tile = w.finish()?;
+                    let region = current.take();
+                    verify_tile_against_wal(&tile, &wal_entries, lower, cutoff, region.as_deref())?;
+                    emitted.push(EmittedTile { name: tile_name(&region_tile_path(tile_path, emitted.len())), tile });
+                }
+                current = region;
+                let path = region_tile_path(tile_path, emitted.len());
+                let (page_size, bits) = self.layout.for_region(&current.as_deref().map(keys::region_name).unwrap_or_default());
+                writer = Some(TileWriter::new(&path, cutoff, &digest, page_size)?);
+                bloom = (bits > 0).then(|| BloomBuilder::new(self.mt.len() as u64, bits as u32));
+            }
+            let w = writer.as_mut().expect("a writer exists once a region is open");
+            w.push(key, value)?;
+            if let Some(b) = bloom.as_mut() {
+                if let Some(prefix) = unique_prefix_of(key) { b.insert(prefix); }
+            }
+        }
+        if let Some(mut w) = writer.take() {
+            if let Some(b) = bloom.take() { w.set_bloom(b.finish())?; }
+            let tile = w.finish()?;
+            let region = current.take();
+            verify_tile_against_wal(&tile, &wal_entries, lower, cutoff, region.as_deref())?;
+            emitted.push(EmittedTile { name: tile_name(&region_tile_path(tile_path, emitted.len())), tile });
+        }
+        Ok(emitted)
+    }
+
+    /// Write one tile covering the whole `(lower, cutoff]` window from the
+    /// serving memtable, with the given layout region's `(page_size, bits)`.
+    fn write_one_tile(&self, tile_path: &Path, cutoff: u64, digest: &[u8; 32], lower: u64, layout_region: &str) -> io::Result<Tile> {
+        let (page_size, bloom_bits_per_key) = self.layout.for_region(layout_region);
+        let mut writer = TileWriter::new(tile_path, cutoff, digest, page_size)?;
         // Bloom over exactly the unique prefixes this pass stores, sized from a
         // known upper bound (the serving memtable's entry count) so the publish
         // pass stays single and streaming: no second read to count keys and no
@@ -664,12 +791,7 @@ impl Engine {
             }
         }
         if let Some(bloom) = bloom { writer.set_bloom(bloom.finish())?; }
-        let tile = writer.finish()?;
-        // Source (b): the WAL-derived expectation map. Independent of the
-        // memtable the tile was written from, so a divergence between the two
-        // fails closed here - unlike compaction's self-referential re-merge.
-        verify_tile_against_wal(&tile, &wal_entries, lower, cutoff)?;
-        Ok(tile)
+        writer.finish()
     }
 
     /// Durable publication of one tile: build the verified tile exactly as
@@ -709,8 +831,8 @@ impl Engine {
         if !manifest::valid_tile_name(name) || parent_dir(tile_path) != self.dir {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "tile path must be a plain filename inside the engine directory"));
         }
-        // 1. Build + verify the tile file without touching serving state.
-        let tile = match self.write_verified_tile(tile_path, cutoff) {
+        // 1. Build + verify the tile file(s) without touching serving state.
+        let emitted = match self.write_verified_tiles(tile_path, cutoff) {
             Ok(t) => t,
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
                 return Err(io::Error::new(io::ErrorKind::AlreadyExists, format!(
@@ -718,19 +840,23 @@ impl Engine {
             }
             Err(e) => return Err(e),
         };
-        // 2. The tile's own directory entry must be durable before the manifest
-        //    can reference it (checkpoint publication ordering).
+        // 2. The tiles' own directory entries must be durable before the manifest
+        //    can reference them (checkpoint publication ordering).
         File::open(&self.dir)?.sync_all()?;
         // 3. Manifest protocol; any error poisons the writer until reopen. The
-        //    page always carries the full ordered active list plus the new tile.
-        let tref = TileRef { name: name.to_string(), cutoff, digest: *tile.digest() };
+        //    page always carries the full ordered active list plus the new tiles,
+        //    which append in region order at the new (strictly greater) cutoff.
         let mut refs: Vec<TileRef> = self.tiles.iter().map(|t| t.tile_ref()).collect();
-        refs.push(tref);
+        for e in &emitted {
+            refs.push(TileRef { name: e.name.clone(), cutoff, digest: *e.tile.digest() });
+        }
         let checkpoint = Checkpoint { csn: cutoff, handle_watermark: self.max_handle };
         self.manifest_publish(refs, checkpoint, self.segment.clone())?;
         // 4. In-memory flip only after the durable flip.
         self.mt.evict_through(cutoff);
-        self.tiles.push(TileHandle { tile, name: name.to_string() });
+        for EmittedTile { name, tile } in emitted {
+            self.tiles.push(TileHandle { tile, name });
+        }
         Ok(())
     }
 
@@ -883,6 +1009,20 @@ impl Engine {
         if self.tiles.len() < 2 {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "compaction requires at least two active tiles"));
         }
+        if self.region_mode == RegionMode::PerRegion {
+            // One output per region: each region's full cutoff-ordered sequence
+            // collapses to a single tile, and no region merges with another.
+            let mut groups: HashMap<Vec<u8>, Vec<usize>> = HashMap::new();
+            for (i, t) in self.tiles.iter().enumerate() {
+                groups.entry(tile_first_region(t).unwrap_or_default().to_vec()).or_default().push(i);
+            }
+            let mut runs: Vec<Vec<usize>> = groups.into_values().filter(|v| v.len() >= 2).collect();
+            runs.sort_by_key(|v| v[0]);
+            for indices in runs {
+                self.merge_region_run(&indices)?;
+            }
+            return Ok(());
+        }
         let len = self.tiles.len();
         self.merge_run(0, len)?;
         Ok(())
@@ -930,6 +1070,12 @@ impl Engine {
             return Err(io::Error::new(io::ErrorKind::Other, "manifest writer poisoned; reopen to recover"));
         }
         self.ensure_attached()?;
+        if self.region_mode == RegionMode::PerRegion {
+            let Some(indices) = self.select_region_run(max_merge_bytes, max_tiles, shape)? else {
+                return Ok(None);
+            };
+            return self.merge_region_run(&indices).map(Some);
+        }
         let (start, len) = self.select_run(max_merge_bytes, max_tiles, shape)?;
         self.merge_run(start, len).map(Some)
     }
@@ -949,11 +1095,52 @@ impl Engine {
             .iter()
             .map(|t| fs::metadata(self.dir.join(&t.name)).map(|m| m.len()))
             .collect::<io::Result<Vec<_>>>()?;
+        Ok(Self::choose_run(&sizes, max_merge_bytes, max_tiles, shape))
+    }
+
+    /// The list indices of a run to merge WITHIN one region, or `None` when no
+    /// region has at least two tiles. Region-partitioned compaction never merges
+    /// across regions: each region's tiers are its own, so a per-region trigger
+    /// is meaningful. The run is selected by the same [`CompactShape`] policy
+    /// applied to that region's own cutoff-ordered sizes, and among regions the
+    /// smallest combined run wins (ties: the oldest list index).
+    fn select_region_run(&self, max_merge_bytes: u64, max_tiles: usize, shape: CompactShape) -> io::Result<Option<Vec<usize>>> {
+        let sizes: Vec<u64> = self.tiles
+            .iter()
+            .map(|t| fs::metadata(self.dir.join(&t.name)).map(|m| m.len()))
+            .collect::<io::Result<Vec<_>>>()?;
+        // A region's tiles are spread across the `(cutoff, region)`-ordered list
+        // (one per cutoff group), so group by region rather than adjacency; each
+        // group's indices stay in increasing-cutoff order.
+        let mut groups: HashMap<Vec<u8>, Vec<usize>> = HashMap::new();
+        for (i, t) in self.tiles.iter().enumerate() {
+            let region = tile_first_region(t).unwrap_or_default().to_vec();
+            groups.entry(region).or_default().push(i);
+        }
+        let mut best: Option<(u64, usize, Vec<usize>)> = None;
+        for idxs in groups.values() {
+            if idxs.len() < 2 { continue; }
+            let region_sizes: Vec<u64> = idxs.iter().map(|&i| sizes[i]).collect();
+            let (start, len) = Self::choose_run(&region_sizes, max_merge_bytes, max_tiles, shape);
+            let combined: u64 = region_sizes[start..start + len].iter().sum();
+            let first = idxs[start];
+            let indices: Vec<usize> = idxs[start..start + len].to_vec();
+            if best.as_ref().map_or(true, |(c0, f0, _)| (combined, first) < (*c0, *f0)) {
+                best = Some((combined, first, indices));
+            }
+        }
+        Ok(best.map(|(_, _, indices)| indices))
+    }
+
+    /// The run-selection core shared by [`Engine::select_run`] (whole-list) and
+    /// [`Engine::select_region_run`] (one region's sizes). Returns a local start
+    /// and length. Requires `sizes.len() >= 2`.
+    fn choose_run(sizes: &[u64], max_merge_bytes: u64, max_tiles: usize, shape: CompactShape) -> (usize, usize) {
         let n = sizes.len();
         if shape != CompactShape::CheapestPair {
             let ratio = (shape == CompactShape::RatioGroup).then_some(2u64);
-            if let Some(run) = Self::grow_around_smallest(&sizes, max_merge_bytes, max_tiles, ratio) {
-                return Ok(run);
+            if let Some(run) = Self::grow_around_smallest(sizes, max_merge_bytes, max_tiles, ratio) {
+                return run;
             }
         }
         let mut best: Option<(u64, usize, usize)> = None; // (combined size, start, len)
@@ -970,14 +1157,14 @@ impl Engine {
             }
         }
         if let Some((_, start, len)) = best {
-            return Ok((start, len));
+            return (start, len);
         }
         // Nothing fits the budget; merge the two adjacent tiles with the
         // smallest combined size so the active count still drops.
         let start = (0..n - 1)
             .min_by_key(|&i| (sizes[i].saturating_add(sizes[i + 1]), i))
-            .expect("select_run requires at least two tiles");
-        Ok((start, 2))
+            .expect("choose_run requires at least two tiles");
+        (start, 2)
     }
 
     /// Greedy interval around the globally smallest tile, the seed policy shared
@@ -1056,7 +1243,8 @@ impl Engine {
         }
         // 1. Build + verify the merged tile for the run's union range against the
         //    retained WAL projection, exactly as publish verifies one tile.
-        let tile = match self.write_compacted_tile(&path, &self.tiles[start..end], lower, cutoff) {
+        let inputs: Vec<&TileHandle> = self.tiles[start..end].iter().collect();
+        let tile = match self.write_compacted_tile(&path, &inputs, lower, cutoff) {
             Ok(t) => t,
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
                 return Err(io::Error::new(io::ErrorKind::AlreadyExists, format!(
@@ -1106,6 +1294,70 @@ impl Engine {
         Ok(out_size)
     }
 
+    /// Merge a run of tiles that all belong to one `(entity, key family)` region
+    /// into a single replacement tile covering that region's `(lower, cutoff]`,
+    /// where `lower` is the region's previous tile cutoff (0 when the run reaches
+    /// the region's oldest tile) and `cutoff` is the run's newest cutoff. The
+    /// replacement keeps the region's per-region invariant while leaving every
+    /// other region's tiles untouched, so compaction never merges across regions.
+    /// The manifest is rewritten as the full `(cutoff, region)`-ordered list with
+    /// the selected tiles retired and the replacement inserted at its
+    /// `(cutoff, region)` position; the durable protocol and cleanup mirror
+    /// [`Engine::merge_run`].
+    fn merge_region_run(&mut self, indices: &[usize]) -> io::Result<u64> {
+        debug_assert!(indices.len() >= 2 && indices.windows(2).all(|w| w[0] < w[1]));
+        let newest = *indices.last().unwrap();
+        let cutoff = self.tiles[newest].cutoff();
+        let region: Option<Vec<u8>> = tile_first_region(&self.tiles[indices[0]]).map(<[u8]>::to_vec);
+        let lower = (0..indices[0])
+            .rev()
+            .find(|&i| tile_first_region(&self.tiles[i]).map(<[u8]>::to_vec) == region)
+            .map(|i| self.tiles[i].cutoff())
+            .unwrap_or(0);
+        let name = self.unique_compaction_name(cutoff)?;
+        let path = self.dir.join(&name);
+        let inputs: Vec<&TileHandle> = indices.iter().map(|&i| &self.tiles[i]).collect();
+        let tile = match self.write_compacted_tile(&path, &inputs, lower, cutoff) {
+            Ok(t) => t,
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                return Err(io::Error::new(io::ErrorKind::AlreadyExists, format!(
+                    "compaction candidate already exists and is unreferenced by the manifest (leftover from a failed compaction or crash after tile sync); remove {} and retry", path.display())));
+            }
+            Err(e) => return Err(e),
+        };
+        let out_size = fs::metadata(&path)?.len();
+        File::open(&self.dir)?.sync_all()?;
+        let retired: HashSet<usize> = indices.iter().copied().collect();
+        let replacement = TileRef { name: name.clone(), cutoff, digest: *tile.digest() };
+        let checkpoint = Checkpoint { csn: self.tiles.last().unwrap().cutoff(), handle_watermark: self.max_handle };
+        let segment = self.segment.clone();
+        // The replacement's position in the `(cutoff, region)`-ordered list: the
+        // count of surviving tiles that sort before it.
+        let pos = self.tiles.iter().enumerate()
+            .filter(|(i, t)| !retired.contains(i)
+                && (t.cutoff(), tile_first_region(t).map(<[u8]>::to_vec)) < (cutoff, region.clone()))
+            .count();
+        let mut refs: Vec<TileRef> = Vec::with_capacity(self.tiles.len() - indices.len() + 1);
+        for (i, t) in self.tiles.iter().enumerate() {
+            if !retired.contains(&i) { refs.push(t.tile_ref()); }
+        }
+        refs.insert(pos, replacement);
+        self.manifest_publish(refs, checkpoint, segment)?;
+        // In-memory flip: rebuild the ordered list with the replacement inserted.
+        let mut new_tile = Some(tile);
+        let mut kept: Vec<TileHandle> = Vec::with_capacity(self.tiles.len() - indices.len() + 1);
+        for (i, t) in self.tiles.drain(..).enumerate() {
+            if retired.contains(&i) { continue; }
+            if kept.len() == pos {
+                kept.push(TileHandle { tile: new_tile.take().expect("replacement inserted once"), name: name.clone() });
+            }
+            kept.push(t);
+        }
+        if let Some(t) = new_tile { kept.push(TileHandle { tile: t, name }); }
+        self.tiles = kept;
+        Ok(out_size)
+    }
+
     /// A free compaction output name: `compact-<cutoff>.tile` when no live tile
     /// or on-disk file claims it, otherwise the first free
     /// `compact-<cutoff>-<k>.tile`. Needed because a middle run may end on a
@@ -1150,7 +1402,7 @@ impl Engine {
     /// key-ordered map. [`Engine::stream_merged_reduction`] merges both sources
     /// and pushes the reduced stream straight into the streaming writer, so peak
     /// compaction RAM tracks the WAL window, not the total tile bytes.
-    fn write_compacted_tile(&self, tile_path: &Path, tiles: &[TileHandle], lower: u64, cutoff: u64) -> io::Result<Tile> {
+    fn write_compacted_tile(&self, tile_path: &Path, tiles: &[&TileHandle], lower: u64, cutoff: u64) -> io::Result<Tile> {
         let (records, _) = wal::replay(&self.wal_path)?;
         self.verify_wal_matches_state(&records)?;
         let digest = wal_digest(&records, cutoff, self.wal_floor())?;
@@ -1180,7 +1432,11 @@ impl Engine {
         let expected: u64 = tiles
             .iter()
             .fold(wal_entries.len() as u64, |acc, t| acc.saturating_add(t.tile.count()));
-        let (page_size, bloom_bits_per_key) = self.layout.for_region(TILE_LAYOUT_REGION);
+        let layout_region = match (self.region_mode, tiles.first().and_then(|t| t.tile.first_key()).and_then(keys::region_prefix)) {
+            (RegionMode::PerRegion, Some(region)) => keys::region_name(region),
+            _ => TILE_LAYOUT_REGION.to_string(),
+        };
+        let (page_size, bloom_bits_per_key) = self.layout.for_region(&layout_region);
         let mut bloom = (bloom_bits_per_key > 0)
             .then(|| BloomBuilder::new(expected, bloom_bits_per_key as u32));
         let mut writer = TileWriter::new(tile_path, cutoff, &digest, page_size)?;
@@ -1225,7 +1481,7 @@ impl Engine {
     /// here is proportional to the tile bytes.
     fn stream_merged_reduction(
         &self,
-        tiles: &[TileHandle],
+        tiles: &[&TileHandle],
         lower: u64,
         cutoff: u64,
         wal_entries: &BTreeMap<Vec<u8>, Vec<u8>>,
@@ -1278,7 +1534,7 @@ impl Engine {
     fn verify_compacted_tile(
         &self,
         tile: &Tile,
-        tiles: &[TileHandle],
+        tiles: &[&TileHandle],
         lower: u64,
         wal_entries: &BTreeMap<Vec<u8>, Vec<u8>>,
         cutoff: u64,
@@ -1398,6 +1654,17 @@ impl Engine {
 
     /// The engine's current layout policy (inspection/measurement hook).
     pub fn layout_policy(&self) -> &LayoutPolicy { &self.layout }
+
+    /// Select the tile write mode. [`RegionMode::Global`] (the default) writes
+    /// one whole-keyspace tile per publish/compaction output exactly as before
+    /// slice 24; [`RegionMode::PerRegion`] writes one tile per `(entity, key
+    /// family)` region so a per-region [`LayoutPolicy`] has something to act on.
+    /// The choice is not persisted: recovery derives each tile's region from the
+    /// tile itself, so both layouts reopen under either mode.
+    pub fn set_region_mode(&mut self, mode: RegionMode) { self.region_mode = mode; }
+
+    /// The engine's current tile write mode (inspection/measurement hook).
+    pub fn region_mode(&self) -> RegionMode { self.region_mode }
 
     // K-way merge of the serving memtable and every published tile, all
     // traversed in global key order. Keys encode CSN descending, so each logical
@@ -1975,6 +2242,45 @@ fn parent_dir(path: &Path) -> PathBuf {
     path.parent().filter(|p| !p.as_os_str().is_empty()).map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from("."))
 }
 
+/// One tile emitted by a write path: the plain filename the manifest will
+/// reference it under, and the opened, verified tile.
+struct EmittedTile {
+    name: String,
+    tile: Tile,
+}
+
+/// The plain filename a tile path resolves to.
+fn tile_name(path: &Path) -> String {
+    path.file_name().and_then(|n| n.to_str()).unwrap_or_default().to_string()
+}
+
+/// The filename for the `index`-th region tile of a partitioned write, derived
+/// from the caller's base name (`tile-9.tile` -> `tile-9.r0.tile`). Region
+/// identity is derived from each tile's own first key at recovery, so the name
+/// only needs to be unique and a valid plain filename, never reversible.
+fn region_tile_path(base: &Path, index: usize) -> PathBuf {
+    let name = tile_name(base);
+    match name.rsplit_once('.') {
+        Some((stem, ext)) => base.with_file_name(format!("{stem}.r{index}.{ext}")),
+        None => base.with_file_name(format!("{name}.r{index}")),
+    }
+}
+
+/// The `(entity, key family)` region a tile belongs to, taken from its first
+/// stored key. `None` for an empty tile.
+fn tile_first_region(t: &TileHandle) -> Option<&[u8]> {
+    t.tile.first_key().and_then(keys::region_prefix)
+}
+
+/// `Some(region)` when the tile covers exactly one region (its first and last
+/// keys share a region prefix, i.e. a region-partitioned tile), `None` for a
+/// whole-keyspace tile or an empty one. Recovery uses this to pick a per-region
+/// `lower` bound; a multi-region tile keeps the global one.
+fn tile_single_region(t: &TileHandle) -> Option<&[u8]> {
+    let first = tile_first_region(t)?;
+    (t.tile.last_key().and_then(keys::region_prefix) == Some(first)).then_some(first)
+}
+
 /// The unique-index prefix a stored key belongs to, or `None` for a non-`U`
 /// key. The prefix is the key up to and including its value terminator - exactly
 /// the bytes `keys::unique_prefix(entity, field, value)` produces, i.e. without
@@ -2070,16 +2376,25 @@ fn newest_projection(mt: &Memtable, lower: u64, cutoff: u64) -> Memtable {
 /// written from the *serving memtable*, so this comparison is genuinely
 /// independent (two different sources), unlike a re-derivation of the writer's
 /// own input.
+///
+/// `region` restricts the expectation to one `(family, entity)` region: a
+/// region-partitioned tile is only obligated for its own region's keys (its
+/// siblings cover the rest), so the map is filtered to that region before the
+/// alignment. `None` is the whole-keyspace tile.
 fn verify_tile_against_wal(
     tile: &Tile,
     wal_entries: &BTreeMap<Vec<u8>, Vec<u8>>,
     lower: u64,
     cutoff: u64,
+    region: Option<&[u8]>,
 ) -> io::Result<()> {
     let mut actual = tile.entries();
     let mut pending = actual.next();
     let mut last_logical: Option<Vec<u8>> = None;
     for (key, value) in wal_entries {
+        if let Some(region) = region {
+            if keys::region_prefix(key) != Some(region) { continue; }
+        }
         let Some(csn) = keys::key_csn(key) else { continue };
         if csn <= lower || csn > cutoff { continue; }
         let logical = &key[..key.len() - 8];
@@ -2903,6 +3218,103 @@ mod tests {
         assert_eq!(get_ok(&reopened, "E", 11), Some(b"d11".to_vec()));
         assert_eq!(reopened.unique_lookup(b"E", b"u", b"a1").unwrap(), Some(1));
         assert_eq!(reopened.unique_lookup(b"E", b"u", b"b1").unwrap(), Some(11));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn region_partitioned_publish_fault_leaves_the_previous_region_set_intact() {
+        let dir = tmp_dir("region-publish-fault");
+        let mut e = Engine::create(&dir.join("data.wal")).unwrap();
+        e.set_region_mode(RegionMode::PerRegion);
+        let put = |entity: &[u8], h: u64, v: &[u8]| Op::PutDoc { entity: entity.to_vec(), handle: h, doc: v.to_vec() };
+        let uniq = |v: &[u8], h: u64| Op::PutUnique { entity: b"Stock".to_vec(), field: b"u".to_vec(), value: v.to_vec(), handle: h };
+        e.commit_block(b"b1", &[put(b"Order", 1, b"o1"), uniq(b"A", 1)]).unwrap();
+        e.publish_tile(dir.join("p1.tile"), 1).unwrap();
+        assert_eq!(e.tiles.len(), 2, "P|Order and U|Stock");
+        let before = e.active_tile_cutoffs();
+        let root_tiles_before = e.manifest.as_ref().unwrap().root().tiles.len();
+        // The next publish writes both region files, then the manifest page write
+        // fails: no region of the set may become durable while another does not.
+        e.commit_block(b"b2", &[put(b"Order", 1, b"o2"), uniq(b"A", 1)]).unwrap();
+        e.manifest.as_mut().unwrap().inject_page_write_error = true;
+        assert!(e.publish_tile(dir.join("p2.tile"), 2).is_err(), "the injected manifest write fails the publish");
+        assert_eq!(e.active_tile_cutoffs(), before, "the in-memory region set is unchanged by the failed publish");
+        assert_eq!(e.manifest.as_ref().unwrap().root().tiles.len(), root_tiles_before, "the durable root still lists the previous set");
+        drop(e);
+        let e = Engine::open_discover(&dir).unwrap();
+        assert_eq!(e.active_tile_cutoffs(), before, "no partially published region set survived the crash");
+        assert_eq!(get_ok(&e, "Order", 1), Some(b"o2".to_vec()), "the WAL still serves the failed publish's state");
+        assert_eq!(e.unique_lookup(b"Stock", b"u", b"A").unwrap(), Some(1));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn region_partitioned_compaction_merges_only_within_one_region() {
+        let dir = tmp_dir("region-compact");
+        let mut e = Engine::create(&dir.join("data.wal")).unwrap();
+        e.set_region_mode(RegionMode::PerRegion);
+        for (i, v) in [b"a".as_slice(), b"b", b"c"].iter().enumerate() {
+            let csn = (i + 1) as u64;
+            e.commit_block(format!("b{csn}").as_bytes(), &[
+                Op::PutDoc { entity: b"Order".to_vec(), handle: 1, doc: v.to_vec() },
+                Op::PutUnique { entity: b"Stock".to_vec(), field: b"u".to_vec(), value: b"A".to_vec(), handle: 1 },
+            ]).unwrap();
+            e.publish_tile(dir.join(format!("p{csn}.tile")), csn).unwrap();
+        }
+        assert_eq!(e.tiles.len(), 6);
+        e.maybe_compact(u64::MAX, 2).unwrap().expect("a region run merges");
+        assert_eq!(e.tiles.len(), 5, "one run of ONE region merged; the other region is untouched");
+        let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        for t in &e.tiles {
+            *counts.entry(keys::region_name(tile_first_region(t).unwrap())).or_default() += 1;
+        }
+        let mut per_region: Vec<usize> = counts.values().copied().collect();
+        per_region.sort();
+        assert_eq!(per_region, vec![2, 3], "no tile spans two regions and none merged across them");
+        assert_eq!(get_ok(&e, "Order", 1), Some(b"c".to_vec()));
+        assert_eq!(e.unique_lookup(b"Stock", b"u", b"A").unwrap(), Some(1));
+        drop(e);
+        let e = Engine::open_discover(&dir).unwrap();
+        assert_eq!(e.tiles.len(), 5, "the region-local merge reopens");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn region_partitioned_tiles_are_single_region_and_ordered_by_region() {
+        let dir = tmp_dir("region-helpers");
+        let mut e = Engine::create(&dir.join("data.wal")).unwrap();
+        e.set_region_mode(RegionMode::PerRegion);
+        e.commit_block(b"b1", &[
+            Op::PutDoc { entity: b"Order".to_vec(), handle: 1, doc: b"o".to_vec() },
+            Op::PutUnique { entity: b"Stock".to_vec(), field: b"sku".to_vec(), value: b"A".to_vec(), handle: 1 },
+            Op::PutUnique { entity: b"Stock".to_vec(), field: b"loc".to_vec(), value: b"L".to_vec(), handle: 1 },
+        ]).unwrap();
+        e.publish_tile(dir.join("t.tile"), 1).unwrap();
+        // Both U fields of Stock are one region; the list is region-ordered.
+        let names: Vec<String> = e.tiles.iter().map(|t| keys::region_name(tile_first_region(t).unwrap())).collect();
+        assert_eq!(names, vec!["P|Order".to_string(), "U|Stock".to_string()]);
+        assert!(e.tiles.iter().all(|t| tile_single_region(t).is_some()), "every partitioned tile is single-region");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reopen_rejects_a_region_out_of_order_within_a_cutoff_group() {
+        let dir = tmp_dir("region-order");
+        let mut e = Engine::create(&dir.join("data.wal")).unwrap();
+        e.set_region_mode(RegionMode::PerRegion);
+        e.commit_block(b"b1", &[
+            Op::PutDoc { entity: b"Order".to_vec(), handle: 1, doc: b"o".to_vec() },
+            Op::PutUnique { entity: b"Stock".to_vec(), field: b"u".to_vec(), value: b"A".to_vec(), handle: 1 },
+        ]).unwrap();
+        e.publish_tile(dir.join("t.tile"), 1).unwrap();
+        // A hand-built root lists the same-cutoff tiles in region-DECREASING
+        // order. The manifest only requires non-decreasing cutoffs, so it accepts
+        // it; `open_impl` must reject it on the `(cutoff, region)` invariant.
+        let mut refs: Vec<TileRef> = e.tiles.iter().map(|t| t.tile_ref()).collect();
+        refs.reverse();
+        e.manifest.as_mut().unwrap().publish(refs, Checkpoint { csn: 1, handle_watermark: e.max_handle }, None).unwrap();
+        drop(e);
+        assert!(Engine::open_discover(&dir).is_err(), "reopen enforces (cutoff, region)");
         let _ = fs::remove_dir_all(&dir);
     }
 
