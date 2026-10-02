@@ -120,3 +120,25 @@ run to confirm correctness (20k requests, commit_rate 1.0000, family shares P
 publish tiles from `seed-inventory` and open the replay/load drivers via
 `open_discover`, then run `flashdb-load` twice (global 4 KiB vs mixed per-region)
 at one offered rate.
+
+## Result (2026-10-01): partitioning works; the page-size axis is flat on this workload
+
+Region partitioning is in and the harness can finally exercise it end to end: with tiles,
+`active_tiles=45` and `serving_memtable_entries=0`, and the same reads return the same rows, while
+`--no-tiles` shows 63,000 memtable entries - so reads demonstrably come from tiles (every earlier
+"real workload" number could not distinguish the two paths).
+
+The per-region page-size axis, however, measures **flat** here. At equal offered load (scan variants
+at 100 and 200 rps, full flow at 120 rps, fresh engine per configuration, in-session device fsync
+5.5-6.7 ms), mixed (64 KiB for the scan-heavy region, 4 KiB for probe-heavy) vs uniform 4 KiB is
+indistinguishable on p50 (the sign flips between runs); p99 looks 45-50% lower but that is inside
+this shared box's between-run spread; and the deterministic tie-break says mixed costs **+1.0% tile
+bytes**. The reason is concrete: `movements_scan` is JSON-decode-bound, so block size never reaches
+the critical path. Separately, the full-flow A/B is invalid because movements stay memtable-resident
+there.
+
+So the axes left with MEASURED gradients are **bloom bits per region** (in-range absent probes:
+151.84 -> 1.59 us at 12 tiles) and **compaction parameters per region** (write_amp 4.09 -> 1.66 from
+cap headroom). Page size stays available but is documented as flat for these access shapes, and the
+axis reopens only with a block-bound scan workload (large-value sequential scan without per-document
+JSON decode).
