@@ -150,3 +150,29 @@ carries the irreducible WAL stream the model does not count. Direction and mecha
 **Open consideration:** each `Tile` keeps its file open, so `MAX_TILES = 1024` needs ~1024 fds;
 the default soft `RLIMIT_NOFILE` (1024) is too low. Either raise it in deployment or cap lower
 (the simulation's validated knee is 96).
+
+## Result (2026-10-01)
+
+Implemented as a chained root (fixed window of up to 96 continuation pages per A/B slot, no
+next-pointer so a chain cannot loop; inline payloads stay byte-compatible with the old format).
+`MAX_TILES` is now a policy constant of 1024, proven to fit by a compile-time assertion, with a
+fail-closed list covering every malformed chain shape; a chain failure invalidates that A/B side
+so the other can still win.
+
+Measured on the scale driver (1,000,000 docs x 1 KiB, commit 5000, budget_prefix):
+
+| cap | write_amp | compactions | compaction bytes | tile bytes total |
+|---|---|---|---|---|
+| 12 (old) | 2.637 | 1 | 519,798,817 | 1,633,723,418 |
+| **1024 (new)** | **2.133** | **0** | **0** | **1,113,924,601** |
+
+Tile-only write amplification 1.585 -> 1.081 (-32%); total -19%. At this scale the merge budget no
+longer binds at all - with enough active tiles the tier structure simply does not need to merge,
+which is exactly the mechanism the simulation described. The simulation's -59% was a 5 M-doc
+inventory comparison at 12 -> 96, not this one; the measurement and the model agree in direction
+and differ in magnitude, and both numbers are now on the record.
+
+**New risk to fix:** each `Tile` holds an fd, so a cap of 1024 wants ~1024 file descriptors while
+the default soft `RLIMIT_NOFILE` is often 1024. Options: raise the soft limit at startup with a
+clear error if it cannot, open tile fds lazily, or bound the cap by the observed limit. Recorded
+rather than patched inside this slice.
