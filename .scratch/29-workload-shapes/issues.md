@@ -81,3 +81,50 @@ Consequences:
 
 This does not yet say which axes have headroom; it says we do not know, and that the earlier flat
 results cannot be used as evidence either way.
+
+## RESULT (2026-10-02): in the COLD regime the learnable axes have real headroom - the warm conclusions are reversed
+
+The cold comparison finally ran (`harness/flashdb_harness/cold_axis_compare.py`, cap 192 MiB,
+**data 1,645,273,432 B = 8.17x** the cap, 10.3 M rows, 151-324 tiles, rotate cadence 8 MiB so the
+open-time suffix replay (5.15x its bytes) fits; in-session device 4 KiB O_DIRECT read p50 99.9 us
+and fsync p50 ~5.8-6.2 ms; every arm `commit_rate 1.0` with the stock guard firing 2,000 times, so
+the load is real).
+
+**(a) global 4 KiB vs per-region mixed pages, at an equal offered 300 rps:**
+
+| config | achieved rps | win p50 | win p99 | tiles | tile bytes |
+|---|---|---|---|---|---|
+| global-4k | 87.0 | 40,355 us | 80,629 us | 151 | 1,610,277,355 |
+| per_region-mixed | **134.0 (+54%)** | **20,880 us** | **51,290 us** | 324 | 1,638,230,842 (+1.7%) |
+
+The mechanism is in the per-region telemetry, not inferred: partitioning makes each probe consult
+only its own region's tiles, so cold read amplification collapses - `P|Stock` bytes_read
+7,789,516 -> 2,519,567 (3.1x less), `P|Customer` 1,279,445 -> 504,470 (2.5x less), with p50/p99
+falling accordingly (447.7/4,399.3 us -> 206.8/3,567.3 us for P|Stock).
+
+**This directly contradicts the warm "page size is flat" conclusion (slice 25) and confirms the
+methodological correction in this ticket**: with the working set in page cache the axis could only
+move CPU; cold it moves 54% of throughput.
+
+**(b) per-region compaction trigger, same cold configuration:**
+
+| config | merges | compaction bytes | rewrite factor | achieved rps | win p99 | active tiles |
+|---|---|---|---|---|---|---|
+| eager | 14 | 3,164,956,564 | 1.932 | 135.0 | 107,540 us | 10 |
+| defer | 6 | **10,446,643** | **0.006** | 132.0 | 208,515 us | 306 |
+
+Deferral removes 3.15 GB of compaction output (a 300x difference, deterministic) at statistically
+equal throughput, at the cost of doubling p99 and holding 306 live tiles. That is exactly the
+trade-off the learner is supposed to price, and it is now measured cold rather than assumed.
+
+**So the thesis's first testable premise survives**: there IS a per-region layout decision whose
+measured effect is a large fraction of throughput and write volume, and the actuator for it exists
+(a per-region policy: page size/bloom plus `merge_min_tiles`, injected as JSON and echoed in the
+telemetry).
+
+Caveats, stated rather than buried: the ratio is 8.17x, below the pre-registration's 10x floor
+(the runner prints a WARNING and the report says so); the read mix is a deliberately constructed
+uniform probe/scan mix over a large working set rather than the design's Zipfian MIX, because the
+Zipfian head fits in a small cache and would not force cold reads; and this box is shared, so the
+timing figures are indicative while the byte counts and the 54%/300x gaps are not explainable by
+the noise we have measured (10-20%).
