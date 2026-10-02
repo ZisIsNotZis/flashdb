@@ -152,6 +152,37 @@ fn region_layout_policy() -> LayoutPolicy {
     }
     policy
 }
+
+/// `seed-inventory` checkpoint cadence (measurement knob). When set, the seeded
+/// inventory publishes the current memtable as tiles through the tested
+/// `maybe_checkpoint`/`publish_tile` protocol once the retained WAL exceeds this
+/// many bytes, and always publishes the unpublished tail at the end (so the
+/// caller is guaranteed at least one tile). Unset (the default) keeps the
+/// pre-slice behaviour: the seed stays in the WAL-backed memtable and the flow
+/// reads it from RAM, never from tiles.
+fn seed_checkpoint_bytes() -> Option<u64> {
+    std::env::var("FLASHDB_SEED_CHECKPOINT_BYTES")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+}
+
+/// Every `*.tile` file in the engine directory as `(plain name, bytes)`, sorted.
+/// Used by the seed/checkpoint/tileinfo reporting; unreferenced leftovers from a
+/// failed publish would be included, so a caller that needs the active set must
+/// cross-check against `Engine::active_tile_cutoffs`.
+fn tile_files(dir: &Path) -> io::Result<Vec<(String, u64)>> {
+    let mut out = Vec::new();
+    for entry in fs::read_dir(dir)? {
+        let path = entry?.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else { continue };
+        if path.extension().and_then(|e| e.to_str()) == Some("tile") {
+            out.push((name.to_string(), fs::metadata(&path)?.len()));
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
 /// unique_lookup probes per entity in `verify`. Deliberately small: each probe
 /// is a full prefix scan over tiles + memtable (O(data)).
 const PROBES_PER_ENTITY: u64 = 20;
@@ -265,6 +296,8 @@ fn parse_num(text: &str, name: &str) -> Result<u64, Box<dyn std::error::Error>> 
 
 const USAGE: &str = "usage: flashdb-scale seed <dir> <total_docs> <docs_per_commit> <value_bytes>\n\
                      usage: flashdb-scale seed-inventory <dir> <seed-trace.jsonl>\n\
+                     usage: flashdb-scale checkpoint <dir>\n\
+                     usage: flashdb-scale tileinfo <dir>\n\
                      usage: flashdb-scale verify <dir> <total_docs>\n\
                      usage: flashdb-scale scanbench <dir> <passes>";
 
@@ -279,6 +312,8 @@ fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         Some("seed-inventory") if args.len() == 4 => {
             cmd_seed_inventory(Path::new(&args[2]), Path::new(&args[3]))
         }
+        Some("checkpoint") if args.len() == 3 => cmd_checkpoint(Path::new(&args[2])),
+        Some("tileinfo") if args.len() == 3 => cmd_tileinfo(Path::new(&args[2])),
         Some("verify") if args.len() == 4 => {
             cmd_verify(Path::new(&args[2]), parse_num(&args[3], "total_docs")?)
         }
@@ -613,7 +648,15 @@ fn cmd_seed_inventory(dir: &Path, trace: &Path) -> Result<(), Box<dyn std::error
         fs::create_dir_all(dir)?;
         Engine::create(&wal)?
     };
+    // Same region/layout knobs as `seed`, so a per-region page assignment can be
+    // measured through this bootstrap too; the parameters land in each tile's
+    // own superblock, so the directory reads back without the env set.
+    let layout = region_layout_policy();
+    e.set_layout_policy(layout.clone());
+    e.set_region_mode(region_mode());
     e.set_metrics_enabled(metrics_enabled());
+    let (layout_page_size, layout_bloom_bits) = layout.default_layout();
+    let checkpoint_bytes = seed_checkpoint_bytes();
     let file = fs::File::open(trace)
         .map_err(|e| format!("seed trace {} unreadable ({e})", trace.display()))?;
     let started = Instant::now();
@@ -621,6 +664,8 @@ fn cmd_seed_inventory(dir: &Path, trace: &Path) -> Result<(), Box<dyn std::error
     let mut docs = 0u64;
     let mut customers = 0u64;
     let mut stocks = 0u64;
+    let mut publishes = 0u64;
+    let mut last_published_csn = 0u64;
     for (index, line) in BufReader::new(file).lines().enumerate() {
         let line = line.map_err(|e| format!("seed trace line {}: {e}", index + 1))?;
         let parsed: SeedBlock = serde_json::from_str(&line)
@@ -668,12 +713,167 @@ fn cmd_seed_inventory(dir: &Path, trace: &Path) -> Result<(), Box<dyn std::error
             return Err(format!("block {blocks}: handle watermark drifted").into());
         }
         blocks += 1;
+        if let Some(max_wal_bytes) = checkpoint_bytes {
+            if e.maybe_checkpoint(max_wal_bytes)? {
+                publishes += 1;
+                last_published_csn = e.csn();
+            }
+        }
+    }
+    // Guarantee at least one tile when checkpointing is on, even if the trace is
+    // smaller than the cadence: publish the unpublished tail through the same
+    // machinery (`maybe_checkpoint(0)` publishes whenever anything is uncovered).
+    if checkpoint_bytes.is_some() && last_published_csn < e.csn() {
+        e.maybe_checkpoint(0)?;
+        publishes += 1;
     }
     emit(&format!(
-        "phase=seed-inventory ok=true blocks={blocks} docs={docs} customers={customers} stocks={stocks} csn={} dir={} elapsed_s={:.3}",
+        "phase=seed-inventory ok=true blocks={blocks} docs={docs} customers={customers} stocks={stocks} csn={} publishes={publishes} tiles={} serving_memtable_entries={} region_mode={} layout_page_size={layout_page_size} layout_bloom_bits={layout_bloom_bits} dir={} elapsed_s={:.3}",
         e.csn(),
+        tile_files(dir)?.len(),
+        e.serving_memtable_entries(),
+        region_mode().name(),
         dir.display(),
         started.elapsed().as_secs_f64(),
+    ));
+    Ok(())
+}
+
+// ---------- checkpoint ----------
+
+/// Publish everything the engine's WAL-backed memtable currently holds as tiles
+/// through the tested `maybe_checkpoint` protocol, so a later read consults
+/// tiles instead of the memtable. The engine must already exist; layout/region
+/// policy come from the same env knobs as `seed`. A no-op (published=false) when
+/// the newest active tile already covers the current CSN.
+fn cmd_checkpoint(dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let mut e = Engine::open_discover(dir)?;
+    e.set_layout_policy(region_layout_policy());
+    e.set_region_mode(region_mode());
+    e.set_metrics_enabled(metrics_enabled());
+    let csn_before = e.csn();
+    let newest = e.active_tile_cutoffs().last().copied().unwrap_or(0);
+    let published = if newest < csn_before { e.maybe_checkpoint(0)? } else { false };
+    emit(&format!(
+        "phase=checkpoint ok=true csn_before={csn_before} published={published} csn={} tiles={} serving_memtable_entries={} region_mode={} dir={}",
+        e.csn(),
+        tile_files(dir)?.len(),
+        e.serving_memtable_entries(),
+        region_mode().name(),
+        dir.display(),
+    ));
+    Ok(())
+}
+
+// ---------- tileinfo ----------
+
+/// One active tile's self-described layout, parsed read-only from its
+/// superblock and first directory fence (never opened as an engine tile, so no
+/// tile/WAL/index RAM is paid). This is the evidence that a flow's data is
+/// tile-resident and with which page/bloom parameters.
+struct TileMeta {
+    name: String,
+    bytes: u64,
+    cutoff: u64,
+    entries: u64,
+    page_size: u32,
+    bloom_len: u64,
+    bits_per_key: u32,
+    hash_count: u8,
+    dir_len: u64,
+    fences: u16,
+    region: String,
+}
+
+fn read_tile_meta(path: &Path) -> Result<TileMeta, Box<dyn std::error::Error>> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = fs::File::open(path)?;
+    let bytes = f.metadata()?.len();
+    let mut sb = [0u8; 4096];
+    f.read_exact(&mut sb).map_err(|e| format!("{}: superblock unreadable ({e})", path.display()))?;
+    if &sb[0..8] != b"FDBTILE3" {
+        return Err(format!("{}: superblock magic is not FDBTILE3", path.display()).into());
+    }
+    let u64at = |b: &[u8], i: usize| u64::from_le_bytes(b[i..i + 8].try_into().unwrap());
+    let u32at = |b: &[u8], i: usize| u32::from_le_bytes(b[i..i + 4].try_into().unwrap());
+    let dir_offset = u64at(&sb, 56);
+    let dir_len = u64at(&sb, 64);
+    // First fence record: [block_len u32][crc u32][fence_count u16]
+    // [first_key_len u32][block_offset u64][block_len u32][first_key bytes].
+    let (region, fences) = if dir_len == 0 {
+        ("?".to_string(), 0)
+    } else {
+        f.seek(SeekFrom::Start(dir_offset + 8))?;
+        let mut fencesb = [0u8; 2];
+        f.read_exact(&mut fencesb)?;
+        let fences = u16::from_le_bytes(fencesb);
+        f.seek(SeekFrom::Start(dir_offset + 10))?;
+        let mut lenb = [0u8; 4];
+        f.read_exact(&mut lenb)?;
+        let first_key_len = u32::from_le_bytes(lenb) as usize;
+        f.seek(SeekFrom::Start(dir_offset + 10 + 4 + 8 + 4))?;
+        let mut key = vec![0u8; first_key_len];
+        f.read_exact(&mut key)?;
+        let region = flashdb_engine::keys::region_prefix(&key)
+            .map(flashdb_engine::keys::region_name)
+            .unwrap_or_else(|| "?".to_string());
+        (region, fences)
+    };
+    Ok(TileMeta {
+        name: path.file_name().and_then(|n| n.to_str()).unwrap_or_default().to_string(),
+        bytes,
+        cutoff: u64at(&sb, 8),
+        entries: u64at(&sb, 48),
+        page_size: u32at(&sb, 72),
+        bloom_len: u64at(&sb, 84),
+        bits_per_key: u32at(&sb, 96),
+        hash_count: sb[100],
+        dir_len,
+        fences,
+        region,
+    })
+}
+
+/// Report every tile file's page size, bloom state and region, plus the active
+/// tile count and the serving-memtable entry count. A serving memtable of 0
+/// entries with a non-empty active tile list is the direct proof that reads
+/// cannot be served from RAM: the data is only readable through tiles.
+fn cmd_tileinfo(dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let e = Engine::open_discover(dir)?;
+    let active = e.active_tile_cutoffs();
+    // The write-time region mode is not persisted; each tile's region is derived
+    // from its own first key, which is what the per-tile lines report below.
+    emit(&format!(
+        "phase=tileinfo ok=true dir={} active_tiles={} serving_memtable_entries={}",
+        dir.display(),
+        active.len(),
+        e.serving_memtable_entries(),
+    ));
+    let mut metas = Vec::new();
+    for (name, bytes) in tile_files(dir)? {
+        match read_tile_meta(&dir.join(&name)) {
+            Ok(mut m) => {
+                m.bytes = bytes;
+                metas.push(m);
+            }
+            Err(err) => emit(&format!("phase=tileinfo file={name} parse_error={err}")),
+        }
+    }
+    metas.sort_by(|a, b| (a.cutoff, &a.region).cmp(&(b.cutoff, &b.region)));
+    for m in &metas {
+        emit(&format!(
+            "phase=tileinfo tile={} bytes={} cutoff={} entries={} page_size={} bloom_len={} bits_per_key={} hash_count={} dir_len={} fences={} region={}",
+            m.name, m.bytes, m.cutoff, m.entries, m.page_size, m.bloom_len, m.bits_per_key, m.hash_count, m.dir_len,
+            m.fences, m.region,
+        ));
+    }
+    let page_sizes: std::collections::BTreeSet<u32> = metas.iter().map(|m| m.page_size).collect();
+    emit(&format!(
+        "phase=tileinfo ok=true tiles={} tile_bytes_total={} page_sizes={:?} bloom_tiles={}",
+        metas.len(),
+        metas.iter().map(|m| m.bytes).sum::<u64>(),
+        page_sizes,
+        metas.iter().filter(|m| m.bloom_len > 0).count(),
     ));
     Ok(())
 }

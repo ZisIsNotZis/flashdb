@@ -11,9 +11,15 @@
 //! in Python means the pacer has no opinion about workload semantics.
 //!
 //! usage:
-//!   flashdb-load <existing-wal> <trace.jsonl> --rate-rps R[,R...] [--segment-requests N]
+//!   flashdb-load <dir-or-wal> <trace.jsonl> --rate-rps R[,R...] [--segment-requests N]
 //!                [--window-ms 1000] [--ceiling-us N] [--patterns] [--commit-batch B]
-//!                [--group-requests B]
+//!                [--group-requests B] [--no-tiles]
+//!
+//! Opening: a **directory** is opened tile-aware with `Engine::open_discover`, so a published
+//! tile is consulted before the memtable and the measured flow exercises the real tile read path;
+//! a **WAL file** (or `--no-tiles`) keeps the historical `Engine::open` behaviour (full WAL replay
+//! into the memtable, tiles ignored). `--no-tiles` on a directory is the controlled A/B: the same
+//! data and trace, served from the replayed memtable instead of from tiles.
 //!
 //! Exit status is 0 even when the engine is saturated: saturation is data, not an error. A
 //! trace/parse failure is an error (non-zero), because it means the measurement is invalid.
@@ -34,7 +40,7 @@ const MAX_LINE: u64 = 1 << 20;
 const LAG_SATURATION_US: u64 = 10_000;
 
 struct Args {
-    wal: String,
+    target: String,
     trace: String,
     rates: Vec<f64>,
     segment_requests: Option<u64>,
@@ -43,14 +49,15 @@ struct Args {
     patterns: bool,
     commit_batch: Option<u64>,
     group_requests: Option<u64>,
+    discover: bool,
 }
 
 fn parse_args(argv: Vec<String>) -> Result<Args, String> {
     if argv.len() < 3 {
-        return Err("usage: flashdb-load <existing-wal> <trace.jsonl> --rate-rps R[,R...] [--segment-requests N] [--window-ms N] [--ceiling-us N] [--patterns] [--commit-batch B] [--group-requests B]".into());
+        return Err("usage: flashdb-load <dir-or-wal> <trace.jsonl> --rate-rps R[,R...] [--segment-requests N] [--window-ms N] [--ceiling-us N] [--patterns] [--commit-batch B] [--group-requests B] [--no-tiles]".into());
     }
     let mut args = Args {
-        wal: argv[1].clone(),
+        target: argv[1].clone(),
         trace: argv[2].clone(),
         rates: Vec::new(),
         segment_requests: None,
@@ -59,6 +66,7 @@ fn parse_args(argv: Vec<String>) -> Result<Args, String> {
         patterns: false,
         commit_batch: None,
         group_requests: None,
+        discover: true,
     };
     let mut i = 3;
     while i < argv.len() {
@@ -100,6 +108,7 @@ fn parse_args(argv: Vec<String>) -> Result<Args, String> {
                 i += 2;
             }
             "--patterns" => { args.patterns = true; i += 1; }
+            "--no-tiles" => { args.discover = false; i += 1; }
             other => return Err(format!("unknown argument {other:?}")),
         }
     }
@@ -124,6 +133,28 @@ fn rate_for(index: u64, total: u64, rates: &[f64], segment_requests: Option<u64>
     }
     let seg = (index * rates.len() as u64 / total.max(1)) as usize;
     rates[seg.min(rates.len() - 1)]
+}
+
+/// Resolve the CLI target. A directory opens tile-aware with `Engine::open_discover` unless
+/// `discover` is false, in which case (and for a WAL file path) the engine is opened by WAL
+/// path with tiles ignored: `--no-tiles` is the memtable-only control for the same data.
+fn open_target(target: &str, discover: bool) -> io::Result<Engine> {
+    let path = Path::new(target);
+    if path.is_dir() {
+        if discover { Engine::open_discover(path) } else { Engine::open(path.join("data.wal")) }
+    } else {
+        Engine::open(path)
+    }
+}
+
+/// Directory the in-session device baseline writes its scratch file into.
+fn probe_dir(target: &str) -> std::path::PathBuf {
+    let path = Path::new(target);
+    if path.is_dir() {
+        path.to_path_buf()
+    } else {
+        path.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| std::path::PathBuf::from("."))
+    }
 }
 
 /// Nearest-rank percentile of a sorted slice, in microseconds. `None` when empty.
@@ -219,13 +250,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Device context first. On this shared box a single fsync varies by two orders of magnitude
     // depending on what else is running, so a load run without a device baseline cannot be
     // interpreted: "saturation" may be the device, not the engine. Same session, same directory.
-    let device = probe_device(Path::new(&args.wal).parent().unwrap_or(Path::new(".")), 100);
-    let mut engine = Engine::open(&args.wal)?;
+    let device = probe_device(&probe_dir(&args.target), 100);
+    let mut engine = open_target(&args.target, args.discover)?;
     let stdout = io::stdout();
     let mut out = stdout.lock();
     writeln!(out, "device_fsync_p50_us={} device_fsync_p99_us={}",
         device.0.map(|v| v.to_string()).unwrap_or_else(|| "none".into()),
         device.1.map(|v| v.to_string()).unwrap_or_else(|| "none".into()))?;
+    // Tile-touch context: an empty serving memtable with active tiles means reads must come
+    // from tiles; with --no-tiles the same data is fully replayed into the memtable.
+    writeln!(out, "engine_open target={} discover={} active_tiles={} serving_memtable_entries={}",
+        args.target, args.discover, engine.active_tile_cutoffs().len(), engine.serving_memtable_entries())?;
 
     let t0 = Instant::now();
     // `due_us` is ALWAYS the due time of the next request to issue, so an unissued request never
@@ -297,7 +332,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             } else if args.commit_batch.is_none() {
                 let request: Value = serde_json::from_str(&lines[index as usize])?;
                 match execute_request(&mut engine, &request) {
-                    Ok(_) => completed += 1,
+                    Ok(blocks) => {
+                        completed += 1;
+                        // `take: failed` is the stock guard's else branch. Count it
+                        // here too (the grouped path already does), so a single-request
+                        // run still proves the workload exercised the guard.
+                        if blocks.get("take").is_some_and(|b| b.status == "failed") { else_used += 1; }
+                    }
                     Err(e) => {
                         errors += 1;
                         if first_error.is_none() {
@@ -430,7 +471,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let elapsed = t0.elapsed();
-    let device_end = probe_device(Path::new(&args.wal).parent().unwrap_or(Path::new(".")), 50);
+    let device_end = probe_device(&probe_dir(&args.target), 50);
     writeln!(out, "device_fsync_end_p50_us={} device_fsync_end_p99_us={}",
         device_end.0.map(|v| v.to_string()).unwrap_or_else(|| "none".into()),
         device_end.1.map(|v| v.to_string()).unwrap_or_else(|| "none".into()))?;
@@ -484,6 +525,11 @@ mod tests {
         let ok = ok.expect("valid args");
         assert_eq!(ok.rates, vec![10.0, 20.0]);
         assert_eq!(ok.window_ms, 500);
+        assert!(ok.discover, "tile-aware discovery is the default");
+        let memtable = parse_args(vec!["b".into(), "dir".into(), "t.jsonl".into(),
+                                        "--rate-rps".into(), "10".into(), "--no-tiles".into()])
+            .expect("valid memtable-control args");
+        assert!(!memtable.discover, "--no-tiles forces the memtable-only open");
         assert!(parse_args(vec!["b".into(), "wal".into(), "t.jsonl".into()]).is_err(), "rate is required");
         assert!(parse_args(vec!["b".into(), "wal".into(), "t.jsonl".into(), "--rate-rps".into(), "0".into()]).is_err(), "zero rate rejected");
         assert!(parse_args(vec!["b".into(), "wal".into(), "t.jsonl".into(), "--rate-rps".into(), "10".into(), "--nope".into()]).is_err());
