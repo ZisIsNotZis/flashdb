@@ -304,6 +304,20 @@ fn batch_write_block(req: &Value, handle: u64) -> io::Result<(Vec<u8>, Vec<Op>)>
     Ok((id.as_bytes().to_vec(), ops))
 }
 
+/// Return already-freed heap pages to the OS. The load path streams large transient buffers (each
+/// `movements_scan` result is hundreds of KB), and glibc keeps the freed arena pages, which showed
+/// up as a ~243 MB process peak on a 760 MB working set - enough to OOM under the small memory caps
+/// the cold-cache axis comparison needs. Purely allocator hygiene: no semantics, no format.
+fn trim_heap() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    unsafe {
+        extern "C" {
+            fn malloc_trim(pad: usize) -> std::ffi::c_int;
+        }
+        malloc_trim(0);
+    }
+}
+
 fn main() {
     if let Err(e) = run() {
         eprintln!("flashdb-load: {e}");
@@ -579,6 +593,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             out.flush()?;
             latencies.clear();
             lags.clear();
+            // keep the process footprint flat across windows (scan results churn hundred-KB Vecs)
+            trim_heap();
             window_index += 1;
             window_start = Instant::now();
             window_late_start = late_total;

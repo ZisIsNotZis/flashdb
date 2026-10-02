@@ -122,3 +122,31 @@ Two different numbers, each with its own measurement conditions:
 Consequence for the pre-registration: with the fix, an instance only needs its **retained WAL suffix
 and tile bloom** to fit under the cap, so a >= 10x-data:256-MiB-cap cold run is no longer blocked by
 the open footprint.
+
+## Load-path footprint (same day, follow-up): open is fixed, the LOAD is now the blocker
+
+After the open-time trim fix, the engine opens a 760 MB / 36-tile instance at ~5 MB live, but a
+6000-request read load on it peaks at **~243 MB RSS** (measured with `/usr/bin/time -v`, warm, no
+cgroup). Consequences and evidence:
+
+- The load fits under a **384 MiB** cgroup cap but is OOM-killed under **192 MiB**, even with
+  `MALLOC_ARENA_MAX=1`. So for a >=10x-cache cold run the instance must be >= ~3.9 GB (at a 384 MiB
+  cap) or the load's footprint must come down.
+- The peak is **not** glibc retention that a boundary trim can undo: I added a per-window
+  `malloc_trim(0)` to the pacer and the maximum RSS was unchanged (243,176 KB vs 243,244 KB), because
+  `/usr/bin/time` reports the maximum and the peak occurs *inside* a window. (The per-window trim is
+  kept: it is harmless hygiene, but it is not the fix, and the earlier "arena retention" reading of
+  this number was wrong.)
+- **Leading hypothesis (NOT isolated):** the scan path materialises a whole-entity result set. This
+  instance holds 3 M stock rows, and 243 MB / 3 M is ~80 bytes per row, which is the size of a row's
+  key+value - i.e. one `movements_scan` over an entity returning its entire row set would explain the
+  peak exactly. Consistent with `reverse_lookup` collecting into a `Vec` and sorting it before
+  returning, and with the adapter building the row list. A dedicated isolation test (probes only vs
+  scans only vs writes only, and with the pacer streaming rather than holding the trace) was NOT run,
+  so this remains a hypothesis with a plausible mechanism and matching arithmetic, not a finding.
+- This matters beyond the cold comparison: it is a **bounded-memory claim** issue. If a scan
+  materialises its result set, then scan memory is proportional to the result set, not to the window,
+  and the data:RAM story needs that stated (or the scan streamed).
+
+Next: isolate the load footprint (probes-only / scans-only / writes-only; pacer streaming), fix or
+bound it (streaming scan results is the likely fix), and only then run the >=10x cold comparison.
