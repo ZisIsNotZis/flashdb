@@ -820,6 +820,21 @@ impl Engine {
             }
             prev_cutoff = t.cutoff();
         }
+        // Every active tile is now verified against the WAL projection. That
+        // verification built each tile's expected-version map and streamed the
+        // tile's entries, so the peak live set during open is bounded by the
+        // retained WAL suffix (the replayed `records`, the `covered` projection
+        // and the per-tile `newest_projection`/`expect` copies), not by total
+        // data. Release the suffix temporaries, then return the freed arena pages
+        // to the OS: glibc keeps them, so without this the open-time peak stays
+        // resident afterwards - and a cgroup `MemoryMax` counts it. Measured on a
+        // rotated 6-tile / 118 MB instance (16 MiB checkpoint+rotate): open-time
+        // peak (VmHWM) 88 MB, live RSS 5.3 MB with this trim (82 MB resident with
+        // the trim omitted). Allocator hygiene only: no format, read, write or
+        // durability change.
+        drop(records);
+        drop(covered);
+        Self::trim_retained_heap();
         Ok(Engine { wal, mt, tiles, wal_path: wal_path.to_path_buf(), dir: parent_dir(wal_path), manifest: None, segment: None, segment_suffix_csn: csn, wal_detached: false, csn, dedup, max_handle, group_open: false, group_pending: false, layout: LayoutPolicy::declared_default(), region_mode: RegionMode::Global, metrics: RefCell::new(Metrics::new()) })
     }
 
@@ -828,6 +843,27 @@ impl Engine {
     /// retained in `data.wal`.
     fn wal_floor(&self) -> u64 {
         self.segment.as_ref().map(|s| s.start_csn).unwrap_or(0)
+    }
+
+    /// Return freed-but-retained heap back to the OS after open-time verification.
+    ///
+    /// `open_impl` streams every active tile's entries and builds each tile's
+    /// projected `expect` map to check it against the WAL, so the peak allocated
+    /// during open can exceed the live engine's own footprint. glibc keeps freed
+    /// small/medium allocations in per-thread arenas and does not return those
+    /// pages to the kernel, so that transient peak stays resident (RSS) after
+    /// open returns - and a cgroup `MemoryMax` counts it. `malloc_trim(0)` returns
+    /// the retained free pages; it is pure allocator hygiene and changes neither
+    /// the on-disk format nor any read, write, or durability semantics, only RSS.
+    /// It is a no-op where the symbol is absent (non-glibc targets).
+    fn trim_retained_heap() {
+        #[cfg(all(target_os = "linux", target_env = "gnu"))]
+        unsafe {
+            extern "C" {
+                fn malloc_trim(pad: usize) -> std::ffi::c_int;
+            }
+            malloc_trim(0);
+        }
     }
 
     /// Fail closed once a rotation's live-WAL rebinding failed after the

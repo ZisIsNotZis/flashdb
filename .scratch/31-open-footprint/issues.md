@@ -58,3 +58,67 @@ Two things are clear and one is not:
    *steady-state serving* footprint, and give the tile count and page size both were measured at.
 4. If the bloom's RAM cost is material at high tile counts, say so and state the trade (bits/key vs
    RAM), since it is the knob we measured as dead-on-this-workload but it still costs memory.
+
+## Result (slice 31) — driver located, allocator-hygiene fix landed
+
+The controlled experiment is `harness/flashdb_harness/open_footprint.py` (one knob off `base` at a
+time; `flashdb-scale openinfo <dir>` reports `VmHWM` = open-time peak, `VmRSS` = live after open).
+One 800 k-row / ~114 MB inventory trace, global mode, 4 KiB pages, 10 bloom bits unless varied:
+
+| variant | axis | tiles | data MB | open peak (VmHWM) MB | live RSS MB |
+|---|---|---:|---:|---:|---:|
+| base | 4 MiB checkpoint+rotate | 22 | 113.7 | 9.9 | 5.1 |
+| manytiles | 1 MiB checkpoint+rotate | 80 | 113.8 | 5.1 | 5.1 |
+| fewtiles | 16 MiB checkpoint+rotate | 6 | 120.5 | 85.9 | 5.1 |
+| bigsuffix | 4 MiB ckpt / 16 MiB rotate | 292 | 122.1 | 65.4 | 5.5 |
+| nosuffix | no rotation (full WAL replay) | 381 | 202.8 | 457.4 | 7.2 |
+| nobloom | bloom bits = 0 | 22 | 111.8 | 8.1 | 3.2 |
+| page64k | 64 KiB pages | 22 | 112.3 | 9.9 | 5.0 |
+
+**The driver is the retained WAL suffix, i.e. the rotate threshold — not tile count and not total
+data.** `open_impl` replays the retained WAL suffix into `records`/`covered`, then for every active
+tile builds `newest_projection(&covered, lower, cutoff)` and copies it into `verify_projection`'s
+`expect` map before streaming the tile's entries. That working set is O(suffix) (plus one tile's
+entries), so:
+
+* at a 16 MiB suffix the open-time peak is ~65-86 MB; at 4 MiB it is ~10 MB; at 1 MiB it is ~5 MB;
+* the *tile count* is irrelevant (6 tiles peak at 86 MB, 80 tiles at 5 MB, 292 tiles at 65 MB at the
+  same 16 MiB suffix);
+* with rotation **disabled** (`FLASHDB_SEED_ROTATE_BYTES` unset) the suffix is the whole WAL, so open
+  replays the entire dataset: 381 tiles / 203 MB on disk (tile bytes plus the un-retired WAL) →
+  open peak **457 MB** (an ad-hoc 16 MiB-cadence run without rotation peaked at 554 MB). This is the
+  5 GB/760 MB contradiction: those runs differed in rotate cadence, not in tile count.
+
+**It is glibc arena retention, and the fix is allocator hygiene.** Pre-fix, RSS *stayed* at the peak
+after open (6-tile instance: 82 MB live; 292-tile/16 MiB-suffix: 63 MB live) because glibc keeps the
+freed arena pages. `open_impl` now drops the suffix temporaries (`records`, `covered`) and calls
+`malloc_trim(0)` (`Engine::trim_retained_heap`, glibc-only, no-op elsewhere) before returning. Live
+RSS after open is now a ~5 MB floor in every rotated variant above (a 16x cut on the 6-tile case),
+and 5.2 MB for the earlier 82 MB case. This changes **no** on-disk format, read/write semantics, or
+durability; it returns already-freed pages to the OS.
+
+**Bloom trade (material at high tile counts, measured):** bloom RAM is ~10 bits per stored
+unique-prefix, so it scales with total live entries, not with tile count per se: at 22 tiles the
+bloom accounts for ~1.9 MB of the 5.1 MB live RSS (nobloom 3.2 MB), and the 10-bits/key default is
+what slice 26 measured dead on these workloads. Turning the bloom off (bits/key = 0) saves that
+memory and costs the in-range-absent device read the bloom would skip.
+
+## Restated memory claim
+
+Two different numbers, each with its own measurement conditions:
+
+* **Steady-state serving footprint** (the 22-24:1 headline): measured during the **seed** phase of
+  the slice-10d generic `seed` path (10 M docs × 1 KiB, 1 KiB docs, rotate/checkpoint window
+  W = 64 MiB), so the instance there had 1 KiB documents and tile pages were not exercised.
+  Live RSS ≈ `2.3 × W` + sparse directory index (0.20 MiB/GiB) + bloom (~10 bits per live entry) +
+  ~5 MB process floor; it is a function of the *window*, not of total data.
+* **Open footprint** (what this ticket is about): the floor to open a checkpointed instance is now
+  **~5 MB plus bloom/directory**, independent of total data and tile count, *provided the WAL is
+  rotated* (retained suffix ≤ rotate threshold). Without rotation the open-time peak is ~4-5× the
+  full WAL and total-data-proportional. Both numbers above were measured at 4 KiB pages, global
+  mode, 10 bloom bits, at tile counts of 6/22/80/292 on a ~114 MB instance; the 10d number used
+  1 KiB docs.
+
+Consequence for the pre-registration: with the fix, an instance only needs its **retained WAL suffix
+and tile bloom** to fit under the cap, so a >= 10x-data:256-MiB-cap cold run is no longer blocked by
+the open footprint.

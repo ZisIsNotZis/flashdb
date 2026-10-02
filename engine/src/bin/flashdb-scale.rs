@@ -274,9 +274,16 @@ fn print_metrics(phase: &str, e: &Engine) {
 /// (non-Linux). Sampled, not a guaranteed peak — hence the separate peak
 /// tracking across sample points.
 fn rss_kb() -> u64 {
+    vm_field_kb("VmRSS:")
+}
+
+/// One `VmXXX:  <value> kB` field from /proc/self/status, in KiB; 0 when
+/// unavailable. `VmHWM` is the peak resident set and `VmSize` the virtual size,
+/// both needed to separate the open-time transient peak from the live footprint.
+fn vm_field_kb(field: &str) -> u64 {
     let Ok(status) = fs::read_to_string("/proc/self/status") else { return 0 };
     for line in status.lines() {
-        if let Some(rest) = line.strip_prefix("VmRSS:") {
+        if let Some(rest) = line.strip_prefix(field) {
             return rest.trim().trim_end_matches("kB").trim().parse().unwrap_or(0);
         }
     }
@@ -335,6 +342,7 @@ const USAGE: &str = "usage: flashdb-scale seed <dir> <total_docs> <docs_per_comm
                      usage: flashdb-scale checkpoint <dir>\n\
                      usage: flashdb-scale compact <dir>\n\
                      usage: flashdb-scale tileinfo <dir>\n\
+                     usage: flashdb-scale openinfo <dir>\n\
                      usage: flashdb-scale verify <dir> <total_docs>\n\
                      usage: flashdb-scale scanbench <dir> <passes>";
 
@@ -352,6 +360,7 @@ fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         Some("checkpoint") if args.len() == 3 => cmd_checkpoint(Path::new(&args[2])),
         Some("compact") if args.len() == 3 => cmd_compact(Path::new(&args[2])),
         Some("tileinfo") if args.len() == 3 => cmd_tileinfo(Path::new(&args[2])),
+        Some("openinfo") if args.len() == 3 => cmd_openinfo(Path::new(&args[2])),
         Some("verify") if args.len() == 4 => {
             cmd_verify(Path::new(&args[2]), parse_num(&args[3], "total_docs")?)
         }
@@ -986,6 +995,28 @@ fn cmd_tileinfo(dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
         metas.iter().map(|m| m.bytes).sum::<u64>(),
         page_sizes,
         metas.iter().filter(|m| m.bloom_len > 0).count(),
+    ));
+    Ok(())
+}
+
+/// `openinfo <dir>` (slice 31): report the engine's footprint immediately after
+/// `open_discover` (recovery + active-tile verification). Separates the open-time
+/// transient peak (`VmHWM`, which includes the verification working set and any
+/// allocator retention during open) from the live resident set (`VmRSS` after
+/// `open_impl`'s allocator-hygiene trim returns the freed arenas). Purely
+/// diagnostic: it opens the directory and reports, and never mutates it.
+fn cmd_openinfo(dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let e = Engine::open_discover(dir)?;
+    let bytes = e.active_tile_bytes()?;
+    emit(&format!(
+        "phase=openinfo ok=true dir={} active_tiles={} serving_memtable_entries={} tile_bytes_total={} rss_kb={} vm_hwm_kb={} vsize_kb={}",
+        dir.display(),
+        e.active_tile_cutoffs().len(),
+        e.serving_memtable_entries(),
+        bytes,
+        rss_kb(),
+        vm_field_kb("VmHWM:"),
+        vm_field_kb("VmSize:"),
     ));
     Ok(())
 }
