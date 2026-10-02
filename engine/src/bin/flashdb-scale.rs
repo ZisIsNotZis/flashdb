@@ -136,7 +136,26 @@ fn region_mode() -> RegionMode {
 /// `region=page_size:bloom_bits`, the region spelled as `LayoutPolicy` expects).
 /// Applied on top of [`layout_policy`]; each value lands in the emitted tile's
 /// superblock, so a directory written here reads back without the env set.
+///
+/// `FLASHDB_POLICY_FILE=<path>` (slice 27) is the external-controller channel and
+/// is **authoritative**: when it is set and parses, it REPLACES the env-derived
+/// policy above, so a controller declares the whole per-region policy (page size,
+/// bloom bits and merge threshold) in one file. The schema and its reject-on-
+/// invalid error policy are documented on [`LayoutPolicy`]. A file that fails to
+/// parse is a hard error (a controller must never silently measure a policy it
+/// did not set).
 fn region_layout_policy() -> LayoutPolicy {
+    if let Ok(path) = std::env::var("FLASHDB_POLICY_FILE") {
+        if !path.is_empty() {
+            return match LayoutPolicy::from_json_file(Path::new(&path)) {
+                Ok(policy) => policy,
+                Err(e) => {
+                    eprintln!("FLASHDB_POLICY_FILE={path:?} rejected: {e}");
+                    std::process::exit(1);
+                }
+            };
+        }
+    }
     let mut policy = layout_policy();
     let Ok(spec) = std::env::var("FLASHDB_REGION_LAYOUT") else { return policy };
     for entry in spec.split(',').filter(|s| !s.is_empty()) {
@@ -151,6 +170,12 @@ fn region_layout_policy() -> LayoutPolicy {
         }
     }
     policy
+}
+
+/// Emit the active policy as one machine-readable line so a run is
+/// self-describing and a controller can confirm what the engine holds.
+fn emit_policy(phase: &str, policy: &LayoutPolicy) {
+    emit(&format!("phase={phase} policy={}", policy.to_json()));
 }
 
 /// `seed-inventory` checkpoint cadence (measurement knob). When set, the seeded
@@ -297,6 +322,7 @@ fn parse_num(text: &str, name: &str) -> Result<u64, Box<dyn std::error::Error>> 
 const USAGE: &str = "usage: flashdb-scale seed <dir> <total_docs> <docs_per_commit> <value_bytes>\n\
                      usage: flashdb-scale seed-inventory <dir> <seed-trace.jsonl>\n\
                      usage: flashdb-scale checkpoint <dir>\n\
+                     usage: flashdb-scale compact <dir>\n\
                      usage: flashdb-scale tileinfo <dir>\n\
                      usage: flashdb-scale verify <dir> <total_docs>\n\
                      usage: flashdb-scale scanbench <dir> <passes>";
@@ -313,6 +339,7 @@ fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             cmd_seed_inventory(Path::new(&args[2]), Path::new(&args[3]))
         }
         Some("checkpoint") if args.len() == 3 => cmd_checkpoint(Path::new(&args[2])),
+        Some("compact") if args.len() == 3 => cmd_compact(Path::new(&args[2])),
         Some("tileinfo") if args.len() == 3 => cmd_tileinfo(Path::new(&args[2])),
         Some("verify") if args.len() == 4 => {
             cmd_verify(Path::new(&args[2]), parse_num(&args[3], "total_docs")?)
@@ -411,6 +438,7 @@ fn cmd_seed(
     e.set_region_mode(region_mode());
     let (layout_page_size, layout_bloom_bits) = layout.default_layout();
     e.set_metrics_enabled(metrics_enabled());
+    emit_policy("seed", &layout);
     let docs_a = total_docs / 2;
     let docs_b = total_docs - docs_a;
     let total_blocks = total_docs.div_ceil(docs_per_commit);
@@ -655,6 +683,7 @@ fn cmd_seed_inventory(dir: &Path, trace: &Path) -> Result<(), Box<dyn std::error
     e.set_layout_policy(layout.clone());
     e.set_region_mode(region_mode());
     e.set_metrics_enabled(metrics_enabled());
+    emit_policy("seed-inventory", &layout);
     let (layout_page_size, layout_bloom_bits) = layout.default_layout();
     let checkpoint_bytes = seed_checkpoint_bytes();
     let file = fs::File::open(trace)
@@ -748,9 +777,11 @@ fn cmd_seed_inventory(dir: &Path, trace: &Path) -> Result<(), Box<dyn std::error
 /// the newest active tile already covers the current CSN.
 fn cmd_checkpoint(dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let mut e = Engine::open_discover(dir)?;
-    e.set_layout_policy(region_layout_policy());
+    let policy = region_layout_policy();
+    e.set_layout_policy(policy.clone());
     e.set_region_mode(region_mode());
     e.set_metrics_enabled(metrics_enabled());
+    emit_policy("checkpoint", &policy);
     let csn_before = e.csn();
     let newest = e.active_tile_cutoffs().last().copied().unwrap_or(0);
     let published = if newest < csn_before { e.maybe_checkpoint(0)? } else { false };
@@ -760,6 +791,65 @@ fn cmd_checkpoint(dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
         tile_files(dir)?.len(),
         e.serving_memtable_entries(),
         region_mode().name(),
+        dir.display(),
+    ));
+    Ok(())
+}
+
+// ---------- compact ----------
+
+/// Active tiles per region, in first-seen list order, as `(region, count)`.
+/// A whole-keyspace tile is reported as `(global)`.
+fn tiles_per_region(e: &Engine) -> Vec<(String, usize)> {
+    let mut order: Vec<String> = Vec::new();
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for region in e.active_tile_regions() {
+        let name = region.unwrap_or_else(|| "(global)".to_string());
+        if !counts.contains_key(&name) { order.push(name.clone()); }
+        *counts.entry(name).or_default() += 1;
+    }
+    order.into_iter().map(|name| { let count = counts[&name]; (name, count) }).collect()
+}
+
+/// `compact <dir>` (slice 27): apply the active per-region policy's merge
+/// thresholds to an already tile-resident directory the inventory flow
+/// published, compacting every eligible region to a fixed point, and report the
+/// per-region tile counts and merge accounting. `max_tiles` is set to the
+/// current active count on each call so the engine's global gate is always open
+/// and the per-region threshold is the only thing deciding which regions merge -
+/// exactly the actuator under test. Compaction output bytes are measured; the
+/// rewrite factor is `compaction_bytes / tile_bytes_before`.
+fn cmd_compact(dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let mut e = Engine::open_discover(dir)?;
+    let policy = region_layout_policy();
+    e.set_layout_policy(policy.clone());
+    e.set_region_mode(region_mode());
+    e.set_metrics_enabled(metrics_enabled());
+    let shape = compact_shape();
+    emit_policy("compact", &policy);
+    let before = tiles_per_region(&e);
+    let before_render = before.iter().map(|(r, c)| format!("{r}:{c}")).collect::<Vec<_>>().join(",");
+    let tile_bytes_before = e.active_tile_bytes()?;
+    let mut merges = 0u64;
+    let mut compaction_bytes = 0u64;
+    loop {
+        let active = e.active_tile_cutoffs().len();
+        if active < 2 { break; }
+        match e.maybe_compact_shape(compact_merge_budget(), active, shape)? {
+            Some(merged) => { merges += 1; compaction_bytes += merged; }
+            None => break,
+        }
+    }
+    let after = tiles_per_region(&e);
+    let after_render = after.iter().map(|(r, c)| format!("{r}:{c}")).collect::<Vec<_>>().join(",");
+    let tile_bytes_after = e.active_tile_bytes()?;
+    let rewrite_factor = compaction_bytes as f64 / tile_bytes_before.max(1) as f64;
+    emit(&format!(
+        "phase=compact ok=true shape={} region_mode={} merges={merges} compaction_bytes={compaction_bytes} tile_bytes_before={tile_bytes_before} tile_bytes_after={tile_bytes_after} rewrite_factor={rewrite_factor:.3} active_tiles_before={} active_tiles_after={} tiles_per_region_before={before_render} tiles_per_region_after={after_render} dir={}",
+        shape.name(),
+        region_mode().name(),
+        before.iter().map(|(_, c)| c).sum::<usize>(),
+        after.iter().map(|(_, c)| c).sum::<usize>(),
         dir.display(),
     ));
     Ok(())

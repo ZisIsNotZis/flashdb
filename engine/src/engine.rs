@@ -19,6 +19,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 use crate::bloom::BloomBuilder;
@@ -88,25 +89,83 @@ impl RegionMode {
     }
 }
 
-/// Provisional per-prefix-region layout declaration (slice 17).
+/// Default per-region **merge threshold** (in that region's own tile count): a
+/// region's automatic merges are only considered once the region holds this
+/// many tiles. `2` reproduces today's effective behaviour exactly - selection
+/// already required a run of at least two tiles, so the only precondition a
+/// region had to satisfy was that it held two tiles. Raising a region's
+/// threshold *defers* its merges; that trade of write amplification against
+/// read latency is the per-region compaction-trigger actuator a learner sets.
+///
+/// The threshold gates only the automatic [`Engine::maybe_compact_shape`] path,
+/// never the explicit [`Engine::compact`] (which a caller invokes to collapse a
+/// region on request). A threshold above the active-tile cap can therefore defer
+/// a region's merges until publishes start refusing once the manifest is full;
+/// that is the documented cost of the lazy end of the range.
+pub const DEFAULT_MERGE_MIN_TILES: u8 = 2;
+
+/// One region's declared physical parameters: page size and bloom bits per key
+/// (per-tile values, written into each tile's superblock) plus the region's
+/// merge threshold (`merge_min_tiles`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RegionLayout {
+    name: String,
+    page_size: u32,
+    bloom_bits_per_key: u8,
+    merge_min_tiles: u8,
+}
+
+/// Provisional per-prefix-region layout declaration (slice 17; per-region merge
+/// threshold added by slice 27).
 ///
 /// A policy maps a prefix-region name to a tile's two already-safe physical
-/// parameters - page size and bloom bits per key - and returns a default for any
+/// parameters - page size and bloom bits per key - and to the region's
+/// **compaction trigger** (`merge_min_tiles`), and returns defaults for any
 /// region it does not name. It is deliberately **not persisted**: there is no
 /// policy table and no manifest field, and the reader never consults it. The
 /// only durable declaration is what each tile's superblock already records
 /// (`page_size`, `bits_per_key`), which is exactly what makes this safe to land
-/// now: a policy change affects only *new* tiles, and a reader honors the stored
-/// per-tile value, so a stale or bad layout is slow, never wrong (I2).
+/// now: a policy change affects only *new* tiles and the *future* merge schedule,
+/// and a reader honors the stored per-tile value, so a stale or bad layout is
+/// slow, never wrong (I2).
 ///
 /// [`LayoutPolicy::declared_default`] reproduces today's behaviour exactly
-/// (4096-byte pages, 10 bloom bits/key everywhere). A durable declaration
-/// surface mapping regions to layouts - and the family partitioning that needs
-/// it - is a later slice.
+/// (4096-byte pages, 10 bloom bits/key everywhere, `merge_min_tiles = 2`).
+///
+/// ## External control: JSON policy file
+///
+/// A controller outside the process declares the policy by writing a JSON file
+/// and pointing the driver at it (`FLASHDB_POLICY_FILE`, or `--policy-file` for
+/// `flashdb-load`). The frozen schema is:
+///
+/// ```json
+/// {
+///   "default": { "page_size": 4096, "bloom_bits_per_key": 10, "merge_min_tiles": 2 },
+///   "regions": {
+///     "P|Stock":  { "merge_min_tiles": 2 },
+///     "P|Order":  { "merge_min_tiles": 64 },
+///     "P|Movement": { "page_size": 65536, "merge_min_tiles": 256 }
+///   }
+/// }
+/// ```
+///
+/// `default` and `regions` are both optional; every field inside an entry is
+/// optional and falls back to the policy default. `page_size` must be in
+/// `4096..=65536`, `bloom_bits_per_key` in `0..=64`, and `merge_min_tiles`
+/// `>= 2`. A region key must be a real region spelling (`P|`, `U|` or `R|`
+/// followed by a non-empty entity).
+///
+/// **Error policy (frozen):** any malformed or invalid entry is a hard error -
+/// [`LayoutPolicy::from_json_slice`] rejects the whole file rather than silently
+/// ignoring part of a controller's declaration, so a controller can never
+/// believe it set a threshold it did not. A *well-formed* region name that names
+/// no tile in the database is not an error: the policy is a lookup table, and an
+/// unused row simply has no effect.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LayoutPolicy {
     default: (u32, u8),
-    regions: Vec<(String, u32, u8)>,
+    default_merge_min_tiles: u8,
+    regions: Vec<RegionLayout>,
 }
 
 impl Default for LayoutPolicy {
@@ -114,17 +173,25 @@ impl Default for LayoutPolicy {
 }
 
 impl LayoutPolicy {
-    /// Today's values exactly: 4096-byte pages and 10 bloom bits/key for every
-    /// region.
+    /// Today's values exactly: 4096-byte pages, 10 bloom bits/key and a merge
+    /// threshold of 2 everywhere.
     pub fn declared_default() -> Self {
-        LayoutPolicy { default: (DEFAULT_PAGE_SIZE, UNIQUE_BLOOM_BITS_PER_KEY as u8), regions: Vec::new() }
+        LayoutPolicy {
+            default: (DEFAULT_PAGE_SIZE, UNIQUE_BLOOM_BITS_PER_KEY as u8),
+            default_merge_min_tiles: DEFAULT_MERGE_MIN_TILES,
+            regions: Vec::new(),
+        }
     }
 
     /// A policy with a different default and no per-region overrides. `page_size`
     /// must be in `4096..=65536`; the tile writer rejects anything else at build
     /// time rather than writing a tile it cannot read back.
     pub fn with_default(page_size: u32, bloom_bits_per_key: u8) -> Self {
-        LayoutPolicy { default: (page_size, bloom_bits_per_key), regions: Vec::new() }
+        LayoutPolicy {
+            default: (page_size, bloom_bits_per_key),
+            default_merge_min_tiles: DEFAULT_MERGE_MIN_TILES,
+            regions: Vec::new(),
+        }
     }
 
     /// The `(page_size, bloom_bits_per_key)` a tile in `region` is written with.
@@ -133,26 +200,141 @@ impl LayoutPolicy {
     pub fn for_region(&self, region: &str) -> (u32, u8) {
         self.regions
             .iter()
-            .find(|(name, _, _)| name == region)
-            .map(|(_, page_size, bits)| (*page_size, *bits))
+            .find(|r| r.name == region)
+            .map(|r| (r.page_size, r.bloom_bits_per_key))
             .unwrap_or(self.default)
+    }
+
+    /// The issue-27 actuator: the tile count at which `region`'s automatic
+    /// merges become eligible. An undeclared region returns the policy default
+    /// (today: 2).
+    pub fn merge_min_tiles_for_region(&self, region: &str) -> u8 {
+        self.regions
+            .iter()
+            .find(|r| r.name == region)
+            .map(|r| r.merge_min_tiles)
+            .unwrap_or(self.default_merge_min_tiles)
     }
 
     /// The policy-wide default, returned for every region without an override.
     pub fn default_layout(&self) -> (u32, u8) { self.default }
 
-    /// Override one named prefix-region; returns the previous value when the
-    /// region was already declared. `page_size` is validated by the tile writer,
-    /// not here, so a bad override surfaces as a failed tile build (`InvalidData`).
+    /// The policy-wide merge threshold, returned for every region without an
+    /// override (today: [`DEFAULT_MERGE_MIN_TILES`]).
+    pub fn default_merge_min_tiles(&self) -> u8 { self.default_merge_min_tiles }
+
+    /// Override one named prefix-region's page size and bloom bits; the region's
+    /// merge threshold keeps its existing value (or the policy default). Returns
+    /// the previous `(page_size, bits)` when the region was already declared.
+    /// `page_size` is validated by the tile writer, not here, so a bad override
+    /// surfaces as a failed tile build (`InvalidData`).
     pub fn set_region(&mut self, region: &str, page_size: u32, bloom_bits_per_key: u8) -> Option<(u32, u8)> {
-        if let Some(entry) = self.regions.iter_mut().find(|(name, _, _)| name == region) {
-            let previous = (entry.1, entry.2);
-            entry.1 = page_size;
-            entry.2 = bloom_bits_per_key;
+        if let Some(entry) = self.regions.iter_mut().find(|r| r.name == region) {
+            let previous = (entry.page_size, entry.bloom_bits_per_key);
+            entry.page_size = page_size;
+            entry.bloom_bits_per_key = bloom_bits_per_key;
             return Some(previous);
         }
-        self.regions.push((region.to_string(), page_size, bloom_bits_per_key));
+        let merge_min_tiles = self.default_merge_min_tiles;
+        self.regions.push(RegionLayout { name: region.to_string(), page_size, bloom_bits_per_key, merge_min_tiles });
         None
+    }
+
+    /// Override one named prefix-region's merge threshold; the region's page
+    /// size and bloom bits keep their existing values (or the policy default).
+    /// Returns the previous threshold when the region was already declared.
+    pub fn set_region_merge(&mut self, region: &str, merge_min_tiles: u8) -> Option<u8> {
+        if let Some(entry) = self.regions.iter_mut().find(|r| r.name == region) {
+            return Some(std::mem::replace(&mut entry.merge_min_tiles, merge_min_tiles));
+        }
+        let (page_size, bloom_bits_per_key) = self.default;
+        self.regions.push(RegionLayout { name: region.to_string(), page_size, bloom_bits_per_key, merge_min_tiles });
+        None
+    }
+
+    /// Set the policy-wide merge threshold returned for every region without an
+    /// override.
+    pub fn set_default_merge_min_tiles(&mut self, merge_min_tiles: u8) { self.default_merge_min_tiles = merge_min_tiles; }
+
+    /// The frozen controller-facing JSON form of this policy (sorted object
+    /// keys, so a dump is byte-deterministic). Mirrors [`LayoutPolicy::from_json_slice`].
+    pub fn to_json(&self) -> serde_json::Value {
+        let mut regions = serde_json::Map::new();
+        for r in &self.regions {
+            regions.insert(r.name.clone(), serde_json::json!({
+                "page_size": r.page_size,
+                "bloom_bits_per_key": r.bloom_bits_per_key,
+                "merge_min_tiles": r.merge_min_tiles,
+            }));
+        }
+        serde_json::json!({
+            "default": {
+                "page_size": self.default.0,
+                "bloom_bits_per_key": self.default.1,
+                "merge_min_tiles": self.default_merge_min_tiles,
+            },
+            "regions": serde_json::Value::Object(regions),
+        })
+    }
+
+    /// Parse the frozen JSON policy-file schema (see the type docs). Rejects the
+    /// whole document - not individual entries - on any malformed field, invalid
+    /// value, or region key that is not a real region spelling.
+    pub fn from_json_slice(bytes: &[u8]) -> io::Result<Self> {
+        let file: PolicyFile = serde_json::from_slice(bytes)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("policy file is not valid JSON: {e}")))?;
+        let mut policy = Self::declared_default();
+        if let Some(entry) = &file.default {
+            if let Some(page) = entry.page_size {
+                validate_page_size(page)?;
+                policy.default.0 = page;
+            }
+            if let Some(bits) = entry.bloom_bits_per_key {
+                validate_bloom_bits(bits)?;
+                policy.default.1 = bits;
+            }
+            if let Some(min) = entry.merge_min_tiles {
+                validate_merge_min_tiles(min)?;
+                policy.default_merge_min_tiles = min;
+            }
+        }
+        for (name, entry) in &file.regions {
+            if !is_region_spelling(name) {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, format!(
+                    "policy region {name:?} is not a region spelling (expected P|<entity>, U|<entity> or R|<entity> with a non-empty entity)")));
+            }
+            let mut layout = RegionLayout {
+                name: name.clone(),
+                page_size: policy.default.0,
+                bloom_bits_per_key: policy.default.1,
+                merge_min_tiles: policy.default_merge_min_tiles,
+            };
+            if let Some(page) = entry.page_size {
+                validate_page_size(page)?;
+                layout.page_size = page;
+            }
+            if let Some(bits) = entry.bloom_bits_per_key {
+                validate_bloom_bits(bits)?;
+                layout.bloom_bits_per_key = bits;
+            }
+            if let Some(min) = entry.merge_min_tiles {
+                validate_merge_min_tiles(min)?;
+                layout.merge_min_tiles = min;
+            }
+            if let Some(existing) = policy.regions.iter_mut().find(|r| r.name == *name) {
+                *existing = layout;
+            } else {
+                policy.regions.push(layout);
+            }
+        }
+        Ok(policy)
+    }
+
+    /// Read and parse the JSON policy file at `path`. See
+    /// [`LayoutPolicy::from_json_slice`] for the schema and error policy.
+    pub fn from_json_file(path: &Path) -> io::Result<Self> {
+        let bytes = fs::read(path).map_err(|e| io::Error::new(e.kind(), format!("policy file {} unreadable: {e}", path.display())))?;
+        Self::from_json_slice(&bytes)
     }
 
     /// Provisional benchmark override: read `FLASHDB_PAGE_SIZE` and
@@ -182,6 +364,57 @@ impl LayoutPolicy {
         }
         policy
     }
+}
+
+/// One entry of the JSON policy file: every field is optional and falls back to
+/// the policy default. `deny_unknown_fields` makes a typo a hard error rather
+/// than a silently ignored setting.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PolicyEntry {
+    #[serde(default)]
+    page_size: Option<u32>,
+    #[serde(default)]
+    bloom_bits_per_key: Option<u8>,
+    #[serde(default)]
+    merge_min_tiles: Option<u8>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PolicyFile {
+    #[serde(default)]
+    default: Option<PolicyEntry>,
+    #[serde(default)]
+    regions: BTreeMap<String, PolicyEntry>,
+}
+
+fn validate_page_size(page: u32) -> io::Result<()> {
+    if (MIN_PAGE_SIZE..=MAX_PAGE_SIZE).contains(&page) { Ok(()) } else {
+        Err(io::Error::new(io::ErrorKind::InvalidData, format!(
+            "policy page_size={page} is not in {MIN_PAGE_SIZE}..={MAX_PAGE_SIZE}")))
+    }
+}
+
+fn validate_bloom_bits(bits: u8) -> io::Result<()> {
+    if bits <= 64 { Ok(()) } else {
+        Err(io::Error::new(io::ErrorKind::InvalidData, format!(
+            "policy bloom_bits_per_key={bits} is above the supported maximum 64")))
+    }
+}
+
+fn validate_merge_min_tiles(min: u8) -> io::Result<()> {
+    if min >= DEFAULT_MERGE_MIN_TILES { Ok(()) } else {
+        Err(io::Error::new(io::ErrorKind::InvalidData, format!(
+            "policy merge_min_tiles={min} must be >= {DEFAULT_MERGE_MIN_TILES} (a merge needs two tiles)")))
+    }
+}
+
+/// Whether `name` is a well-formed region spelling: `P`/`U`/`R`, a `|`, and a
+/// non-empty entity (the only names [`keys::region_name`] can produce).
+fn is_region_spelling(name: &str) -> bool {
+    matches!(name.split_once('|'), Some((family, entity))
+        if matches!(family, "P" | "U" | "R") && !entity.is_empty())
 }
 
 /// The largest active-tile list the engine will hold, re-exported from
@@ -1084,6 +1317,14 @@ impl Engine {
     /// invariants (contiguous run, length >= 2, union range, disjoint ranges,
     /// streaming merge) are shared by every [`CompactShape`]; only `select_run`
     /// differs.
+    ///
+    /// Under [`RegionMode::PerRegion`] the run is selected per region (never
+    /// across regions) and a region is eligible only once its own tile count
+    /// reaches its [`LayoutPolicy`] merge threshold - the slice-27 actuator. The
+    /// `max_tiles` gate below still decides whether compaction runs at all; a
+    /// region whose threshold is not yet reached is simply skipped, so a high
+    /// threshold defers that region's merges while an eager neighbour keeps
+    /// compacting.
     pub fn maybe_compact_shape(&mut self, max_merge_bytes: u64, max_tiles: usize, shape: CompactShape) -> io::Result<Option<u64>> {
         if self.tiles.len() < max_tiles || self.tiles.len() < 2 {
             return Ok(None);
@@ -1122,11 +1363,13 @@ impl Engine {
     }
 
     /// The list indices of a run to merge WITHIN one region, or `None` when no
-    /// region has at least two tiles. Region-partitioned compaction never merges
-    /// across regions: each region's tiers are its own, so a per-region trigger
-    /// is meaningful. The run is selected by the same [`CompactShape`] policy
-    /// applied to that region's own cutoff-ordered sizes, and among regions the
-    /// smallest combined run wins (ties: the oldest list index).
+    /// region is eligible. Region-partitioned compaction never merges across
+    /// regions: each region's tiers are its own, so a per-region trigger is
+    /// meaningful. A region is eligible only when its OWN tile count reaches its
+    /// `LayoutPolicy` merge threshold ([`LayoutPolicy::merge_min_tiles_for_region`],
+    /// today 2); among eligible regions the smallest combined run wins (ties: the
+    /// oldest list index). The run is selected by the same [`CompactShape`] policy
+    /// applied to that region's own cutoff-ordered sizes.
     fn select_region_run(&self, max_merge_bytes: u64, max_tiles: usize, shape: CompactShape) -> io::Result<Option<Vec<usize>>> {
         let sizes: Vec<u64> = self.tiles
             .iter()
@@ -1141,8 +1384,9 @@ impl Engine {
             groups.entry(region).or_default().push(i);
         }
         let mut best: Option<(u64, usize, Vec<usize>)> = None;
-        for idxs in groups.values() {
-            if idxs.len() < 2 { continue; }
+        for (region, idxs) in &groups {
+            let threshold = self.layout.merge_min_tiles_for_region(&keys::region_name(region));
+            if idxs.len() < 2 || idxs.len() < threshold as usize { continue; }
             let region_sizes: Vec<u64> = idxs.iter().map(|&i| sizes[i]).collect();
             let (start, len) = Self::choose_run(&region_sizes, max_merge_bytes, max_tiles, shape);
             let combined: u64 = region_sizes[start..start + len].iter().sum();
@@ -1404,6 +1648,20 @@ impl Engine {
     /// regions disjoint.
     pub fn active_tile_cutoffs(&self) -> Vec<u64> {
         self.tiles.iter().map(|t| t.cutoff()).collect()
+    }
+
+    /// Each active tile's region name in list order (inspection/benchmark hook),
+    /// derived from the tile's own first key, so it is correct for both layouts.
+    /// `None` for a whole-keyspace (Global) tile or an empty one.
+    pub fn active_tile_regions(&self) -> Vec<Option<String>> {
+        self.tiles.iter().map(|t| tile_first_region(t).map(keys::region_name)).collect()
+    }
+
+    /// Sum of the active tiles' on-disk file lengths (inspection/benchmark hook).
+    /// Unlike a directory glob this counts only manifest-referenced tiles, so it
+    /// is not inflated by orphaned files a crash or failed compaction left behind.
+    pub fn active_tile_bytes(&self) -> io::Result<u64> {
+        self.tiles.iter().try_fold(0u64, |acc, t| Ok(acc.saturating_add(fs::metadata(self.dir.join(&t.name))?.len())))
     }
 
     /// Create-new the compacted tile for the `(lower, cutoff]` union of the
@@ -1671,9 +1929,12 @@ impl Engine {
     pub fn serving_memtable_entries(&self) -> usize { self.mt.len() }
 
     /// Install the provisional layout policy the two tile write paths (publish and
-    /// compaction) consult. The default is [`LayoutPolicy::declared_default`].
+    /// compaction) consult, including the per-region merge threshold the
+    /// automatic compaction trigger reads. The default is
+    /// [`LayoutPolicy::declared_default`].
     /// Because the policy is not persisted, setting it affects only tiles written
-    /// after this call; every existing tile keeps the parameters in its own
+    /// after this call and the future merge schedule; every existing tile keeps
+    /// the parameters in its own
     /// superblock and is read on those terms.
     pub fn set_layout_policy(&mut self, policy: LayoutPolicy) { self.layout = policy; }
 
@@ -3318,6 +3579,22 @@ mod tests {
         assert_eq!(policy.set_region("U|Order|no", 8192, 7), Some((65536, 14)));
         assert_eq!(policy.for_region("U|Order|no"), (8192, 7));
         assert_eq!(policy.for_region("U|Order|other"), (16384, 0));
+
+        // Slice 27: the merge threshold defaults to today's effective value and
+        // is set/looked up per region independently of the page/bloom layout.
+        let policy = LayoutPolicy::declared_default();
+        assert_eq!(policy.default_merge_min_tiles(), DEFAULT_MERGE_MIN_TILES);
+        assert_eq!(DEFAULT_MERGE_MIN_TILES, 2, "today's effective per-region threshold");
+        assert_eq!(policy.merge_min_tiles_for_region("anything"), 2);
+        let mut policy = LayoutPolicy::declared_default();
+        assert_eq!(policy.set_region_merge("P|Order", 64), None);
+        assert_eq!(policy.merge_min_tiles_for_region("P|Order"), 64);
+        assert_eq!(policy.merge_min_tiles_for_region("U|Stock"), 2, "another region keeps the default");
+        assert_eq!(policy.set_region_merge("P|Order", 8), Some(64));
+        assert_eq!(policy.for_region("P|Order"), (4096, 10), "a merge-only row keeps the layout default");
+        // A layout override on an existing merge-only row keeps its threshold.
+        policy.set_region("P|Order", 65536, 4);
+        assert_eq!(policy.merge_min_tiles_for_region("P|Order"), 8);
     }
 
     /// White-box proof that both write paths take their per-tile parameters from

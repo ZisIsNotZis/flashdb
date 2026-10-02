@@ -1,0 +1,45 @@
+traces seed_blocks=21 write_requests=2000 read_requests=1000 rate_rps=200
+seed_inventory: phase=seed-inventory ok=true blocks=21 docs=21000 customers=5000 stocks=16000 csn=21 publishes=19 tiles=38 serving_memtable_entries=0 region_mode=per_region layout_page_size=4096 layout_bloom_bits=10 dir=/tmp/slice27/base elapsed_s=1.631
+checkpoint: phase=checkpoint ok=true csn_before=1428 published=true csn=1428 tiles=45 serving_memtable_entries=0 region_mode=per_region dir=/tmp/slice27/base
+base active_tiles=45 memtable_entries=0 tiles_per_region={'P|Customer': 3, 'U|Customer': 3, 'P|Stock': 17, 'U|Stock': 16, 'P|Order': 1, 'P|StockMovement': 1, 'R|Order': 1, 'R|StockMovement': 1, 'U|Order': 1, 'U|StockMovement': 1}
+split_policy={"default": {"merge_min_tiles": 2}, "regions": {"P|Order": {"merge_min_tiles": 200}, "R|Order": {"merge_min_tiles": 200}, "R|StockMovement": {"merge_min_tiles": 200}, "U|StockMovement": {"merge_min_tiles": 200}}}
+defer_policy={"default": {"merge_min_tiles": 2}, "regions": {"P|Stock": {"merge_min_tiles": 200}, "U|Stock": {"merge_min_tiles": 200}, "P|Customer": {"merge_min_tiles": 200}, "U|Customer": {"merge_min_tiles": 200}}}
+eager compact: phase=compact ok=true shape=budget_prefix region_mode=per_region merges=5 compaction_bytes=12629247 tile_bytes_before=4287849 tile_bytes_after=4863653 rewrite_factor=2.945 active_tiles_before=45 active_tiles_after=7 tiles_per_region_before=P|Customer:3,U|Customer:3,P|Stock:17,U|Stock:16,P|Order:1,P|StockMovement:1,R|Order:1,R|StockMovement:1,U|Order:1,U|StockMovement:1 tiles_per_region_after=P|Customer:1,P|Order:1,P|StockMovement:1,R|Order:1,R|StockMovement:1,U|Order:1,U|StockMovement:1 dir=/tmp/slice27/eager
+eager after active_tiles=7 tiles_per_region={'P|Customer': 8, 'U|Customer': 3, 'P|Stock': 17, 'U|Stock': 16, 'P|Order': 1, 'P|StockMovement': 1, 'R|Order': 1, 'R|StockMovement': 1, 'U|Order': 1, 'U|StockMovement': 1}
+eager device_fsync_p50_us=6353
+eager region=P|Customer probes=19 p50_ns=33034 p99_ns=53877 bytes_read=86835
+eager region=P|Stock probes=26 p50_ns=32746 p99_ns=40739 bytes_read=110179
+eager region=P|StockMovement probes=0 p50_ns=2960789 p99_ns=4102380 bytes_read=2445798
+eager region=U|Customer probes=19 p50_ns=52392 p99_ns=71252 bytes_read=86436
+eager region=U|Stock probes=26 p50_ns=49371 p99_ns=81940 bytes_read=107458
+eager load_summary: load_summary requests=1000 completed=1000 errors=0 else_used=0 late_total=0 windows=4 invalid_windows=0 last_valid_rate_rps=200 saturated_at_rps=none commit_batch=1 group_requests=none elapsed_ms=5000 achieved_rps=200 first_error="none"
+split compact: phase=compact ok=true shape=budget_prefix region_mode=per_region merges=5 compaction_bytes=12629247 tile_bytes_before=4287849 tile_bytes_after=4863653 rewrite_factor=2.945 active_tiles_before=45 active_tiles_after=7 tiles_per_region_before=P|Customer:3,U|Customer:3,P|Stock:17,U|Stock:16,P|Order:1,P|StockMovement:1,R|Order:1,R|StockMovement:1,U|Order:1,U|StockMovement:1 tiles_per_region_after=P|Customer:1,P|Order:1,P|StockMovement:1,R|Order:1,R|StockMovement:1,U|Order:1,U|StockMovement:1 dir=/tmp/slice27/split
+split after active_tiles=7 tiles_per_region={'P|Customer': 8, 'U|Customer': 3, 'P|Stock': 17, 'U|Stock': 16, 'P|Order': 1, 'P|StockMovement': 1, 'R|Order': 1, 'R|StockMovement': 1, 'U|Order': 1, 'U|StockMovement': 1}
+split device_fsync_p50_us=6636
+split region=P|Customer probes=19 p50_ns=32651 p99_ns=40739 bytes_read=86835
+split region=P|Stock probes=26 p50_ns=33170 p99_ns=40739 bytes_read=110179
+split region=P|StockMovement probes=0 p50_ns=7175088 p99_ns=10912412 bytes_read=2445798
+split region=U|Customer probes=19 p50_ns=46850 p99_ns=81940 bytes_read=86436
+split region=U|Stock probes=26 p50_ns=47795 p99_ns=2697381 bytes_read=107458
+split load_summary: load_summary requests=1000 completed=1000 errors=0 else_used=0 late_total=1 windows=4 invalid_windows=0 last_valid_rate_rps=200 saturated_at_rps=none commit_batch=1 group_requests=none elapsed_ms=5000 achieved_rps=200 first_error="none"
+defer compact: phase=compact ok=true shape=budget_prefix region_mode=per_region merges=0 compaction_bytes=0 tile_bytes_before=4287849 tile_bytes_after=4287849 rewrite_factor=0.000 active_tiles_before=45 active_tiles_after=45 tiles_per_region_before=P|Customer:3,U|Customer:3,P|Stock:17,U|Stock:16,P|Order:1,P|StockMovement:1,R|Order:1,R|StockMovement:1,U|Order:1,U|StockMovement:1 tiles_per_region_after=P|Customer:3,U|Customer:3,P|Stock:17,U|Stock:16,P|Order:1,P|StockMovement:1,R|Order:1,R|StockMovement:1,U|Order:1,U|StockMovement:1 dir=/tmp/slice27/defer
+defer after active_tiles=45 tiles_per_region={'P|Customer': 3, 'U|Customer': 3, 'P|Stock': 17, 'U|Stock': 16, 'P|Order': 1, 'P|StockMovement': 1, 'R|Order': 1, 'R|StockMovement': 1, 'U|Order': 1, 'U|StockMovement': 1}
+defer device_fsync_p50_us=6529
+defer region=P|Customer probes=19 p50_ns=27417 p99_ns=40739 bytes_read=82180
+defer region=P|Stock probes=26 p50_ns=35924 p99_ns=53877 bytes_read=213040
+defer region=P|StockMovement probes=0 p50_ns=2892619 p99_ns=5425398 bytes_read=1213572
+defer region=U|Customer probes=19 p50_ns=51425 p99_ns=71252 bytes_read=80474
+defer region=U|Stock probes=26 p50_ns=43081 p99_ns=53877 bytes_read=107174
+defer load_summary: load_summary requests=1000 completed=1000 errors=0 else_used=0 late_total=0 windows=4 invalid_windows=0 last_valid_rate_rps=200 saturated_at_rps=none commit_batch=1 group_requests=none elapsed_ms=5000 achieved_rps=200 first_error="none"
+=== comparison ===
+merges eager=5 split=5
+compaction_bytes eager=12629247 split=12629247
+rewrite_factor eager=2.945 split=2.945
+tile_bytes_before eager=4287849 split=4287849
+tile_bytes_after eager=4863653 split=4863653
+eager merges=5 compaction_bytes=12629247 rewrite_factor=2.945 after_active=7
+split merges=5 compaction_bytes=12629247 rewrite_factor=2.945 after_active=7
+defer merges=0 compaction_bytes=0 rewrite_factor=0.000 after_active=45
+CONSTRAINT_VIOLATION region=P|StockMovement eager_p99=4102380.05 split_p99=10912412.1
+CONSTRAINT_VIOLATION region=U|Stock eager_p99=81939.79999999999 split_p99=2697381.3499999996
+constraint_margin=0.25

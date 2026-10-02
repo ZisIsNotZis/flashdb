@@ -14,6 +14,17 @@
 //!   flashdb-load <dir-or-wal> <trace.jsonl> --rate-rps R[,R...] [--segment-requests N]
 //!                [--window-ms 1000] [--ceiling-us N] [--patterns] [--metrics-json]
 //!                [--commit-batch B] [--group-requests B] [--no-tiles]
+//!                [--policy-file PATH] [--policy-reload]
+//!
+//! External policy control (slice 27): `--policy-file PATH` (or the
+//! `FLASHDB_POLICY_FILE` env var) points the driver at the frozen JSON policy
+//! file documented on [`flashdb_engine::engine::LayoutPolicy`]; it is read once
+//! at open and installed on the engine. With `--policy-reload` the driver
+//! re-reads and re-installs it at every window boundary, which is how an
+//! external controller can retune the per-region merge trigger while a run is in
+//! flight. A reload error is reported on stderr and the previously installed
+//! policy is kept. The active policy is printed in the metrics JSON
+//! (`"policy"`) so the controller can see what the engine actually holds.
 //!
 //! `--metrics-json` prints one JSON object per window (instead of the human
 //! `window=` line) so a controller can consume per-region and per-pattern
@@ -34,7 +45,7 @@ use std::path::Path;
 use std::io::{self, BufRead, BufReader, Write};
 use std::time::{Duration, Instant};
 
-use flashdb_engine::engine::{BatchOutcome, Engine, Op, Outcome};
+use flashdb_engine::engine::{BatchOutcome, Engine, LayoutPolicy, Op, Outcome};
 use flashdb_engine::metrics::WindowSnapshot;
 use flashdb_engine::replay::execute_requests_grouped;
 use flashdb_engine::request::execute_request;
@@ -57,11 +68,13 @@ struct Args {
     commit_batch: Option<u64>,
     group_requests: Option<u64>,
     discover: bool,
+    policy_file: Option<String>,
+    policy_reload: bool,
 }
 
 fn parse_args(argv: Vec<String>) -> Result<Args, String> {
     if argv.len() < 3 {
-        return Err("usage: flashdb-load <dir-or-wal> <trace.jsonl> --rate-rps R[,R...] [--segment-requests N] [--window-ms N] [--ceiling-us N] [--patterns] [--metrics-json] [--commit-batch B] [--group-requests B] [--no-tiles]".into());
+        return Err("usage: flashdb-load <dir-or-wal> <trace.jsonl> --rate-rps R[,R...] [--segment-requests N] [--window-ms N] [--ceiling-us N] [--patterns] [--metrics-json] [--commit-batch B] [--group-requests B] [--no-tiles] [--policy-file PATH] [--policy-reload]".into());
     }
     let mut args = Args {
         target: argv[1].clone(),
@@ -75,6 +88,8 @@ fn parse_args(argv: Vec<String>) -> Result<Args, String> {
         commit_batch: None,
         group_requests: None,
         discover: true,
+        policy_file: None,
+        policy_reload: false,
     };
     let mut i = 3;
     while i < argv.len() {
@@ -117,6 +132,11 @@ fn parse_args(argv: Vec<String>) -> Result<Args, String> {
             }
             "--patterns" => { args.patterns = true; i += 1; }
             "--metrics-json" => { args.metrics_json = true; i += 1; }
+            "--policy-file" => {
+                args.policy_file = Some(argv.get(i + 1).ok_or("--policy-file needs a value")?.clone());
+                i += 2;
+            }
+            "--policy-reload" => { args.policy_reload = true; i += 1; }
             "--no-tiles" => { args.discover = false; i += 1; }
             other => return Err(format!("unknown argument {other:?}")),
         }
@@ -128,6 +148,9 @@ fn parse_args(argv: Vec<String>) -> Result<Args, String> {
     if args.window_ms == 0 { return Err("--window-ms must be positive".into()); }
     if args.commit_batch.is_some() && args.group_requests.is_some() {
         return Err("--commit-batch and --group-requests are different workloads; pick one".into());
+    }
+    if args.policy_reload && args.policy_file.is_none() {
+        return Err("--policy-reload needs --policy-file (or FLASHDB_POLICY_FILE)".into());
     }
     Ok(args)
 }
@@ -174,13 +197,28 @@ fn percentile_us(sorted_us: &[u64], q: f64) -> Option<u64> {
     Some(sorted_us[idx])
 }
 
+/// The policy file the driver should read: `--policy-file` wins over the
+/// `FLASHDB_POLICY_FILE` env var; `None` means the engine keeps its default
+/// policy (today's behaviour).
+fn policy_file_path(cli: Option<&str>) -> Option<String> {
+    cli.map(str::to_string)
+        .or_else(|| std::env::var("FLASHDB_POLICY_FILE").ok().filter(|s| !s.is_empty()))
+}
+
+/// Read and parse the JSON policy file at `path`. The schema and its reject-on-
+/// invalid error policy are documented on [`LayoutPolicy`].
+fn read_policy(path: &str) -> io::Result<LayoutPolicy> {
+    LayoutPolicy::from_json_file(Path::new(path))
+}
+
 /// Frozen machine-readable window line for `--metrics-json`. Top-level fields:
 /// `window`, `rate_rps`, `requests` (this window), `completed`/`errors`
-/// (cumulative), `p50_us`/`p99_us` (this window), then `current` and `previous`
-/// window snapshots. A window snapshot is `{"patterns", "regions"}` as frozen by
-/// [`WindowSnapshot::to_json`]; `previous` is `null` for the first window. Object
-/// key order is serde_json's sorted map, so two identical runs emit identical
-/// lines.
+/// (cumulative), `p50_us`/`p99_us` (this window), `policy` (the active
+/// per-region policy, see [`LayoutPolicy::to_json`]), then `current` and
+/// `previous` window snapshots. A window snapshot is `{"patterns", "regions"}`
+/// as frozen by [`WindowSnapshot::to_json`]; `previous` is `null` for the first
+/// window. Object key order is serde_json's sorted map, so two identical runs
+/// emit identical lines.
 fn metrics_json_line(
     window: u64,
     rate: f64,
@@ -189,6 +227,7 @@ fn metrics_json_line(
     errors: u64,
     p50_us: u64,
     p99_us: u64,
+    policy: serde_json::Value,
     current: &WindowSnapshot,
     previous: Option<&WindowSnapshot>,
 ) -> String {
@@ -200,6 +239,7 @@ fn metrics_json_line(
         "errors": errors,
         "p50_us": p50_us,
         "p99_us": p99_us,
+        "policy": policy,
         "current": current.to_json(),
         "previous": previous.map(WindowSnapshot::to_json),
     })
@@ -293,6 +333,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // interpreted: "saturation" may be the device, not the engine. Same session, same directory.
     let device = probe_device(&probe_dir(&args.target), 100);
     let mut engine = open_target(&args.target, args.discover)?;
+    // External policy control: apply the JSON policy file (CLI wins over the
+    // `FLASHDB_POLICY_FILE` env var) before any work. A malformed file is a hard
+    // error at start: the controller asked for a policy it did not get.
+    let policy_path = policy_file_path(args.policy_file.as_deref());
+    if let Some(path) = &policy_path {
+        let policy = read_policy(path)
+            .map_err(|e| io::Error::new(e.kind(), format!("policy file {path}: {e}")))?;
+        engine.set_layout_policy(policy);
+    }
     let stdout = io::stdout();
     let mut out = stdout.lock();
     writeln!(out, "device_fsync_p50_us={} device_fsync_p99_us={}",
@@ -302,6 +351,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // from tiles; with --no-tiles the same data is fully replayed into the memtable.
     writeln!(out, "engine_open target={} discover={} active_tiles={} serving_memtable_entries={}",
         args.target, args.discover, engine.active_tile_cutoffs().len(), engine.serving_memtable_entries())?;
+    writeln!(out, "engine_policy policy={}", engine.layout_policy().to_json())?;
 
     let t0 = Instant::now();
     // `due_us` is ALWAYS the due time of the next request to issue, so an unissued request never
@@ -496,11 +546,21 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 // is `previous`. Emitting JSON instead of the human line keeps
                 // stdout parseable by the controller; the header and summary
                 // lines are not `{`-prefixed and are ignored by a JSONL reader.
+                // With `--policy-reload` the file is re-read here, before the
+                // snapshot, so the controller sees the policy it just set.
+                if args.policy_reload {
+                    if let Some(path) = &policy_path {
+                        match read_policy(path) {
+                            Ok(policy) => engine.set_layout_policy(policy),
+                            Err(e) => eprintln!("flashdb-load: policy reload {path} failed; keeping previous policy: {e}"),
+                        }
+                    }
+                }
                 let current = engine.metrics_snapshot();
                 let previous = engine.metrics_previous_window();
                 writeln!(out, "{}", metrics_json_line(
                     window_index, window_rate, latencies.len() as u64, completed, errors,
-                    p50, p99, &current, previous.as_ref()))?;
+                    p50, p99, engine.layout_policy().to_json(), &current, previous.as_ref()))?;
                 engine.metrics_rotate_window();
             } else {
                 writeln!(out, "window={window_index} rate_rps={:.0} requests={} completed={completed} \
@@ -582,15 +642,31 @@ mod tests {
     }
 
     #[test]
+    fn policy_file_and_reload_flags_are_parsed() {
+        let argv = vec!["b".into(), "wal".into(), "t.jsonl".into(), "--rate-rps".into(), "10".into(),
+                        "--policy-file".into(), "/tmp/p.json".into(), "--policy-reload".into()];
+        let args = parse_args(argv).expect("valid policy args");
+        assert_eq!(args.policy_file.as_deref(), Some("/tmp/p.json"));
+        assert!(args.policy_reload);
+        assert!(parse_args(vec!["b".into(), "wal".into(), "t.jsonl".into(), "--rate-rps".into(), "10".into(),
+                                "--policy-reload".into()]).is_err(),
+            "--policy-reload without a policy source is rejected");
+        assert!(parse_args(vec!["b".into(), "wal".into(), "t.jsonl".into(), "--rate-rps".into(), "10".into(),
+                                "--policy-file".into()]).is_err(),
+            "--policy-file needs a value");
+    }
+
+    #[test]
     fn metrics_json_line_freezes_the_wrapper_field_names() {
         let empty = WindowSnapshot::default();
-        let line = metrics_json_line(3, 120.0, 10, 9, 1, 500, 1500, &empty, None);
+        let policy = LayoutPolicy::declared_default().to_json();
+        let line = metrics_json_line(3, 120.0, 10, 9, 1, 500, 1500, policy.clone(), &empty, None);
         assert_eq!(
             line,
-            r#"{"completed":9,"current":{"patterns":[],"regions":[]},"errors":1,"p50_us":500,"p99_us":1500,"previous":null,"rate_rps":120.0,"requests":10,"window":3}"#
+            r#"{"completed":9,"current":{"patterns":[],"regions":[]},"errors":1,"p50_us":500,"p99_us":1500,"policy":{"default":{"bloom_bits_per_key":10,"merge_min_tiles":2,"page_size":4096},"regions":{}},"previous":null,"rate_rps":120.0,"requests":10,"window":3}"#
         );
         // A previous window is embedded as an object, not a string.
-        let with_prev = metrics_json_line(4, 120.0, 10, 19, 1, 500, 1500, &empty, Some(&empty));
+        let with_prev = metrics_json_line(4, 120.0, 10, 19, 1, 500, 1500, policy, &empty, Some(&empty));
         assert!(with_prev.contains(r#""previous":{"patterns":[],"regions":[]}"#), "got {with_prev}");
     }
 
