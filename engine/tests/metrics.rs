@@ -2,8 +2,8 @@
 //! cap's folding rule, window rollup, disabled mode, determinism, and the
 //! engine call-site instrumentation.
 
-use flashdb_engine::engine::{Engine, Op};
-use flashdb_engine::metrics::{Metrics, WindowSnapshot, DISABLED, MAX_PATTERNS, OTHER};
+use flashdb_engine::engine::{Engine, Op, RegionMode};
+use flashdb_engine::metrics::{Metrics, RegionSummary, WindowSnapshot, DISABLED, MAX_PATTERNS, MAX_REGIONS, OTHER};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -209,4 +209,187 @@ fn engine_instruments_each_read_path_and_commit() {
     assert_eq!(after, snap, "disabled calls must not change any counter");
 
     let _ = std::fs::remove_dir_all(&d);
+}
+
+// ---------- slice 26: per-region counters ----------
+
+fn region_of<'a>(snap: &'a WindowSnapshot, name: &str) -> Option<&'a RegionSummary> {
+    snap.regions.iter().find(|r| r.region == name)
+}
+
+#[test]
+fn region_counters_attribute_probes_misses_reads_writes_and_commits() {
+    let d = dir();
+    let mut e = Engine::create(d.join("data.wal")).unwrap();
+    e.set_region_mode(RegionMode::PerRegion);
+    // Two docs in P|E at handles 1 and 5, published so the reads are tile-resident.
+    e.commit_block(b"b1", &[
+        Op::PutDoc { entity: b"E".to_vec(), handle: 1, doc: b"a".to_vec() },
+        Op::PutDoc { entity: b"E".to_vec(), handle: 5, doc: b"b".to_vec() },
+    ]).unwrap();
+    e.build_tile(d.join("data.tile"), 1).unwrap();
+    assert_eq!(e.serving_memtable_entries(), 0, "reads must be tile-resident");
+
+    assert_eq!(e.get(b"E", 1).unwrap().as_deref(), Some(&b"a"[..]), "hit");
+    assert_eq!(e.get(b"E", 3).unwrap(), None, "in-range miss (handle 3 sits between 1 and 5)");
+    assert_eq!(e.get(b"F", 1).unwrap(), None, "a region no tile covers");
+
+    let snap = e.metrics_snapshot();
+    let pe = region_of(&snap, "P|E").expect("P|E region row");
+    assert_eq!(pe.probes, 2, "the two P|E gets; the P|F get is its own region");
+    assert_eq!(pe.probe_misses, 1, "handle 1 is a hit, handle 3 is a miss");
+    assert!(pe.bytes_read > 0, "the in-range miss still read a tile block");
+    assert_eq!(pe.commit_ops, 2);
+    assert_eq!(pe.commit_blocks, 1, "both ops were in one block");
+    assert_eq!(pe.count, 2, "two latency samples: the hit and the in-range miss");
+    assert!(pe.mean_ns > 0.0, "a tile read takes measurable time");
+    // entity "E" (1 byte), doc 1 byte: each op = tag 1 + (4+1) + 8 + (4+1) = 19.
+    assert_eq!(pe.bytes_written, 38, "two 19-byte PutDoc ops");
+
+    let pf = region_of(&snap, "P|F").expect("P|F region row");
+    assert_eq!(pf.probes, 1);
+    assert_eq!(pf.probe_misses, 1);
+    assert_eq!(pf.bytes_read, 0, "no tile covers P|F, so no block was read");
+    assert_eq!(pf.bytes_written, 0, "P|F was only read");
+    assert!(region_of(&snap, "U|E").is_none(), "an idle region must not appear");
+
+    // A unique-index commit lands in U|E, not P|E: same entity, different family.
+    e.commit_block(b"b2", &[Op::PutUnique {
+        entity: b"E".to_vec(), field: b"f".to_vec(), value: b"v".to_vec(), handle: 1,
+    }]).unwrap();
+    let snap = e.metrics_snapshot();
+    let ue = region_of(&snap, "U|E").expect("U|E region row");
+    assert_eq!(ue.commit_ops, 1);
+    assert_eq!(ue.bytes_written, 1 + (4 + 1) + (4 + 1) + (4 + 1) + 8, "one 24-byte PutUnique op");
+    assert_eq!(region_of(&snap, "P|E").unwrap().commit_blocks, 1, "the unique op is not a P|E block");
+
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn region_cap_folds_extra_regions_into_other() {
+    let mut m = Metrics::new();
+    for i in 0..MAX_REGIONS {
+        let name = format!("P{i}\x00");
+        let id = m.resolve_region(name.as_bytes());
+        assert!(id < MAX_REGIONS);
+        m.region_probe(id, true);
+    }
+    assert_eq!(m.region_count(), MAX_REGIONS);
+
+    const EXTRA: u64 = 20;
+    for i in 0..EXTRA {
+        let name = format!("X{i}\x00");
+        let id = m.resolve_region(name.as_bytes());
+        assert_eq!(id, OTHER, "a region past the cap must fold, not intern");
+        m.region_probe(id, false);
+    }
+    assert_eq!(m.region_count(), MAX_REGIONS, "the region table must not grow past the cap");
+    let snap = m.snapshot();
+    assert_eq!(snap.regions.len(), MAX_REGIONS + 1, "named regions plus the other bin");
+    let other = region_of(&snap, "other").expect("other region row");
+    assert_eq!(other.probes, EXTRA);
+    assert_eq!(other.probe_misses, EXTRA);
+    assert_eq!(region_of(&snap, "P|0").unwrap().probes, 1);
+}
+
+#[test]
+fn disabled_mode_records_no_regions() {
+    let mut m = Metrics::new();
+    m.set_enabled(false);
+    let id = m.resolve_region(b"PE\x00");
+    assert_eq!(id, DISABLED);
+    m.region_probe(id, false);
+    m.region_bytes_read(id, 4096);
+    m.region_bytes_written(id, 100);
+    m.region_commit_op(id);
+    m.region_commit_block(id);
+    m.record_region_latency(id, Duration::from_nanos(1_000));
+    m.region_probe(OTHER, false); // even a stale id is a no-op when off
+    assert!(m.snapshot().regions.is_empty());
+    assert!(m.snapshot().patterns.is_empty());
+    assert_eq!(m.region_count(), 0);
+    assert_eq!(m.resolve_region_parts(b'P', b"E"), DISABLED);
+}
+
+#[test]
+fn window_rollup_moves_region_counters_and_omits_idle_regions() {
+    let mut m = Metrics::new();
+    let a = m.resolve_region(b"PA\x00");
+    let b = m.resolve_region(b"PB\x00");
+    m.region_probe(a, true);
+    m.region_probe(a, false);
+    m.region_probe(b, true);
+    m.region_bytes_read(a, 4096);
+
+    let finished = m.rotate_window().clone();
+    assert_eq!(region_of(&finished, "P|A").unwrap().probes, 2);
+    assert_eq!(region_of(&finished, "P|A").unwrap().probe_misses, 1);
+    assert_eq!(region_of(&finished, "P|A").unwrap().bytes_read, 4096);
+    assert_eq!(region_of(&finished, "P|B").unwrap().probes, 1);
+    assert!(m.snapshot().regions.is_empty(), "the current window must be cleared");
+    assert_eq!(m.previous_window().map(|w| w.regions.len()), Some(2));
+
+    // Second window touches only P|A: P|B is interned but idle, so omitted.
+    let a2 = m.resolve_region(b"PA\x00");
+    assert_eq!(a, a2, "region indices stay stable across a rollup");
+    m.region_probe(a, true);
+    let cur = m.snapshot();
+    assert_eq!(region_of(&cur, "P|A").unwrap().probes, 1);
+    assert!(region_of(&cur, "P|B").is_none(), "an idle region is omitted, not zero-filled");
+    assert_eq!(region_of(m.previous_window().unwrap(), "P|A").unwrap().probes, 2, "the previous window is immutable");
+}
+
+#[test]
+fn region_json_dump_is_deterministic_and_uses_frozen_field_names() {
+    fn dump() -> String {
+        let mut m = Metrics::new();
+        let r = m.resolve_region(b"PStock\x00");
+        let s = m.resolve_region(b"UStock\x00");
+        m.region_probe(r, true);
+        m.region_probe(r, false);
+        m.region_bytes_read(r, 4096);
+        m.region_bytes_written(r, 100);
+        m.region_commit_op(r);
+        m.region_commit_block(r);
+        m.region_bytes_written(s, 7);
+        m.snapshot().to_json().to_string()
+    }
+    let a = dump();
+    assert_eq!(a, dump(), "same input, same dump");
+    // The whole document is pinned, so a renamed field is a failing diff here.
+    assert_eq!(
+        a,
+        r#"{"patterns":[],"regions":[{"bytes_read":4096,"bytes_written":100,"commit_blocks":1,"commit_ops":1,"count":0,"mean_ns":0.0,"p50_ns":0.0,"p99_ns":0.0,"probe_misses":1,"probes":2,"region":"P|Stock"},{"bytes_read":0,"bytes_written":7,"commit_blocks":0,"commit_ops":0,"count":0,"mean_ns":0.0,"p50_ns":0.0,"p99_ns":0.0,"probe_misses":0,"probes":0,"region":"U|Stock"}]}"#
+    );
+}
+
+#[test]
+fn identical_engine_runs_produce_the_same_region_dump() {
+    fn run() -> String {
+        let d = dir();
+        let mut e = Engine::create(d.join("data.wal")).unwrap();
+        e.commit_block(b"b1", &[
+            Op::PutDoc { entity: b"E".to_vec(), handle: 1, doc: b"a".to_vec() },
+            Op::PutDoc { entity: b"F".to_vec(), handle: 2, doc: b"b".to_vec() },
+        ]).unwrap();
+        e.build_tile(d.join("data.tile"), 1).unwrap();
+        e.get(b"E", 1).unwrap();
+        e.get(b"F", 9).unwrap();
+        let mut json = e.metrics_snapshot().to_json();
+        let _ = std::fs::remove_dir_all(&d);
+        // Latency is wall-clock and therefore not byte-reproducible; the counters
+        // are. (The metrics-level dump test pins the full document with fixed
+        // durations.)
+        if let Some(rows) = json["regions"].as_array_mut() {
+            for row in rows {
+                let obj = row.as_object_mut().unwrap();
+                for key in ["count", "mean_ns", "p50_ns", "p99_ns"] {
+                    obj.remove(key);
+                }
+            }
+        }
+        json["regions"].to_string()
+    }
+    assert_eq!(run(), run(), "same input, same region dump");
 }

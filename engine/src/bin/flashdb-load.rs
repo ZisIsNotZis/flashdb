@@ -12,8 +12,13 @@
 //!
 //! usage:
 //!   flashdb-load <dir-or-wal> <trace.jsonl> --rate-rps R[,R...] [--segment-requests N]
-//!                [--window-ms 1000] [--ceiling-us N] [--patterns] [--commit-batch B]
-//!                [--group-requests B] [--no-tiles]
+//!                [--window-ms 1000] [--ceiling-us N] [--patterns] [--metrics-json]
+//!                [--commit-batch B] [--group-requests B] [--no-tiles]
+//!
+//! `--metrics-json` prints one JSON object per window (instead of the human
+//! `window=` line) so a controller can consume per-region and per-pattern
+//! counters without parsing text. Its frozen schema is documented on
+//! `metrics_json_line`.
 //!
 //! Opening: a **directory** is opened tile-aware with `Engine::open_discover`, so a published
 //! tile is consulted before the memtable and the measured flow exercises the real tile read path;
@@ -30,6 +35,7 @@ use std::io::{self, BufRead, BufReader, Write};
 use std::time::{Duration, Instant};
 
 use flashdb_engine::engine::{BatchOutcome, Engine, Op, Outcome};
+use flashdb_engine::metrics::WindowSnapshot;
 use flashdb_engine::replay::execute_requests_grouped;
 use flashdb_engine::request::execute_request;
 use serde_json::Value;
@@ -47,6 +53,7 @@ struct Args {
     window_ms: u64,
     ceiling_us: Option<u64>,
     patterns: bool,
+    metrics_json: bool,
     commit_batch: Option<u64>,
     group_requests: Option<u64>,
     discover: bool,
@@ -54,7 +61,7 @@ struct Args {
 
 fn parse_args(argv: Vec<String>) -> Result<Args, String> {
     if argv.len() < 3 {
-        return Err("usage: flashdb-load <dir-or-wal> <trace.jsonl> --rate-rps R[,R...] [--segment-requests N] [--window-ms N] [--ceiling-us N] [--patterns] [--commit-batch B] [--group-requests B] [--no-tiles]".into());
+        return Err("usage: flashdb-load <dir-or-wal> <trace.jsonl> --rate-rps R[,R...] [--segment-requests N] [--window-ms N] [--ceiling-us N] [--patterns] [--metrics-json] [--commit-batch B] [--group-requests B] [--no-tiles]".into());
     }
     let mut args = Args {
         target: argv[1].clone(),
@@ -64,6 +71,7 @@ fn parse_args(argv: Vec<String>) -> Result<Args, String> {
         window_ms: 1000,
         ceiling_us: None,
         patterns: false,
+        metrics_json: false,
         commit_batch: None,
         group_requests: None,
         discover: true,
@@ -108,6 +116,7 @@ fn parse_args(argv: Vec<String>) -> Result<Args, String> {
                 i += 2;
             }
             "--patterns" => { args.patterns = true; i += 1; }
+            "--metrics-json" => { args.metrics_json = true; i += 1; }
             "--no-tiles" => { args.discover = false; i += 1; }
             other => return Err(format!("unknown argument {other:?}")),
         }
@@ -163,6 +172,38 @@ fn percentile_us(sorted_us: &[u64], q: f64) -> Option<u64> {
     let rank = ((sorted_us.len() as f64) * q).ceil() as usize;
     let idx = rank.saturating_sub(1).min(sorted_us.len() - 1);
     Some(sorted_us[idx])
+}
+
+/// Frozen machine-readable window line for `--metrics-json`. Top-level fields:
+/// `window`, `rate_rps`, `requests` (this window), `completed`/`errors`
+/// (cumulative), `p50_us`/`p99_us` (this window), then `current` and `previous`
+/// window snapshots. A window snapshot is `{"patterns", "regions"}` as frozen by
+/// [`WindowSnapshot::to_json`]; `previous` is `null` for the first window. Object
+/// key order is serde_json's sorted map, so two identical runs emit identical
+/// lines.
+fn metrics_json_line(
+    window: u64,
+    rate: f64,
+    requests: u64,
+    completed: u64,
+    errors: u64,
+    p50_us: u64,
+    p99_us: u64,
+    current: &WindowSnapshot,
+    previous: Option<&WindowSnapshot>,
+) -> String {
+    serde_json::json!({
+        "window": window,
+        "rate_rps": rate,
+        "requests": requests,
+        "completed": completed,
+        "errors": errors,
+        "p50_us": p50_us,
+        "p99_us": p99_us,
+        "current": current.to_json(),
+        "previous": previous.map(WindowSnapshot::to_json),
+    })
+    .to_string()
 }
 
 /// Time `n` fsyncs on a scratch file in the engine's directory and report the distribution.
@@ -449,17 +490,31 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let invalid = ceiling_breached || saturated || rejected;
             if invalid { invalid_windows += 1 } else { last_valid_rate = last_valid_rate.max(window_rate) }
             if saturated && saturated_at.is_none() { saturated_at = Some(window_rate) }
-            writeln!(out, "window={window_index} rate_rps={:.0} requests={} completed={completed} \
-                errors={errors} lag_p50_us={lag_p50} lag_p99_us={lag_p99} behind={behind} \
-                late_total={late_total} errors_window={window_error_count} p50_us={p50} p99_us={p99} \
-                invalid={invalid} ceiling_us={}",
-                window_rate, latencies.len(),
-                args.ceiling_us.map(|c| c.to_string()).unwrap_or_else(|| "none".into()))?;
-            if args.patterns {
-                let snap = engine.metrics_rotate_window();
-                write!(out, "{snap}")?;
-            } else {
+            if args.metrics_json {
+                // Machine-readable window line: the window just measured is
+                // `current` (it has not been rotated yet) and the one before it
+                // is `previous`. Emitting JSON instead of the human line keeps
+                // stdout parseable by the controller; the header and summary
+                // lines are not `{`-prefixed and are ignored by a JSONL reader.
+                let current = engine.metrics_snapshot();
+                let previous = engine.metrics_previous_window();
+                writeln!(out, "{}", metrics_json_line(
+                    window_index, window_rate, latencies.len() as u64, completed, errors,
+                    p50, p99, &current, previous.as_ref()))?;
                 engine.metrics_rotate_window();
+            } else {
+                writeln!(out, "window={window_index} rate_rps={:.0} requests={} completed={completed} \
+                    errors={errors} lag_p50_us={lag_p50} lag_p99_us={lag_p99} behind={behind} \
+                    late_total={late_total} errors_window={window_error_count} p50_us={p50} p99_us={p99} \
+                    invalid={invalid} ceiling_us={}",
+                    window_rate, latencies.len(),
+                    args.ceiling_us.map(|c| c.to_string()).unwrap_or_else(|| "none".into()))?;
+                if args.patterns {
+                    let snap = engine.metrics_rotate_window();
+                    write!(out, "{snap}")?;
+                } else {
+                    engine.metrics_rotate_window();
+                }
             }
             out.flush()?;
             latencies.clear();
@@ -516,6 +571,27 @@ mod tests {
         assert_eq!(percentile_us(&xs, 0.99), Some(1000));
         assert_eq!(percentile_us(&xs, 1.0), Some(1000));
         assert_eq!(percentile_us(&[], 0.99), None);
+    }
+
+    #[test]
+    fn metrics_json_flag_is_parsed_off_by_default() {
+        let mut argv = vec!["b".into(), "wal".into(), "t.jsonl".into(), "--rate-rps".into(), "10".into()];
+        assert!(!parse_args(argv.clone()).expect("valid args").metrics_json);
+        argv.push("--metrics-json".into());
+        assert!(parse_args(argv).expect("valid args").metrics_json);
+    }
+
+    #[test]
+    fn metrics_json_line_freezes_the_wrapper_field_names() {
+        let empty = WindowSnapshot::default();
+        let line = metrics_json_line(3, 120.0, 10, 9, 1, 500, 1500, &empty, None);
+        assert_eq!(
+            line,
+            r#"{"completed":9,"current":{"patterns":[],"regions":[]},"errors":1,"p50_us":500,"p99_us":1500,"previous":null,"rate_rps":120.0,"requests":10,"window":3}"#
+        );
+        // A previous window is embedded as an object, not a string.
+        let with_prev = metrics_json_line(4, 120.0, 10, 19, 1, 500, 1500, &empty, Some(&empty));
+        assert!(with_prev.contains(r#""previous":{"patterns":[],"regions":[]}"#), "got {with_prev}");
     }
 
     #[test]

@@ -376,17 +376,24 @@ impl TileHandle {
 }
 
 /// RAII latency sample: records on drop, so every exit path (including `?`) is
-/// observed. A no-op with no clock read when telemetry is disabled.
+/// observed. A no-op with no clock read when telemetry is disabled. The region
+/// is set after the call resolves its prefix ([`metrics::DISABLED`] for a call
+/// with no single region, e.g. a commit), so the same clock read feeds both the
+/// pattern and the region histogram.
 struct MetricsSample<'a> {
     metrics: &'a RefCell<Metrics>,
     id: usize,
+    region: usize,
     started: Option<Instant>,
 }
 
 impl Drop for MetricsSample<'_> {
     fn drop(&mut self) {
         if let Some(t0) = self.started {
-            self.metrics.borrow_mut().record(self.id, t0.elapsed());
+            let elapsed = t0.elapsed();
+            let mut metrics = self.metrics.borrow_mut();
+            metrics.record(self.id, elapsed);
+            metrics.record_region_latency(self.region, elapsed);
         }
     }
 }
@@ -1690,7 +1697,12 @@ impl Engine {
     // wins — the only state reads observe (2026-09-29: no historical reads).
     // Tile CSN ranges are disjoint, so cross-tier equal keys are impossible;
     // the memtable-wins skip below is defensive only.
-    fn scan_merged(&self, prefix: &[u8], mut visit: impl FnMut(&[u8], &[u8]) -> io::Result<bool>) -> io::Result<()> {
+    //
+    // `region` is the metrics region id this call serves (or [`metrics::DISABLED`]
+    // for a whole-keyspace pass). Every data-block byte the tile cursors read is
+    // attributed to it once the merge ends, on both the success and the error
+    // path, so a bloom miss that still reads a block is visible as `bytes_read`.
+    fn scan_merged(&self, prefix: &[u8], region: usize, mut visit: impl FnMut(&[u8], &[u8]) -> io::Result<bool>) -> io::Result<()> {
         let mut mem = self.mt.scan_iter(prefix).peekable();
         // The bloom reject below is only sound for a full unique prefix, so it is
         // gated once per scan on the prefix shape; every other probe (primary,
@@ -1711,35 +1723,12 @@ impl Engine {
             if unique_prefix && !t.tile.might_contain_unique_prefix(prefix) { continue; }
             cursors.push(t.tile.prefix_cursor(prefix)?);
         }
-        let mut disk_key: Vec<u8> = Vec::new();
-        loop {
-            let disk = smallest_disk_head(&mut cursors, &mut disk_key)?;
-            let mem_head = mem.peek();
-            if mem_head.is_none() && disk.is_none() { break; }
-            let use_mem = match (mem_head, disk) {
-                (Some((mk, _)), Some(_)) => *mk <= disk_key.as_slice(),
-                (Some(_), None) => true,
-                (None, _) => false,
-            };
-            if use_mem {
-                let (key, value) = mem.next().unwrap();
-                if let Some(i) = disk {
-                    // Tile CSN ranges are disjoint, so an equal key is defensive only.
-                    if disk_key.as_slice() == key {
-                        cursors[i].next()?;
-                    }
-                }
-                if !visit(key, value)? { return Ok(()); }
-            } else {
-                let i = disk.unwrap();
-                let (key, value) = match cursors[i].next()? {
-                    Some(entry) => entry,
-                    None => return Err(io::Error::new(io::ErrorKind::InvalidData, "tile cursor lost its head")),
-                };
-                if !visit(key, value)? { return Ok(()); }
-            }
+        let result = merge_streams(&mut mem, &mut cursors, &mut visit);
+        if region != metrics::DISABLED {
+            let bytes: u64 = cursors.iter().map(|c| c.bytes_read()).sum();
+            self.metrics.borrow_mut().region_bytes_read(region, bytes);
         }
-        Ok(())
+        result
     }
 
     /// 已发布的最新 CSN。读只看最新提交状态（不存在历史读），发布检查亦然。
@@ -1790,6 +1779,43 @@ impl Engine {
         self.metrics.borrow().enabled().then(Instant::now)
     }
 
+    /// The metrics region id of an operation's prefix, or [`metrics::DISABLED`]
+    /// when observation is off or the prefix names no `P`/`U`/`R` region. The
+    /// region is taken from the prefix bytes, so a probe and a commit op on the
+    /// same `(family, entity)` resolve to the same row.
+    fn region_of_prefix(&self, prefix: &[u8]) -> usize {
+        match keys::region_prefix(prefix) {
+            Some(region) => self.metrics.borrow_mut().resolve_region(region),
+            None => metrics::DISABLED,
+        }
+    }
+
+    /// Attribute one appended WAL record's ops to their regions. `bytes_written`
+    /// is each op's exact encoded size in `encode_payload` (the shared record
+    /// header is not attributed); a region touched by the block gets one
+    /// `commit_blocks` and its op count. Allocates one `Vec` proportional to the
+    /// block's op count and nothing after region warm-up; the commit path already
+    /// allocates per op, and this is off the read path entirely.
+    fn record_commit_regions(&self, ops: &[Op]) {
+        if !self.metrics.borrow().enabled() {
+            return;
+        }
+        let mut touched: Vec<usize> = Vec::with_capacity(ops.len());
+        for op in ops {
+            let (marker, entity) = op_region(op);
+            let id = self.metrics.borrow_mut().resolve_region_parts(marker, entity);
+            let bytes = op_encoded_len(op);
+            self.metrics.borrow_mut().region_bytes_written(id, bytes);
+            self.metrics.borrow_mut().region_commit_op(id);
+            touched.push(id);
+        }
+        touched.sort_unstable();
+        touched.dedup();
+        for id in touched {
+            self.metrics.borrow_mut().region_commit_block(id);
+        }
+    }
+
     /// Whether a block was published (including after WAL recovery).
     pub fn committed_block_csn(&self, block_id: &[u8]) -> Option<u64> {
         self.dedup.get(block_id).copied()
@@ -1800,12 +1826,14 @@ impl Engine {
     pub fn reverse_lookup(&self, entity: &[u8], field: &[u8], target: u64) -> io::Result<Vec<u64>> {
         let t0 = self.timing();
         let id = self.metrics.borrow_mut().resolve_reverse(entity, field);
-        let _sample = MetricsSample { metrics: &self.metrics, id, started: t0 };
+        let mut sample = MetricsSample { metrics: &self.metrics, id, region: metrics::DISABLED, started: t0 };
         check_name(entity)?;
         check_name(field)?;
         let pfx = keys::reverse_prefix(entity, field, target)?;
+        let region = self.region_of_prefix(&pfx);
+        sample.region = region;
         let mut newest: HashMap<u64, bool> = HashMap::new();
-        self.scan_merged(&pfx, |key, value| {
+        self.scan_merged(&pfx, region, |key, value| {
             let Some((_, source, _)) = keys::decode_reverse(key) else { return Ok(true); };
             // 键序内同一 source 按 CSN 降序排列，首个条目即最新状态。
             newest.entry(source).or_insert(!value.is_empty());
@@ -1813,6 +1841,7 @@ impl Engine {
         })?;
         let mut out: Vec<u64> = newest.into_iter().filter(|(_, alive)| *alive).map(|(s, _)| s).collect();
         out.sort();
+        self.metrics.borrow_mut().region_probe(region, !out.is_empty());
         Ok(out)
     }
 
@@ -1821,11 +1850,13 @@ impl Engine {
     pub fn unique_lookup(&self, entity: &[u8], field: &[u8], value: &[u8]) -> io::Result<Option<u64>> {
         let t0 = self.timing();
         let id = self.metrics.borrow_mut().resolve_unique(entity, field);
-        let _sample = MetricsSample { metrics: &self.metrics, id, started: t0 };
+        let mut sample = MetricsSample { metrics: &self.metrics, id, region: metrics::DISABLED, started: t0 };
         let pfx = keys::unique_prefix(entity, field, value)?;
+        let region = self.region_of_prefix(&pfx);
+        sample.region = region;
         let mut seen = std::collections::HashSet::new();
         let mut owner = None;
-        self.scan_merged(&pfx, |key, val| {
+        self.scan_merged(&pfx, region, |key, val| {
             if key.len() != pfx.len() + 16 {
                 return Err(io::Error::new(io::ErrorKind::InvalidData, "malformed unique key"));
             }
@@ -1842,6 +1873,7 @@ impl Engine {
             }
             Ok(true)
         })?;
+        self.metrics.borrow_mut().region_probe(region, owner.is_some());
         Ok(owner)
     }
 
@@ -1850,17 +1882,20 @@ impl Engine {
     pub fn get(&self, entity: &[u8], handle: u64) -> io::Result<Option<Vec<u8>>> {
         let t0 = self.timing();
         let id = self.metrics.borrow_mut().resolve_primary(entity);
-        let _sample = MetricsSample { metrics: &self.metrics, id, started: t0 };
+        let mut sample = MetricsSample { metrics: &self.metrics, id, region: metrics::DISABLED, started: t0 };
         check_name(entity)?;
         let pfx = keys::primary_prefix(entity, handle)?;
+        let region = self.region_of_prefix(&pfx);
+        sample.region = region;
         let mut result = None;
-        self.scan_merged(&pfx, |key, value| {
+        self.scan_merged(&pfx, region, |key, value| {
             if keys::key_csn(key).is_some() {
                 result = if value.is_empty() { None } else { Some(value.to_vec()) };
                 return Ok(false);
             }
             Ok(true)
         })?;
+        self.metrics.borrow_mut().region_probe(region, result.is_some());
         Ok(result)
     }
 
@@ -1874,12 +1909,14 @@ impl Engine {
     ) -> io::Result<()> {
         let t0 = self.timing();
         let id = self.metrics.borrow_mut().resolve_scan(entity);
-        let _sample = MetricsSample { metrics: &self.metrics, id, started: t0 };
+        let mut sample = MetricsSample { metrics: &self.metrics, id, region: metrics::DISABLED, started: t0 };
         check_name(entity)?;
         let mut prefix = keys::primary_prefix(entity, 0)?;
         prefix.truncate(prefix.len() - 8);
+        let region = self.region_of_prefix(&prefix);
+        sample.region = region;
         let mut last_handle = None;
-        self.scan_merged(&prefix, |key, value| {
+        self.scan_merged(&prefix, region, |key, value| {
             let (key_entity, handle, _) = keys::decode_primary(key)
                 .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "malformed primary key"))?;
             if key_entity != entity {
@@ -1901,7 +1938,7 @@ impl Engine {
         &self,
         mut visit: impl FnMut(&[u8], &[u8]) -> io::Result<()>,
     ) -> io::Result<()> {
-        self.scan_merged(&[], |key, value| {
+        self.scan_merged(&[], metrics::DISABLED, |key, value| {
             visit(key, value)?;
             Ok(true)
         })
@@ -2002,7 +2039,7 @@ impl Engine {
     fn commit_block_inner(&mut self, block_id: &[u8], ops: &[Op], barrier: bool) -> io::Result<Outcome> {
         let t0 = self.timing();
         let id = self.metrics.borrow_mut().resolve_commit();
-        let _sample = MetricsSample { metrics: &self.metrics, id, started: t0 };
+        let _sample = MetricsSample { metrics: &self.metrics, id, region: metrics::DISABLED, started: t0 };
         self.ensure_attached()?;
         if block_id.is_empty() {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "empty block_id"));
@@ -2037,7 +2074,8 @@ impl Engine {
         }
         for (pfx, (entity, field, value, overlay)) in touched {
             let mut live: HashMap<u64, bool> = HashMap::new();
-            self.scan_merged(&pfx, |key, val| {
+            let region = self.region_of_prefix(&pfx);
+            self.scan_merged(&pfx, region, |key, val| {
                 // Fail closed: a key under the unique prefix that cannot be
                 // decoded cannot be proven to have no other live owner, so
                 // silently skipping it would fail *open* in a constraint check.
@@ -2057,6 +2095,7 @@ impl Engine {
 
         let payload = encode_payload(csn, block_id, ops);
         self.wal.append(&payload)?;
+        self.record_commit_regions(ops);
         if barrier {
             self.wal.sync()?;
         }
@@ -2112,7 +2151,7 @@ impl Engine {
         self.ensure_no_group("commit_batch")?;
         let t0 = self.timing();
         let id = self.metrics.borrow_mut().resolve_commit();
-        let _sample = MetricsSample { metrics: &self.metrics, id, started: t0 };
+        let _sample = MetricsSample { metrics: &self.metrics, id, region: metrics::DISABLED, started: t0 };
         self.ensure_attached()?;
 
         let mut overlay: HashMap<Vec<u8>, BatchUnique> = HashMap::new();
@@ -2173,7 +2212,8 @@ impl Engine {
         // leave at most one live owner.
         for (pfx, entry) in overlay {
             let mut live: HashMap<u64, bool> = HashMap::new();
-            self.scan_merged(&pfx, |key, val| {
+            let region = self.region_of_prefix(&pfx);
+            self.scan_merged(&pfx, region, |key, val| {
                 if key.len() != pfx.len() + 16 {
                     return Err(io::Error::new(io::ErrorKind::InvalidData, "malformed unique key in merged view"));
                 }
@@ -2198,6 +2238,7 @@ impl Engine {
         for &(csn, block_id, ops) in &pending {
             let payload = encode_payload(csn, block_id, ops);
             self.wal.append(&payload)?;
+            self.record_commit_regions(ops);
         }
         self.wal.sync()?;
         for &(csn, _block_id, ops) in &pending {
@@ -2215,6 +2256,50 @@ impl Engine {
         }
         Ok(BatchOutcome::Committed(outcomes))
     }
+}
+
+// Merge the serving-memtable cursor and the tile cursors in ascending encoded-key
+// order, reduced to the newest version per logical key (the memtable wins a
+// defensive equal key; tile ranges are disjoint). `visit` returns `false` to stop
+// early. Split out of `Engine::scan_merged` so the caller can attribute the tile
+// cursors' read bytes on every exit path. Generic over the memtable iterator type.
+fn merge_streams<'a, I>(
+    mem: &mut std::iter::Peekable<I>,
+    cursors: &mut [TileCursor<'a>],
+    visit: &mut impl FnMut(&[u8], &[u8]) -> io::Result<bool>,
+) -> io::Result<()>
+where
+    I: Iterator<Item = (&'a [u8], &'a [u8])>,
+{
+    let mut disk_key: Vec<u8> = Vec::new();
+    loop {
+        let disk = smallest_disk_head(cursors, &mut disk_key)?;
+        let mem_head = mem.peek();
+        if mem_head.is_none() && disk.is_none() { break; }
+        let use_mem = match (mem_head, disk) {
+            (Some((mk, _)), Some(_)) => *mk <= disk_key.as_slice(),
+            (Some(_), None) => true,
+            (None, _) => false,
+        };
+        if use_mem {
+            let (key, value) = mem.next().unwrap();
+            if let Some(i) = disk {
+                // Tile CSN ranges are disjoint, so an equal key is defensive only.
+                if disk_key.as_slice() == key {
+                    cursors[i].next()?;
+                }
+            }
+            if !visit(key, value)? { return Ok(()); }
+        } else {
+            let i = disk.unwrap();
+            let (key, value) = match cursors[i].next()? {
+                Some(entry) => entry,
+                None => return Err(io::Error::new(io::ErrorKind::InvalidData, "tile cursor lost its head")),
+            };
+            if !visit(key, value)? { return Ok(()); }
+        }
+    }
+    Ok(())
 }
 
 // Index of the smallest pending tile head, if any; linear over at most
@@ -2354,6 +2439,32 @@ fn op_handle(op: &Op) -> u64 {
         Op::PutDoc { handle, .. } | Op::DelDoc { handle, .. }
         | Op::PutUnique { handle, .. } | Op::DelUnique { handle, .. } => *handle,
         Op::PutReverse { target, source, .. } | Op::DelReverse { target, source, .. } => (*target).max(*source),
+    }
+}
+
+/// The `(family marker, entity)` region an op writes to. The marker is the
+/// first byte of the op's encoded key, so the metrics region this resolves to
+/// is exactly the region a probe on that key family/entity serves.
+fn op_region(op: &Op) -> (u8, &[u8]) {
+    match op {
+        Op::PutDoc { entity, .. } | Op::DelDoc { entity, .. } => (keys::P, entity),
+        Op::PutUnique { entity, .. } | Op::DelUnique { entity, .. } => (keys::U, entity),
+        Op::PutReverse { entity, .. } | Op::DelReverse { entity, .. } => (keys::R, entity),
+    }
+}
+
+/// The exact number of bytes one op contributes to `encode_payload`: its type tag
+/// plus each length-prefixed field and fixed-width integer, in the same order the
+/// encoder writes them. Kept beside `encode_payload` so a field-size change there
+/// is a visible diff here (a unit test also pins their sum to a real payload).
+fn op_encoded_len(op: &Op) -> u64 {
+    match op {
+        Op::PutDoc { entity, doc, .. } => 1 + 4 + entity.len() as u64 + 8 + 4 + doc.len() as u64,
+        Op::DelDoc { entity, .. } => 1 + 4 + entity.len() as u64 + 8,
+        Op::PutUnique { entity, field, value, .. } | Op::DelUnique { entity, field, value, .. } =>
+            1 + 4 + entity.len() as u64 + 4 + field.len() as u64 + 4 + value.len() as u64 + 8,
+        Op::PutReverse { entity, field, .. } | Op::DelReverse { entity, field, .. } =>
+            1 + 4 + entity.len() as u64 + 4 + field.len() as u64 + 8 + 8,
     }
 }
 

@@ -380,9 +380,21 @@ pub(crate) struct TileCursor<'a> {
     done: bool,
     /// At most one parsed directory block, read on demand from the sparse index.
     dir: DirCache,
+    /// Data-block bytes read through this cursor so far. Purely observational:
+    /// no read decision in this module consults it, and it changes no on-disk
+    /// byte. Directory blocks, the superblock and the trailer are not counted;
+    /// this is exactly the data-block traffic a probe or scan pays, which is
+    /// what a bloom reject avoids.
+    bytes_read: u64,
 }
 
 impl<'a> TileCursor<'a> {
+    /// Data-block bytes this cursor has read from disk so far. Observability
+    /// only: nothing in this module reads it, and it changes no on-disk byte.
+    pub(crate) fn bytes_read(&self) -> u64 {
+        self.bytes_read
+    }
+
     fn new(tile: &'a Tile, prefix: Option<&[u8]>, block: usize) -> Self {
         TileCursor {
             tile,
@@ -397,6 +409,7 @@ impl<'a> TileCursor<'a> {
             started: false,
             done: false,
             dir: DirCache::new(),
+            bytes_read: 0,
         }
     }
 
@@ -409,6 +422,9 @@ impl<'a> TileCursor<'a> {
         };
         self.buffer.resize(len, 0);
         read_exact_at(&self.tile.file, &mut self.buffer, offset)?;
+        // Observability counter (never consulted here): the block length actually
+        // read. `len` is the fence's `len`, so this is the on-disk data-block size.
+        self.bytes_read = self.bytes_read.saturating_add(self.buffer.len() as u64);
         if self.buffer.len() < BLOCK_HEADER { return Err(invalid("tile block truncated")); }
         let blen = u32::from_le_bytes(self.buffer[..4].try_into().unwrap()) as usize;
         let block_crc = u32::from_le_bytes(self.buffer[4..8].try_into().unwrap());
