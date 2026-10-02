@@ -75,3 +75,21 @@ set (so a relaxed oracle over it is tractable), evaluated by the capacity curve 
   it by >=15% in achieved throughput at the same offered load) on the win workload, and must not
   lose on the adversarial-uniform workload. Threshold and seed count remain to be fixed before
   the run, and the estimate must state its calibration error.
+
+## Update 2026-10-01: which actuator the measurements actually support
+
+Slice 26's per-region telemetry was built precisely to answer "what would the learner act on", and
+it redirected the plan by measuring instead of assuming:
+
+| axis | status after measurement |
+|---|---|
+| per-region bloom bits | **dead on this workload.** Every absent probe is rejected by the range filter before the bloom is consulted (new monotonic order numbers sort above the tile's last key; `U|Backorder` has no tile), so absent probes cost 0 block bytes. The measured bloom gradient (151.84 -> 1.59 us) needs absent probes INSIDE a tile's range, which this flow does not produce. |
+| per-region page size | **flat** (slice 25): the scanning region is JSON-decode bound, so block size never reaches the critical path. |
+| **per-region compaction trigger** | **live, with a measured gradient.** Write-only regions (`P|Order`, movement families) accumulate with zero read pressure while probe-hot regions (`P/U|Stock`, `P/U|Customer`) must stay few-block. Write amplification is the efficiency metric (4.09 -> 1.66 measured from cap headroom; up to 59% in the tier simulation) and the per-region p99 is the constraint that prevents "defer everything" from winning. |
+
+So the learned object is a per-region merge/compaction policy (how eagerly a region's tiers are
+merged), applied per emitted tile, with the capacity curve as the primary metric and write
+amplification reported alongside. Blooms and page size stay in `LayoutPolicy` as available knobs
+whose gradient is real but absent on this workload - the honest statement is that they would matter
+for a workload with in-range absent probes or block-bound scans, and the harness can now prove which
+case a workload is.
