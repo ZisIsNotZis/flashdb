@@ -18,6 +18,7 @@
 //! trace/parse failure is an error (non-zero), because it means the measurement is invalid.
 
 use std::fs::File;
+use std::path::Path;
 use std::io::{self, BufRead, BufReader, Write};
 use std::time::{Duration, Instant};
 
@@ -110,6 +111,29 @@ fn percentile_us(sorted_us: &[u64], q: f64) -> Option<u64> {
     Some(sorted_us[idx])
 }
 
+/// Time `n` fsyncs on a scratch file in the engine's directory and report the distribution.
+/// 0/N is reported as "none" rather than 0, so a failed probe is never read as "infinitely fast".
+fn probe_device(dir: &Path, n: usize) -> (Option<u64>, Option<u64>) {
+    use std::fs::OpenOptions;
+    let path = dir.join("device-probe.tmp");
+    let Ok(file) = OpenOptions::new().create(true).write(true).truncate(true).open(&path) else {
+        return (None, None);
+    };
+    let mut samples = Vec::with_capacity(n);
+    for i in 0..n {
+        // MUST write before syncing: an earlier version truncated and synced without writing,
+        // which is a no-op and reported a 0 us device (i.e. it silently invalidated the baseline).
+        if std::io::Write::write_all(&mut &file, format!("probe {i}
+").as_bytes()).is_err() { break; }
+        let t = Instant::now();
+        if file.sync_data().is_err() { break; }
+        samples.push(t.elapsed().as_micros() as u64);
+    }
+    let _ = std::fs::remove_file(&path);
+    samples.sort_unstable();
+    (percentile_us(&samples, 0.50), percentile_us(&samples, 0.99))
+}
+
 fn main() {
     if let Err(e) = run() {
         eprintln!("flashdb-load: {e}");
@@ -134,9 +158,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let total = lines.len() as u64;
     if total == 0 { return Err(io::Error::other("empty trace").into()); }
 
+    // Device context first. On this shared box a single fsync varies by two orders of magnitude
+    // depending on what else is running, so a load run without a device baseline cannot be
+    // interpreted: "saturation" may be the device, not the engine. Same session, same directory.
+    let device = probe_device(Path::new(&args.wal).parent().unwrap_or(Path::new(".")), 100);
     let mut engine = Engine::open(&args.wal)?;
     let stdout = io::stdout();
     let mut out = stdout.lock();
+    writeln!(out, "device_fsync_p50_us={} device_fsync_p99_us={}",
+        device.0.map(|v| v.to_string()).unwrap_or_else(|| "none".into()),
+        device.1.map(|v| v.to_string()).unwrap_or_else(|| "none".into()))?;
 
     let t0 = Instant::now();
     // `due_us` is ALWAYS the due time of the next request to issue, so an unissued request never
@@ -234,6 +265,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    let device_end = probe_device(Path::new(&args.wal).parent().unwrap_or(Path::new(".")), 50);
+    writeln!(out, "device_fsync_end_p50_us={} device_fsync_end_p99_us={}",
+        device_end.0.map(|v| v.to_string()).unwrap_or_else(|| "none".into()),
+        device_end.1.map(|v| v.to_string()).unwrap_or_else(|| "none".into()))?;
     writeln!(out, "load_summary requests={total} completed={completed} errors={errors} \
         late_total={late_total} windows={window_index} invalid_windows={invalid_windows} \
         last_valid_rate_rps={last_valid_rate:.0} saturated_at_rps={} first_error={:?}",
