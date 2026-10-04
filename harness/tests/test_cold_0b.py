@@ -17,10 +17,12 @@ from flashdb_harness import cold_0b as m  # noqa: E402
 
 def _window_line(window: int, rate: float, requests: int, completed: int, *,
                  errors: int = 0, p50: int = 1000, p99: int = 2000,
-                 regions: list[dict] | None = None, policy: dict | None = None) -> str:
+                 regions: list[dict] | None = None, policy: dict | None = None,
+                 compact: int = 0) -> str:
     return json.dumps({
         "window": window, "rate_rps": rate, "requests": requests,
         "completed": completed, "errors": errors, "p50_us": p50, "p99_us": p99,
+        "compact_bytes": compact,
         "policy": policy or {"default": {"page_size": 4096, "bloom_bits_per_key": 10,
                                          "merge_min_tiles": 2}, "regions": {}},
         "current": {"patterns": [], "regions": regions or []},
@@ -210,14 +212,41 @@ def test_threshold2_passes_on_a_tie() -> None:
     assert t2["status"] == "PASS" and t2["loss"] == 0.0
 
 
-def test_threshold3_is_not_measurable_when_the_driver_never_compacts() -> None:
+def test_threshold3_is_not_measurable_when_compaction_is_not_actuated() -> None:
     records = {
         "win/declared": _record([(50, 50, True)]),
         "win/learned@1.0": _record([(50, 50, True)]),
     }
-    t3 = [v for v in m.evaluate_thresholds(records, lambdas=(1.0,)) if "reorganisation" in v["threshold"]][0]
+    t3 = [v for v in m.evaluate_thresholds(records, lambdas=(1.0,), compaction_actuated=False)
+          if "reorganisation" in v["threshold"]][0]
     assert t3["status"] == "NOT-MEASURABLE"
-    assert "never calls maybe_compact_shape" in t3["detail"]
+    assert "not actuated" in t3["detail"]
+
+
+def test_threshold3_zero_bytes_with_actuation_is_flagged_as_a_defect() -> None:
+    # Slice 37: the driver DOES compact now, so 0 vs 0 is no longer an inert-knob non-result; it
+    # means the actuation did not fire and must be reported as a defect, not repeated as the old
+    # NOT-MEASURABLE.
+    records = {
+        "win/declared": _record([(50, 50, True)]),
+        "win/learned@1.0": _record([(50, 50, True)]),
+    }
+    t3 = [v for v in m.evaluate_thresholds(records, lambdas=(1.0,), compaction_actuated=True)
+          if "reorganisation" in v["threshold"]][0]
+    assert t3["status"] == "NOT-MEASURABLE"
+    assert "DEFECT" in t3["detail"]
+
+
+def test_threshold3_is_measurable_and_passes_when_declared_compacts() -> None:
+    # Compaction actuated: declared (eager merge) writes output, learned (deferred) writes 0.
+    records = {
+        "win/declared": _record([(50, 50, True)], reorg=2_000_000),
+        "win/learned@1.0": _record([(50, 50, True)], reorg=0),
+    }
+    t3 = [v for v in m.evaluate_thresholds(records, lambdas=(1.0,), compaction_actuated=True)
+          if "reorganisation" in v["threshold"]][0]
+    assert t3["status"] == "PASS"
+    assert t3["declared_bytes"] == 2_000_000 and t3["learned_bytes"] == 0
 
 
 def test_threshold3_fails_when_learned_writes_four_times_more() -> None:
@@ -253,6 +282,28 @@ def test_threshold4_passes_on_a_two_window_recovery() -> None:
 # ---------------------------------------------------------------------------
 # Header / summary parsing
 # ---------------------------------------------------------------------------
+def test_window_records_and_curve_carry_driver_compact_bytes() -> None:
+    lines = [_window_line(0, 50, 50, 50, compact=4096),
+             _window_line(1, 50, 50, 100, compact=0)]
+    recs = m.window_records(lines, window_ms=1000)
+    assert [r["compact_bytes"] for r in recs] == [4096, 0]
+    curve = m.summarize_curve(recs)
+    assert curve[0]["compact_bytes"] == 4096
+
+
+def test_flashdb_load_command_passes_compact_bytes_only_when_actuated() -> None:
+    bins = {"load": "flashdb-load"}
+    plan = m.plan_workload("win", 50, 100)
+    cmd = m.flashdb_load_command(bins, "dir", "t.jsonl", plan, "p.json", reload=True,
+                                 checkpoint_bytes=16384, rotate_bytes=16384, group_requests=64,
+                                 window_ms=1000, ceiling_us=None, compact_bytes=64 << 20)
+    assert "--compact-bytes 67108864" in cmd
+    off = m.flashdb_load_command(bins, "dir", "t.jsonl", plan, "p.json", reload=False,
+                                 checkpoint_bytes=16384, rotate_bytes=16384, group_requests=64,
+                                 window_ms=1000, ceiling_us=None, compact_bytes=0)
+    assert "--compact-bytes" not in off, "0 means the pre-slice inert path, so no flag"
+
+
 def test_parse_engine_open_and_summary() -> None:
     text = "\n".join([
         "engine_open target=/tmp/x discover=true active_tiles=324 serving_memtable_entries=4000",

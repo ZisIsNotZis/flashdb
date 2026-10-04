@@ -16,6 +16,7 @@
 //!                [--commit-batch B] [--group-requests B] [--no-tiles]
 //!                [--policy-file PATH] [--policy-reload] [--peak-report]
 //!                [--checkpoint-bytes N] [--rotate-bytes N] [--region-mode global|per_region]
+//!                [--compact-bytes N]
 //!
 //! External policy control (slice 27): `--policy-file PATH` (or the
 //! `FLASHDB_POLICY_FILE` env var) points the driver at the frozen JSON policy
@@ -42,6 +43,20 @@
 //! by replaying a multi-tens-of-MB suffix. Off the read path: with neither flag,
 //! no extra engine call is made.
 //!
+//! Compaction actuation (Slice 37): `--compact-bytes N` calls the engine's
+//! EXISTING `maybe_compact_shape` (the shipped `CheapestPair` shape, merge budget
+//! N bytes) once per metrics window, inside the same process that serves the load.
+//! It is the missing half of the external-policy channel: `--policy-file` alone
+//! installs a per-region policy, but until this slice the offered-load driver
+//! never called compaction, so the policy's `merge_min_tiles` knob was inert on
+//! this path. The driver passes the tile-count gate at its floor (2) so each
+//! region's OWN `merge_min_tiles` decides eligibility, and it compacts at the
+//! window boundary BEFORE the policy reload and the snapshot: the merge threshold
+//! that governed the window being reported is the one that governs its compaction,
+//! and the merged bytes land in that window's per-region `compaction_bytes`. The
+//! window line carries the driver's own `compact_bytes` for the merge it just ran.
+//! Off by default: with no `--compact-bytes`, no extra engine call is made.
+//!
 //! Opening: a **directory** is opened tile-aware with `Engine::open_discover`, so a published
 //! tile is consulted before the memtable and the measured flow exercises the real tile read path;
 //! a **WAL file** (or `--no-tiles`) keeps the historical `Engine::open` behaviour (full WAL replay
@@ -56,7 +71,7 @@ use std::path::Path;
 use std::io::{self, BufRead, BufReader, Write};
 use std::time::{Duration, Instant};
 
-use flashdb_engine::engine::{BatchOutcome, Engine, LayoutPolicy, Op, Outcome, RegionMode};
+use flashdb_engine::engine::{BatchOutcome, CompactShape, Engine, LayoutPolicy, Op, Outcome, RegionMode};
 use flashdb_engine::metrics::WindowSnapshot;
 use flashdb_engine::replay::execute_requests_grouped;
 use flashdb_engine::request::execute_request;
@@ -66,6 +81,10 @@ const MAX_LINE: u64 = 1 << 20;
 /// A request issued more than this long after its scheduled time means the engine is not keeping
 /// up with the offered rate. Well above the burst pacer's own <= 1 ms chunking floor.
 const LAG_SATURATION_US: u64 = 10_000;
+/// `--compact-bytes` passes the global active-tile gate at its floor, so under
+/// [`RegionMode::PerRegion`] each region's OWN `merge_min_tiles` (the learner's knob)
+/// is what decides eligibility rather than a driver-imposed cap.
+const COMPACT_MIN_TILES: usize = 2;
 
 struct Args {
     target: String,
@@ -85,6 +104,7 @@ struct Args {
     checkpoint_bytes: Option<u64>,
     rotate_bytes: Option<u64>,
     region_mode: Option<RegionMode>,
+    compact_bytes: Option<u64>,
 }
 
 fn parse_args(argv: Vec<String>) -> Result<Args, String> {
@@ -109,6 +129,7 @@ fn parse_args(argv: Vec<String>) -> Result<Args, String> {
         checkpoint_bytes: None,
         rotate_bytes: None,
         region_mode: None,
+        compact_bytes: None,
     };
     let mut i = 3;
     while i < argv.len() {
@@ -169,6 +190,13 @@ fn parse_args(argv: Vec<String>) -> Result<Args, String> {
                     .parse().map_err(|_| "--rotate-bytes must be a positive integer")?;
                 if n == 0 { return Err("--rotate-bytes must be a positive integer".into()); }
                 args.rotate_bytes = Some(n);
+                i += 2;
+            }
+            "--compact-bytes" => {
+                let n: u64 = argv.get(i + 1).ok_or("--compact-bytes needs a value")?
+                    .parse().map_err(|_| "--compact-bytes must be a positive integer")?;
+                if n == 0 { return Err("--compact-bytes must be a positive integer".into()); }
+                args.compact_bytes = Some(n);
                 i += 2;
             }
             "--region-mode" => {
@@ -268,6 +296,7 @@ fn metrics_json_line(
     requests: u64,
     completed: u64,
     errors: u64,
+    compact_bytes: u64,
     p50_us: u64,
     p99_us: u64,
     policy: serde_json::Value,
@@ -280,6 +309,7 @@ fn metrics_json_line(
         "requests": requests,
         "completed": completed,
         "errors": errors,
+        "compact_bytes": compact_bytes,
         "p50_us": p50_us,
         "p99_us": p99_us,
         "policy": policy,
@@ -376,6 +406,15 @@ fn maintain_wal(engine: &mut Engine, checkpoint_bytes: Option<u64>, rotate_bytes
     if let Some(n) = checkpoint_bytes { engine.maybe_checkpoint(n)?; }
     if let Some(n) = rotate_bytes { engine.rotate_wal(n)?; }
     Ok(())
+}
+
+/// One window's compaction actuation: the engine's existing `maybe_compact_shape`
+/// with the shipped shape and the driver's tile gate at its floor, so the ACTIVE
+/// per-region policy's `merge_min_tiles` chooses which regions merge. Returns the
+/// merged output tile's bytes (`None` when no region was eligible), exactly what
+/// `maybe_compact` returns - no format, manifest, WAL or tile change.
+fn compact_window(engine: &mut Engine, budget_bytes: u64) -> io::Result<Option<u64>> {
+    engine.maybe_compact_shape(budget_bytes, COMPACT_MIN_TILES, CompactShape::CheapestPair)
 }
 
 /// Return already-freed heap pages to the OS. The load path streams large transient buffers (each
@@ -477,6 +516,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut invalid_windows: u64 = 0;
     let mut last_valid_rate: f64 = 0.0;
     let mut saturated_at: Option<f64> = None;
+    // Compaction actuation accounting (Slice 37): driver-side bytes and merges
+    // produced by `--compact-bytes`. The engine also records each merge in the
+    // per-region `compaction_bytes`/`compaction_merges` counters (metrics.rs);
+    // these two are the driver's own total for the `load_summary` line.
+    let mut compact_bytes_total: u64 = 0;
+    let mut compact_merges: u64 = 0;
 
     while index < total {
         let errors_before = errors;
@@ -630,6 +675,18 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         if window_start.elapsed() >= Duration::from_millis(args.window_ms) {
+            // Compaction actuation (Slice 37), BEFORE the policy reload and the
+            // snapshot: the merge threshold that governed this window is the one
+            // that governs its compaction, and the merged bytes are attributed to
+            // this window's per-region `compaction_bytes`. Off when unset.
+            let mut compact_bytes_window: u64 = 0;
+            if let Some(budget) = args.compact_bytes {
+                if let Some(merged) = compact_window(&mut engine, budget)? {
+                    compact_bytes_window = merged;
+                    compact_bytes_total += merged;
+                    compact_merges += 1;
+                }
+            }
             latencies.sort_unstable();
             let p50 = percentile_us(&latencies, 0.50).unwrap_or(0);
             let p99 = percentile_us(&latencies, 0.99).unwrap_or(0);
@@ -667,13 +724,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 let previous = engine.metrics_previous_window();
                 writeln!(out, "{}", metrics_json_line(
                     window_index, window_rate, latencies.len() as u64, completed, errors,
-                    p50, p99, engine.layout_policy().to_json(), &current, previous.as_ref()))?;
+                    compact_bytes_window, p50, p99, engine.layout_policy().to_json(), &current,
+                    previous.as_ref()))?;
                 engine.metrics_rotate_window();
             } else {
                 writeln!(out, "window={window_index} rate_rps={:.0} requests={} completed={completed} \
                     errors={errors} lag_p50_us={lag_p50} lag_p99_us={lag_p99} behind={behind} \
                     late_total={late_total} errors_window={window_error_count} p50_us={p50} p99_us={p99} \
-                    invalid={invalid} ceiling_us={}",
+                    invalid={invalid} compact_bytes={compact_bytes_window} ceiling_us={}",
                     window_rate, latencies.len(),
                     args.ceiling_us.map(|c| c.to_string()).unwrap_or_else(|| "none".into()))?;
                 if args.patterns {
@@ -708,7 +766,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     writeln!(out, "load_summary requests={total} completed={completed} errors={errors} \
         else_used={else_used} late_total={late_total} windows={window_index} invalid_windows={invalid_windows} \
         last_valid_rate_rps={last_valid_rate:.0} saturated_at_rps={} commit_batch={} group_requests={} \
-        elapsed_ms={elapsed_ms} achieved_rps={achieved_rps:.0} first_error={:?}",
+        elapsed_ms={elapsed_ms} achieved_rps={achieved_rps:.0} compact_bytes_total={compact_bytes_total} \
+        compact_merges={compact_merges} first_error={:?}",
         saturated_at.map(|r| format!("{r:.0}")).unwrap_or_else(|| "none".into()),
         args.commit_batch.unwrap_or(1),
         args.group_requests.map(|g| g.to_string()).unwrap_or_else(|| "none".into()),
@@ -787,6 +846,25 @@ mod tests {
     }
 
     #[test]
+    fn compact_bytes_flag_enables_actuation_and_rejects_zero() {
+        let plain = parse_args(vec!["b".into(), "dir".into(), "t.jsonl".into(),
+                                     "--rate-rps".into(), "10".into()]).expect("valid args");
+        assert_eq!(plain.compact_bytes, None, "actuation is off unless requested");
+        let on = parse_args(vec!["b".into(), "dir".into(), "t.jsonl".into(),
+                                  "--rate-rps".into(), "10".into(),
+                                  "--compact-bytes".into(), "67108864".into()]).expect("valid actuation args");
+        assert_eq!(on.compact_bytes, Some(67_108_864));
+        assert!(parse_args(vec!["b".into(), "dir".into(), "t.jsonl".into(),
+                                 "--rate-rps".into(), "10".into(),
+                                 "--compact-bytes".into(), "0".into()]).is_err(),
+            "a zero merge budget is rejected");
+        assert!(parse_args(vec!["b".into(), "dir".into(), "t.jsonl".into(),
+                                 "--rate-rps".into(), "10".into(),
+                                 "--compact-bytes".into()]).is_err(),
+            "--compact-bytes needs a value");
+    }
+
+    #[test]
     fn region_mode_flag_selects_and_rejects() {
         let per = parse_args(vec!["b".into(), "dir".into(), "t.jsonl".into(), "--rate-rps".into(), "10".into(),
                                   "--region-mode".into(), "per_region".into()]).expect("valid region mode");
@@ -829,7 +907,7 @@ mod tests {
                 count: 0, p50_ns: 0.0, p99_ns: 0.0, mean_ns: 0.0,
             }],
         };
-        let line = metrics_json_line(1, 100.0, 1, 1, 0, 10, 20,
+        let line = metrics_json_line(1, 100.0, 1, 1, 0, 0, 10, 20,
             LayoutPolicy::declared_default().to_json(), &snap, None);
         assert!(line.contains(r#""compaction_bytes":4288,"compaction_merges":1"#), "got {line}");
         assert!(line.contains(r#""bytes_written":40"#), "got {line}");
@@ -839,13 +917,16 @@ mod tests {
     fn metrics_json_line_freezes_the_wrapper_field_names() {
         let empty = WindowSnapshot::default();
         let policy = LayoutPolicy::declared_default().to_json();
-        let line = metrics_json_line(3, 120.0, 10, 9, 1, 500, 1500, policy.clone(), &empty, None);
+        // `compact_bytes` is the slice-37 driver-side field: the bytes merged by the
+        // `--compact-bytes` actuation call at this window's boundary (0 when unset).
+        let line = metrics_json_line(3, 120.0, 10, 9, 1, 0, 500, 1500, policy.clone(), &empty, None);
         assert_eq!(
             line,
-            r#"{"completed":9,"current":{"patterns":[],"regions":[]},"errors":1,"p50_us":500,"p99_us":1500,"policy":{"default":{"bloom_bits_per_key":10,"merge_min_tiles":2,"page_size":4096},"regions":{}},"previous":null,"rate_rps":120.0,"requests":10,"window":3}"#
+            r#"{"compact_bytes":0,"completed":9,"current":{"patterns":[],"regions":[]},"errors":1,"p50_us":500,"p99_us":1500,"policy":{"default":{"bloom_bits_per_key":10,"merge_min_tiles":2,"page_size":4096},"regions":{}},"previous":null,"rate_rps":120.0,"requests":10,"window":3}"#
         );
         // A previous window is embedded as an object, not a string.
-        let with_prev = metrics_json_line(4, 120.0, 10, 19, 1, 500, 1500, policy, &empty, Some(&empty));
+        let with_prev = metrics_json_line(4, 120.0, 10, 19, 1, 4288, 500, 1500, policy, &empty, Some(&empty));
+        assert!(with_prev.contains(r#""compact_bytes":4288"#), "got {with_prev}");
         assert!(with_prev.contains(r#""previous":{"patterns":[],"regions":[]}"#), "got {with_prev}");
     }
 

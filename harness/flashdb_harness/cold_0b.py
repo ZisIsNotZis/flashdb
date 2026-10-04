@@ -33,12 +33,14 @@ Two measured facts bound what any arm can move on this box:
    therefore gives every arm the same write fraction and the same bounded checkpoint cadence
    (``--checkpoint-bytes``/``--rotate-bytes``), so each arm republishes its regions under its own
    policy and the read segments measure it.
-2. **The offered-load driver does not compact.** ``flashdb-load`` publishes (``maybe_checkpoint``)
-   and rotates (``rotate_wal``) but never calls ``maybe_compact_shape``; the engine's own comment
-   on the tile cap is "no compaction exists in this slice". So the learner's *merge* threshold is
-   not actuated by this driver and ``compaction_bytes`` is 0 for every arm on this path. The
-   reorganisation-write threshold is therefore reported as NOT-MEASURABLE here (0 vs 0), not as a
-   pass - see the report.
+2. **The offered-load driver now compacts (Slice 37).** ``--compact-bytes N`` calls the engine's
+   existing ``maybe_compact_shape`` once per metrics window with the active per-region policy, so
+   the learner's *merge* ``merge_min_tiles`` threshold governs the eligible regions and
+   ``compaction_bytes`` is non-zero for arms whose policy makes regions eligible. Before this
+   slice the driver published (``maybe_checkpoint``) and rotated (``rotate_wal``) but never
+   compacted, so that knob was inert and the reorganisation-write threshold was NOT-MEASURABLE
+   (0 vs 0). The driver field ``compact_bytes`` reports each window's merged bytes and the
+   engine's per-region ``compaction_bytes``/``compaction_merges`` counters are populated.
 
 Cold execution
 --------------
@@ -50,8 +52,8 @@ Usage (from the harness directory)::
 
     nohup uv run python -m flashdb_harness.cold_0b --release \\
         --instance /tmp/cold33/per_region-mixed --workdir /tmp/cold0b \\
-        --report .scratch/35-0b-cold-arms/report.md \\
-        --json .scratch/35-0b-cold-arms/results.json > /tmp/cold0b.log 2>&1 &
+        --report .scratch/37-0b-actuated/report.md \\
+        --json .scratch/37-0b-actuated/results.json > /tmp/cold0b.log 2>&1 &
 
 The long run is meant to be started with ``nohup`` and polled; it prints one line per window.
 """
@@ -95,8 +97,12 @@ RATE_MULTIPLES = (1, 2, 4, 8)
 SUSTAINED_TOLERANCE = 0.95
 
 # Per-segment shape mixes (integer weights). They are the *offered* mix; every arm gets the same.
-WIN_MIX = {"stock": 30, "customer": 10, "scan": 45, "write": 15}
-UNIFORM_MIX = {"stock": 45, "customer": 45, "scan": 0, "write": 10}
+# Write share raised from 15% to 40% (Slice 37): a per-region page size only acts on tiles written
+# AFTER the switch, so a read-dominated trace cannot measure it above the lower bound. The write
+# segment republishes its regions under the arm's active policy and drives the checkpoint / merge
+# cycle that the ``--compact-bytes`` actuation now exercises.
+WIN_MIX = {"stock": 20, "customer": 10, "scan": 30, "write": 40}
+UNIFORM_MIX = {"stock": 30, "customer": 30, "scan": 0, "write": 40}
 
 
 # ---------------------------------------------------------------------------
@@ -137,8 +143,10 @@ def parse_load_summary(text: str) -> dict:
                 out["load_hwm_kb"] = None if v in (None, "none") else int(v)
         elif line.startswith("load_summary "):
             for key in ("requests", "completed", "errors", "else_used", "elapsed_ms",
-                        "invalid_windows", "late_total"):
-                out[key] = int(_kv(line, key))
+                        "invalid_windows", "late_total", "compact_bytes_total", "compact_merges"):
+                v = _kv(line, key)
+                if v is not None:
+                    out[key] = int(v)
             out["achieved_rps"] = float(_kv(line, "achieved_rps"))
             v = _kv(line, "saturated_at_rps")
             out["saturated_at_rps"] = None if v in (None, "none") else float(v)
@@ -220,6 +228,10 @@ def window_records(lines: list[str], window_ms: int) -> list[dict]:
             "p99_us": int(obj.get("p99_us", 0)),
             "regions": regions,
             "policy": obj.get("policy"),
+            # Slice 37 driver field: bytes merged by the `--compact-bytes` actuation call at this
+            # window's boundary. The per-region `compaction_bytes` above is the same merge split
+            # by region; this is the driver's own per-window total.
+            "compact_bytes": int(obj.get("compact_bytes", 0)),
         })
         prev_completed = completed
     return out
@@ -258,6 +270,7 @@ def summarize_curve(windows: list[dict], ceiling_us: int | None = None) -> list[
             "error_windows": sum(1 for w in ws if w["errors"] > 0),
             "valid_windows": len(valid),
             "lag_p99_us": max(w.get("lag_p99_us", 0) for w in ws),
+            "compact_bytes": sum(w.get("compact_bytes", 0) for w in ws),
             "sustained": achieved >= SUSTAINED_TOLERANCE * rate and not rejected and not ceiling_breached,
         })
     return curve
@@ -585,7 +598,7 @@ class LiveLoad:
 def flashdb_load_command(bins: dict, target: Path, trace: Path, plan: WorkloadPlan,
                          policy_path: Path, *, reload: bool, checkpoint_bytes: int,
                          rotate_bytes: int, group_requests: int, window_ms: int,
-                         ceiling_us: int | None) -> str:
+                         ceiling_us: int | None, compact_bytes: int | None) -> str:
     rates = ",".join(str(r) for r in plan.rates)
     cmd = [bins["load"], str(target), str(trace),
            "--rate-rps", rates, "--segment-requests", str(plan.segment_requests),
@@ -594,6 +607,10 @@ def flashdb_load_command(bins: dict, target: Path, trace: Path, plan: WorkloadPl
            "--checkpoint-bytes", str(checkpoint_bytes), "--rotate-bytes", str(rotate_bytes),
            "--region-mode", "per_region",
            "--policy-file", str(policy_path)]
+    if compact_bytes:
+        # Slice 37: actuate the per-region merge knob once per window with the active policy.
+        # 0 or None leaves the flag off (the pre-slice inert-merge path).
+        cmd += ["--compact-bytes", str(compact_bytes)]
     if reload:
         cmd.append("--policy-reload")
     if ceiling_us is not None:
@@ -615,7 +632,8 @@ def run_arm(name: str, workload: str, base: Path, workroot: Path, bins: dict,
     payload = flashdb_load_command(
         bins, engine_dir, trace, plan, policy_path, reload=controller is not None,
         checkpoint_bytes=args.checkpoint_bytes, rotate_bytes=args.rotate_bytes,
-        group_requests=args.group_requests, window_ms=args.window_ms, ceiling_us=args.ceiling_us)
+        group_requests=args.group_requests, window_ms=args.window_ms, ceiling_us=args.ceiling_us,
+        compact_bytes=args.compact_bytes)
     print(f"+ [{workload}/{name}] {payload}", flush=True)
     live = LiveLoad(scope_command(cap_bytes, payload), env, controller=controller,
                     policy_path=policy_path, stderr_path=workroot / f"{workload}-{name}.stderr",
@@ -683,8 +701,14 @@ def throughput_at_common_sustained(a: dict, b: dict) -> tuple[float, float] | No
 
 def evaluate_thresholds(records: dict[str, dict], win: str = "win", adv: str = "adversarial",
                        drift: str = "drift", lambdas: tuple[float, ...] = (0.1, 1.0, 10.0),
-                       noise_band: float | None = None) -> list[dict]:
-    """Compute the four pre-registered comparisons for each lambda; PASS/FAIL/NOT-MEASURABLE."""
+                       noise_band: float | None = None,
+                       compaction_actuated: bool = True) -> list[dict]:
+    """Compute the four pre-registered comparisons for each lambda; PASS/FAIL/NOT-MEASURABLE.
+
+    ``compaction_actuated`` names whether the run passed ``--compact-bytes``, so a 0-vs-0
+    reorganisation result is reported as an actuation DEFECT when it was on and as an inert-knob
+    non-result when it was off. Both are NOT-MEASURABLE; neither is a pass.
+    """
     verdicts: list[dict] = []
     declared_win = records.get(f"{win}/declared")
     for lam in lambdas:
@@ -768,9 +792,15 @@ def evaluate_thresholds(records: dict[str, dict], win: str = "win", adv: str = "
         learn_reorg = sum(r["compaction_bytes"] for r in learned_win["regions"].values())
         if decl_reorg == 0 and learn_reorg == 0:
             status = "NOT-MEASURABLE"
-            detail = ("both arms wrote 0 bytes of compaction output: the offered-load driver "
-                      "never calls maybe_compact_shape, so the merge threshold is inert on this "
-                      "path (0 vs 0 is not a pass)")
+            if compaction_actuated:
+                detail = ("0 vs 0 compaction bytes WITH the per-window `--compact-bytes` "
+                          "actuation ON: the calls produced no merge at all. That is a DEFECT in "
+                          "this run (actuation did not fire, or no region was eligible), not a "
+                          "pass - investigate before quoting T3")
+            else:
+                detail = ("0 vs 0 compaction bytes and compaction is not actuated "
+                          "(`--compact-bytes 0`): the merge threshold is inert on this path, so "
+                          "the comparison says nothing (0 vs 0 is not a pass)")
         else:
             ratio = learn_reorg / decl_reorg if decl_reorg else float("inf")
             status = "PASS" if ratio <= 3.0 else "FAIL"
@@ -819,6 +849,9 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--group-requests", type=int, default=64)
     ap.add_argument("--checkpoint-bytes", type=int, default=16384)
     ap.add_argument("--rotate-bytes", type=int, default=16384)
+    ap.add_argument("--compact-bytes", type=int, default=64 << 20,
+                    help="merge budget for the per-window compaction actuation (Slice 37); "
+                         "0 disables it and reproduces the pre-slice inert-merge path")
     ap.add_argument("--reference-rate", type=int, default=50)
     ap.add_argument("--drift-rate", type=int, default=150,
                     help="fixed offered rate for the drift workload (in the sustainable band)")
@@ -965,7 +998,8 @@ def main(argv: list[str]) -> int:
         for rec in records.values():
             if rec["workload"] == wl:
                 rec.setdefault("noise", {})
-    verdicts = evaluate_thresholds(records, lambdas=tuple(a.lambdas), noise_band=noise_band)
+    verdicts = evaluate_thresholds(records, lambdas=tuple(a.lambdas), noise_band=noise_band,
+                                   compaction_actuated=a.compact_bytes > 0)
 
     result = {
         "schema": "flashdb.cold-0b.v1",
@@ -977,6 +1011,8 @@ def main(argv: list[str]) -> int:
         "ratio_below_floor": ratio < PREREG_RATIO_FLOOR,
         "reference_rate_rps": a.reference_rate,
         "rate_multiples": list(RATE_MULTIPLES),
+        "mix": {"win": dict(WIN_MIX), "adversarial": dict(UNIFORM_MIX)},
+        "compact_bytes": a.compact_bytes,
         "lambdas": a.lambdas,
         "noise_band_relative": noise_band,
         "workloads": {wl: plans[wl].to_dict() for wl in a.workloads},
@@ -985,10 +1021,14 @@ def main(argv: list[str]) -> int:
         "ladder_underpowered": {wl: ladder_underpowered(records, wl) for wl in a.workloads},
         "not_concluded": [
             "data:cap is %.2fx, below the 10x pre-registration floor" % ratio,
-            "compaction reorganisation writes are 0 for every arm: the offered-load driver never "
-            "calls maybe_compact_shape, so the learner's merge threshold is not actuated on this path",
-            "per-region page size acts only on tiles written after the switch; the write fraction "
-            "in these traces is small, so the measured page-size effect is a lower bound",
+            "compaction is actuated once per metrics window with a %d-byte merge budget, so the "
+            "learner's merge_min_tiles knob is live; a region whose threshold exceeds its tile "
+            "count still never merges (a true 0), so the reorganisation comparison is bounded by "
+            "the observed tile counts, not by the knob's full range" % a.compact_bytes,
+            "per-region page size acts only on tiles written after the switch; the write share was "
+            "raised to %d%% so compaction and the write segment republish regions under the arm's "
+            "active policy, but a policy switched late still acts only on what is written after it"
+            % WIN_MIX["write"],
             "the model-calibration gate (<=25% p90 per-region prediction error) is not evaluable; "
             "no simulated verdict is quoted",
             "the 10-seed median/IQR requirement is not met (one seed per arm on a shared box)",
@@ -1077,7 +1117,7 @@ def render_report(result: dict) -> str:
     """Markdown report: per-arm capacity curves, telemetry, and the threshold table."""
     L: list[str] = []
     w = L.append
-    w("# 0b - the cold arms at equal offered load (Slices 35/36)")
+    w("# 0b - the cold arms at equal offered load (Slices 35/36/37, compaction actuated)")
     w("")
     w(f"Instance `{result['instance']}`: data {result['data_bytes']:,} B, cgroup cap "
       f"{result['cap_bytes']:,} B, **ratio {result['ratio']:.2f}x**")
@@ -1091,6 +1131,20 @@ def render_report(result: dict) -> str:
       "constraint, efficiency reported. Offered levels are the reference rate x "
       f"{result['rate_multiples']}. `lambda` is the endurance price in the learner's reward proxy "
       "(a policy choice, not a measurement); every verdict names it.")
+    mix = result.get("mix") or {}
+    if mix:
+        w("")
+        rendered = "; ".join(f"`{wl}` `{dict(sorted(m.items()))}`"
+                            for wl, m in sorted(mix.items()))
+        w("**Offered mix** (integer weights; every arm gets the same trace): " + rendered)
+    comp = result.get("compact_bytes")
+    if comp is not None:
+        w("")
+        note = (" (so the learner's `merge_min_tiles` governs)." if comp
+                else " - disabled (`--compact-bytes 0`), the pre-slice inert path.")
+        w("**Compaction actuation (Slice 37):** the driver calls the engine's existing "
+          f"`maybe_compact_shape` once per metrics window with a `{comp:,}`-byte merge budget and "
+          "the active per-region policy" + note)
     if result.get("noise_band_relative") is not None:
         w("")
         w(f"**Measured noise band** (declared repeated at the same offered load, max relative "
@@ -1137,6 +1191,19 @@ def render_report(result: dict) -> str:
       "guard's else/backorder branch count; `reorg bytes` is the summed per-region "
       "`compaction_bytes` over the run. A row is `sustained` when the median window completed "
       f">= {SUSTAINED_TOLERANCE:.0%} of the offered rate with no rejected window.")
+    w("")
+    w("## Compaction actuation (`compact_bytes`, driver field summed per offered level)")
+    w("")
+    w("| workload | arm | offered | compact_bytes |")
+    w("|---|---|---:|---:|")
+    for key, rec in sorted(result["arms"].items()):
+        for row in rec.get("curve") or []:
+            w(f"| {rec['workload']} | {rec['arm']} | {row['offered_rps']:.0f} | "
+              f"{row.get('compact_bytes', 0):,} |")
+    w("")
+    w("`compact_bytes` is the bytes merged by the actuation call at each window boundary, summed "
+      "over the windows of that offered level; the same merges are split by region in the telemetry "
+      "section below.")
     w("")
     w("## Coldness evidence (per arm)")
     w("")
@@ -1186,6 +1253,16 @@ def render_report(result: dict) -> str:
                 first = dec[0].get("selections")
                 last = dec[-1].get("selections")
                 w(f"- first policy: {first}")
+                # The learner's decisions OVER TIME: only the windows where the per-region
+                # selection actually changed, so the adaptation is visible without 80 rows.
+                changes = []
+                prev = None
+                for d in dec:
+                    sel = d.get("selections")
+                    if sel != prev:
+                        changes.append(f"w{d.get('window')}: {sel}")
+                        prev = sel
+                w(f"- policy changes ({len(changes)}): {changes}")
                 w(f"- final policy: {last}")
             w("")
     w("## Pre-registered thresholds")
