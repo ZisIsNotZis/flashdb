@@ -50,3 +50,39 @@ invalid-window count, lag) for every arm, and `sustained` must be derived from p
 achieved-vs-offered with the same tolerance the pacer uses, with the noise band stated. If the
 aggregation is wrong (as it looks), the first full 0b matrix produced no valid threshold verdict at
 all - which is why this is being written down now rather than after the numbers are quoted.
+
+## Actuated win result (slice 37, win arms COMPLETE; adversarial/drift still in flight)
+
+`flashdb-load` now takes `--compact-bytes 67108864`, so the injected policy's `merge_min_tiles`
+actually governs compaction during the offered load. Cold instance (1.647 GB / 192 MiB = 8.18x,
+every arm's cgroup peak == the cap, so `cache_evicting=true`), rates [50,100,200,400], 2000 requests
+per rung, 1 s windows:
+
+| arm | lambda | achieved rps | highest sustained | invalid windows | reorg (compaction) bytes |
+|---|---:|---:|---:|---:|---:|
+| declared | - | 80 | 100 | 30 | 2,599,988 |
+| learned@0.1 | 0.1 | 82 | 100 | 27 | 10,735,363 (4.13x) |
+| learned@1.0 | 1.0 | 83 | 100 | 28 | 10,865,545 (4.18x) |
+| learned@10.0 | 10.0 | 81 | 100 | 29 | 11,112,647 (4.27x) |
+
+**T3 is now measurable and it FAILS**: the learner writes 4.1-4.3x the declared arm's compaction
+bytes. **T1 ties at the top**: every arm sustains the same highest level (100 rps), and the
+whole-run achieved difference is 80 vs 81-83 rps = +1.3% to +3.8%, inside the box's noise band, so
+T1 cannot be called a win.
+
+Two findings worth following up, neither of which is a thesis verdict:
+
+1. **lambda barely moves the learned policy** (0.1 -> 10 changes reorg bytes only from 4.13x to
+   4.27x). Either the reward proxy's write term is negligible against the service-time term at
+   these magnitudes, or exploration/confidence dominates the choice. Either way the endurance price
+   is not being priced in practice, which the objective intends it to be.
+2. **The declared arm is already strong on this workload.** The learner's differentiated policy
+   (defer `P|Order` and `P|StockMovement` to merge_min_tiles=200, keep `P|Stock` at 8 with 4 KiB
+   pages, 64 KiB for `R|Order`) is *plausible* and matches the access pattern, yet it buys no
+   measured throughput and costs 4x the writes - i.e. on this workload the declared default's small
+   pages and eager merging are not the bottleneck the learner can improve.
+
+Caveats, unchanged and required: 8.18x is below the 10x floor; one seed per arm (the 10-seed
+median/IQR requirement is unmet); the calibration gate (<=25% p90) is not evaluable; and the ladder
+tops out at 100 rps for every arm, so T1's "one load level higher" criterion cannot discriminate
+here at all.
