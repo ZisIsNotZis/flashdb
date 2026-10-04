@@ -26,3 +26,27 @@ scan share is what makes the layout axis matter); the instance is 1.65 GB at a 1
 (below the pre-registration's 10x, flagged); and the drift target of 2 windows is an author-owned
 threshold that the current parameters cannot reach (6 windows), so it must be reported as a failed
 threshold or renegotiated - not silently relaxed.
+
+## Verification item found while observing the first full matrix run (2026-10-02)
+
+Watching `/tmp/cold0b.log` during the slice-36 matrix (instance `/tmp/cold33/per_region-mixed`,
+data 1,647,135,638 B, cap 192 MiB, **ratio 8.18x, cgroup_peak == the cap on every arm, so
+cold=True is evidenced**), two arms report numbers that are internally inconsistent and must be
+explained before any verdict from this run is accepted:
+
+```
+[win/*]        achieved_rps=75.0  sustained=100.0  invalid=44
+[adversarial/*] achieved_rps=107.0 sustained=400.0  invalid=0
+```
+
+`achieved_rps` appears to be the average over the WHOLE four-step ladder (50/100/200/400), and
+`sustained=400` claims the top step was sustained while the average completed rate was 107 rps and
+`invalid=0`. Those cannot all be true unless `highest_sustained_rate` is computed from something
+other than per-step achieved-vs-offered. Also note the adversarial arm's command line carries no
+`--ceiling-us`, so the latency-ceiling check is inert there by construction.
+
+Required before a verdict is quoted: the report must show the PER-STEP curve (offered, achieved,
+invalid-window count, lag) for every arm, and `sustained` must be derived from per-step
+achieved-vs-offered with the same tolerance the pacer uses, with the noise band stated. If the
+aggregation is wrong (as it looks), the first full 0b matrix produced no valid threshold verdict at
+all - which is why this is being written down now rather than after the numbers are quoted.
