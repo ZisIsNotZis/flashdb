@@ -200,6 +200,13 @@ def window_records(lines: list[str], window_ms: int) -> list[dict]:
                 "compaction_bytes": r.get("compaction_bytes", 0),
                 "compaction_merges": r.get("compaction_merges", 0),
             }
+        # The pacer marks a window invalid when its schedule lag ran away (saturation) or its p99
+        # exceeded the declared ceiling, and prints the lag distribution. These were NOT parsed
+        # before, which is why a saturated arm could be scored as "sustained": the FIRST window of
+        # each ladder step carries completions drained from the previous step, so it can look like
+        # it achieved the new offered rate. Keep the signals.
+        invalid = bool(obj.get("invalid", False))
+        lag_p99 = int(obj.get("lag_p99_us", 0))
         out.append({
             "window": int(obj.get("window", len(out))),
             "rate_rps": float(obj.get("rate_rps", 0.0)),
@@ -207,6 +214,8 @@ def window_records(lines: list[str], window_ms: int) -> list[dict]:
             "completed": completed,
             "errors": int(obj.get("errors", 0)),
             "achieved_rps": max(0.0, (completed - prev_completed) / window_s),
+            "invalid": invalid,
+            "lag_p99_us": lag_p99,
             "p50_us": int(obj.get("p50_us", 0)),
             "p99_us": int(obj.get("p99_us", 0)),
             "regions": regions,
@@ -219,8 +228,12 @@ def window_records(lines: list[str], window_ms: int) -> list[dict]:
 def summarize_curve(windows: list[dict], ceiling_us: int | None = None) -> list[dict]:
     """Aggregate windows by offered rate into the capacity curve (one row per rate level).
 
-    A level is ``sustained`` when the median achieved throughput is within ``SUSTAINED_TOLERANCE``
-    of the offered rate, no window was rejected, and no window's p99 exceeded ``ceiling_us``.
+    A level is ``sustained`` when, over its VALID windows only, the median achieved throughput is
+    within ``SUSTAINED_TOLERANCE`` of the offered rate, no window had an error, and no window's p99
+    exceeded ``ceiling_us``. A window the pacer marked invalid (schedule lag ran away, i.e. the
+    engine was not keeping up) is EXCLUDED from the median and makes the level unsustained: the
+    first window of a step can otherwise be credited with completions drained from the previous
+    step, which is how a saturated arm previously scored as "sustained" at every rung.
     """
     by_rate: dict[float, list[dict]] = {}
     for w in windows:
@@ -228,9 +241,11 @@ def summarize_curve(windows: list[dict], ceiling_us: int | None = None) -> list[
     curve = []
     for rate in sorted(by_rate):
         ws = by_rate[rate]
-        achieved = median(w["achieved_rps"] for w in ws)
-        p99 = max(w["p99_us"] for w in ws)
-        rejected = any(w["errors"] > 0 for w in ws)
+        valid = [w for w in ws if not w.get("invalid", False)]
+        measured = valid or ws
+        achieved = median(w["achieved_rps"] for w in measured)
+        p99 = max(w["p99_us"] for w in valid) if valid else max(w["p99_us"] for w in ws)
+        rejected = any(w["errors"] > 0 for w in ws) or any(w.get("invalid", False) for w in ws)
         ceiling_breached = ceiling_us is not None and p99 > ceiling_us
         curve.append({
             "offered_rps": rate,
@@ -239,7 +254,10 @@ def summarize_curve(windows: list[dict], ceiling_us: int | None = None) -> list[
             "p50_us": median(w["p50_us"] for w in ws),
             "p99_us": p99,
             "achieved_fraction": achieved / rate if rate else 0.0,
-            "invalid_windows": sum(1 for w in ws if w["errors"] > 0),
+            "invalid_windows": sum(1 for w in ws if w.get("invalid", False)),
+            "error_windows": sum(1 for w in ws if w["errors"] > 0),
+            "valid_windows": len(valid),
+            "lag_p99_us": max(w.get("lag_p99_us", 0) for w in ws),
             "sustained": achieved >= SUSTAINED_TOLERANCE * rate and not rejected and not ceiling_breached,
         })
     return curve
@@ -249,6 +267,49 @@ def highest_sustained_rate(curve: list[dict]) -> float:
     """The highest offered rate the arm sustained (0.0 when none did)."""
     rates = [row["offered_rps"] for row in curve if row["sustained"]]
     return max(rates) if rates else 0.0
+
+
+def ladder_top_rate(curve: list[dict]) -> float:
+    """The highest offered level present in a curve (0.0 for an empty curve)."""
+    return max((row["offered_rps"] for row in curve), default=0.0)
+
+
+def ladder_underpowered(records: dict, workload: str,
+                        top_rate: float | None = None) -> bool:
+    """True when every measured arm for ``workload`` sustained the ladder's top step.
+
+    A ladder whose top step is sustained by every arm cannot separate the arms on
+    "highest sustained load level" - that metric ties by construction at the top, so a T1 line
+    drawn from it says nothing about the layout. The guard flags that case so the verdict becomes
+    NOT-MEASURABLE instead of a spurious tie, and the caller can raise the top step and retry.
+    ``top_rate`` defaults to the highest level any arm saw; an explicit value is the ceiling the
+    run claims to have reached.
+    """
+    arms = [r for r in records.values() if r.get("workload") == workload]
+    if not arms:
+        return False
+    if top_rate is None:
+        top_rate = max(ladder_top_rate(r.get("curve", [])) for r in arms)
+    if top_rate <= 0.0:
+        return False
+    return all(highest_sustained_rate(r.get("curve", [])) >= top_rate - 1e-9 for r in arms)
+
+
+def is_ladder(plan: WorkloadPlan) -> bool:
+    """True for a stepped offered-load plan (win/adversarial); drift runs at one fixed rate."""
+    return all(b > a for a, b in zip(plan.rates, plan.rates[1:]))
+
+
+def extend_ladder(plan: WorkloadPlan, factor: int = 2) -> WorkloadPlan:
+    """The same plan with one more offered-load step at ``factor`` x the old top.
+
+    The mix list is extended in lockstep with the rate list: ``build_trace`` emits
+    ``segment_requests`` requests per mix, so a rate without a mix would truncate the trace.
+    """
+    if factor < 2:
+        raise ValueError("ladder extension factor must be >= 2")
+    return WorkloadPlan(plan.name, plan.rates + [plan.rates[-1] * factor], plan.segment_requests,
+                        plan.mixes + [dict(plan.mixes[-1])])
 
 
 def region_compaction_totals(windows: list[dict]) -> dict[str, dict]:
@@ -425,6 +486,28 @@ def dir_bytes(path: Path) -> int:
     return sum(p.stat().st_size for p in path.rglob("*") if p.is_file())
 
 
+def coldness_evidence(summary: dict, cap_bytes: int, data_bytes: int) -> dict:
+    """Per-arm proof the run was cache-evicting: the cgroup peak and the data:cap ratio.
+
+    The cgroup counts page cache, so a run whose peak reaches the cap has been under memory
+    pressure and cannot have kept the working set resident. This matters because warm runs on
+    this box measured the opposite page-size conclusion (slice 25 flat vs slice 29 +54% cold), so
+    "cold" must be shown per arm, not asserted. ``cache_evicting`` is true when the observed peak
+    reached at least 90% of the cap - the signal the box actually pressured memory.
+    """
+    peak = summary.get("cgroup_peak_bytes")
+    load_hwm_kb = summary.get("load_hwm_kb")
+    return {
+        "cap_bytes": cap_bytes,
+        "data_bytes": data_bytes,
+        "data_cap_ratio": data_bytes / cap_bytes if cap_bytes else None,
+        "cgroup_peak_bytes": peak,
+        "load_hwm_bytes": load_hwm_kb * 1024 if load_hwm_kb else None,
+        "peak_over_cap": peak / cap_bytes if peak and cap_bytes else None,
+        "cache_evicting": peak is not None and cap_bytes > 0 and peak >= 0.9 * cap_bytes,
+    }
+
+
 def copy_instance(src: Path, dst: Path) -> None:
     if dst.exists():
         shutil.rmtree(dst)
@@ -553,6 +636,7 @@ def run_arm(name: str, workload: str, base: Path, workroot: Path, bins: dict,
         "windows": windows,
         "curve": summarize_curve(windows, args.ceiling_us),
         "regions": region_compaction_totals(windows),
+        "coldness": coldness_evidence(summary, cap_bytes, dir_bytes(base)),
         "noise": {},
         "learner_decisions": live.decisions,
         "restarts": getattr(controller, "restarts", lambda: None)() if controller else None,
@@ -562,7 +646,10 @@ def run_arm(name: str, workload: str, base: Path, workroot: Path, bins: dict,
     print(f"  rc={rc} achieved_rps={summary.get('achieved_rps')} "
           f"commit_rate={summary.get('commit_rate')} sustained={highest_sustained_rate(record['curve'])} "
           f"invalid={summary.get('invalid_windows')} reorg_bytes="
-          f"{sum(r['compaction_bytes'] for r in record['regions'].values())}", flush=True)
+          f"{sum(r['compaction_bytes'] for r in record['regions'].values())} "
+          f"cgroup_peak={record['coldness']['cgroup_peak_bytes']} "
+          f"data:cap={record['coldness']['data_cap_ratio']:.2f}x "
+          f"(cold={record['coldness']['cache_evicting']})", flush=True)
     # Keep the copy only on request: the record has everything the report needs.
     if not args.keep_engines:
         shutil.rmtree(engine_dir, ignore_errors=True)
@@ -607,8 +694,32 @@ def evaluate_thresholds(records: dict[str, dict], win: str = "win", adv: str = "
         # Threshold 1: learned beats declared by > 15% in sustained load on win.
         decl_rate = highest_sustained_rate(declared_win["curve"])
         learn_rate = highest_sustained_rate(learned_win["curve"])
+        top = max(ladder_top_rate(declared_win["curve"]), ladder_top_rate(learned_win["curve"]))
         common = throughput_at_common_sustained(learned_win, declared_win)
-        if decl_rate == 0.0 or learn_rate == 0.0:
+        both_top = top > 0.0 and decl_rate >= top - 1e-9 and learn_rate >= top - 1e-9
+        if both_top:
+            # Both arms cleared the ladder's top step, so the highest-sustained-level metric ties by
+            # construction. A > 15% throughput win at that common level still decides (the
+            # pre-registration's alternative); anything else is an under-powered ladder, not a tie.
+            decl_top = _curve_row(declared_win, top)
+            learn_top = _curve_row(learned_win, top)
+            gain = ((learn_top["achieved_rps"] - decl_top["achieved_rps"]) / decl_top["achieved_rps"]
+                    if decl_top and learn_top and decl_top["achieved_rps"] else None)
+            if gain is not None and gain > 0.15:
+                status, detail = "PASS", (
+                    f"both arms sustained the top step ({top:.0f} rps); learned throughput "
+                    f"{learn_top['achieved_rps']:.1f} vs declared {decl_top['achieved_rps']:.1f} "
+                    f"({gain:+.1%} > 15%) at that common level")
+            else:
+                status = "NOT-MEASURABLE"
+                detail = (
+                    f"ladder under-powered: both arms sustained the top step ({top:.0f} rps) - "
+                    f"declared achieved {_fmt(decl_top and decl_top['achieved_rps'], '.1f')} rps, "
+                    f"learned {_fmt(learn_top and learn_top['achieved_rps'], '.1f')} rps "
+                    f"(gain {_fmt(gain, '+.1%') if gain is not None else 'n/a'}). 'Highest sustained "
+                    "load level' ties by construction when every arm clears the top, so a tie is "
+                    "not a verdict; raise the top step until at least one arm fails.")
+        elif decl_rate == 0.0 or learn_rate == 0.0:
             status, detail = "NOT-MEASURABLE", (
                 f"declared sustained rate {decl_rate}, learned {learn_rate}: no sustained level "
                 "to compare (the box could not complete even the reference level)")
@@ -727,6 +838,11 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--learner-seed", type=int, default=0)
     ap.add_argument("--noise-repeat", action="store_true",
                     help="run declared twice on win to measure the box's noise band")
+    ap.add_argument("--ladder-extension-steps", type=int, default=1,
+                    help="if every arm sustains the ladder's top step (under-powered ladder), raise "
+                         "the top by 2x and rerun the workload, up to this many times")
+    ap.add_argument("--ladder-ceiling-rps", type=float, default=None,
+                    help="stop extending the ladder once its top step reaches this rate")
     ap.add_argument("--keep-engines", action="store_true")
     ap.add_argument("--quick", action="store_true", help="one workload, one arm set, tiny trace")
     a = ap.parse_args(argv)
@@ -771,9 +887,8 @@ def main(argv: list[str]) -> int:
     def key(workload: str, arm: str, lam: float | None = None) -> str:
         return f"{workload}/{arm}" + (f"@{lam}" if lam is not None else "")
 
-    for wl in a.workloads:
-        plan = plans[wl]
-        trace = traces[wl]
+    def run_workload_arms(wl: str, plan: WorkloadPlan, trace: Path) -> None:
+        """Run every configured arm for one workload against one plan/trace."""
         # declared
         if "declared" in a.arms:
             records[key(wl, "declared")] = run_arm(
@@ -792,7 +907,7 @@ def main(argv: list[str]) -> int:
             seed_lam = a.lambdas[0]
             src = records.get(key(wl, "learned", seed_lam))
             if src is not None:
-                sweep = build_sweep(src["windows"], max_rate=a.reference_rate)
+                sweep = build_sweep(src["windows"], max_rate=plan.rates[0])
                 frozen = argmin_from_sweep(sweep, seed=a.learner_seed)
                 static_controller = _FrozenController(frozen)
                 records[key(wl, "static-derived")] = run_arm(
@@ -804,6 +919,31 @@ def main(argv: list[str]) -> int:
             records[key(wl, "oracle")] = run_arm(
                 "oracle", wl, base, workroot, bins, trace, plan,
                 _oracle_policy(records, wl, a), None, a, cap_bytes, env)
+
+    for wl in a.workloads:
+        plan = plans[wl]
+        trace = traces[wl]
+        run_workload_arms(wl, plan, trace)
+        # Ladder under-power guard: when every arm clears the top step the level metric ties by
+        # construction, so raise the top (and rerun the whole workload) until an arm fails or the
+        # stated ceiling is reached. Bounded by `--ladder-extension-steps`.
+        extensions = 0
+        while (extensions < a.ladder_extension_steps and is_ladder(plan)
+               and ladder_underpowered(records, wl)
+               and (a.ladder_ceiling_rps is None or plan.rates[-1] < a.ladder_ceiling_rps)):
+            plan = extend_ladder(plan)
+            plans[wl] = plan
+            trace = workroot / f"{wl}.jsonl"
+            meta = build_trace(trace, plan, a)
+            traces[wl] = trace
+            extensions += 1
+            print(f"LADDER under-powered for {wl}: raising the top step to {plan.rates[-1]} rps "
+                  f"(extension {extensions}/{a.ladder_extension_steps}); trace total={meta['total']}",
+                  flush=True)
+            run_workload_arms(wl, plan, trace)
+        if extensions >= a.ladder_extension_steps and is_ladder(plan) and ladder_underpowered(records, wl):
+            print(f"LADDER still under-powered for {wl} at {plan.rates[-1]} rps after "
+                  f"{extensions} extension(s): T1 will report NOT-MEASURABLE", flush=True)
 
     # Noise band: same arm, same trace, run twice.
     noise_band = None
@@ -842,6 +982,7 @@ def main(argv: list[str]) -> int:
         "workloads": {wl: plans[wl].to_dict() for wl in a.workloads},
         "arms": {k: _slim_record(v) for k, v in records.items()},
         "thresholds": verdicts,
+        "ladder_underpowered": {wl: ladder_underpowered(records, wl) for wl in a.workloads},
         "not_concluded": [
             "data:cap is %.2fx, below the 10x pre-registration floor" % ratio,
             "compaction reorganisation writes are 0 for every arm: the offered-load driver never "
@@ -853,6 +994,10 @@ def main(argv: list[str]) -> int:
             "the 10-seed median/IQR requirement is not met (one seed per arm on a shared box)",
         ],
     }
+    if a.ladder_extension_steps <= 0:
+        result["not_concluded"].append(
+            "the ladder under-power guard detected and reported but was not allowed to extend "
+            "(--ladder-extension-steps 0), so a fully-sustained ladder is NOT-MEASURABLE")
     if a.json:
         a.json.parent.mkdir(parents=True, exist_ok=True)
         a.json.write_text(json.dumps(result, indent=2, default=str), encoding="utf-8")
@@ -932,7 +1077,7 @@ def render_report(result: dict) -> str:
     """Markdown report: per-arm capacity curves, telemetry, and the threshold table."""
     L: list[str] = []
     w = L.append
-    w("# 0b - the cold arms at equal offered load (Slice 35)")
+    w("# 0b - the cold arms at equal offered load (Slices 35/36)")
     w("")
     w(f"Instance `{result['instance']}`: data {result['data_bytes']:,} B, cgroup cap "
       f"{result['cap_bytes']:,} B, **ratio {result['ratio']:.2f}x**")
@@ -955,6 +1100,17 @@ def render_report(result: dict) -> str:
         w("**Noise band: not measured this run** (the `--noise-repeat` control did not run); "
           "differences smaller than ~10-20% (the band slices 12/29 measured on this shared box) "
           "must be treated as noise-ambiguous.")
+    w("")
+    under = result.get("ladder_underpowered") or {}
+    if under:
+        w("**Ladder under-power guard** (per workload): " + "; ".join(
+            f"`{wl}` " + ("UNDER-POWERED - T1 NOT-MEASURABLE" if flag
+                          else "bracketed (at least one arm failed the top step)")
+            for wl, flag in sorted(under.items())) + ".")
+        if any(under.values()):
+            w("")
+            w("When every arm sustains the ladder's top step the \"highest sustained load level\" "
+              "metric ties by construction, so T1 is reported NOT-MEASURABLE rather than as a tie.")
     w("")
     w("## Per-arm capacity curve")
     w("")
@@ -982,6 +1138,24 @@ def render_report(result: dict) -> str:
       "`compaction_bytes` over the run. A row is `sustained` when the median window completed "
       f">= {SUSTAINED_TOLERANCE:.0%} of the offered rate with no rejected window.")
     w("")
+    w("## Coldness evidence (per arm)")
+    w("")
+    w("The cgroup counts page cache, so a run whose peak reached its cap has been under memory "
+      "pressure and evicted the working set. It is reported per arm because warm runs on this box "
+      "reversed the page-size conclusion (slice 25 flat vs slice 29 +54% cold). `data:cap` is the "
+      "instance's whole-data ratio to the cap; `cache-evicting` is the 90%-of-cap memory-pressure "
+      "signal.")
+    w("")
+    w("| workload | arm | cgroup peak B | cap B | peak/cap | data B | data:cap | load hwm B | "
+      "cache-evicting |")
+    w("|---|---|---:|---:|---:|---:|---:|---:|:--:|")
+    for key, rec in sorted(result["arms"].items()):
+        c = rec.get("coldness") or {}
+        w(f"| {rec['workload']} | {rec['arm']} | {_fmt(c.get('cgroup_peak_bytes'))} | "
+          f"{_fmt(c.get('cap_bytes'))} | {_fmt(c.get('peak_over_cap'), '.3f')} | "
+          f"{_fmt(c.get('data_bytes'))} | {_fmt(c.get('data_cap_ratio'), '.2f')}x | "
+          f"{_fmt(c.get('load_hwm_bytes'))} | {'yes' if c.get('cache_evicting') else 'no'} |")
+    w("")
     w("## Per-region telemetry (summed over the run)")
     w("")
     for key, rec in sorted(result["arms"].items()):
@@ -990,11 +1164,13 @@ def render_report(result: dict) -> str:
             continue
         w(f"### {key}")
         w("")
-        w("| region | windows | bytes_read | bytes_written | compaction_bytes | merges |")
-        w("|---|---:|---:|---:|---:|---:|")
+        w("| region | windows | bytes_read | bytes_written | compaction_bytes | merges | "
+          "rewrite factor |")
+        w("|---|---:|---:|---:|---:|---:|---:|")
         for region, t in sorted(regs.items()):
+            rw = t["compaction_bytes"] / t["bytes_written"] if t["bytes_written"] else None
             w(f"| {region} | {t['windows']} | {t['bytes_read']:,} | {t['bytes_written']:,} | "
-              f"{t['compaction_bytes']:,} | {t['compaction_merges']} |")
+              f"{t['compaction_bytes']:,} | {t['compaction_merges']} | {_fmt(rw, '.4f')} |")
         w("")
     w("## Learner decisions and drift")
     w("")

@@ -148,8 +148,9 @@ def test_build_sweep_attributes_window_cost_to_the_echoed_candidate() -> None:
 # Threshold evaluation
 # ---------------------------------------------------------------------------
 def _record(rates: list[tuple[float, float, bool]], reorg: int = 0,
-            recovery: dict | None = None) -> dict:
+            recovery: dict | None = None, workload: str | None = None) -> dict:
     return {
+        "workload": workload,
         "curve": [{"offered_rps": r, "achieved_rps": a, "sustained": s,
                    "p50_us": 1, "p99_us": 2, "invalid_windows": 0} for r, a, s in rates],
         "regions": {"P|Stock": {"compaction_bytes": reorg}} if reorg else {},
@@ -269,3 +270,109 @@ def test_parse_engine_open_and_summary() -> None:
     assert summary["invalid_windows"] == 2
     assert summary["saturated_at_rps"] == 200.0
     assert summary["cgroup_peak_bytes"] == 150000000
+
+
+# ---------------------------------------------------------------------------
+# Ladder under-power guard (Slice 36)
+# ---------------------------------------------------------------------------
+def test_ladder_underpowered_when_every_arm_sustains_the_top_step() -> None:
+    records = {
+        "win/declared": _record([(50, 50, True), (100, 100, True), (200, 200, True)], workload="win"),
+        "win/learned@1.0": _record([(50, 50, True), (100, 100, True), (200, 200, True)], workload="win"),
+        "win/static-derived": _record([(50, 50, True), (100, 100, True), (200, 200, True)], workload="win"),
+    }
+    assert m.ladder_underpowered(records, "win") is True
+    assert m.ladder_underpowered(records, "adversarial") is False, "no arm for that workload"
+
+
+def test_ladder_not_underpowered_when_one_arm_fails_the_top() -> None:
+    records = {
+        "win/declared": _record([(50, 50, True), (100, 60, False)], workload="win"),
+        "win/learned@1.0": _record([(50, 50, True), (100, 98, True)], workload="win"),
+    }
+    assert m.ladder_underpowered(records, "win") is False
+
+
+def test_threshold1_underpowered_ladder_is_not_measurable_not_a_tie() -> None:
+    # Every level sustained with equal throughput: the highest-sustained-level metric ties by
+    # construction, so the verdict is NOT-MEASURABLE, never a tie PASS/FAIL artefact.
+    records = {
+        "win/declared": _record([(50, 50, True), (100, 100, True), (200, 200, True), (400, 400, True)]),
+        "win/learned@1.0": _record([(50, 50, True), (100, 100, True), (200, 200, True), (400, 400, True)]),
+    }
+    t1 = m.evaluate_thresholds(records, lambdas=(1.0,))[0]
+    assert t1["status"] == "NOT-MEASURABLE"
+    assert "ladder under-powered" in t1["detail"]
+    assert "top step (400 rps)" in t1["detail"], "the observed top rate must be named"
+
+
+def test_threshold1_sustained_top_with_a_fifteen_percent_win_still_passes() -> None:
+    # A fully-sustained ladder whose top level shows a > 15% throughput gap is decidable (the
+    # pre-registration's alternative basis); the guard must not hide a real win.
+    records = {
+        "win/declared": _record([(50, 50, True), (100, 100, True)]),
+        "win/learned@1.0": _record([(50, 50, True), (100, 120, True)]),
+    }
+    t1 = m.evaluate_thresholds(records, lambdas=(1.0,))[0]
+    assert t1["status"] == "PASS" and t1["gain"] > 0.15
+
+
+def test_extend_ladder_appends_a_rate_and_a_matching_mix() -> None:
+    plan = m.plan_workload("win", 50, 100)
+    bigger = m.extend_ladder(plan)
+    assert bigger.rates == [50, 100, 200, 400, 800]
+    assert len(bigger.mixes) == len(bigger.rates), "a rate without a mix would truncate the trace"
+    assert bigger.mixes[-1] == plan.mixes[-1]
+    assert m.is_ladder(plan) is True
+    assert m.is_ladder(m.plan_workload("drift", 50, 100, drift_rate=150)) is False
+
+
+# ---------------------------------------------------------------------------
+# Coldness evidence (Slice 36)
+# ---------------------------------------------------------------------------
+def test_coldness_evidence_flags_cache_evicting_at_the_cap() -> None:
+    cold = m.coldness_evidence({"cgroup_peak_bytes": 190 << 20, "load_hwm_kb": 4096},
+                               192 << 20, 1_645_273_432)
+    assert cold["cgroup_peak_bytes"] == 190 << 20
+    assert cold["cache_evicting"] is True
+    assert abs(cold["data_cap_ratio"] - 1_645_273_432 / (192 << 20)) < 1e-9
+    assert cold["load_hwm_bytes"] == 4096 * 1024
+    warm = m.coldness_evidence({"cgroup_peak_bytes": 8 << 20}, 192 << 20, 1_645_273_432)
+    assert warm["cache_evicting"] is False
+    assert m.coldness_evidence({}, 192 << 20, 1)["cache_evicting"] is False
+
+
+def test_summarize_curve_excludes_invalid_windows_from_sustained():
+    """Regression for the bug that made a saturated arm score as sustained at every rung.
+
+    The first window of a ladder step can carry completions drained from the previous step, so it
+    can look like it achieved the new offered rate. The pacer marks such a window invalid (its
+    schedule lag ran away); that flag was not parsed, so the step was scored sustained anyway.
+    """
+    from flashdb_harness.cold_0b import summarize_curve
+
+    windows = [
+        # a genuinely sustained rung: two valid windows at 100 rps
+        {"rate_rps": 100.0, "achieved_rps": 100.0, "p50_us": 100, "p99_us": 200,
+         "errors": 0, "invalid": False, "lag_p99_us": 1000},
+        {"rate_rps": 100.0, "achieved_rps": 99.0, "p50_us": 100, "p99_us": 200,
+         "errors": 0, "invalid": False, "lag_p99_us": 1000},
+        # a saturated rung: the draining window "achieves" the offered rate but is invalid, while
+        # the other window is still valid (the lag rule needs consecutive windows) and shows the
+        # engine honestly far behind
+        {"rate_rps": 400.0, "achieved_rps": 400.0, "p50_us": 100, "p99_us": 200,
+         "errors": 0, "invalid": True, "lag_p99_us": 5_000_000},
+        {"rate_rps": 400.0, "achieved_rps": 120.0, "p50_us": 100, "p99_us": 200,
+         "errors": 0, "invalid": False, "lag_p99_us": 2_000_000},
+    ]
+    curve = summarize_curve(windows)
+    by_rate = {row["offered_rps"]: row for row in curve}
+    assert by_rate[100.0]["sustained"] is True
+    assert by_rate[400.0]["sustained"] is False, (
+        "a rung whose windows the pacer marked invalid must never be scored sustained, even if one "
+        "of them appears to achieve the offered rate by draining a previous step's backlog")
+    assert by_rate[400.0]["invalid_windows"] == 1
+    assert by_rate[400.0]["achieved_rps"] == 120.0, "the invalid windows are excluded from the median"
+
+    from flashdb_harness.cold_0b import highest_sustained_rate
+    assert highest_sustained_rate(curve) == 100.0
