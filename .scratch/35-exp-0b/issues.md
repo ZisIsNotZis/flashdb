@@ -86,3 +86,34 @@ Caveats, unchanged and required: 8.18x is below the 10x floor; one seed per arm 
 median/IQR requirement is unmet); the calibration gate (<=25% p90) is not evaluable; and the ladder
 tops out at 100 rps for every arm, so T1's "one load level higher" criterion cannot discriminate
 here at all.
+
+## Drift arm results (2026-10-02): the drift rate is above capacity, and the learner churns
+
+The reduced matrix (adversarial + drift, arms declared / learned@1.0 / static-derived) ran to the
+drift workload and produced two findings, both about the EXPERIMENT and the LEARNER rather than the
+thesis:
+
+| arm (drift, fixed 150 rps) | achieved | sustained | invalid windows | reorg bytes |
+|---|---|---|---|---|
+| declared | 58 | **0.0** | 148 | 1,673,926 |
+| learned@1.0 | 54 | **0.0** | 151 | **402,984,851** |
+
+1. **The drift workload's fixed rate is above the engine's capacity for its own mix.** The drift plan
+   runs at a constant 150 rps, but its trace is 64% scans (7,697 of 12,000) versus the win mix's 45%,
+   and scans are the slowest shape (21-40 ms each cold). Every arm saturates (`sustained=0`, ~150
+   invalid windows), so "recover to within 10% of pre-drift throughput" is undefinable - there is no
+   sustainable pre-drift baseline to recover to. The rate must be chosen below the capacity of the
+   HEAVIEST pre-drift mix, or the drift claim cannot be evaluated at all. (This is also why the
+   earlier log line "sustained=800" belonged to the adversarial arms, whose ladder is cheap, not to
+   drift.)
+2. **Under drift the learner churns: 402,984,851 reorganisation bytes against declared's 1,673,926 -
+   a 240x difference.** That is the anti-overfitting failure mode the adversarial-uniform workload
+   was designed to catch, appearing on the drift workload instead: drift triggers re-exploration,
+   the re-exploration moves merge thresholds, and every threshold change makes the next compaction
+   rewrite more. The pre-registration's "must not need >3x the reorganisation writes" is therefore
+   already violated by a wide margin BEFORE a drift verdict is even defined.
+
+Both are recorded as defects to fix (drift rate below the heaviest pre-drift mix's capacity; churn
+control between re-explorations, e.g. a reorganisation budget or a cooldown), not as thesis
+evidence. The adversarial arm's numbers are in the same run and will be read from the finished
+report.
