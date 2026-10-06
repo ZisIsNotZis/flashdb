@@ -36,6 +36,24 @@ def stats(region: str, *, count: int = 100, mean_ns: float = 1000.0,
     )
 
 
+
+def make_learner(**kw):
+    """Construct a learner in the HISTORICAL absolute units these tests were tuned in.
+
+    The production default prices writes relative to a calibrated typical window; with identity
+    references the reward is ``service + lambda * bytes`` exactly as these synthetic numbers assume.
+    """
+    kw.setdefault("service_ref_ns", 1.0)
+    kw.setdefault("bytes_ref", 1.0)
+    return ll.LayoutLearner(**kw)
+
+
+def make_static_derived(**kw):
+    kw.setdefault("service_ref_ns", 1.0)
+    kw.setdefault("bytes_ref", 1.0)
+    return ll.StaticDerivedController(**kw)
+
+
 def window(index: int, tables: dict, selection: dict) -> ll.WindowTelemetry:
     """One simulated metrics window: each region reports its active candidate's row."""
     rows = {}
@@ -87,19 +105,19 @@ def test_candidate_set_is_the_published_2x3_grid():
 
 def test_reward_proxy_is_service_time_plus_lambda_times_bytes():
     row = stats("P|Stock", count=10, mean_ns=200.0, bytes_written=500)
-    assert ll.region_cost_ns(row, 1.0) == 10 * 200.0 + 500
+    assert ll.region_cost_ns(row, 1.0, 1.0, 1.0) == 10 * 200.0 + 500
     # lambda prices endurance: a bigger lambda makes a write-heavy candidate costlier
-    assert ll.region_cost_ns(row, 4.0) == 10 * 200.0 + 4 * 500
+    assert ll.region_cost_ns(row, 4.0, 1.0, 1.0) == 10 * 200.0 + 4 * 500
 
 
 def test_candidate_set_is_configurable():
-    learner = ll.LayoutLearner(candidates=(A, B))
+    learner = make_learner(candidates=(A, B))
     learner.observe(window(0, {"P|Stock": uniform_table(1.0)}, {}))
     assert set(learner.pulls("P|Stock")) == {A, B}
 
 
 def test_folded_other_region_is_ignored():
-    learner = ll.LayoutLearner()
+    learner = make_learner()
     w = ll.WindowTelemetry(window=0, rate_rps=1.0,
                            regions={"other": stats("other"), "P|Stock": stats("P|Stock")})
     learner.observe(w)
@@ -117,7 +135,7 @@ def test_finds_the_best_candidate_in_a_synthetic_environment():
         "P|Stock": uniform_table(5000.0, best_stock, 1000.0),
         "U|Customer": uniform_table(4000.0, best_customer, 900.0),
     }
-    learner = ll.LayoutLearner(min_samples=2, stability_window=2, margin=0.05,
+    learner = make_learner(min_samples=2, stability_window=2, margin=0.05,
                                drift_margin=10.0, seed=1)
     drive(learner, tables, windows=40)
     assert learner.selections()["P|Stock"] == best_stock
@@ -126,7 +144,7 @@ def test_finds_the_best_candidate_in_a_synthetic_environment():
 
 def test_no_churn_when_all_candidates_are_equal():
     tables = {"P|Stock": uniform_table(3000.0)}
-    learner = ll.LayoutLearner(min_samples=2, stability_window=2, margin=0.05,
+    learner = make_learner(min_samples=2, stability_window=2, margin=0.05,
                                drift_margin=10.0, seed=3)
     trace = drive(learner, tables, windows=60)
     burn_in = len(ll.DEFAULT_CANDIDATES) * 2
@@ -138,7 +156,7 @@ def test_no_churn_when_all_candidates_are_equal():
 
 def test_min_sample_gate_delays_a_switch():
     region = "P|Stock"
-    learner = ll.LayoutLearner(candidates=(A, B), min_samples=3, margin=0.05,
+    learner = make_learner(candidates=(A, B), min_samples=3, margin=0.05,
                                stability_window=1, drift_margin=10.0, seed=0)
     for _ in range(2):
         learner.record(region, A, stats(region, mean_ns=5000.0))
@@ -172,7 +190,7 @@ def test_hysteresis_resists_a_one_window_noise_spike():
         return stats(region, mean_ns=5000.0)
 
     # One very cheap window among three expensive ones does not move the challenger's mean.
-    spiky = ll.LayoutLearner(candidates=(A, B), min_samples=3, margin=0.05,
+    spiky = make_learner(candidates=(A, B), min_samples=3, margin=0.05,
                              stability_window=2, drift_margin=10.0, seed=0)
     for _ in range(3):
         spiky.record(region, A, good())
@@ -184,7 +202,7 @@ def test_hysteresis_resists_a_one_window_noise_spike():
     assert spiky.gated_switches().get(region, 0) == 0
 
     # A sustained improvement switches, but only after the stability window.
-    sustained = ll.LayoutLearner(candidates=(A, B), min_samples=3, margin=0.05,
+    sustained = make_learner(candidates=(A, B), min_samples=3, margin=0.05,
                                  stability_window=2, drift_margin=10.0, seed=0)
     for _ in range(3):
         sustained.record(region, A, bad())
@@ -205,7 +223,7 @@ def test_p99_constraint_excludes_a_violating_candidate():
     table = {}
     for c in ll.DEFAULT_CANDIDATES:
         table[c] = (100.0, 0, 9000.0) if c == tempting else (1000.0, 0, 500.0)
-    learner = ll.LayoutLearner(min_samples=1, margin=0.05, stability_window=1,
+    learner = make_learner(min_samples=1, margin=0.05, stability_window=1,
                                drift_margin=10.0, ceilings_ns={region: ceiling}, seed=0)
 
     selection: dict = {}
@@ -227,7 +245,7 @@ def test_learner_ignores_a_region_without_a_declared_ceiling():
     region = "P|Stock"
     best = ll.LayoutCandidate(65536, 200)
     tables = {region: uniform_table(5000.0, best, 100.0, p99_ns=99_000.0)}
-    learner = ll.LayoutLearner(min_samples=2, stability_window=2, margin=0.05,
+    learner = make_learner(min_samples=2, stability_window=2, margin=0.05,
                                drift_margin=10.0, seed=1)
     drive(learner, tables, windows=30)
     assert learner.selections()[region] == best
@@ -236,18 +254,18 @@ def test_learner_ignores_a_region_without_a_declared_ceiling():
 def test_determinism_same_seed_same_decisions():
     tables = {"P|Stock": uniform_table(5000.0, C, 1000.0),
               "U|Stock": uniform_table(3000.0)}
-    first = drive(ll.LayoutLearner(min_samples=2, seed=11), tables, windows=30)
-    second = drive(ll.LayoutLearner(min_samples=2, seed=11), tables, windows=30)
+    first = drive(make_learner(min_samples=2, seed=11), tables, windows=30)
+    second = drive(make_learner(min_samples=2, seed=11), tables, windows=30)
     assert first == second
 
 
 def test_seed_only_orders_exact_ties():
     # The seed is used nowhere but the tie-break permutation, and that permutation
     # is stable for a fixed seed and a permutation of the candidate set.
-    learner = ll.LayoutLearner(seed=0)
-    assert learner.candidate_order == ll.LayoutLearner(seed=0).candidate_order
+    learner = make_learner(seed=0)
+    assert learner.candidate_order == make_learner(seed=0).candidate_order
     assert sorted(learner.candidate_order) == sorted(ll.DEFAULT_CANDIDATES)
-    seeds = {tuple(ll.LayoutLearner(seed=s).candidate_order) for s in range(8)}
+    seeds = {tuple(make_learner(seed=s).candidate_order) for s in range(8)}
     assert len(seeds) > 1, "the seed must actually move the tie order"
 
 
@@ -273,7 +291,7 @@ def test_static_derived_picks_the_cheapest_from_the_pre_drift_sweep():
         B: stats(region, mean_ns=1000.0),
         C: stats(region, mean_ns=9000.0),
     }}
-    static = ll.StaticDerivedController(candidates=(A, B, C))
+    static = make_static_derived(candidates=(A, B, C))
     static.derive(sweep)
     assert static.selections()[region] == B
 
@@ -287,14 +305,14 @@ def test_static_derived_does_not_adapt_after_drift_while_learner_does():
     post[old_best] = (6000.0, 0, 0.0)          # the old best degrades: the drift signal
 
     sweep = {region: {c: stats(region, mean_ns=pre[c][0]) for c in pre}}
-    static = ll.StaticDerivedController()
+    static = make_static_derived()
     static.derive(sweep)
     assert static.selections()[region] == old_best
 
     # Full re-exploration (None): the new best is not the pre-drift runner-up
     # (all non-incumbents were tied), so the complete candidate set must be
     # re-sampled. This pins the correctness fallback of the targeted response.
-    learner = ll.LayoutLearner(min_samples=2, stability_window=2, margin=0.05,
+    learner = make_learner(min_samples=2, stability_window=2, margin=0.05,
                                drift_margin=0.25, drift_windows=2,
                                drift_reexplore_candidates=None, seed=1)
     selection: dict = {}
@@ -319,7 +337,7 @@ def test_drift_reexplores_only_the_changed_regions():
     regions = ["P|A", "P|B", "P|C", "P|D", "P|E"]
     stable = {A: (1000.0, 0, 0.0), B: (5000.0, 0, 0.0)}
     drifted = {A: (9000.0, 0, 0.0), B: (1000.0, 0, 0.0)}   # A worsens, B improves
-    learner = ll.LayoutLearner(candidates=(A, B), min_samples=2, stability_window=2,
+    learner = make_learner(candidates=(A, B), min_samples=2, stability_window=2,
                                margin=0.05, drift_margin=0.25, drift_windows=2,
                                drift_reexplore_candidates=2, seed=0)
 
@@ -364,7 +382,7 @@ def test_targeted_drift_response_window_count_and_the_two_window_gap():
         return learner.recovery_windows()[region]
 
     min_samples = 2
-    targeted = ll.LayoutLearner(candidates=(A, B), min_samples=min_samples,
+    targeted = make_learner(candidates=(A, B), min_samples=min_samples,
                                 stability_window=2, margin=0.05, drift_margin=0.25,
                                 drift_windows=2, drift_reexplore_candidates=2, seed=0)
     targeted_windows = measure(targeted, {A: (1000.0, 0, 0.0), B: (5000.0, 0, 0.0)},
@@ -374,7 +392,7 @@ def test_targeted_drift_response_window_count_and_the_two_window_gap():
         f"(K=2 x min_samples={min_samples}); the pre-registration target is 2")
 
     new_best = ll.LayoutCandidate(65536, 200)
-    full = ll.LayoutLearner(candidates=ll.DEFAULT_CANDIDATES, min_samples=min_samples,
+    full = make_learner(candidates=ll.DEFAULT_CANDIDATES, min_samples=min_samples,
                             stability_window=2, margin=0.05, drift_margin=0.25,
                             drift_windows=2, drift_reexplore_candidates=None, seed=0)
     full_windows = measure(full, uniform_table(5000.0, A, 1000.0),
@@ -388,8 +406,8 @@ def test_targeted_drift_response_window_count_and_the_two_window_gap():
 
 def test_drift_reexplore_candidates_is_configurable_and_validated():
     with pytest.raises(ValueError):
-        ll.LayoutLearner(drift_reexplore_candidates=0)
-    assert ll.LayoutLearner(drift_reexplore_candidates=None).drift_reexplore_candidates is None
+        make_learner(drift_reexplore_candidates=0)
+    assert make_learner(drift_reexplore_candidates=None).drift_reexplore_candidates is None
 
 
 # ---------------------------------------------------------------------------
@@ -399,7 +417,7 @@ def test_driver_loop_runs_against_simulated_rewards():
     region = "P|Stock"
     best = ll.LayoutCandidate(65536, 200)
     tables = {region: uniform_table(1000.0, best, 100.0)}
-    learner = ll.LayoutLearner(min_samples=2, stability_window=2, margin=0.05,
+    learner = make_learner(min_samples=2, stability_window=2, margin=0.05,
                                drift_margin=10.0, seed=1)
 
     state = {"selection": {}, "written": [], "read": 0}
@@ -462,7 +480,7 @@ def test_parse_window_line_reads_the_slice26_schema():
 
 
 def test_policy_document_is_valid_engine_json():
-    learner = ll.LayoutLearner()
+    learner = make_learner()
     learner.observe(window(0, {"P|Stock": uniform_table(1.0)}, {}))
     doc = learner.policy_document()
     assert json.loads(json.dumps(doc)) == doc
@@ -473,7 +491,34 @@ def test_policy_document_is_valid_engine_json():
 
 def test_write_policy_file_round_trips(tmp_path):
     path = tmp_path / "policy.json"
-    learner = ll.LayoutLearner()
+    learner = make_learner()
     learner.observe(window(0, {"P|Stock": uniform_table(1.0)}, {}))
     ll.write_policy_file(path, learner.policy_document())
     assert json.loads(path.read_text(encoding="utf-8")) == learner.policy_document()
+
+
+def test_lambda_actually_bites_with_calibrated_references():
+    """Regression for slice 35's finding: lambda 0.1 -> 10 barely moved the policy.
+
+    With the old absolute reward the write term was ~300x smaller than the service term, so the
+    endurance price did nothing. This pins the arithmetic directly (the bandit's convergence is
+    covered by the other tests): with references calibrated to the arm's own typical window, a
+    candidate that is faster but writes more must be preferred at a low endurance price and beaten
+    at a high one - i.e. lambda must be able to change the ranking.
+    """
+    from flashdb_harness import layout_learner as ll2
+    fast_but_writey = stats("P|Stock", count=1000, mean_ns=40_000.0, bytes_written=40_000)
+    slow_but_cheap = stats("P|Stock", count=1000, mean_ns=80_000.0, bytes_written=2_000)
+    refs = (ll2.DEFAULT_SERVICE_REF_NS, ll2.DEFAULT_BYTES_REF)
+
+    # low endurance price: the faster, write-heavier candidate is cheaper overall
+    assert (ll2.region_cost_ns(fast_but_writey, 0.1, *refs)
+            < ll2.region_cost_ns(slow_but_cheap, 0.1, *refs))
+    # high endurance price: the ordering flips
+    assert (ll2.region_cost_ns(fast_but_writey, 10.0, *refs)
+            > ll2.region_cost_ns(slow_but_cheap, 10.0, *refs))
+
+    # the references are the values measured on the inventory workload, not arbitrary constants:
+    # with a 1e7/1e6 pair (my first attempt) the write term stays ~30x too small to matter.
+    assert ll2.DEFAULT_SERVICE_REF_NS == 6.5e6
+    assert ll2.DEFAULT_BYTES_REF == 2.0e4

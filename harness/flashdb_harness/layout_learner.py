@@ -303,12 +303,33 @@ def parse_window_line(line: str) -> WindowTelemetry | None:
     return WindowTelemetry.from_json(obj)
 
 
-def region_cost_ns(stats: RegionStats, lambda_ns_per_byte: float = DEFAULT_LAMBDA_NS_PER_BYTE) -> float:
-    """The reward proxy: service time (``count * mean_ns``) plus the priced write term.
+# Reference magnitudes for the relative reward. They must be TYPICAL per-window values for the
+# region, not arbitrary constants, or the write term stays implicitly down-weighted: on the real
+# workload a window is ~6.5e6 ns of service time against ~2e4 bytes written, so a constant 1e7/1e6
+# pair still left the write term ~30x too small and lambda could not price endurance (slice 35
+# measured reorg bytes moving only 4.13x -> 4.27x across two orders of magnitude of lambda).
+# With references calibrated to what the arm actually sees, lambda = 1 means "typical writes cost
+# the same as typical service time", which is the legible meaning the objective intends.
+DEFAULT_SERVICE_REF_NS = 6.5e6
+DEFAULT_BYTES_REF = 2.0e4
 
-    Lower is better. See the module docstring for why the endurance term exists.
+
+def region_cost_ns(
+    stats: RegionStats,
+    lambda_ns_per_byte: float = DEFAULT_LAMBDA_NS_PER_BYTE,
+    service_ref_ns: float = DEFAULT_SERVICE_REF_NS,
+    bytes_ref: float = DEFAULT_BYTES_REF,
+) -> float:
+    """The reward proxy, RELATIVE and dimensionless.
+
+    ``cost = (count * mean_ns) / service_ref_ns + lambda * bytes_written / bytes_ref``
+
+    Lower is better. With references calibrated to the arm's own typical window (the defaults are
+    the values measured on the inventory workload), ``lambda = 1`` means "a typical window's writes
+    cost as much as its service time", so lambda is a legible endurance price rather than a scale
+    factor that does nothing.
     """
-    return stats.count * stats.mean_ns + lambda_ns_per_byte * stats.bytes_written
+    return (stats.count * stats.mean_ns) / service_ref_ns + lambda_ns_per_byte * stats.bytes_written / bytes_ref
 
 
 def region_rewrite_factor(stats: RegionStats) -> float | None:
@@ -397,6 +418,10 @@ class LayoutLearner:
 
     candidates: tuple[LayoutCandidate, ...] = DEFAULT_CANDIDATES
     lambda_ns_per_byte: float = DEFAULT_LAMBDA_NS_PER_BYTE
+    # Calibrated to the arm's own typical window by default; tests pass 1.0/1.0 to work in the
+    # historical absolute units their synthetic numbers were tuned in.
+    service_ref_ns: float = DEFAULT_SERVICE_REF_NS
+    bytes_ref: float = DEFAULT_BYTES_REF
     min_samples: int = 3
     margin: float = 0.05
     stability_window: int = 2
@@ -487,7 +512,7 @@ class LayoutLearner:
         if ceiling is not None and stats.p99_ns > ceiling:
             st.arms[candidate].violating = True
             return
-        cost = region_cost_ns(stats, self.lambda_ns_per_byte)
+        cost = region_cost_ns(stats, self.lambda_ns_per_byte, self.service_ref_ns, self.bytes_ref)
         if candidate == st.active and self._in_exploitation(st) and st.reference_cost is not None:
             self._note_deviation(st, cost)
         arm = st.arms[candidate]
@@ -728,6 +753,8 @@ class StaticDerivedController:
     sweep, computed once and frozen; ``observe`` never changes a selection."""
 
     lambda_ns_per_byte: float = DEFAULT_LAMBDA_NS_PER_BYTE
+    service_ref_ns: float = DEFAULT_SERVICE_REF_NS
+    bytes_ref: float = DEFAULT_BYTES_REF
     ceilings_ns: Mapping[str, float] = field(default_factory=dict)
     candidates: tuple[LayoutCandidate, ...] = DEFAULT_CANDIDATES
     seed: int = 0
@@ -753,7 +780,9 @@ class StaticDerivedController:
             if not eligible:
                 continue
             self._frozen[region] = min(
-                eligible, key=lambda c: (region_cost_ns(eligible[c], self.lambda_ns_per_byte), self._tie[c])
+                eligible,
+                key=lambda c: (region_cost_ns(eligible[c], self.lambda_ns_per_byte,
+                                              self.service_ref_ns, self.bytes_ref), self._tie[c])
             )
 
     def observe(self, window: WindowTelemetry) -> None:
