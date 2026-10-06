@@ -117,3 +117,33 @@ Both are recorded as defects to fix (drift rate below the heaviest pre-drift mix
 control between re-explorations, e.g. a reorganisation budget or a cooldown), not as thesis
 evidence. The adversarial arm's numbers are in the same run and will be read from the finished
 report.
+
+## Aggregation defect #2 (2026-10-02): the adversarial curve reports achieved > offered
+
+From the reduced adversarial run's per-rung table:
+
+| offered | declared achieved | achieved % |
+|---|---|---|
+| 50 | 64.0 | **128%** |
+| 100 | 128.0 | **128%** |
+| 200 | 192.0 | 96% |
+| 400 | 448.0 | **112%** |
+| 800 | 768.0 | 96% |
+
+Achieved throughput above the offered rate is impossible in a closed system, so the window-to-rung
+attribution is still wrong: a rung's first window carries completions drained from the previous
+(cheaper) rung, and `achieved_rps = (completed - prev_completed) / window_s` attributes them to the
+new rate. My earlier fix excluded windows the pacer marked invalid, but at these rates the pacer's
+lag rule does not trip (p99 is 130-160 ms while no `--ceiling-us` is set, so nothing is invalid), so
+the wrong frames survive. Also note the run's p99 is 26-160 ms for a PROBE-ONLY mix, which deserves
+its own look.
+
+Required fix: attribute completions to the rung they were *offered* under, e.g. by tagging each
+request's rung in the pacer output (per-rung request/completion counters) instead of differencing a
+cumulative counter across window boundaries; and set `--ceiling-us` so the latency constraint is
+actually evaluated in these runs (the pre-registration makes it a constraint, and a run with it off
+cannot claim to have respected it).
+
+Until this is fixed, per-rung achieved numbers from this runner must not be quoted; only the
+whole-run totals (commits, reorg bytes, invalid counts) are trustworthy, and those are what the
+ticket's findings so far rest on.
