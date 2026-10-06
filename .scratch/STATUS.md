@@ -33,7 +33,7 @@ replay fits, every arm's cgroup peak at the cap (cache-evicting), one seed per a
 | threshold | verdict | evidence |
 |---|---|---|
 | T1 learned beats `flashdb-declared` by >15% on the win workload | **TIE / not a win** | every arm sustains the same top rung (100 rps); whole-run achieved 80 vs 81-83 rps (inside the noise band) |
-| T2 no >5% loss on adversarial-uniform | **NOT MEASURED** | the arm ran; the per-rung aggregation is broken (see §4) so no verdict was produced |
+| T2 no >5% loss on adversarial-uniform | **NOT-MEASURABLE (7.7% loss)** | the arm ran; the learner lost 7.7% at 400 rps, but the noise band was not measured this run and ~10-20% is what this shared box has shown, so 7.7% cannot be called a disqualifying loss |
 | T3 reorganisation writes <=3x declared | **FAIL** | learner 10.7-11.1 MB vs declared 2.6 MB = **4.13-4.27x**, once compaction was actually actuated |
 | T4 drift recovery within 2 windows | **NOT MEASURABLE** | the drift rate (150 rps) exceeds the capacity of its own 64%-scan mix, so every arm saturated and no pre-drift baseline exists; separately, the default parameters need 6 windows |
 
@@ -43,8 +43,12 @@ Two findings that are *not* thesis verdicts but matter:
   to merge_min_tiles=200, keep `P|Stock` at 8 with 4 KiB pages, 64 KiB for `R|Order`) that matches
   the access pattern - and still buys no throughput while costing ~4x the writes. On this workload
   the declared default is simply strong.
-- **`lambda` barely moves the learned policy** (0.1 → 10 changes reorg bytes only from 4.13x to
-  4.27x), i.e. the endurance price the objective intends is not being priced in practice.
+- **`lambda` cannot make endurance decisive, structurally**: the write term is 0.003% of the service
+  term for ingest and 0.083-0.669% for reorganisation, so no lambda sweep can move a candidate's
+  argmin. This is an objective-design decision (raise the weight ~100x, normalise the terms, or make
+  endurance a constraint), not a calibration fix.
+- **Churn control works**: per-region cooldown plus a per-window reorganisation budget cut the
+  learner's reorganissation bytes from 402,984,851 to 28,191,940 (14x) under drift.
 
 ## 3. What has been falsified or closed along the way (all by measurement)
 

@@ -147,3 +147,31 @@ cannot claim to have respected it).
 Until this is fixed, per-rung achieved numbers from this runner must not be quoted; only the
 whole-run totals (commits, reorg bytes, invalid counts) are trustworthy, and those are what the
 ticket's findings so far rest on.
+
+## Slice 39 results (2026-10-02): churn control works, T1 under-powered, T2 is inside the unmeasured band
+
+The worker's own report (`.scratch/39-0b-measurable/adversarial.md`) resolved several open items and
+corrected one label:
+
+1. **The endurance term is structurally unable to matter - a stronger finding than "lambda needs
+   calibrating".** The report prints the term ratios: ingest writes are **0.003%** of the service
+   term, and even the reorganisation writes are **0.083% (declared) to 0.669% (learned)**. As it says,
+   a write term that is a fraction of a percent of the service term cannot move any candidate's
+   `argmin` however lambda is swept. So lambda's insensitivity was never a calibration bug; the two
+   terms live 2-3 orders of magnitude apart, and **making endurance decisive is an objective-design
+   decision for the author** (raise lambda ~100x, normalise the terms, or make endurance a CONSTRAINT
+   rather than a term - the pre-registration already treats reorganisation writes as a threshold).
+2. **Churn control works and is measured**: per-region cooldown (3 windows) plus a per-window
+   reorganisation budget derived from the declared arm's rate. The learner's reorg bytes fell from
+   402,984,851 (slice 37) to **28,191,940** (14x), with 10 budget blocks and 42 cooldown holds.
+3. **T1 for the adversarial workload is NOT-MEASURABLE, correctly**: every arm sustained the ladder's
+   top step, so the under-power guard fired instead of reporting a tie.
+4. **T2's label needs correcting from FAIL to NOT-MEASURABLE.** The commit message says "T2 FAIL,
+   learned loses 7.7% vs declared at 400 rps", but the same report states the noise band was NOT
+   measured this run and that slices 12/29 measured ~10-20% on this shared box. A 7.7% loss is
+   inside that band, so the honest verdict is **NOT-MEASURABLE (7.7% loss, band unmeasured)** - not a
+   disqualifying loss. The pre-registration's >5% rule needs a MEASURED band to be applied at all,
+   which is another reason to run the noise repeats.
+
+Still open from the measurement side: the per-rung attribution defect (achieved > offered, 128% at
+the 50 and 100 rps rungs above) is visible in this report's own curve and is not fixed yet.
