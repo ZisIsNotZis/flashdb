@@ -20,8 +20,28 @@ The arms (equal durability: the same ``--group-requests`` batch everywhere, same
                            workload; regret = (oracle - arm) / oracle).
 
 ``lambda`` is the endurance price in the learner's reward proxy (``count*mean_ns +
-lambda*bytes_written``); it is a POLICY choice, not a measurement, so the runner sweeps it
-(default 0.1/1.0/10.0 ns/byte) and every verdict names the lambda it belongs to.
+lambda*(bytes_written + compaction_bytes)``). Slice 39 anchored it to the measured device write
+bandwidth (831 MiB/s ~= 1.148 ns/byte): at lambda=1 a written byte costs exactly its device write
+time, and lambda is the explicit endurance weight on top of that. Before slice 39 the write term
+priced only ``bytes_written`` (WAL ingest, close to constant across candidates), so lambda could
+not move the argmin; the reorganisation output the merge knob actually moves is now priced too.
+It is a POLICY choice, not a measurement, so the runner sweeps it (default 0.1/1.0/10.0) and
+every verdict names the lambda it belongs to. The runner reports the term magnitudes (service vs
+ingest-write vs reorganisation-write) so a reader can see which term can move the argmin.
+
+The drift workload runs at a FIXED offered rate, resolved from ``--drift-rate``: an explicit
+rate, or ``auto`` (slice 39). ``auto`` runs a short pre-flight ladder on the PRE-DRIFT (win) mix,
+takes its highest sustained level, and sets the drift rate to ``--drift-rate-fraction`` of it
+(70% by default). Slice 38's drift arm used a fixed 150 rps while its trace is 64% scans (vs the
+win mix's 45%), above the engine's capacity for that mix: every arm saturated, so "recover to
+within 10% of pre-drift throughput" had no baseline. A rate below the pre-drift mix's capacity
+makes the drift threshold evaluable.
+
+The learner also carries CHURN CONTROL between re-explorations (slice 39): a per-region cooldown
+after a change (``--learner-cooldown-windows``) and a per-window reorganisation budget derived
+from the declared arm's measured reorganisation rate (``--learner-reorg-budget-factor``). Without
+it the slice-38 drift learner wrote 402,984,851 reorganisation bytes against declared's 1,673,926
+(240x).
 
 What the cold instance already tells us, and why this runner is built the way it is
 --------------------------------------------------------------------------------------
@@ -78,6 +98,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from flashdb_harness.generator import Generator, Rng, loc_name, render, sku_name  # noqa: E402
 from flashdb_harness.layout_learner import (  # noqa: E402
     DECLARED_DEFAULT,
+    DEFAULT_LAMBDA_NS_PER_BYTE,
     LayoutCandidate,
     LayoutLearner,
     parse_window_line,
@@ -95,6 +116,10 @@ RATE_MULTIPLES = (1, 2, 4, 8)
 # A window is "sustained" when the offered rate is completed (within this tolerance) and the run's
 # lag-growth rule did not reject it (the pacer marks invalid windows; none here).
 SUSTAINED_TOLERANCE = 0.95
+
+# Slice 39: the default `--drift-rate auto` sets the fixed drift rate to this fraction of the
+# pre-drift mix's highest sustained level (measured by a short pre-flight ladder on the win mix).
+DRIFT_RATE_FRACTION = 0.70
 
 # Per-segment shape mixes (integer weights). They are the *offered* mix; every arm gets the same.
 # Write share raised from 15% to 40% (Slice 37): a per-region page size only acts on tiles written
@@ -326,17 +351,96 @@ def extend_ladder(plan: WorkloadPlan, factor: int = 2) -> WorkloadPlan:
 
 
 def region_compaction_totals(windows: list[dict]) -> dict[str, dict]:
-    """Per-region summed bytes_read / bytes_written / compaction_bytes / merges over the run."""
+    """Per-region summed bytes_read / bytes_written / compaction_bytes / merges over the run.
+
+    Also accumulates the region's total **service time** (``sum(count * mean_ns)``), so the report
+    can price the reward's two terms on the same run (slice 39).
+    """
     totals: dict[str, dict] = {}
     for w in windows:
         for region, r in w["regions"].items():
             t = totals.setdefault(region, {"bytes_read": 0, "bytes_written": 0,
                                            "compaction_bytes": 0, "compaction_merges": 0,
-                                           "windows": 0})
+                                           "count": 0, "service_ns": 0.0, "windows": 0})
             for key in ("bytes_read", "bytes_written", "compaction_bytes", "compaction_merges"):
                 t[key] += r[key]
+            t["count"] += r["count"]
+            t["service_ns"] += r["count"] * r["mean_ns"]
             t["windows"] += 1
     return totals
+
+
+def run_window_count(record: dict) -> int:
+    """The number of driver windows in an arm's run.
+
+    Sums the capacity-curve rows when present, else falls back to the largest per-region window
+    count, and only then to 1, so a record with neither still yields a usable rate denominator.
+    """
+    total = sum(row.get("windows", 0) for row in (record.get("curve") or []))
+    if total > 0:
+        return total
+    per_region = max((t.get("windows", 0) for t in (record.get("regions") or {}).values()),
+                     default=0)
+    return per_region if per_region > 0 else 1
+
+
+def total_reorg_bytes(record: dict) -> int:
+    """The arm's summed per-region reorganisation (compaction output) bytes over the run."""
+    return sum(r["compaction_bytes"] for r in (record.get("regions") or {}).values())
+
+
+def declared_reorg_rate_bytes_per_window(record: dict) -> float:
+    """The declared arm's observed reorganisation rate -- the learner's budget (slice 39)."""
+    return total_reorg_bytes(record) / max(1, run_window_count(record))
+
+
+def reward_term_totals(record: dict, lambda_ns_per_byte: float) -> dict:
+    """Price the reward's two terms over a whole arm so a reader can see which can move it.
+
+    ``service_ns`` is ``sum(count * mean_ns)``; the write term is split into the WAL-ingest part
+    (the pre-slice-39 quantity, candidate-invariant) and the reorganisation part the merge knob
+    moves. The ratios are of each write sub-term to the service term at the arm's lambda: a term
+    whose ratio is tiny cannot change an ``argmin`` no matter how lambda is swept.
+    """
+    regs = record.get("regions") or {}
+    service_ns = sum(t.get("service_ns", 0.0) for t in regs.values())
+    ingest_bytes = sum(t.get("bytes_written", 0) for t in regs.values())
+    reorg_bytes = sum(t.get("compaction_bytes", 0) for t in regs.values())
+    ingest_ns = lambda_ns_per_byte * ingest_bytes
+    reorg_ns = lambda_ns_per_byte * reorg_bytes
+    base = max(service_ns, 1.0)
+    return {
+        "service_ns": service_ns,
+        "ingest_bytes": ingest_bytes,
+        "reorg_bytes": reorg_bytes,
+        "ingest_write_term_ns": ingest_ns,
+        "reorg_write_term_ns": reorg_ns,
+        "ingest_to_service_ratio": ingest_ns / base,
+        "reorg_to_service_ratio": reorg_ns / base,
+    }
+
+
+def resolve_drift_rate(spec, *, pre_drift_highest_sustained_rps: float | None,
+                       reference_rate: int, fraction: float = DRIFT_RATE_FRACTION) -> tuple[int, dict]:
+    """Resolve ``--drift-rate``: an explicit int, or ``auto`` -> a fraction of the pre-drift capacity.
+
+    ``auto`` needs the pre-drift (win) mix's highest sustained level, measured by the pre-flight
+    ladder (or read from a win arm's curve when the win workload already ran). Below that level
+    the fixed drift rate is sustainable, which is what the recovery threshold needs; above it
+    (slice 38's fixed 150 rps) every arm saturates and the threshold is undefined. Returns
+    ``(rate_rps, info)`` and the info is reported so the rule and its inputs are auditable.
+    """
+    info: dict = {"requested": spec, "fraction": fraction,
+                  "pre_drift_highest_sustained_rps": pre_drift_highest_sustained_rps}
+    if spec != "auto":
+        info.update(mode="explicit", rate_rps=int(spec))
+        return int(spec), info
+    if pre_drift_highest_sustained_rps and pre_drift_highest_sustained_rps > 0:
+        rate = max(1, int(round(pre_drift_highest_sustained_rps * fraction)))
+        info.update(mode="auto_from_pre_drift_capacity", rate_rps=rate)
+        return rate, info
+    info.update(mode="auto_fallback_reference_rate", rate_rps=int(reference_rate))
+    return int(reference_rate), info
 
 
 def build_sweep(windows: list[dict], max_rate: float | None = None) -> dict:
@@ -421,6 +525,26 @@ def plan_workload(name: str, reference_rate: int, segment_requests: int,
         mixes += [drifted] * (n - pre)
         return WorkloadPlan("drift", [rate] * n, segment_requests, mixes)
     raise ValueError(f"unknown workload {name!r}")
+
+
+def preflight_plan(reference_rate: int, segment_requests: int) -> WorkloadPlan:
+    """The `--drift-rate auto` pre-flight: a short ladder on the PRE-DRIFT (win) mix.
+
+    Its highest sustained level is the pre-drift capacity the drift rate is a fraction of. Only
+    the declared policy is run on it (the pre-flight is a capacity probe, not a comparison).
+    """
+    return WorkloadPlan("preflight", [reference_rate * m for m in RATE_MULTIPLES],
+                        segment_requests, [dict(WIN_MIX)] * len(RATE_MULTIPLES))
+
+
+def run_preflight(base: Path, workroot: Path, bins: dict, args: argparse.Namespace,
+                  cap_bytes: int, env: dict) -> dict:
+    """Run the pre-flight declared arm on the win mix and return its record (Slice 39)."""
+    plan = preflight_plan(args.reference_rate, args.drift_preflight_segment_requests)
+    trace = workroot / "preflight.jsonl"
+    build_trace(trace, plan, args)
+    return run_arm("preflight", "preflight", base, workroot, bins, trace, plan,
+                   policy_document({}), None, args, cap_bytes, env)
 
 
 def _stock_probe(rng: Rng, gen: Generator, skus: int, locs: int, i: int) -> dict:
@@ -660,7 +784,14 @@ def run_arm(name: str, workload: str, base: Path, workroot: Path, bins: dict,
         "restarts": getattr(controller, "restarts", lambda: None)() if controller else None,
         "gated_switches": getattr(controller, "gated_switches", lambda: None)() if controller else None,
         "recovery_windows": getattr(controller, "recovery_windows", lambda: None)() if controller else None,
+        "budget_blocks": getattr(controller, "budget_blocks", lambda: None)() if controller else None,
+        "cooldown_holds": getattr(controller, "cooldown_holds", lambda: None)() if controller else None,
+        "reorg_budget_bytes_per_window": getattr(controller, "reorg_budget_bytes_per_window", None),
+        "cooldown_windows": getattr(controller, "cooldown_windows", None),
     }
+    arm_lambda = getattr(controller, "lambda_ns_per_byte", None)
+    record["reward_terms"] = reward_term_totals(
+        record, arm_lambda if arm_lambda is not None else DEFAULT_LAMBDA_NS_PER_BYTE)
     print(f"  rc={rc} achieved_rps={summary.get('achieved_rps')} "
           f"commit_rate={summary.get('commit_rate')} sustained={highest_sustained_rate(record['curve'])} "
           f"invalid={summary.get('invalid_windows')} reorg_bytes="
@@ -699,6 +830,65 @@ def throughput_at_common_sustained(a: dict, b: dict) -> tuple[float, float] | No
     return ra["achieved_rps"], rb["achieved_rps"]
 
 
+def threshold1_verdict(declared_win: dict, learned_win: dict, lam: float,
+                       noise_band: float | None) -> dict:
+    """Threshold 1 (win): learned beats declared by > 15% in sustained load or achieved throughput.
+
+    Extracted from :func:`evaluate_thresholds` so a run without the win workload can still emit
+    T2/T3/T4 (slice 39: the required adversarial+drift run does not include win).
+    """
+    decl_rate = highest_sustained_rate(declared_win["curve"])
+    learn_rate = highest_sustained_rate(learned_win["curve"])
+    top = max(ladder_top_rate(declared_win["curve"]), ladder_top_rate(learned_win["curve"]))
+    common = throughput_at_common_sustained(learned_win, declared_win)
+    both_top = top > 0.0 and decl_rate >= top - 1e-9 and learn_rate >= top - 1e-9
+    if both_top:
+        # Both arms cleared the ladder's top step, so the highest-sustained-level metric ties by
+        # construction. A > 15% throughput win at that common level still decides (the
+        # pre-registration's alternative); anything else is an under-powered ladder, not a tie.
+        decl_top = _curve_row(declared_win, top)
+        learn_top = _curve_row(learned_win, top)
+        gain = ((learn_top["achieved_rps"] - decl_top["achieved_rps"]) / decl_top["achieved_rps"]
+                if decl_top and learn_top and decl_top["achieved_rps"] else None)
+        if gain is not None and gain > 0.15:
+            status, detail = "PASS", (
+                f"both arms sustained the top step ({top:.0f} rps); learned throughput "
+                f"{learn_top['achieved_rps']:.1f} vs declared {decl_top['achieved_rps']:.1f} "
+                f"({gain:+.1%} > 15%) at that common level")
+        else:
+            status = "NOT-MEASURABLE"
+            detail = (
+                f"ladder under-powered: both arms sustained the top step ({top:.0f} rps) - "
+                f"declared achieved {_fmt(decl_top and decl_top['achieved_rps'], '.1f')} rps, "
+                f"learned {_fmt(learn_top and learn_top['achieved_rps'], '.1f')} rps "
+                f"(gain {_fmt(gain, '+.1%') if gain is not None else 'n/a'}). 'Highest sustained "
+                "load level' ties by construction when every arm clears the top, so a tie is "
+                "not a verdict; raise the top step until at least one arm fails.")
+    elif decl_rate == 0.0 or learn_rate == 0.0:
+        status, detail = "NOT-MEASURABLE", (
+            f"declared sustained rate {decl_rate}, learned {learn_rate}: no sustained level "
+            "to compare (the box could not complete even the reference level)")
+        gain = None
+    elif learn_rate > decl_rate * 1.001:
+        status, detail = "PASS", (f"learned sustained {learn_rate} > declared {decl_rate} "
+                                  "(at least one load level higher)")
+        gain = (learn_rate - decl_rate) / decl_rate
+    elif common is not None and common[0] > common[1] * 1.15:
+        gain = (common[0] - common[1]) / common[1]
+        status, detail = "PASS", (f"learned throughput {common[0]:.1f} vs declared {common[1]:.1f} "
+                                  f"at the highest common sustained level ({gain:+.1%} > 15%)")
+    else:
+        gain = (common[0] - common[1]) / common[1] if common else None
+        status, detail = "FAIL", (f"both sustain {decl_rate}/{learn_rate} rps; throughput gain "
+                                  f"at the highest common level = "
+                                  f"{gain:+.1%}" if gain is not None else "no common sustained level")
+        if noise_band is not None and gain is not None and abs(gain) <= noise_band:
+            status = "NOT-MEASURABLE"
+            detail += f" (inside the measured noise band +/-{noise_band:.1%})"
+    return {"threshold": "T1 learned > declared by 15% on win", "lambda": lam,
+            "status": status, "detail": detail, "gain": gain}
+
+
 def evaluate_thresholds(records: dict[str, dict], win: str = "win", adv: str = "adversarial",
                        drift: str = "drift", lambdas: tuple[float, ...] = (0.1, 1.0, 10.0),
                        noise_band: float | None = None,
@@ -713,59 +903,10 @@ def evaluate_thresholds(records: dict[str, dict], win: str = "win", adv: str = "
     declared_win = records.get(f"{win}/declared")
     for lam in lambdas:
         learned_win = records.get(f"{win}/learned@{lam}")
-        if learned_win is None or declared_win is None:
-            continue
-        # Threshold 1: learned beats declared by > 15% in sustained load on win.
-        decl_rate = highest_sustained_rate(declared_win["curve"])
-        learn_rate = highest_sustained_rate(learned_win["curve"])
-        top = max(ladder_top_rate(declared_win["curve"]), ladder_top_rate(learned_win["curve"]))
-        common = throughput_at_common_sustained(learned_win, declared_win)
-        both_top = top > 0.0 and decl_rate >= top - 1e-9 and learn_rate >= top - 1e-9
-        if both_top:
-            # Both arms cleared the ladder's top step, so the highest-sustained-level metric ties by
-            # construction. A > 15% throughput win at that common level still decides (the
-            # pre-registration's alternative); anything else is an under-powered ladder, not a tie.
-            decl_top = _curve_row(declared_win, top)
-            learn_top = _curve_row(learned_win, top)
-            gain = ((learn_top["achieved_rps"] - decl_top["achieved_rps"]) / decl_top["achieved_rps"]
-                    if decl_top and learn_top and decl_top["achieved_rps"] else None)
-            if gain is not None and gain > 0.15:
-                status, detail = "PASS", (
-                    f"both arms sustained the top step ({top:.0f} rps); learned throughput "
-                    f"{learn_top['achieved_rps']:.1f} vs declared {decl_top['achieved_rps']:.1f} "
-                    f"({gain:+.1%} > 15%) at that common level")
-            else:
-                status = "NOT-MEASURABLE"
-                detail = (
-                    f"ladder under-powered: both arms sustained the top step ({top:.0f} rps) - "
-                    f"declared achieved {_fmt(decl_top and decl_top['achieved_rps'], '.1f')} rps, "
-                    f"learned {_fmt(learn_top and learn_top['achieved_rps'], '.1f')} rps "
-                    f"(gain {_fmt(gain, '+.1%') if gain is not None else 'n/a'}). 'Highest sustained "
-                    "load level' ties by construction when every arm clears the top, so a tie is "
-                    "not a verdict; raise the top step until at least one arm fails.")
-        elif decl_rate == 0.0 or learn_rate == 0.0:
-            status, detail = "NOT-MEASURABLE", (
-                f"declared sustained rate {decl_rate}, learned {learn_rate}: no sustained level "
-                "to compare (the box could not complete even the reference level)")
-            gain = None
-        elif learn_rate > decl_rate * 1.001:
-            status, detail = "PASS", (f"learned sustained {learn_rate} > declared {decl_rate} "
-                                      "(at least one load level higher)")
-            gain = (learn_rate - decl_rate) / decl_rate
-        elif common is not None and common[0] > common[1] * 1.15:
-            gain = (common[0] - common[1]) / common[1]
-            status, detail = "PASS", (f"learned throughput {common[0]:.1f} vs declared {common[1]:.1f} "
-                                      f"at the highest common sustained level ({gain:+.1%} > 15%)")
-        else:
-            gain = (common[0] - common[1]) / common[1] if common else None
-            status, detail = "FAIL", (f"both sustain {decl_rate}/{learn_rate} rps; throughput gain "
-                                      f"at the highest common level = "
-                                      f"{gain:+.1%}" if gain is not None else "no common sustained level")
-            if noise_band is not None and gain is not None and abs(gain) <= noise_band:
-                status = "NOT-MEASURABLE"
-                detail += f" (inside the measured noise band +/-{noise_band:.1%})"
-        verdicts.append({"threshold": "T1 learned > declared by 15% on win", "lambda": lam,
-                         "status": status, "detail": detail, "gain": gain})
+        # T1 needs the win workload; T2/T3/T4 are computed independently so an adversarial+drift
+        # run (no win) still emits them.
+        if learned_win is not None and declared_win is not None:
+            verdicts.append(threshold1_verdict(declared_win, learned_win, lam, noise_band))
 
         # Threshold 2: learned must not lose > 5% on adversarial-uniform.
         adv_decl = records.get(f"{adv}/declared")
@@ -787,45 +928,61 @@ def evaluate_thresholds(records: dict[str, dict], win: str = "win", adv: str = "
             verdicts.append({"threshold": "T2 learned loses <= 5% on adversarial-uniform",
                              "lambda": lam, "status": status, "detail": detail, "loss": loss})
 
-        # Threshold 3: reorganisation writes <= 3x declared.
-        decl_reorg = sum(r["compaction_bytes"] for r in declared_win["regions"].values())
-        learn_reorg = sum(r["compaction_bytes"] for r in learned_win["regions"].values())
-        if decl_reorg == 0 and learn_reorg == 0:
-            status = "NOT-MEASURABLE"
-            if compaction_actuated:
-                detail = ("0 vs 0 compaction bytes WITH the per-window `--compact-bytes` "
-                          "actuation ON: the calls produced no merge at all. That is a DEFECT in "
-                          "this run (actuation did not fire, or no region was eligible), not a "
-                          "pass - investigate before quoting T3")
+        # Threshold 3: reorganisation writes <= 3x declared (win workload).
+        if declared_win is not None and learned_win is not None:
+            decl_reorg = sum(r["compaction_bytes"] for r in declared_win["regions"].values())
+            learn_reorg = sum(r["compaction_bytes"] for r in learned_win["regions"].values())
+            if decl_reorg == 0 and learn_reorg == 0:
+                status = "NOT-MEASURABLE"
+                if compaction_actuated:
+                    detail = ("0 vs 0 compaction bytes WITH the per-window `--compact-bytes` "
+                              "actuation ON: the calls produced no merge at all. That is a DEFECT in "
+                              "this run (actuation did not fire, or no region was eligible), not a "
+                              "pass - investigate before quoting T3")
+                else:
+                    detail = ("0 vs 0 compaction bytes and compaction is not actuated "
+                              "(`--compact-bytes 0`): the merge threshold is inert on this path, so "
+                              "the comparison says nothing (0 vs 0 is not a pass)")
             else:
-                detail = ("0 vs 0 compaction bytes and compaction is not actuated "
-                          "(`--compact-bytes 0`): the merge threshold is inert on this path, so "
-                          "the comparison says nothing (0 vs 0 is not a pass)")
-        else:
-            ratio = learn_reorg / decl_reorg if decl_reorg else float("inf")
-            status = "PASS" if ratio <= 3.0 else "FAIL"
-            detail = f"learned reorg {learn_reorg} B vs declared {decl_reorg} B (ratio {ratio:.2f})"
-        verdicts.append({"threshold": "T3 reorganisation <= 3x declared", "lambda": lam,
-                         "status": status, "detail": detail,
-                         "declared_bytes": decl_reorg, "learned_bytes": learn_reorg})
+                ratio = learn_reorg / decl_reorg if decl_reorg else float("inf")
+                status = "PASS" if ratio <= 3.0 else "FAIL"
+                detail = f"learned reorg {learn_reorg} B vs declared {decl_reorg} B (ratio {ratio:.2f})"
+            verdicts.append({"threshold": "T3 reorganisation <= 3x declared", "lambda": lam,
+                             "status": status, "detail": detail,
+                             "declared_bytes": decl_reorg, "learned_bytes": learn_reorg})
 
         # Threshold 4: drift recovery within 2 windows while static-derived does not.
         drift_learn = records.get(f"{drift}/learned@{lam}")
         if drift_learn is not None:
             rec = drift_learn.get("recovery_windows") or {}
             shortest = min(rec.values()) if rec else None
+            # Drift reorganisation (reported with T4; not itself a pre-registered threshold).
+            drift_decl = records.get(f"{drift}/declared")
+            drift_static = records.get(f"{drift}/static-derived")
+            reorg_note = ""
+            if drift_decl is not None:
+                d_bytes = total_reorg_bytes(drift_decl)
+                l_bytes = total_reorg_bytes(drift_learn)
+                reorg_note = (f" drift reorg: declared {d_bytes} B, learned {l_bytes} B "
+                              f"(ratio {l_bytes / d_bytes:.2f})" if d_bytes else
+                              f" drift reorg: declared {d_bytes} B, learned {l_bytes} B")
+                if drift_static is not None:
+                    reorg_note += f", static-derived {total_reorg_bytes(drift_static)} B"
+                reorg_note += "."
             if shortest is None:
                 status = "NOT-MEASURABLE"
-                detail = "the learner recorded no drift-triggered re-exploration window count"
+                detail = ("the learner recorded no drift-triggered re-exploration window count "
+                          "(the drift segment may have been too short to move an active region's "
+                          "cost past drift_margin for drift_windows).") + reorg_note
             elif shortest <= 2:
                 status = "PASS"
-                detail = f"learner recovered in {shortest} windows"
+                detail = f"learner recovered in {shortest} windows." + reorg_note
             else:
                 status = "NOT MEETABLE WITH CURRENT PARAMETERS"
                 detail = (f"learner recovered in {shortest} windows; slice 34's arithmetic "
                           "(drift_reexplore_candidates * min_samples = 6 with defaults) bounds "
-                          "this, so the 2-window target is unreachable at the published defaults. "
-                          f"static-derived recovery: {records.get(f'{drift}/static-derived', {}).get('note')}")
+                          "this, so the 2-window target is unreachable at the published defaults."
+                          + reorg_note)
             verdicts.append({"threshold": "T4 drift recovery within 2 windows", "lambda": lam,
                              "status": status, "detail": detail,
                              "recovery_windows": rec})
@@ -853,8 +1010,14 @@ def main(argv: list[str]) -> int:
                     help="merge budget for the per-window compaction actuation (Slice 37); "
                          "0 disables it and reproduces the pre-slice inert-merge path")
     ap.add_argument("--reference-rate", type=int, default=50)
-    ap.add_argument("--drift-rate", type=int, default=150,
-                    help="fixed offered rate for the drift workload (in the sustainable band)")
+    ap.add_argument("--drift-rate", type=str, default="auto",
+                    help="fixed offered rate for the drift workload: an integer, or 'auto' to set "
+                         "it to --drift-rate-fraction of the pre-drift mix's highest sustained "
+                         "level (a short pre-flight ladder on the win mix; Slice 39)")
+    ap.add_argument("--drift-rate-fraction", type=float, default=DRIFT_RATE_FRACTION,
+                    help="fraction of the pre-drift highest sustained level used by --drift-rate auto")
+    ap.add_argument("--drift-preflight-segment-requests", type=int, default=1000,
+                    help="requests per level in the pre-flight ladder that --drift-rate auto runs")
     ap.add_argument("--segment-requests", type=int, default=2000)
     ap.add_argument("--ceiling-us", type=int, default=None)
     ap.add_argument("--arm-timeout-s", type=float, default=1200.0)
@@ -869,6 +1032,12 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--arms", nargs="+", default=["declared", "learned", "static-derived", "oracle"])
     ap.add_argument("--learner-min-samples", type=int, default=3)
     ap.add_argument("--learner-seed", type=int, default=0)
+    ap.add_argument("--learner-cooldown-windows", type=int, default=3,
+                    help="per-region cooldown after a change: no further change for N windows "
+                         "(Slice 39 churn control; 0 disables)")
+    ap.add_argument("--learner-reorg-budget-factor", type=float, default=1.0,
+                    help="learner's per-window reorganisation budget = declared arm's observed "
+                         "reorg rate x this factor (Slice 39 churn control)")
     ap.add_argument("--noise-repeat", action="store_true",
                     help="run declared twice on win to measure the box's noise band")
     ap.add_argument("--ladder-extension-steps", type=int, default=1,
@@ -903,19 +1072,42 @@ def main(argv: list[str]) -> int:
 
     bins = build_binaries(a.release)
     env = os.environ.copy()
+    records: dict[str, dict] = {}
+
+    # Slice 39: resolve the drift rate BEFORE the drift trace is built. `auto` runs a short
+    # pre-flight ladder on the PRE-DRIFT (win) mix and takes a fraction of its highest sustained
+    # level; an explicit integer is used as given. The pre-flight numbers are reported.
+    resolved_drift_rate: int | None = None
+    drift_rate_info: dict | None = None
+    if "drift" in a.workloads:
+        if a.drift_rate == "auto":
+            pre = run_preflight(base, workroot, bins, a, cap_bytes, env)
+            pre_rate = highest_sustained_rate(pre["curve"])
+            resolved_drift_rate, drift_rate_info = resolve_drift_rate(
+                "auto", pre_drift_highest_sustained_rps=pre_rate,
+                reference_rate=a.reference_rate, fraction=a.drift_rate_fraction)
+            drift_rate_info["preflight"] = {
+                "segment_requests": a.drift_preflight_segment_requests,
+                "rates": [row["offered_rps"] for row in pre["curve"]],
+                "achieved_rps": [row["achieved_rps"] for row in pre["curve"]],
+                "sustained": [row["sustained"] for row in pre["curve"]],
+                "highest_sustained_rps": pre_rate,
+            }
+        else:
+            resolved_drift_rate, drift_rate_info = resolve_drift_rate(
+                a.drift_rate, pre_drift_highest_sustained_rps=None, reference_rate=a.reference_rate)
+        print(f"drift-rate resolved: {drift_rate_info}", flush=True)
 
     # Traces: one per workload, emitted once and shared by every arm (equal offered load).
     plans: dict[str, WorkloadPlan] = {}
     traces: dict[str, Path] = {}
     for wl in a.workloads:
-        plan = plan_workload(wl, a.reference_rate, a.segment_requests, drift_rate=a.drift_rate)
+        plan = plan_workload(wl, a.reference_rate, a.segment_requests, drift_rate=resolved_drift_rate)
         plans[wl] = plan
         trace = workroot / f"{wl}.jsonl"
         meta = build_trace(trace, plan, a)
         traces[wl] = trace
         print(f"trace {wl}: total={meta['total']} counts={meta['counts']} rates={plan.rates}", flush=True)
-
-    records: dict[str, dict] = {}
 
     def key(workload: str, arm: str, lam: float | None = None) -> str:
         return f"{workload}/{arm}" + (f"@{lam}" if lam is not None else "")
@@ -927,11 +1119,22 @@ def main(argv: list[str]) -> int:
             records[key(wl, "declared")] = run_arm(
                 "declared", wl, base, workroot, bins, trace, plan,
                 policy_document({}), None, a, cap_bytes, env)
+        # Slice 39 churn control: the learner's per-window reorganisation budget is the declared
+        # arm's OBSERVED reorg rate (bytes/window) on the same workload, x the configured factor.
+        declared_rec = records.get(key(wl, "declared"))
+        budget = None
+        if declared_rec is not None:
+            budget = declared_reorg_rate_bytes_per_window(declared_rec) * a.learner_reorg_budget_factor
+            print(f"  [{wl}] learner reorg budget = {budget:.0f} B/window "
+                  f"(declared rate {declared_reorg_rate_bytes_per_window(declared_rec):.0f} B/window)",
+                  flush=True)
         # learned at each lambda (live UCB1)
         if "learned" in a.arms:
             for lam in a.lambdas:
                 learner = LayoutLearner(lambda_ns_per_byte=lam, min_samples=a.learner_min_samples,
-                                        seed=a.learner_seed)
+                                        seed=a.learner_seed,
+                                        cooldown_windows=a.learner_cooldown_windows,
+                                        reorg_budget_bytes_per_window=budget)
                 records[key(wl, "learned", lam)] = run_arm(
                     f"learned@{lam}", wl, base, workroot, bins, trace, plan,
                     None, learner, a, cap_bytes, env)
@@ -1011,6 +1214,10 @@ def main(argv: list[str]) -> int:
         "ratio_below_floor": ratio < PREREG_RATIO_FLOOR,
         "reference_rate_rps": a.reference_rate,
         "rate_multiples": list(RATE_MULTIPLES),
+        "drift_rate": resolved_drift_rate,
+        "drift_rate_rule": drift_rate_info,
+        "learner_cooldown_windows": a.learner_cooldown_windows,
+        "learner_reorg_budget_factor": a.learner_reorg_budget_factor,
         "mix": {"win": dict(WIN_MIX), "adversarial": dict(UNIFORM_MIX)},
         "compact_bytes": a.compact_bytes,
         "lambdas": a.lambdas,
@@ -1032,8 +1239,18 @@ def main(argv: list[str]) -> int:
             "the model-calibration gate (<=25% p90 per-region prediction error) is not evaluable; "
             "no simulated verdict is quoted",
             "the 10-seed median/IQR requirement is not met (one seed per arm on a shared box)",
+            "the churn budget is a per-region projection (challenger's observed reorganisation "
+            "rate minus the incumbent's); the engine chooses which region compacts globally, so "
+            "deferral in one region can funnel merges into an eager neighbour (slice 37/38), "
+            "which a per-region reward cannot see. The drift reorganisation result is therefore a "
+            "bound under this control, not a proof that the learner is reorganisation-optimal",
         ],
     }
+    if "drift" in a.workloads and resolved_drift_rate is not None:
+        result["not_concluded"].append(
+            "the drift rate is a stated fraction (%.0f%%) of the pre-drift mix's highest "
+            "sustained level measured by the pre-flight; it is not the win mix's true capacity "
+            "and the fraction is an author-owned choice, not a measurement" % (a.drift_rate_fraction * 100))
     if a.ladder_extension_steps <= 0:
         result["not_concluded"].append(
             "the ladder under-power guard detected and reported but was not allowed to extend "
@@ -1117,7 +1334,8 @@ def render_report(result: dict) -> str:
     """Markdown report: per-arm capacity curves, telemetry, and the threshold table."""
     L: list[str] = []
     w = L.append
-    w("# 0b - the cold arms at equal offered load (Slices 35/36/37, compaction actuated)")
+    w("# 0b - the cold arms at equal offered load (Slices 35-39: compaction actuated, unit-anchored "
+      "reward, churn control)")
     w("")
     w(f"Instance `{result['instance']}`: data {result['data_bytes']:,} B, cgroup cap "
       f"{result['cap_bytes']:,} B, **ratio {result['ratio']:.2f}x**")
@@ -1129,8 +1347,9 @@ def render_report(result: dict) -> str:
     w("")
     w("Objective (objective-v1): score = sustained throughput at the offered load, latency a "
       "constraint, efficiency reported. Offered levels are the reference rate x "
-      f"{result['rate_multiples']}. `lambda` is the endurance price in the learner's reward proxy "
-      "(a policy choice, not a measurement); every verdict names it.")
+      f"{result['rate_multiples']}. `lambda` is the endurance weight in the learner's reward proxy "
+      "(a policy choice, not a measurement); it is anchored to the device write cost in slice 39 "
+      "and every verdict names it.")
     mix = result.get("mix") or {}
     if mix:
         w("")
@@ -1165,6 +1384,64 @@ def render_report(result: dict) -> str:
             w("")
             w("When every arm sustains the ladder's top step the \"highest sustained load level\" "
               "metric ties by construction, so T1 is reported NOT-MEASURABLE rather than as a tie.")
+    # Slice 39: the reward unit derivation and the measured term magnitudes per arm.
+    w("")
+    w("**Reward units (Slice 39).** The learner's cost per region-window is "
+      "`count*mean_ns + lambda*(bytes_written + compaction_bytes)`, both terms in ns of service "
+      "time. `lambda` is anchored to the measured device write bandwidth 831 MiB/s: "
+      "1 byte = 1e9/(831*2**20) ~= 1.148 ns, so lambda=1 prices a byte at exactly its device write "
+      "time and lambda is the explicit endurance weight on top. The write term prices the "
+      "reorganisation output the merge knob moves, not only the (candidate-invariant) WAL ingest.")
+    term_rows = [(key, rec["reward_terms"]) for key, rec in sorted(result["arms"].items())
+                 if rec.get("reward_terms")]
+    if term_rows:
+        w("")
+        w("| arm | service ns | ingest write term ns | reorg write term ns | ingest/service | "
+          "reorg/service |")
+        w("|---|---:|---:|---:|---:|---:|")
+        for key, rt in term_rows:
+            w(f"| {key} | {rt['service_ns']:.4g} | {rt['ingest_write_term_ns']:.4g} | "
+              f"{rt['reorg_write_term_ns']:.4g} | {rt['ingest_to_service_ratio']:.3%} | "
+              f"{rt['reorg_to_service_ratio']:.3%} |")
+        w("")
+        w("A write term whose ratio to the service term is a tiny fraction of a percent cannot "
+          "move any candidate's `argmin` however lambda is swept; that is the pre-slice-39 "
+          "ingest-only term (slice 37 measured lambda 0.1 -> 10 moving the win reorg output only "
+          "4.13x -> 4.27x). The reorganisation term is the one that can move the merge choice.")
+    rule = result.get("drift_rate_rule")
+    if rule is not None:
+        w("")
+        w(f"**Drift rate (Slice 39):** resolved to **{result.get('drift_rate')} rps** by rule "
+          f"`{rule.get('mode')}`. Rule: the fixed drift rate is `--drift-rate-fraction` = "
+          f"{rule.get('fraction'):.0%} of the PRE-DRIFT (win) mix's highest sustained level, "
+          f"measured by a short pre-flight ladder; pre-flight highest sustained = "
+          f"{_fmt(rule.get('pre_drift_highest_sustained_rps'))} rps.")
+        pf = rule.get("preflight")
+        if pf:
+            w("")
+            w(f"Pre-flight ladder (declared policy, win mix, {pf['segment_requests']} requests/level): "
+              + "; ".join(f"{int(r)} rps -> achieved {a:.1f} ({'sustained' if s else 'failed/saturated'})"
+                          for r, a, s in zip(pf["rates"], pf["achieved_rps"], pf["sustained"])) + ".")
+    if result.get("learner_cooldown_windows") is not None:
+        w("")
+        w(f"**Learner churn control (Slice 39):** per-region cooldown "
+          f"{result['learner_cooldown_windows']} windows after a change; per-window reorganisation "
+          f"budget = the declared arm's observed rate x {result['learner_reorg_budget_factor']} "
+          "(a region is refused a switch whose projected added reorganisation rate exceeds the "
+          "remaining budget). An unexplored challenger projects 0 added bytes, so the bounded "
+          "burn-in is never blocked.")
+        churn_rows = [(key, rec) for key, rec in sorted(result["arms"].items())
+                      if rec.get("restarts") is not None]
+        if churn_rows:
+            w("")
+            w("| arm | restarts | gated switches | budget blocks | cooldown holds | reorg bytes |")
+            w("|---|---:|---:|---:|---:|---:|")
+            for key, rec in churn_rows:
+                reorg = sum(r["compaction_bytes"] for r in (rec.get("regions") or {}).values())
+                w(f"| {key} | {sum(rec['restarts'].values())} | "
+                  f"{sum((rec.get('gated_switches') or {}).values())} | "
+                  f"{sum((rec.get('budget_blocks') or {}).values())} | "
+                  f"{sum((rec.get('cooldown_holds') or {}).values())} | {reorg:,} |")
     w("")
     w("## Per-arm capacity curve")
     w("")

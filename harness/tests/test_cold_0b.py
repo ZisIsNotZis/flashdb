@@ -427,3 +427,85 @@ def test_summarize_curve_excludes_invalid_windows_from_sustained():
 
     from flashdb_harness.cold_0b import highest_sustained_rate
     assert highest_sustained_rate(curve) == 100.0
+
+
+# ---------------------------------------------------------------------------
+# Slice 39: drift-rate auto, the reward terms, and the churn budget
+# ---------------------------------------------------------------------------
+def test_resolve_drift_rate_auto_is_a_fraction_of_the_pre_drift_capacity() -> None:
+    rate, info = m.resolve_drift_rate("auto", pre_drift_highest_sustained_rps=100.0,
+                                      reference_rate=50, fraction=0.70)
+    assert rate == 70 and info["mode"] == "auto_from_pre_drift_capacity"
+    assert info["pre_drift_highest_sustained_rps"] == 100.0
+    # an explicit integer passes through unchanged
+    rate, info = m.resolve_drift_rate("150", pre_drift_highest_sustained_rps=100.0,
+                                      reference_rate=50)
+    assert rate == 150 and info["mode"] == "explicit"
+    # no pre-flight result falls back to the reference rate rather than inventing a capacity
+    rate, info = m.resolve_drift_rate("auto", pre_drift_highest_sustained_rps=0.0,
+                                      reference_rate=50)
+    assert rate == 50 and info["mode"] == "auto_fallback_reference_rate"
+
+
+def test_preflight_plan_is_a_win_mix_ladder() -> None:
+    plan = m.preflight_plan(50, 1000)
+    assert plan.rates == [50, 100, 200, 400]
+    assert plan.segment_requests == 1000
+    assert all(mix == m.WIN_MIX for mix in plan.mixes)
+
+
+def test_declared_reorg_rate_is_bytes_per_window() -> None:
+    rec = {
+        "curve": [{"offered_rps": 70, "windows": 153}],
+        "regions": {"P|Stock": {"compaction_bytes": 1_530_000, "windows": 153}},
+    }
+    assert m.run_window_count(rec) == 153
+    assert m.total_reorg_bytes(rec) == 1_530_000
+    assert m.declared_reorg_rate_bytes_per_window(rec) == 10_000.0
+    # a record with no curve rows falls back to the region window count, never a division by zero
+    empty = {"curve": [], "regions": {"P|Stock": {"compaction_bytes": 500, "windows": 5}}}
+    assert m.declared_reorg_rate_bytes_per_window(empty) == 100.0
+    assert m.run_window_count({"curve": [], "regions": {}}) == 1
+
+
+def test_reward_term_totals_split_ingest_from_reorganisation() -> None:
+    lambda_ns_per_byte = 1.0
+    rec = {"regions": {
+        "P|Stock": {"service_ns": 10_000.0, "bytes_written": 100, "compaction_bytes": 900},
+        "U|Stock": {"service_ns": 10_000.0, "bytes_written": 0, "compaction_bytes": 0},
+    }}
+    terms = m.reward_term_totals(rec, lambda_ns_per_byte)
+    assert terms["service_ns"] == 20_000.0
+    assert terms["ingest_bytes"] == 100 and terms["reorg_bytes"] == 900
+    assert terms["ingest_write_term_ns"] == 100 and terms["reorg_write_term_ns"] == 900
+    assert terms["ingest_to_service_ratio"] == 100 / 20_000.0
+    assert terms["reorg_to_service_ratio"] == 900 / 20_000.0
+
+
+def test_region_compaction_totals_accumulate_service_time() -> None:
+    lines = [_window_line(0, 50, 50, 50, regions=[
+        {"region": "P|Stock", "count": 10, "mean_ns": 100.0, "p50_ns": 90.0, "p99_ns": 200.0,
+         "bytes_read": 10, "bytes_written": 0, "compaction_bytes": 30, "compaction_merges": 1}])]
+    totals = m.region_compaction_totals(m.window_records(lines, window_ms=1000))
+    assert totals["P|Stock"]["service_ns"] == 1000.0
+    assert totals["P|Stock"]["count"] == 10
+
+
+def test_thresholds_two_and_four_are_emitted_without_the_win_workload() -> None:
+    """Slice 39 regression: the required adversarial+drift run has no win arms, so T2/T4 must
+    still be computed (the old loop skipped every threshold when win was absent)."""
+    records = {
+        "adversarial/declared": _record([(50, 100, True)], workload="adversarial"),
+        "adversarial/learned@1.0": _record([(50, 100, True)], workload="adversarial"),
+        "drift/declared": _record([(70, 70, True)], reorg=1000, workload="drift"),
+        "drift/learned@1.0": _record([(70, 70, True)], reorg=2000, recovery={"P|Stock": 8},
+                                     workload="drift"),
+        "drift/static-derived": _record([(70, 70, True)], reorg=9_000, workload="drift"),
+    }
+    verdicts = m.evaluate_thresholds(records, lambdas=(1.0,))
+    kinds = {v["threshold"].split()[0]: v for v in verdicts}
+    assert "T1" not in kinds, "no win arms means no T1 verdict"
+    assert kinds["T2"]["status"] == "PASS"
+    assert kinds["T4"]["status"] == "NOT MEETABLE WITH CURRENT PARAMETERS"
+    assert "drift reorg: declared 1000 B, learned 2000 B (ratio 2.00)" in kinds["T4"]["detail"]
+    assert "static-derived 9000 B" in kinds["T4"]["detail"]

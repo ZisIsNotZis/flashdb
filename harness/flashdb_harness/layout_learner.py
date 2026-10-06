@@ -33,41 +33,57 @@ deliberately *not* a learned axis here: slice 29 measured it dead on this flow
 (absent probes are range-rejected before the bloom is consulted), and the task's
 published set names only page size and merge threshold.
 
-The reward proxy
-----------------
+The reward proxy (Slice 39: unit-anchored, reorganisation-priced)
+-----------------------------------------------------------------
 For one region in one window, from the slice-26 telemetry row, define the
 region's **cost** (LOWER is better), in nanoseconds of service time::
 
-    cost_ns = count * mean_ns  +  lambda_ns_per_byte * bytes_written
+    cost_ns = count * mean_ns
+              + lambda_ns_per_byte * (bytes_written + compaction_bytes)
 
-``count * mean_ns`` is the region's total service time in the window -- exactly
-the throughput term the objective scores (objective v1: sustained throughput
-under offered load). ``bytes_written`` is the endurance term, priced by the
-explicit weight ``lambda_ns_per_byte``. The weight exists because the two knobs
-have **measured, conflicting gradients** (slice 29): deferring merges cuts
-compaction output ~300x at statistically equal throughput but roughly doubles
-p99, so a controller that minimises read cost alone would defer everything and
-abandon tail latency. Lambda is the endurance price that makes a byte written
-comparable to a nanosecond of service time. It is a **policy choice, not a
-measurement** (mirrors ``write_weight_us_per_byte`` in ``layout_headroom.py``):
-the default ``DEFAULT_LAMBDA_NS_PER_BYTE = 1.0`` prices a byte at roughly the
-raw device write cost (831 MiB/s ~ 1.15 ns/byte). The reported numbers are
-comparable only within one lambda; it is stated with every result.
+Both terms are **nanoseconds of service time**. ``count * mean_ns`` is the
+region's total service time in the window -- the throughput term the objective
+scores (objective v1: sustained throughput under offered load). The second term
+is the **endurance** price of the bytes the region wrote to storage in the
+window: its WAL ingest (``bytes_written``) *plus* the reorganisation output the
+merge knob actually moves (``compaction_bytes``, slice 34). It is charged at the
+region's own device cost.
 
-The **write side the merge threshold actually moves** is now observable per
-region: slice 34 added ``compaction_bytes`` (the merged output tile size written
-for the region) and ``compaction_merges`` to the per-region telemetry, and
-:class:`RegionStats` parses both. The **per-region rewrite factor** is defined,
-and must be reported, as::
+**Unit derivation.**  ``lambda_ns_per_byte`` is the price of a written byte, in
+ns of service time. It is anchored -- not free-floating -- to the measured device
+write bandwidth, 831 MiB/s (slice 08/29; the same constant ``DEVICE_MIB_S`` as
+``layout_headroom.py``)::
+
+    1 byte / (831 MiB/s) = 1e9 ns / (831 * 2**20 bytes) ~= 1.148 ns/byte
+
+so ``DEFAULT_LAMBDA_NS_PER_BYTE = DEVICE_WRITE_NS_PER_BYTE`` (1.148) prices a
+byte at exactly the device time it consumes. A write then pays in the same unit
+as a slow read: a 1% increase in written bytes and a 1% increase in service time
+are the same kind of cost. Lambda remains the **explicit endurance knob** on top
+of that unit: it multiplies the device time, so lambda=1 is "price endurance at
+device cost" and lambda=10 is "endurance is worth 10x its device time". It is a
+**policy choice, not a measurement**. The reported numbers are comparable only
+within one lambda; it is stated with every result.
+
+**Why the write term prices ``compaction_bytes``.**  Slice 37 measured the
+learner that priced only ``bytes_written``: sweeping lambda 0.1 -> 10 moved the
+win arm's reorganisation output only from 4.13x to 4.27x of declared, i.e. lambda
+barely moved the learned policy. The diagnosis is in the term magnitudes:
+``bytes_written`` is the region's WAL **ingest**, which the layout policy does
+not change and which is tiny next to the service term (the ordering ratio is
+reported per run), so ``lambda * bytes_written`` was a near-constant offset that
+could not move any arm's ``argmin``. The quantity the merge threshold moves is
+the **reorganisation output**, and slice 34 exposes it per region. Pricing
+``bytes_written + compaction_bytes`` makes lambda act on the knob it is supposed
+to price.
+
+The **per-region rewrite factor** is defined, and must be reported, as::
 
     rewrite_factor(region) = compaction_bytes(region) / bytes_written(region)
 
 over the same window(s) -- compaction output divided by the region's ingested
 (WAL op) bytes. It is the per-region form of ``flashdb-scale compact``'s
-run-level ``compaction_bytes / tile_bytes_before``. This slice keeps the priced
-endurance term at ``bytes_written`` (WAL ingest, close to constant on a real
-engine); the compaction counters are exposed so a report can quote the rewrite
-factor and a later slice can price it directly.
+run-level ``compaction_bytes / tile_bytes_before``.
 
 The bandit
 ----------
@@ -121,6 +137,26 @@ the regions currently re-exploring. With no gradient and no drift no restart
 fires and the learner **picks once and stays** -- the anti-overfitting property
 whose test is the point of the whole exercise.
 
+**Churn control between re-explorations (Slice 39).**  Under drift the learner
+without churn control oscillated: 104 policy changes over 153 windows in the
+slice-37/38 run (81 drift restarts, 50 gated switches), and each merge-threshold
+change makes the next compaction rewrite more -- 402,984,851 reorganisation bytes
+against declared's 1,673,926 (240x), already past the pre-registration's 3x
+bound. Two controls sit between re-explorations:
+
+* **per-region cooldown** (``cooldown_windows``) -- after a region's active
+  candidate changes, it cannot change again for ``cooldown_windows`` steps. The
+  burn-in and any post-restart re-exploration are stretched, not blocked; a
+  bounded exploration still completes.
+* **reorganisation budget per window** (``reorg_budget_bytes_per_window``) -- a
+  region may not switch unless the *projected added* reorganisation rate of the
+  challenger over the incumbent (``max(0, mean_compaction_bytes(challenger) -
+  mean_compaction_bytes(incumbent))``) fits the remaining global budget for this
+  window. The budget is derived by the runner from the declared arm's measured
+  reorganisation rate. An unexplored challenger projects 0 added bytes, so the
+  bounded burn-in is never blocked; only a switch to a candidate *observed* to
+  write more reorganisation is refused.
+
 **Pre-registration gap (stated, not hidden).** Even the targeted response cannot
 meet the pre-registration's *2-window* recovery target with the published grid:
 the response needs ``drift_reexplore_candidates * min_samples`` windows (6 with
@@ -147,14 +183,14 @@ What the learner CANNOT do here
   cost of a window is attributed to the candidate that was active for it, so a
   freshly switched-to page size is credited with a window it only partly
   affected. This is a stated bias, not compensated.
-* It prices the endurance term with **``bytes_written``** (the region's ingested
-  WAL op bytes, close to constant on a real engine), not with the region's
-  **compaction output** that ``merge_min_tiles`` actually moves. Slice 34 now
-  exposes ``compaction_bytes``/``compaction_merges`` and the rewrite factor is
-  derivable (:func:`region_rewrite_factor`), but the reward proxy does not price
-  that quantity yet, so the merge choice is still driven mostly by the read-cost
-  term plus the p99 constraint. (The synthetic tests make ``bytes_written`` vary
-  by candidate so the lambda mechanism itself is exercised.)
+* It prices the endurance term with **``bytes_written + compaction_bytes``**
+  (all bytes the region wrote to storage in the window) at the device-cost unit
+  (Slice 39). It still cannot see the engine's *global* compaction-selection
+  interaction: which region's tiles are merged each window depends on every
+  region's merge threshold (slice 37/38 measured deferral in one region funnelling
+  merges into an eager neighbour), and the reward attributes each region only its
+  own counters. A per-region reward therefore cannot fully predict a
+  workload-level reorganisation change.
 * It does **not price memory**, CPU per op, or reorganisation payback windows.
 * It does not take effect immediately: the driver re-reads the policy once per
   window, and a merge threshold only gates *future* automatic merges.
@@ -176,7 +212,13 @@ from flashdb_harness.generator import Rng
 DEFAULT_PAGE_SIZES = (4096, 65536)
 DEFAULT_MERGE_MIN_TILES = (2, 8, 200)
 DEFAULT_BLOOM_BITS = 10
-DEFAULT_LAMBDA_NS_PER_BYTE = 1.0
+# Device write bandwidth, measured cold with O_DIRECT (831 MiB/s; the same constant as
+# `DEVICE_MIB_S` in `layout_headroom.py`). The endurance unit is the nanoseconds of device
+# write bandwidth a byte consumes: 1e9 ns / (831 * 2**20 bytes) ~= 1.148 ns/byte.
+DEVICE_WRITE_BANDWIDTH_MIB_PER_S = 831.0
+DEVICE_WRITE_NS_PER_BYTE = 1e9 / (DEVICE_WRITE_BANDWIDTH_MIB_PER_S * (1 << 20))
+# Anchored default (Slice 39): a byte is priced at its device cost, not a free-floating 1.0.
+DEFAULT_LAMBDA_NS_PER_BYTE = DEVICE_WRITE_NS_PER_BYTE
 
 
 @dataclass(frozen=True, order=True)
@@ -303,33 +345,16 @@ def parse_window_line(line: str) -> WindowTelemetry | None:
     return WindowTelemetry.from_json(obj)
 
 
-# Reference magnitudes for the relative reward. They must be TYPICAL per-window values for the
-# region, not arbitrary constants, or the write term stays implicitly down-weighted: on the real
-# workload a window is ~6.5e6 ns of service time against ~2e4 bytes written, so a constant 1e7/1e6
-# pair still left the write term ~30x too small and lambda could not price endurance (slice 35
-# measured reorg bytes moving only 4.13x -> 4.27x across two orders of magnitude of lambda).
-# With references calibrated to what the arm actually sees, lambda = 1 means "typical writes cost
-# the same as typical service time", which is the legible meaning the objective intends.
-DEFAULT_SERVICE_REF_NS = 6.5e6
-DEFAULT_BYTES_REF = 2.0e4
+def region_cost_ns(stats: RegionStats, lambda_ns_per_byte: float = DEFAULT_LAMBDA_NS_PER_BYTE) -> float:
+    """The reward proxy: service time (``count * mean_ns``) plus the priced write term.
 
-
-def region_cost_ns(
-    stats: RegionStats,
-    lambda_ns_per_byte: float = DEFAULT_LAMBDA_NS_PER_BYTE,
-    service_ref_ns: float = DEFAULT_SERVICE_REF_NS,
-    bytes_ref: float = DEFAULT_BYTES_REF,
-) -> float:
-    """The reward proxy, RELATIVE and dimensionless.
-
-    ``cost = (count * mean_ns) / service_ref_ns + lambda * bytes_written / bytes_ref``
-
-    Lower is better. With references calibrated to the arm's own typical window (the defaults are
-    the values measured on the inventory workload), ``lambda = 1`` means "a typical window's writes
-    cost as much as its service time", so lambda is a legible endurance price rather than a scale
-    factor that does nothing.
+    Lower is better. The write term prices ALL bytes the region wrote to storage in the window
+    -- WAL ingest (``bytes_written``) plus reorganisation output (``compaction_bytes``) -- at
+    ``lambda_ns_per_byte`` ns/byte, whose default is the measured device write cost. See the
+    module docstring for the unit derivation and why the reorganisation bytes are priced.
     """
-    return (stats.count * stats.mean_ns) / service_ref_ns + lambda_ns_per_byte * stats.bytes_written / bytes_ref
+    return (stats.count * stats.mean_ns
+            + lambda_ns_per_byte * (stats.bytes_written + stats.compaction_bytes))
 
 
 def region_rewrite_factor(stats: RegionStats) -> float | None:
@@ -384,11 +409,26 @@ def _seeded_order(candidates: tuple[LayoutCandidate, ...], seed: int) -> dict[La
 class _Arm:
     n: int = 0
     sum_cost: float = 0.0
+    # Reorganisation evidence is a STABLE property of a candidate (how many bytes its merges
+    # write per window), unlike the non-stationary cost evidence, so it is NOT reset by a drift
+    # restart -- otherwise a restart would forget that a candidate is expensive and re-admit it.
+    compaction_n: int = 0
+    sum_compaction_bytes: float = 0.0
     violating: bool = False       # proved to break this region's p99 ceiling
 
     @property
     def mean_cost(self) -> float:
         return self.sum_cost / self.n if self.n else math.inf
+
+    @property
+    def mean_compaction_bytes(self) -> float:
+        """Mean reorganisation bytes/window observed under this candidate (0.0 if unexplored).
+
+        Unexplored arms report 0.0 -- not ``inf`` -- so the reorganisation budget never blocks
+        the bounded burn-in from sampling a candidate for the first time; only a switch to a
+        candidate *observed* to add reorganisation is refused.
+        """
+        return self.sum_compaction_bytes / self.compaction_n if self.compaction_n else 0.0
 
 
 @dataclass
@@ -405,6 +445,10 @@ class _RegionState:
     reexploring: bool = False
     reexplore_start: int | None = None
     recovery_windows: int | None = None
+    # Churn control (Slice 39): the step index of the last active change.
+    last_change_step: int | None = None
+    budget_blocks: int = 0        # switches refused because projected added reorg exceeded budget
+    cooldown_holds: int = 0       # steps a change was held back by the per-region cooldown
 
 
 @dataclass
@@ -418,10 +462,6 @@ class LayoutLearner:
 
     candidates: tuple[LayoutCandidate, ...] = DEFAULT_CANDIDATES
     lambda_ns_per_byte: float = DEFAULT_LAMBDA_NS_PER_BYTE
-    # Calibrated to the arm's own typical window by default; tests pass 1.0/1.0 to work in the
-    # historical absolute units their synthetic numbers were tuned in.
-    service_ref_ns: float = DEFAULT_SERVICE_REF_NS
-    bytes_ref: float = DEFAULT_BYTES_REF
     min_samples: int = 3
     margin: float = 0.05
     stability_window: int = 2
@@ -433,6 +473,12 @@ class LayoutLearner:
     # challengers (None = the full candidate set, the correctness fallback).
     drift_reexplore_candidates: int | None = 2
     seed: int = 0
+    # Churn control between re-explorations (Slice 39). A per-region cooldown of
+    # `cooldown_windows` steps after a change (0 disables it), and a per-window
+    # reorganisation budget shared across regions (None disables it; the runner derives it
+    # from the declared arm's measured reorganisation rate).
+    cooldown_windows: int = 0
+    reorg_budget_bytes_per_window: float | None = None
 
     def __post_init__(self) -> None:
         self.candidates = tuple(self.candidates)
@@ -446,9 +492,15 @@ class LayoutLearner:
             raise ValueError("drift_windows must be >= 1")
         if self.drift_reexplore_candidates is not None and self.drift_reexplore_candidates < 1:
             raise ValueError("drift_reexplore_candidates must be >= 1 or None")
+        if self.cooldown_windows < 0:
+            raise ValueError("cooldown_windows must be >= 0")
+        if self.reorg_budget_bytes_per_window is not None and self.reorg_budget_bytes_per_window < 0:
+            raise ValueError("reorg_budget_bytes_per_window must be >= 0 or None")
         self.ceilings_ns = dict(self.ceilings_ns)
         self._tie = _seeded_order(self.candidates, self.seed)
         self._regions: dict[str, _RegionState] = {}
+        self._step_index = 0
+        self._window_added_reorg = 0.0
 
     # -- state helpers ------------------------------------------------------
     def _region(self, name: str) -> _RegionState:
@@ -463,11 +515,26 @@ class LayoutLearner:
     def _available(self, st: _RegionState) -> list[LayoutCandidate]:
         return [c for c in self.candidates if not st.arms[c].violating]
 
-    def _in_exploitation(self, st: _RegionState) -> bool:
+    def _admissible(self, st: _RegionState) -> list[LayoutCandidate]:
+        """Available candidates the reorganisation budget can admit (Slice 39).
+
+        A candidate whose observed reorganisation rate exceeds the current incumbent's by more
+        than the per-window budget is not selectable, so it also must not hold the min-sample gate
+        open (otherwise a budget-refused candidate would deadlock the burn-in). The incumbent is
+        always admitted (projected added 0). With no budget every available candidate is admitted.
+        """
         available = self._available(st)
-        if not available:
+        budget = self.reorg_budget_bytes_per_window
+        if budget is None:
+            return available
+        return [c for c in available
+                if c == st.active or self._projected_added_reorg(st, c) <= budget]
+
+    def _in_exploitation(self, st: _RegionState) -> bool:
+        admissible = self._admissible(st)
+        if not admissible:
             return False
-        return min(st.arms[c].n for c in available) >= self.min_samples
+        return min(st.arms[c].n for c in admissible) >= self.min_samples
 
     @staticmethod
     def _reset_gate(st: _RegionState) -> None:
@@ -512,12 +579,14 @@ class LayoutLearner:
         if ceiling is not None and stats.p99_ns > ceiling:
             st.arms[candidate].violating = True
             return
-        cost = region_cost_ns(stats, self.lambda_ns_per_byte, self.service_ref_ns, self.bytes_ref)
+        cost = region_cost_ns(stats, self.lambda_ns_per_byte)
         if candidate == st.active and self._in_exploitation(st) and st.reference_cost is not None:
             self._note_deviation(st, cost)
         arm = st.arms[candidate]
         arm.n += 1
         arm.sum_cost += cost
+        arm.compaction_n += 1
+        arm.sum_compaction_bytes += stats.compaction_bytes
 
     def step(self, regions: Iterable[str], *, explore: bool = True) -> None:
         """One policy step for each region: burn-in exploration, else the gate.
@@ -526,6 +595,8 @@ class LayoutLearner:
         closed until every available candidate is sampled); tests use it to pin
         the gate's behaviour against a fixed evidence set.
         """
+        self._step_index += 1
+        self._window_added_reorg = 0.0
         for name in regions:
             if not is_policy_region(name):
                 continue
@@ -535,21 +606,74 @@ class LayoutLearner:
             else:
                 self._gate(st)
 
+    # -- churn control (Slice 39) ------------------------------------------
+    def _cooled_down(self, st: _RegionState) -> bool:
+        """False while the region's per-change cooldown has not elapsed (counts the hold)."""
+        if self.cooldown_windows <= 0 or st.last_change_step is None:
+            return True
+        if self._step_index - st.last_change_step < self.cooldown_windows:
+            st.cooldown_holds += 1
+            return False
+        return True
+
+    def _projected_added_reorg(self, st: _RegionState, challenger: LayoutCandidate) -> float:
+        """The challenger's mean reorganisation rate minus the incumbent's, floored at 0.
+
+        An unexplored challenger has ``mean_compaction_bytes == 0`` so it always projects 0
+        added bytes -- the bounded burn-in is never blocked by the budget; only a switch to a
+        candidate *observed* to write more reorganisation is refused.
+        """
+        incumbent = st.active
+        if incumbent is None or incumbent not in st.arms:
+            return 0.0
+        return max(0.0, st.arms[challenger].mean_compaction_bytes
+                   - st.arms[incumbent].mean_compaction_bytes)
+
+    def _change_allowed(self, st: _RegionState, challenger: LayoutCandidate) -> float | None:
+        """The projected added reorganisation if the switch is allowed, else ``None``.
+
+        ``None`` means the per-region cooldown has not elapsed or the switch would exceed this
+        window's remaining reorganisation budget. The caller must then hold the incumbent.
+        """
+        if not self._cooled_down(st):
+            return None
+        added = self._projected_added_reorg(st, challenger)
+        budget = self.reorg_budget_bytes_per_window
+        if budget is not None and self._window_added_reorg + added > budget:
+            st.budget_blocks += 1
+            return None
+        return added
+
+    def _set_active(self, st: _RegionState, candidate: LayoutCandidate, added_reorg: float = 0.0) -> None:
+        st.active = candidate
+        st.last_change_step = self._step_index
+        self._window_added_reorg += added_reorg
+
     # -- gate / explore -----------------------------------------------------
     def _burn_in_needed(self, st: _RegionState) -> bool:
-        available = self._available(st)
-        return bool(available) and min(st.arms[c].n for c in available) < self.min_samples
+        admissible = self._admissible(st)
+        return bool(admissible) and min(st.arms[c].n for c in admissible) < self.min_samples
 
     def _explore(self, st: _RegionState) -> None:
-        available = self._available(st)
+        available = self._admissible(st)
         if not available:
             return
         if st.active is None or st.active not in available:
+            # A disqualified incumbent is a forced constraint switch: never held.
             if st.active is not None:
                 st.constraint_switches += 1
-            st.active = self._initial_pick(st, available)
-        else:
-            st.active = self._ucb_pick(st, available)
+            self._set_active(st, self._initial_pick(st, available))
+            self._reset_gate(st)
+            st.reference_cost = None
+            return
+        pick = self._ucb_pick(st, available)
+        if pick == st.active:
+            self._reset_gate(st)
+            st.reference_cost = None
+            return
+        added = self._change_allowed(st, pick)
+        if added is not None:
+            self._set_active(st, pick, added)
         self._reset_gate(st)
         st.reference_cost = None
 
@@ -560,7 +684,7 @@ class LayoutLearner:
         if st.active is None or st.active not in available:
             if st.active is not None:
                 st.constraint_switches += 1
-            st.active = self._initial_pick(st, available)
+            self._set_active(st, self._initial_pick(st, available))
             self._reset_gate(st)
             st.reference_cost = None
             return
@@ -585,7 +709,13 @@ class LayoutLearner:
                 st.pending = challenger
                 st.pending_streak = 1
             if st.pending_streak >= self.stability_window:
-                st.active = challenger
+                added = self._change_allowed(st, challenger)
+                if added is None:
+                    # Cooldown/budget refused: hold the incumbent. Dropping the pending
+                    # candidate makes the streak restart from the current evidence.
+                    self._reset_gate(st)
+                    return
+                self._set_active(st, challenger, added)
                 st.gated_switches += 1
                 self._reset_gate(st)
                 st.reference_cost = None
@@ -628,7 +758,7 @@ class LayoutLearner:
         deviation = abs(cost - reference) / max(abs(reference), 1.0)
         if deviation > self.drift_margin:
             st.deviation_streak += 1
-            if st.deviation_streak >= self.drift_windows:
+            if st.deviation_streak >= self.drift_windows and self._cooled_down(st):
                 self._restart(st)
         else:
             st.deviation_streak = 0
@@ -657,15 +787,15 @@ class LayoutLearner:
         ``drift_reexplore_candidates=None`` (or ``K`` >= the available count)
         re-samples every available candidate, the correctness-complete fallback.
         """
-        available = self._available(st)
+        admissible = set(self._admissible(st))
         k = self.drift_reexplore_candidates
-        if k is None or k >= len(available):
-            return set(available)
+        if k is None or k >= len(admissible):
+            return admissible
         ordered: list[LayoutCandidate] = []
-        if st.active is not None and st.active in available:
+        if st.active is not None and st.active in admissible:
             ordered.append(st.active)
         ordered.extend(sorted(
-            (c for c in available if c != st.active),
+            (c for c in admissible if c != st.active),
             key=lambda c: (st.arms[c].mean_cost, self._tie[c]),
         ))
         return set(ordered[:k])
@@ -685,6 +815,14 @@ class LayoutLearner:
 
     def restarts(self) -> dict[str, int]:
         return {name: st.restarts for name, st in self._regions.items()}
+
+    def budget_blocks(self) -> dict[str, int]:
+        """Steps a region's change was refused because it exceeded the reorganisation budget."""
+        return {name: st.budget_blocks for name, st in self._regions.items()}
+
+    def cooldown_holds(self) -> dict[str, int]:
+        """Steps a region's change was held back by the per-change cooldown."""
+        return {name: st.cooldown_holds for name, st in self._regions.items()}
 
     def reexploring_regions(self) -> set[str]:
         """Regions currently inside a drift re-exploration epoch."""
@@ -753,8 +891,6 @@ class StaticDerivedController:
     sweep, computed once and frozen; ``observe`` never changes a selection."""
 
     lambda_ns_per_byte: float = DEFAULT_LAMBDA_NS_PER_BYTE
-    service_ref_ns: float = DEFAULT_SERVICE_REF_NS
-    bytes_ref: float = DEFAULT_BYTES_REF
     ceilings_ns: Mapping[str, float] = field(default_factory=dict)
     candidates: tuple[LayoutCandidate, ...] = DEFAULT_CANDIDATES
     seed: int = 0
@@ -780,9 +916,7 @@ class StaticDerivedController:
             if not eligible:
                 continue
             self._frozen[region] = min(
-                eligible,
-                key=lambda c: (region_cost_ns(eligible[c], self.lambda_ns_per_byte,
-                                              self.service_ref_ns, self.bytes_ref), self._tie[c])
+                eligible, key=lambda c: (region_cost_ns(eligible[c], self.lambda_ns_per_byte), self._tie[c])
             )
 
     def observe(self, window: WindowTelemetry) -> None:
