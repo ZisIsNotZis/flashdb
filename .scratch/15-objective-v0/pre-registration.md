@@ -92,3 +92,15 @@ and the relaxed oracle over the published candidate set is the stated reference.
    reference-load p99) or a fixed absolute number.
 5. That a rejected verdict on this layout space is publishable as a negative result (the design docs
    require publishing the null, and this space's read-side knobs already measured only ~3%).
+
+## Proposed additions (2026-10-06, awaiting sign-off; nothing has been run against them)
+
+**Proposal B1 — external baselines as arms.** `sqlite` (WAL enabled, `synchronous` setting stated explicitly, one writer), `postgres` (a frozen disclosed config, no tuning race), `lmdb` and `rocksdb` (the honest comparisons named in the design log). Equal durability as closely as each product allows, and the difference disclosed. One request-level harness drives every arm, because flashdb has no SQL and its payload is opaque. Every arm runs in the same memory-constrained regime, and the same latency rule is applied to the baselines when computing their sustained level.
+
+**Proposal T5 — low-load non-inferiority.** At the 1x rung flashdb must be within **1.5x** of the slower of sqlite/postgres; **2x** is the fail line; a **10x** gap is a design failure.
+
+**Proposal T6 — high-load superiority.** At the highest common offered level flashdb must reach at least **3x** the best baseline's sustained throughput under the same latency rule.
+
+**Proposal T7 — initial-policy quality.** The declared arm alone must already pass T5, which turns "the initial policy must not be absurd" into a number on a design deliverable.
+
+The current pre-registration compares arms only against each other (T1–T4: learned vs declared / static-derived / oracle); this external claim is therefore untested.

@@ -37,7 +37,7 @@ replay fits, every arm's cgroup peak at the cap (cache-evicting), one seed per a
 | T3 reorganisation writes <=3x declared | **FAIL** | learner 10.7-11.1 MB vs declared 2.6 MB = **4.13-4.27x**, once compaction was actually actuated |
 | T4 drift recovery within 2 windows | **NOT MEASURABLE** | the drift rate (150 rps) exceeds the capacity of its own 64%-scan mix, so every arm saturated and no pre-drift baseline exists; separately, the default parameters need 6 windows |
 
-Two findings that are *not* thesis verdicts but matter:
+Findings that are *not* thesis verdicts but matter:
 
 - **The learner produces a plausible, differentiated policy** (defer `P|Order` and `P|StockMovement`
   to merge_min_tiles=200, keep `P|Stock` at 8 with 4 KiB pages, 64 KiB for `R|Order`) that matches
@@ -49,6 +49,8 @@ Two findings that are *not* thesis verdicts but matter:
   endurance a constraint), not a calibration fix.
 - **Churn control works**: per-region cooldown plus a per-window reorganisation budget cut the
   learner's reorganissation bytes from 402,984,851 to 28,191,940 (14x) under drift.
+- **The learning unit is the request, not the block** (`docs/learning.md`): the co-occurrence signal
+  lives at the request boundary; block-granular aggregation would split one pattern into several.
 
 ## 3. What has been falsified or closed along the way (all by measurement)
 
@@ -86,6 +88,11 @@ Each of these was found because a number looked too good, and each is fixed or r
    credited with the previous rung's drain), and the runs carry no `--ceiling-us` so the latency
    constraint is not evaluated - **OPEN**, recorded, and the reason no per-rung number from this
    runner is quoted above.
+8. **One unique conflict rejects the whole commit group**, and a deferred-barrier group spans
+   independent requests (slice 23's `--group-requests`), so the contract's validation unit is the
+   request while the implementation's is the group. Latent in every 0b run (all report `commit =
+   1.000`); it bites under a hot unique key. Contract: `docs/contracts.md`; fix ticket:
+   `.scratch/41-request-level-commit/issues.md`.
 
 ## 5. What the author needs to decide
 
@@ -93,8 +100,9 @@ Each of these was found because a number looked too good, and each is fixed or r
    written: the 15% / 5% thresholds, the 10-seed requirement, and the **2-window drift recovery**
    (the current parameters need 6 windows - `drift_reexplore_candidates * min_samples` - so either
    the target or the parameters must change).
-2. **`lambda` semantics**: is endurance priced per byte at device write cost (my proposed fix, being
-   implemented) or is it a pure policy weight, and what value?
+2. **`lambda` semantics — resolved 2026-10-06.** Endurance is a constraint, not a price: the
+   reorganisation write term is 0.083-0.669% of the service-time term (ingest 0.003%), so no lambda
+   sweep can move an argmin and endurance is not the scarce resource. See `docs/objective.md`.
 3. **Whether 0b's win workload should be the current inventory flow** (where the declared default is
    strong and the learner cannot win) **or the motivating join-heavy shapes** from `docs/dev-loop.md`
    (star-schema fan-out, multi-hop, as-of, anti-join), which have still never been generated - ticket
@@ -104,6 +112,10 @@ Each of these was found because a number looked too good, and each is fixed or r
    verification on read), **D1-D5** (constraint surface), and whether the request grammar gets a
    create/seed shape (today dimensions can only be created through engine-level ops, not through the
    documented request surface).
+5. **The external bar (author, 2026-10-06)**: not slower than SQLite/PostgreSQL at low load, far
+   ahead at high load, and the initial policy not absurd. Baselines B1 (`sqlite`/`postgres`/`lmdb`/
+   `rocksdb`) and thresholds T5/T6/T7 are proposed in `.scratch/15-objective-v0/pre-registration.md`
+   and await sign-off.
 
 ## 6. Environment notes for anyone re-running this
 

@@ -111,6 +111,20 @@ subject to worst-regime angriness ≤ cap
 - **The cap contradicts Invariant I10.** "Angriness is the only currency" and a second, non-currency criterion cannot both hold, and the cap is precisely the non-tradeable binary constraint argued against in the first section. Either the cap goes, or the objective is a constrained program that must state its scalarisation (shadow price) and its behaviour when the feasible set is empty.
 - **The convexity → fairness claim is false for this form.** `d²σ/dx² ∝ σ'(z)(1 − 2σ(z))`, so the penalty is convex for `x < SLO + a` and **concave for `x > SLO + a`** — concave in the far violation region. The load-spreading argument requires global convexity and does not apply. Fairness must be supplied separately, or the penalty form changed.
 
+## Endurance is a constraint, not a price (author, 2026-10-06)
+
+Measured on the inventory workload: the reorganisation write term is **0.083–0.669%** of the service-time term, and ingest writes **0.003%**. A priced term of that size cannot move any candidate's argmin however `lambda` is swept, so lambda was never a calibration problem — on this workload endurance is **not** the scarce resource; device service time is.
+
+The form therefore becomes:
+
+```
+maximise   sustained load
+subject to latency ceiling       (hard)
+           write-amplitude budget (hard)
+```
+
+The budget is enforced as a **per-window reorganisation allowance**, and the slice-39 churn control is already that mechanism: it cut the learner's reorganisation bytes from 402,984,851 to 28,191,940. The deliverable is a **capacity-versus-budget curve** ("under a reorganisation budget of B bytes/window, sustained load is X"), not a lambda. A small lambda may remain only as a tie-break, and must be described as such.
+
 ## Worked example
 
 One request, 10 ms base service time, 1 MB read per request.
