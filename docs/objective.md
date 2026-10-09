@@ -2,7 +2,7 @@ Budget: 180 lines / 18,000 chars
 
 # flashdb — the objective: angriness
 
-**Angriness is the single scalar objective.** Every decision in the system — which layout, when to reorganize, what tier to promote to, whether to speculate, whether to compile — is evaluated as a predicted angriness delta through one calibrated cost model (`design.md` I10).
+**The governing objective is the constrained program** — maximise the highest sustained offered load, subject to the latency ceiling and the write-amplitude budget as hard feasibility conditions (`Endurance is a constraint, not a price`). **Angriness is the internal pricing form**, not a competing objective. Every decision in the system — which layout, when to reorganize, what tier to promote to, whether to speculate, whether to compile — is evaluated as a predicted angriness delta through one calibrated cost model (`design.md` I10).
 
 Angriness is a **rate**, not a total: angriness per unit of offered load, or per unit time. Reported as a total it can be made to look good by simply receiving less work.
 

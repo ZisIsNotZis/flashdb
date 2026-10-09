@@ -17,7 +17,7 @@ policy-driven, with a durability protocol that has been fault-injected at every 
 | unique probe | 0.46 us (append-shaped keys), 1.59 us (in-range absent, with bloom) | 12 active tiles |
 | write throughput | 150 rps → 6,378 rps with batch commit (143 → 4,232 rps on the real request path) | one fsync per request vs one per batch; WAL bytes byte-identical |
 | write amplification | 5.87 → 3.92 (merge shape) → 2.13 (cap 1024) | 5 M / 1 M docs x 1 KiB |
-| tests | 250 Rust, 101 Python, zero compiler warnings | `cargo test --workspace --offline` |
+| tests | 259 Rust (sum of per-binary `test result` lines), 126 Python, zero compiler warnings | `cargo test --workspace --offline` |
 
 Deliberately NOT claimed: bounded recovery time (open is O(suffix), not O(data), but that is not the
 same as bounded), a bounded scan footprint (the request adapter streams into a bounded top-100 map,

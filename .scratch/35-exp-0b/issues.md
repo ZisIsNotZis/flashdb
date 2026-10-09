@@ -165,8 +165,9 @@ corrected one label:
    reorganisation budget derived from the declared arm's rate. The learner's reorg bytes fell from
    402,984,851 (slice 37) to **28,191,940** (14x), with 10 budget blocks and 42 cooldown holds.
    RETRACTED 2026-10-06 (review): the pairing is cross-workload — 402,984,851 is the slice-38 **drift**
-   arm and 28,191,940 is the slice-39 **adversarial** arm. Like for like on the adversarial arm the
-   figure moved 33,141,775 (slice 38) to 28,191,940 (slice 39), about 1.18x; the churn control's
+   arm (the original text's "slice 37" label is a mislabel for this slice-38 drift arm) and 28,191,940
+   is the slice-39 **adversarial** arm. Like for like on the adversarial arm the figure moved
+   33,141,775 (slice 38, `learned@1.0`) to 28,191,940 (slice 39, `learned@1.0`), about 1.18x; the churn control's
    effect under drift is **not measured** — slice 39 ran the adversarial arm only, and what was
    observed on it are the control's counters: 52 restarts, 45 gated switches, 10 budget blocks,
    42 cooldown holds.

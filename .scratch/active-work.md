@@ -6,8 +6,9 @@
 
 **Retraction (2026-10-06 review):** the 14x churn claim (402,984,851 → 28,191,940) is retracted — it
 paired the slice-38 **drift** arm with the slice-39 **adversarial** arm. Like for like on the
-adversarial arm the figure moved 33,141,775 (slice 38) to 28,191,940 (slice 39), about 1.18x, and the
-churn control's effect under drift is **not measured** (slice 39 ran the adversarial arm only).
+adversarial arm the figure moved 33,141,775 (slice 38, `learned@1.0`) to 28,191,940 (slice 39,
+`learned@1.0`), about 1.18x, and the churn control's effect under drift is **not measured** (slice 39
+ran the adversarial arm only).
 
 - **Methodological correction (2026-10-01, recorded in 29):** every per-region axis comparison so far (page size, bloom, compaction trigger) ran CACHE-WARM (5 GB data, 128 GB RAM), so it could only measure CPU effects and cannot speak to layout/I-O effects. The pre-registration's ">= 10x cache" rule was honoured by the engine scale runs but not by the axis runs. Those axis comparisons must be re-run under a memory cap with a real cache-evicting working set, with the in-session device fsync p50 reported. Until then "flat" means "flat when warm", not "no headroom".
 - [29-workload-shapes](29-workload-shapes/issues.md) — **OPEN and strategically important.** The measured headroom table: every ENGINEERING axis paid off by a large factor, while every LEARNABLE per-region axis (bloom bits, page size, compaction trigger, family partitioning) measured neutral, harmful, or a pure trade-off. The likely reason is that our generator produces four roughly independent shapes (order_flow/stock_lookup/customer_lookup/movements_scan) and NOT the motivating join-heavy ones from docs/dev-loop.md (star-schema fan-out, multi-hop traceability, as-of join, anti-join) - the shapes whose cost is dominated by where related rows live, i.e. the only thing cross-entity co-location (L2) can move. Plan: generate those shapes, measure fan-out/multi-hop depth/dependent-read share/co-location potential, and only then decide whether 0b's layout space should be per-region parameters (no measured headroom) or L2.
