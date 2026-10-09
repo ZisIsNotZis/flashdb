@@ -10,10 +10,21 @@
 //! per window. The harness maps a load profile onto the rate schedule; keeping the schema coupling
 //! in Python means the pacer has no opinion about workload semantics.
 //!
+//! Arrivals model (latency trust). A request becomes READY at its scheduled due time. A group is
+//! formed only from requests that are ALREADY READY (never future-scheduled ones), capped at
+//! `--group-requests`, and is dispatched as soon as at least one request is ready - it is never
+//! held open to fill the group. Each request's latency is measured PER REQUEST from ITS OWN due
+//! time to the group's completion (`service_p50_us`/`service_p95_us`/`service_p99_us`), and its
+//! schedule lag from due to issue (`lag_p50_us`/`lag_p95_us`/`lag_p99_us`); the group's own
+//! elapsed time is reported only as the separate `group_elapsed_us` diagnostic. Two named ceilings
+//! apply per window: `--ceiling-us` to the per-request service-latency p99 and `--lag-ceiling-us`
+//! (default 10000, the pre-registration's "lag p99 <= 10 ms") to the per-request schedule-lag p99;
+//! `reject_reason` says WHICH one rejected a window.
+//!
 //! usage:
 //!   flashdb-load <dir-or-wal> <trace.jsonl> --rate-rps R[,R...] [--segment-requests N]
-//!                [--window-ms 1000] [--ceiling-us N] [--patterns] [--metrics-json]
-//!                [--commit-batch B] [--group-requests B] [--no-tiles]
+//!                [--window-ms 1000] [--ceiling-us N] [--lag-ceiling-us N] [--patterns]
+//!                [--metrics-json] [--commit-batch B] [--group-requests B] [--no-tiles]
 //!                [--policy-file PATH] [--policy-reload] [--peak-report]
 //!                [--checkpoint-bytes N] [--rotate-bytes N] [--region-mode global|per_region]
 //!                [--compact-bytes N]
@@ -78,9 +89,15 @@ use flashdb_engine::request::execute_request;
 use serde_json::Value;
 
 const MAX_LINE: u64 = 1 << 20;
-/// A request issued more than this long after its scheduled time means the engine is not keeping
-/// up with the offered rate. Well above the burst pacer's own <= 1 ms chunking floor.
+/// Default schedule-lag ceiling in microseconds. This is the pre-registration's own number
+/// (`.scratch/15-objective-v0/pre-registration.md`: "lag p99 <= 10 ms"); `--lag-ceiling-us`
+/// overrides it. A window whose per-request schedule-lag p99 exceeds it is rejected and its rung
+/// cannot be scored sustained.
 const LAG_SATURATION_US: u64 = 10_000;
+/// A request is "early" only if it was issued strictly before its due time by more than this
+/// tolerance. The scheduler never forms a group from a not-yet-ready request, so the count is 0;
+/// it is emitted so a regression (consuming future-scheduled requests) is visible in the output.
+const EARLY_TOLERANCE_US: f64 = 0.0;
 /// `--compact-bytes` passes the global active-tile gate at its floor, so under
 /// [`RegionMode::PerRegion`] each region's OWN `merge_min_tiles` (the learner's knob)
 /// is what decides eligibility rather than a driver-imposed cap.
@@ -93,6 +110,7 @@ struct Args {
     segment_requests: Option<u64>,
     window_ms: u64,
     ceiling_us: Option<u64>,
+    lag_ceiling_us: u64,
     patterns: bool,
     metrics_json: bool,
     commit_batch: Option<u64>,
@@ -118,6 +136,7 @@ fn parse_args(argv: Vec<String>) -> Result<Args, String> {
         segment_requests: None,
         window_ms: 1000,
         ceiling_us: None,
+        lag_ceiling_us: LAG_SATURATION_US,
         patterns: false,
         metrics_json: false,
         commit_batch: None,
@@ -154,6 +173,13 @@ fn parse_args(argv: Vec<String>) -> Result<Args, String> {
             "--ceiling-us" => {
                 args.ceiling_us = Some(argv.get(i + 1).ok_or("--ceiling-us needs a value")?
                     .parse().map_err(|_| "--ceiling-us must be an integer")?);
+                i += 2;
+            }
+            "--lag-ceiling-us" => {
+                let n: u64 = argv.get(i + 1).ok_or("--lag-ceiling-us needs a value")?
+                    .parse().map_err(|_| "--lag-ceiling-us must be a positive integer")?;
+                if n == 0 { return Err("--lag-ceiling-us must be a positive integer".into()); }
+                args.lag_ceiling_us = n;
                 i += 2;
             }
             "--commit-batch" => {
@@ -268,6 +294,50 @@ fn percentile_us(sorted_us: &[u64], q: f64) -> Option<u64> {
     Some(sorted_us[idx])
 }
 
+/// One offered interval (us) for request `i`.
+fn interval_us(i: u64, total: u64, rates: &[f64], segment_requests: Option<u64>) -> f64 {
+    1_000_000.0 / rate_for(i, total, rates, segment_requests)
+}
+
+/// How many requests from `index` form the next group, plus the due time of the request after it.
+///
+/// The arrivals model: a request becomes READY at its scheduled due time. A group is formed only
+/// from requests that are ALREADY READY (`due <= now_us`), never a future-scheduled one, capped at
+/// `size` and never straddling an offered-rate boundary, and is dispatched as soon as at least one
+/// request is ready. It is never held open to fill `size`; a whole group is only possible when the
+/// engine has fallen behind and several requests are already past due. Returns `(end,
+/// next_due_us)` with `index < end`, where `next_due_us` is the due time of request `end`.
+fn ready_group(index: u64, total: u64, size: u64, due_us: f64, now_us: f64,
+               rates: &[f64], segment_requests: Option<u64>) -> (u64, f64) {
+    let window_rate = rate_for(index, total, rates, segment_requests);
+    let cap = (index + size).min(total);
+    let mut end = index;
+    let mut d = due_us;
+    while end < cap {
+        // Never consume a future-scheduled request: only requests due at or before `now_us`.
+        if d > now_us { break; }
+        if end > index && rate_for(end, total, rates, segment_requests) != window_rate { break; }
+        end += 1;
+        if end < total { d += interval_us(end, total, rates, segment_requests); }
+    }
+    (end, d)
+}
+
+/// Which rule rejected a window, as a stable string, or `None` when the window is valid. The
+/// service and lag ceilings are named separately so a report can say WHICH bound failed; a rung
+/// cannot be scored sustained on either.
+fn reject_reason(service_ceiling_breached: bool, lag_ceiling_breached: bool,
+                 saturated: bool, rejected: bool) -> Option<String> {
+    let mut parts: Vec<&str> = Vec::new();
+    if service_ceiling_breached { parts.push("service_ceiling"); }
+    if lag_ceiling_breached { parts.push("lag_ceiling"); }
+    // The lag-growth saturation rule is a distinct signal from a single lag-ceiling breach; keep
+    // it visible even though the ceiling usually fires first.
+    if saturated && !lag_ceiling_breached { parts.push("lag_saturation"); }
+    if rejected { parts.push("errors"); }
+    if parts.is_empty() { None } else { Some(parts.join("+")) }
+}
+
 /// The policy file the driver should read: `--policy-file` wins over the
 /// `FLASHDB_POLICY_FILE` env var; `None` means the engine keeps its default
 /// policy (today's behaviour).
@@ -285,17 +355,27 @@ fn read_policy(path: &str) -> io::Result<LayoutPolicy> {
 /// One `--metrics-json` window line. A struct rather than a long positional argument list, so it
 /// is obvious which measurement each field carries.
 ///
-/// Frozen top-level fields: `window`, `rate_rps`, `requests` (this window),
-/// `completed`/`errors` (cumulative), `p50_us`/`p99_us` (this window), `window_us` (the window's
-/// actual wall time), `lag_p99_us` (schedule-lag p99), `invalid` (the pacer's rejection flag),
-/// `ceiling_us` (`null` when none was supplied) and `ceiling_breached` (the ceiling's own
-/// per-window decision), `compact_bytes` (this window's actuation output), `policy` (the active
-/// per-region policy, see [`LayoutPolicy::to_json`]), then `current` and `previous` window
-/// snapshots. A window snapshot is `{"patterns", "regions"}` as frozen by
-/// [`WindowSnapshot::to_json`]; `previous` is `null` for the first window. Object key order is
-/// serde_json's sorted map, so two identical runs emit identical lines.
+/// Latency model: a request arrives (becomes READY) at its scheduled due time and is issued in a
+/// group at or after that time, so every measured latency includes its own waiting from arrival.
+/// `service_p50_us`/`service_p95_us`/`service_p99_us` (explicit) and their legacy aliases
+/// `p50_us`/`p95_us`/`p99_us` are PER-REQUEST service-latency percentiles (group completion minus
+/// the request's OWN due time), and `lag_p50_us`/`lag_p95_us`/`lag_p99_us` are the PER-REQUEST
+/// schedule-lag percentiles (issue time minus due time). `group_elapsed_us` is a separate
+/// diagnostic (the largest group completion minus its first member's due time); it bounds the
+/// per-request latencies and is NEVER presented as one.
 ///
-/// `invalid`, `lag_p99_us` and `window_us` must be on the JSON line, not only the human
+/// Frozen top-level fields: `window`, `rate_rps`, `requests` (this window), `completed`/`errors`
+/// (cumulative), the per-request service and lag percentiles above, `group_elapsed_us`,
+/// `early_dispatches`, `window_us` (the window's actual wall time), `invalid` (the pacer's
+/// rejection flag), `reject_reason` (WHICH rule rejected it, `null` when valid),
+/// `service_ceiling_us`/`service_ceiling_breached` and `lag_ceiling_us`/`lag_ceiling_breached`,
+/// `compact_bytes` (this window's actuation output), `policy` (the active per-region policy, see
+/// [`LayoutPolicy::to_json`]), then `current` and `previous` window snapshots. A window snapshot
+/// is `{"patterns", "regions"}` as frozen by [`WindowSnapshot::to_json`]; `previous` is `null` for
+/// the first window. Object key order is serde_json's sorted map, so two identical runs emit
+/// identical lines.
+///
+/// `invalid`, the reject reason and `window_us` must be on the JSON line, not only the human
 /// `window=` line: a `--metrics-json` consumer builds the capacity curve from these lines, and
 /// without the rejection flag it can score a saturated rung as sustained.
 struct WindowLine<'a> {
@@ -305,13 +385,26 @@ struct WindowLine<'a> {
     completed: u64,
     errors: u64,
     compact_bytes: u64,
+    /// Per-request service latency (completion minus the request's own due time) percentiles.
+    /// Emitted under the explicit `service_pNN_us` names and the legacy `pNN_us` spellings.
     p50_us: u64,
+    p95_us: u64,
     p99_us: u64,
-    window_us: u64,
+    /// Per-request schedule-lag (issue minus due) percentiles.
+    lag_p50_us: u64,
+    lag_p95_us: u64,
     lag_p99_us: u64,
+    /// Largest group completion minus its first member's due time. Diagnostic, not a latency.
+    group_elapsed_us: u64,
+    /// Requests issued before their due time by more than `EARLY_TOLERANCE_US` (always 0).
+    early_dispatches: u64,
+    window_us: u64,
     invalid: bool,
-    ceiling_us: Option<u64>,
-    ceiling_breached: bool,
+    reject_reason: Option<String>,
+    service_ceiling_us: Option<u64>,
+    service_ceiling_breached: bool,
+    lag_ceiling_us: u64,
+    lag_ceiling_breached: bool,
     policy: serde_json::Value,
     current: &'a WindowSnapshot,
     previous: Option<&'a WindowSnapshot>,
@@ -325,13 +418,24 @@ fn metrics_json_line(w: WindowLine) -> String {
         "completed": w.completed,
         "errors": w.errors,
         "compact_bytes": w.compact_bytes,
+        "service_p50_us": w.p50_us,
+        "service_p95_us": w.p95_us,
+        "service_p99_us": w.p99_us,
         "p50_us": w.p50_us,
+        "p95_us": w.p95_us,
         "p99_us": w.p99_us,
-        "window_us": w.window_us,
+        "lag_p50_us": w.lag_p50_us,
+        "lag_p95_us": w.lag_p95_us,
         "lag_p99_us": w.lag_p99_us,
+        "group_elapsed_us": w.group_elapsed_us,
+        "early_dispatches": w.early_dispatches,
+        "window_us": w.window_us,
         "invalid": w.invalid,
-        "ceiling_us": w.ceiling_us,
-        "ceiling_breached": w.ceiling_breached,
+        "reject_reason": w.reject_reason,
+        "service_ceiling_us": w.service_ceiling_us,
+        "service_ceiling_breached": w.service_ceiling_breached,
+        "lag_ceiling_us": w.lag_ceiling_us,
+        "lag_ceiling_breached": w.lag_ceiling_breached,
         "policy": w.policy,
         "current": w.current.to_json(),
         "previous": w.previous.map(WindowSnapshot::to_json),
@@ -524,19 +628,28 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut else_used: u64 = 0;
     let mut first_error: Option<String> = None;
     let mut latencies: Vec<u64> = Vec::new();
-    // schedule lag = how late a request was issued relative to its due time. The burst pacer
-    // allows a bounded chunk (<= 1 ms), so a small floor is expected and is NOT saturation;
-    // saturation is when the lag distribution runs away, which is what the growth rule detects.
+    // schedule lag = how late a request was issued relative to its due time, PER REQUEST. The
+    // pacer dispatches as soon as a request is ready, so a small floor is expected and is NOT
+    // saturation; saturation is when the lag distribution runs away (the growth rule).
     let mut lags: Vec<u64> = Vec::new();
+    // Per-group elapsed time (completion minus the group's first member's due time), a diagnostic
+    // only: it bounds the window's per-request service latencies and is never one of them.
+    let mut group_elapseds: Vec<u64> = Vec::new();
     let mut window_index: u64 = 0;
     let mut window_start = Instant::now();
     let mut window_late_start: u64 = 0;
     let mut window_rate: f64 = rate_for(0, total, &args.rates, args.segment_requests);
     let mut late_growth_windows: u32 = 0;
     let mut invalid_windows: u64 = 0;
-    // The ceiling's own rejection count, separate from `invalid_windows` (which also folds in lag
-    // and request errors), so the report can state how many windows the latency ceiling rejected.
-    let mut ceiling_rejected_windows: u64 = 0;
+    // The ceilings' own rejection counts, separate from `invalid_windows` (which also folds in lag
+    // and request errors), so the report can state WHICH ceiling rejected a window.
+    let mut service_ceiling_rejected_windows: u64 = 0;
+    let mut lag_ceiling_rejected_windows: u64 = 0;
+    let mut ceil_rejected_windows: u64 = 0;
+    // Requests dispatched strictly before their due time (must stay 0: the scheduler never
+    // consumes a not-yet-ready request). Emitted so a regression is visible in the output.
+    let mut early_dispatches_total: u64 = 0;
+    let mut early_dispatches_window: u64 = 0;
     let mut last_valid_rate: f64 = 0.0;
     let mut saturated_at: Option<f64> = None;
     // Compaction actuation accounting (Slice 37): driver-side bytes and merges
@@ -552,16 +665,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         if due_us <= now_us {
             let size = args.group_requests.or(args.commit_batch).unwrap_or(1).max(1);
             window_rate = rate_for(index, total, &args.rates, args.segment_requests);
-            // Never let a group straddle an offered-rate boundary: every request in the group must
-            // be offered at the same rate, so its completions are attributed to the rung they were
-            // OFFERED under. Before this, a group starting under 50 rps could carry the first 100
-            // rps requests and credit them to the 50 rps rung.
-            let mut end = (index + size).min(total);
-            while end > index + 1
-                && rate_for(end - 1, total, &args.rates, args.segment_requests) != window_rate
-            {
-                end -= 1;
-            }
+            // Arrivals model: form a group only from requests ALREADY READY (due <= now_us), never
+            // future-scheduled ones, capped at `size` and never straddling an offered-rate
+            // boundary (so every completion is attributed to the rung it was OFFERED under).
+            // Dispatch immediately once at least one request is ready; never hold the group open
+            // to fill it. `end_due_us` is the due time of the next unissued request.
+            let (end, end_due_us) = ready_group(
+                index, total, size, due_us, now_us, &args.rates, args.segment_requests);
+            debug_assert!(end > index);
             let started = Instant::now();
             if args.group_requests.is_some() {
                 // Grouped request mode: the real adapter flow (`cust -> take` with its stock
@@ -694,25 +805,30 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             if args.checkpoint_bytes.is_some() || args.rotate_bytes.is_some() {
                 maintain_wal(&mut engine, args.checkpoint_bytes, args.rotate_bytes)?;
             }
-            // One latency sample per request of the group: in batch mode every request in the
-            // group shares the single commit barrier, so their latencies are the same value.
+            // Per-request measurement. A request's latency runs from ITS OWN due time (arrival)
+            // to the group's completion, so each member of the group gets its own sample rather
+            // than the group's elapsed time. The group elapsed (completion minus the FIRST
+            // member's due time) bounds every member's latency and is kept separately as a
+            // diagnostic. A dispatch before a request's due time would make `raw_lag` negative;
+            // the scheduler never does that, so `early_dispatches` stays 0.
             let group_us = started.elapsed().as_micros() as u64;
             let issue_us = started.duration_since(t0).as_secs_f64() * 1e6;
-            let lag = (issue_us - due_us).max(0.0) as u64;
-            for _ in index..end {
-                latencies.push(group_us);
+            let completion_us = issue_us + group_us as f64;
+            let first_due_us = due_us;
+            let mut member_due_us = due_us;
+            for i in index..end {
+                let raw_lag = issue_us - member_due_us;
+                if raw_lag < -EARLY_TOLERANCE_US { early_dispatches_total += 1; early_dispatches_window += 1; }
+                let lag = raw_lag.max(0.0) as u64;
+                let latency = (completion_us - member_due_us).max(0.0) as u64;
                 lags.push(lag);
+                latencies.push(latency);
+                if lag > args.lag_ceiling_us { late_total += 1; }
+                member_due_us += interval_us(i + 1, total, &args.rates, args.segment_requests);
             }
-            if lag > LAG_SATURATION_US { late_total += end - index; }
-            // Advance the open-loop schedule by every request in the group (the group's first
-            // request was due at `due_us`; the next group starts one interval later per request).
-            let mut i = index;
-            while i < end {
-                if i + 1 < total {
-                    due_us += 1_000_000.0 / rate_for(i + 1, total, &args.rates, args.segment_requests);
-                }
-                i += 1;
-            }
+            group_elapseds.push((completion_us - first_due_us).max(0.0) as u64);
+            // Advance the open-loop schedule to the due time of the next unissued request.
+            due_us = end_due_us;
             index = end;
         } else {
             // burst pacing: bounded chunks, never a per-request sleep whose granularity would
@@ -752,28 +868,38 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             // Actual wall time the window covered, emitted so a consumer can compare it with the
-            // window's offered schedule span. The grouped pacer commits a whole group when its
-            // first request is due, so the per-window delta over a nominal `--window-ms` is not
-            // the offered rate; the harness divides a rung's completions by the LONGER of its
-            // offered span and its summed wall time, which the offered rate bounds.
+            // window's offered schedule span. The pacer dispatches a group as soon as its first
+            // request is ready (not a filled burst), so the per-window delta over a nominal
+            // `--window-ms` need not be the offered rate; the harness divides a rung's completions
+            // by the LONGER of its offered span and its summed wall time, which the offered rate
+            // bounds.
             let window_us = window_start.elapsed().as_micros() as u64;
             latencies.sort_unstable();
             let p50 = percentile_us(&latencies, 0.50).unwrap_or(0);
+            let p95 = percentile_us(&latencies, 0.95).unwrap_or(0);
             let p99 = percentile_us(&latencies, 0.99).unwrap_or(0);
             let mut sorted_lags = lags.clone();
             sorted_lags.sort_unstable();
             let lag_p50 = percentile_us(&sorted_lags, 0.50).unwrap_or(0);
+            let lag_p95 = percentile_us(&sorted_lags, 0.95).unwrap_or(0);
             let lag_p99 = percentile_us(&sorted_lags, 0.99).unwrap_or(0);
-            let behind = lag_p99 > LAG_SATURATION_US;
+            // The group elapsed is a diagnostic (the largest group completion minus its first
+            // member's due time); it bounds the per-request service latencies and is never one.
+            let group_elapsed_us = group_elapseds.iter().copied().max().unwrap_or(0);
+            let behind = lag_p99 > args.lag_ceiling_us;
             let window_late = late_total - window_late_start;
-            let ceiling_breached = args.ceiling_us.is_some_and(|c| p99 > c);
+            let service_ceiling_breached = args.ceiling_us.is_some_and(|c| p99 > c);
+            let lag_ceiling_breached = lag_p99 > args.lag_ceiling_us;
             if behind || window_late > 0 { late_growth_windows += 1 } else { late_growth_windows = 0 }
             let saturated = late_growth_windows >= 3;
             let window_error_count = errors - errors_before;
             let rejected = window_error_count > 0;
-            let invalid = ceiling_breached || saturated || rejected;
+            let reason = reject_reason(service_ceiling_breached, lag_ceiling_breached, saturated, rejected);
+            let invalid = reason.is_some();
             if invalid { invalid_windows += 1 } else { last_valid_rate = last_valid_rate.max(window_rate) }
-            if ceiling_breached { ceiling_rejected_windows += 1 }
+            if service_ceiling_breached { service_ceiling_rejected_windows += 1 }
+            if lag_ceiling_breached { lag_ceiling_rejected_windows += 1 }
+            if service_ceiling_breached || lag_ceiling_breached { ceil_rejected_windows += 1 }
             if saturated && saturated_at.is_none() { saturated_at = Some(window_rate) }
             if args.metrics_json {
                 // Machine-readable window line: the window just measured is
@@ -801,12 +927,20 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     errors,
                     compact_bytes: compact_bytes_window,
                     p50_us: p50,
+                    p95_us: p95,
                     p99_us: p99,
-                    window_us,
+                    lag_p50_us: lag_p50,
+                    lag_p95_us: lag_p95,
                     lag_p99_us: lag_p99,
+                    group_elapsed_us,
+                    early_dispatches: early_dispatches_window,
+                    window_us,
                     invalid,
-                    ceiling_us: args.ceiling_us,
-                    ceiling_breached,
+                    reject_reason: reason.clone(),
+                    service_ceiling_us: args.ceiling_us,
+                    service_ceiling_breached,
+                    lag_ceiling_us: args.lag_ceiling_us,
+                    lag_ceiling_breached,
                     policy: engine.layout_policy().to_json(),
                     current: &current,
                     previous: previous.as_ref(),
@@ -814,11 +948,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 engine.metrics_rotate_window();
             } else {
                 writeln!(out, "window={window_index} rate_rps={:.0} requests={} completed={completed} \
-                    errors={errors} lag_p50_us={lag_p50} lag_p99_us={lag_p99} behind={behind} \
-                    late_total={late_total} errors_window={window_error_count} p50_us={p50} p99_us={p99} \
-                    invalid={invalid} compact_bytes={compact_bytes_window} ceiling_us={}",
+                    errors={errors} service_p50_us={p50} service_p95_us={p95} service_p99_us={p99} \
+                    lag_p50_us={lag_p50} lag_p95_us={lag_p95} lag_p99_us={lag_p99} \
+                    group_elapsed_us={group_elapsed_us} early_dispatches={early_dispatches_window} \
+                    behind={behind} late_total={late_total} errors_window={window_error_count} \
+                    invalid={invalid} reject_reason={} service_ceiling_us={} lag_ceiling_us={} \
+                    compact_bytes={compact_bytes_window}",
                     window_rate, latencies.len(),
-                    args.ceiling_us.map(|c| c.to_string()).unwrap_or_else(|| "none".into()))?;
+                    reason.clone().unwrap_or_else(|| "none".into()),
+                    args.ceiling_us.map(|c| c.to_string()).unwrap_or_else(|| "none".into()),
+                    args.lag_ceiling_us)?;
                 if args.patterns {
                     let snap = engine.metrics_rotate_window();
                     write!(out, "{snap}")?;
@@ -829,6 +968,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             out.flush()?;
             latencies.clear();
             lags.clear();
+            group_elapseds.clear();
+            early_dispatches_window = 0;
             // keep the process footprint flat across windows (scan results churn hundred-KB Vecs)
             trim_heap();
             window_index += 1;
@@ -852,8 +993,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
     let achieved_rps = if elapsed.as_secs_f64() > 0.0 { completed as f64 / elapsed.as_secs_f64() } else { 0.0 };
     writeln!(out, "load_summary requests={total} completed={completed} errors={errors} \
-        else_used={else_used} late_total={late_total} windows={window_index} invalid_windows={invalid_windows} \
-        ceiling_rejected_windows={ceiling_rejected_windows} \
+        else_used={else_used} late_total={late_total} early_dispatches={early_dispatches_total} \
+        windows={window_index} invalid_windows={invalid_windows} \
+        service_ceiling_rejected_windows={service_ceiling_rejected_windows} \
+        lag_ceiling_rejected_windows={lag_ceiling_rejected_windows} \
+        ceiling_rejected_windows={ceil_rejected_windows} \
         last_valid_rate_rps={last_valid_rate:.0} saturated_at_rps={} commit_batch={} group_requests={} \
         elapsed_ms={elapsed_ms} achieved_rps={achieved_rps:.0} compact_bytes_total={compact_bytes_total} \
         compact_merges={compact_merges} first_error={:?}",
@@ -998,8 +1142,12 @@ mod tests {
         };
         let line = metrics_json_line(WindowLine {
             window: 1, rate: 100.0, requests: 1, completed: 1, errors: 0, compact_bytes: 0,
-            p50_us: 10, p99_us: 20, window_us: 1_000_000, lag_p99_us: 0, invalid: false,
-            ceiling_us: None, ceiling_breached: false,
+            p50_us: 10, p95_us: 15, p99_us: 20,
+            lag_p50_us: 0, lag_p95_us: 0, lag_p99_us: 0,
+            group_elapsed_us: 0, early_dispatches: 0,
+            window_us: 1_000_000, invalid: false, reject_reason: None,
+            service_ceiling_us: None, service_ceiling_breached: false,
+            lag_ceiling_us: 10_000, lag_ceiling_breached: false,
             policy: LayoutPolicy::declared_default().to_json(), current: &snap, previous: None,
         });
         assert!(line.contains(r#""compaction_bytes":4288,"compaction_merges":1"#), "got {line}");
@@ -1015,15 +1163,21 @@ mod tests {
         let empty = WindowSnapshot::default();
         let line = metrics_json_line(WindowLine {
             window: 7, rate: 50.0, requests: 64, completed: 128, errors: 0, compact_bytes: 0,
-            p50_us: 100, p99_us: 999_999, window_us: 1_280_000, lag_p99_us: 5_000_000,
-            invalid: true, ceiling_us: Some(250_000), ceiling_breached: true,
+            p50_us: 100, p95_us: 500, p99_us: 999_999,
+            lag_p50_us: 0, lag_p95_us: 0, lag_p99_us: 5_000_000,
+            group_elapsed_us: 200, early_dispatches: 0,
+            window_us: 1_280_000, invalid: true,
+            reject_reason: Some("service_ceiling".into()),
+            service_ceiling_us: Some(250_000), service_ceiling_breached: true,
+            lag_ceiling_us: 10_000, lag_ceiling_breached: false,
             policy: LayoutPolicy::declared_default().to_json(), current: &empty, previous: None,
         });
         assert!(line.contains(r#""invalid":true"#), "got {line}");
         assert!(line.contains(r#""lag_p99_us":5000000"#), "got {line}");
         assert!(line.contains(r#""window_us":1280000"#), "got {line}");
-        assert!(line.contains(r#""ceiling_us":250000"#), "got {line}");
-        assert!(line.contains(r#""ceiling_breached":true"#), "got {line}");
+        assert!(line.contains(r#""service_ceiling_us":250000"#), "got {line}");
+        assert!(line.contains(r#""service_ceiling_breached":true"#), "got {line}");
+        assert!(line.contains(r#""reject_reason":"service_ceiling""#), "got {line}");
     }
 
     #[test]
@@ -1034,19 +1188,27 @@ mod tests {
         // `--compact-bytes` actuation call at this window's boundary (0 when unset).
         let line = metrics_json_line(WindowLine {
             window: 3, rate: 120.0, requests: 10, completed: 9, errors: 1, compact_bytes: 0,
-            p50_us: 500, p99_us: 1500, window_us: 1_000_000, lag_p99_us: 0, invalid: false,
-            ceiling_us: None, ceiling_breached: false,
+            p50_us: 500, p95_us: 1000, p99_us: 1500,
+            lag_p50_us: 0, lag_p95_us: 0, lag_p99_us: 0,
+            group_elapsed_us: 0, early_dispatches: 0,
+            window_us: 1_000_000, invalid: false, reject_reason: None,
+            service_ceiling_us: None, service_ceiling_breached: false,
+            lag_ceiling_us: 10_000, lag_ceiling_breached: false,
             policy: policy.clone(), current: &empty, previous: None,
         });
         assert_eq!(
             line,
-            r#"{"ceiling_breached":false,"ceiling_us":null,"compact_bytes":0,"completed":9,"current":{"patterns":[],"regions":[]},"errors":1,"invalid":false,"lag_p99_us":0,"p50_us":500,"p99_us":1500,"policy":{"default":{"bloom_bits_per_key":10,"merge_min_tiles":2,"page_size":4096},"regions":{}},"previous":null,"rate_rps":120.0,"requests":10,"window":3,"window_us":1000000}"#
+            r#"{"compact_bytes":0,"completed":9,"current":{"patterns":[],"regions":[]},"early_dispatches":0,"errors":1,"group_elapsed_us":0,"invalid":false,"lag_ceiling_breached":false,"lag_ceiling_us":10000,"lag_p50_us":0,"lag_p95_us":0,"lag_p99_us":0,"p50_us":500,"p95_us":1000,"p99_us":1500,"policy":{"default":{"bloom_bits_per_key":10,"merge_min_tiles":2,"page_size":4096},"regions":{}},"previous":null,"rate_rps":120.0,"reject_reason":null,"requests":10,"service_ceiling_breached":false,"service_ceiling_us":null,"service_p50_us":500,"service_p95_us":1000,"service_p99_us":1500,"window":3,"window_us":1000000}"#
         );
         // A previous window is embedded as an object, not a string.
         let with_prev = metrics_json_line(WindowLine {
             window: 4, rate: 120.0, requests: 10, completed: 19, errors: 1, compact_bytes: 4288,
-            p50_us: 500, p99_us: 1500, window_us: 1_000_000, lag_p99_us: 0, invalid: false,
-            ceiling_us: None, ceiling_breached: false,
+            p50_us: 500, p95_us: 1000, p99_us: 1500,
+            lag_p50_us: 0, lag_p95_us: 0, lag_p99_us: 0,
+            group_elapsed_us: 0, early_dispatches: 0,
+            window_us: 1_000_000, invalid: false, reject_reason: None,
+            service_ceiling_us: None, service_ceiling_breached: false,
+            lag_ceiling_us: 10_000, lag_ceiling_breached: false,
             policy, current: &empty, previous: Some(&empty),
         });
         assert!(with_prev.contains(r#""compact_bytes":4288"#), "got {with_prev}");
@@ -1085,5 +1247,56 @@ mod tests {
         assert!(parse_args(vec!["b".into(), "wal".into(), "t.jsonl".into(), "--rate-rps".into(), "10".into(),
                                 "--group-requests".into(), "0".into()]).is_err(),
             "a zero group size is rejected");
+    }
+
+    /// Arrivals model: a group is formed only from requests ALREADY READY at dispatch, so it never
+    /// consumes a future-scheduled request; a whole `size` group forms only once enough requests
+    /// are past due (the driver ran ahead before this fix).
+    #[test]
+    fn ready_group_never_consumes_a_future_request() {
+        let rates = [1.0]; // one request per 1_000_000 us
+        // now == the first due time: only request 0 is ready, even with a group size of 64.
+        let (end, next_due) = ready_group(0, 100, 64, 1_000_000.0, 1_000_000.0, &rates, None);
+        assert_eq!(end, 1, "a not-yet-due request must never join the group");
+        assert_eq!(next_due, 2_000_000.0);
+        // The engine is four intervals behind: requests 0..=4 are ready -> a 5-request group.
+        let (end, _) = ready_group(0, 100, 64, 1_000_000.0, 5_000_000.0, &rates, None);
+        assert_eq!(end, 5);
+        // The cap still applies when far behind.
+        let (end, _) = ready_group(0, 100, 3, 1_000_000.0, 100_000_000.0, &rates, None);
+        assert_eq!(end, 3, "the group is capped at --group-requests");
+    }
+
+    /// A group never straddles an offered-rate boundary, so every completion is attributed to the
+    /// rung it was OFFERED under.
+    #[test]
+    fn ready_group_stops_at_the_offered_rate_boundary() {
+        let rates = [1.0, 1_000_000.0];
+        // Segment boundary at index 10 (`--segment-requests 10`): a group at index 8 may only
+        // reach 10 even though every request is past due.
+        let (end, _) = ready_group(8, 20, 64, 1_000_000.0, 1e12, &rates, Some(10));
+        assert_eq!(end, 10);
+    }
+
+    #[test]
+    fn reject_reason_names_which_ceiling_failed() {
+        assert_eq!(reject_reason(false, false, false, false), None);
+        assert_eq!(reject_reason(true, false, false, false).as_deref(), Some("service_ceiling"));
+        assert_eq!(reject_reason(false, true, false, false).as_deref(), Some("lag_ceiling"));
+        assert_eq!(reject_reason(true, true, false, false).as_deref(), Some("service_ceiling+lag_ceiling"));
+        assert_eq!(reject_reason(false, false, false, true).as_deref(), Some("errors"));
+    }
+
+    #[test]
+    fn lag_ceiling_flag_parses_and_defaults() {
+        let plain = parse_args(vec!["b".into(), "wal".into(), "t.jsonl".into(), "--rate-rps".into(), "10".into()])
+            .expect("valid args");
+        assert_eq!(plain.lag_ceiling_us, 10_000, "the pre-registration lag bound is the default");
+        let set = parse_args(vec!["b".into(), "wal".into(), "t.jsonl".into(), "--rate-rps".into(), "10".into(),
+                                  "--lag-ceiling-us".into(), "25000".into()]).expect("valid lag ceiling");
+        assert_eq!(set.lag_ceiling_us, 25_000);
+        assert!(parse_args(vec!["b".into(), "wal".into(), "t.jsonl".into(), "--rate-rps".into(), "10".into(),
+                                "--lag-ceiling-us".into(), "0".into()]).is_err(),
+            "a zero lag ceiling is rejected");
     }
 }

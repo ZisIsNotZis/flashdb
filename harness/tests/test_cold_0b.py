@@ -312,11 +312,14 @@ def test_flashdb_load_command_passes_compact_bytes_only_when_actuated() -> None:
     plan = m.plan_workload("win", 50, 100)
     cmd = m.flashdb_load_command(bins, "dir", "t.jsonl", plan, "p.json", reload=True,
                                  checkpoint_bytes=16384, rotate_bytes=16384, group_requests=64,
-                                 window_ms=1000, ceiling_us=None, compact_bytes=64 << 20)
+                                 window_ms=1000, ceiling_us=None, lag_ceiling_us=10_000,
+                                 compact_bytes=64 << 20)
     assert "--compact-bytes 67108864" in cmd
+    assert "--lag-ceiling-us 10000" in cmd
     off = m.flashdb_load_command(bins, "dir", "t.jsonl", plan, "p.json", reload=False,
                                  checkpoint_bytes=16384, rotate_bytes=16384, group_requests=64,
-                                 window_ms=1000, ceiling_us=None, compact_bytes=0)
+                                 window_ms=1000, ceiling_us=None, lag_ceiling_us=10_000,
+                                 compact_bytes=0)
     assert "--compact-bytes" not in off, "0 means the pre-slice inert path, so no flag"
 
 
@@ -586,3 +589,96 @@ def test_thresholds_two_and_four_are_emitted_without_the_win_workload() -> None:
     assert kinds["T4"]["status"] == "NOT MEETABLE WITH CURRENT PARAMETERS"
     assert "drift reorg: declared 1000 B, learned 2000 B (ratio 2.00)" in kinds["T4"]["detail"]
     assert "static-derived 9000 B" in kinds["T4"]["detail"]
+
+
+# ---------------------------------------------------------------------------
+# Latency model (t1/t2/t3): per-request latency, schedule lag and named ceilings
+# ---------------------------------------------------------------------------
+def _latency_window(rate: float, completed_delta: int, *, requests: int,
+                    group_elapsed_us: int, service_p50: int, service_p95: int, service_p99: int,
+                    lag_p50: int = 0, lag_p95: int = 0, lag_p99: int = 0,
+                    invalid: bool = False, reject_reason: str | None = None,
+                    service_breached: bool = False, lag_breached: bool = False,
+                    early: int = 0, window_s: float = 1.0) -> str:
+    """A ``--metrics-json`` window from the fixed driver (per-request latencies + named ceilings).
+
+    ``p50_us``/``p99_us`` are deliberately set to the GROUP elapsed to reproduce the pre-fix
+    driver, while the explicit ``service_pNN_us`` fields carry the per-request values: a consumer
+    that reads the retired group-inflated ``p50_us`` reports the wrong number.
+    """
+    return json.dumps({
+        "window": 0, "rate_rps": rate, "requests": requests, "completed": completed_delta,
+        "errors": 0, "compact_bytes": 0,
+        "service_p50_us": service_p50, "service_p95_us": service_p95, "service_p99_us": service_p99,
+        "p50_us": group_elapsed_us, "p95_us": group_elapsed_us, "p99_us": group_elapsed_us,
+        "lag_p50_us": lag_p50, "lag_p95_us": lag_p95, "lag_p99_us": lag_p99,
+        "group_elapsed_us": group_elapsed_us, "early_dispatches": early,
+        "window_us": int(window_s * 1e6), "invalid": invalid, "reject_reason": reject_reason,
+        "service_ceiling_us": 10_000, "service_ceiling_breached": service_breached,
+        "lag_ceiling_us": 10_000, "lag_ceiling_breached": lag_breached,
+        "policy": {}, "current": {"patterns": [], "regions": []},
+    }, sort_keys=True)
+
+
+def test_t1_per_request_latency_is_not_the_group_elapsed_time() -> None:
+    """--group-requests 64: the group shares one barrier, so its own elapsed is ~108 ms while each
+    of its 64 members is served in ~1.6 ms. The old driver wrote the group elapsed into ``p50_us``
+    (inflating the per-request bound by ~N); the fixed one reports the PER-REQUEST service p50 and
+    keeps the group elapsed only as the separate ``group_elapsed_us`` diagnostic."""
+    line = _latency_window(50.0, 64, requests=64, group_elapsed_us=108_282,
+                           service_p50=1_600, service_p95=2_100, service_p99=2_500)
+    rec = m.window_records([line], window_ms=1000)[0]
+    assert rec["group_elapsed_us"] == 108_282, "the group elapsed is a separate diagnostic"
+    assert rec["service_p50_us"] == 1_600
+    row = {r["offered_rps"]: r for r in m.summarize_curve(m.window_records([line], 1000))}[50.0]
+    assert row["p50_us"] == 1_600, "the rung p50 is the PER-REQUEST value, not 108,282"
+    assert row["p50_us"] < row["group_elapsed_us"], "the per-request p50 is strictly smaller"
+    assert row["p95_us"] == 2_100 and row["p99_us"] == 2_500
+    assert row["p99_us"] <= row["group_elapsed_us"], "per-request p99 is bounded by the group value"
+
+
+def test_t2_the_driver_never_consumes_a_request_before_its_due_time() -> None:
+    """The scheduler forms a group only from requests ALREADY READY, so no request is issued with
+    ``issue_us < due_us`` and ``early_dispatches`` is 0. The field must reach the window record and
+    the curve; before the fix the driver consumed future-scheduled requests and neither field
+    existed."""
+    line = _latency_window(50.0, 1, requests=1, group_elapsed_us=1_600,
+                           service_p50=1_600, service_p95=1_600, service_p99=1_600, early=0)
+    rec = m.window_records([line], window_ms=1000)[0]
+    assert rec["early_dispatches"] == 0
+    assert m.summarize_curve([rec])[0]["early_dispatches"] == 0
+    # A regression is visible rather than silently dropped.
+    bad = m.window_records([_latency_window(50.0, 1, requests=1, group_elapsed_us=1_600,
+                                            service_p50=1_600, service_p95=1_600, service_p99=1_600,
+                                            early=3)], window_ms=1000)
+    assert m.summarize_curve(bad)[0]["early_dispatches"] == 3
+    # ... and the run summary carries the total.
+    summary = m.parse_load_summary(
+        "load_summary requests=8000 completed=8000 errors=0 early_dispatches=0 "
+        "service_ceiling_rejected_windows=0 lag_ceiling_rejected_windows=0 "
+        "elapsed_ms=1000 achieved_rps=8000")
+    assert summary["early_dispatches"] == 0
+
+
+def test_t3_service_and_lag_ceilings_report_different_reasons() -> None:
+    """One window over the LAG ceiling with a fine service p99, one over the SERVICE ceiling with a
+    fine lag: they must be reported with different reasons and counted in different fields, so the
+    report can say WHICH bound rejected a window."""
+    lag_line = _latency_window(50.0, 50, requests=50, group_elapsed_us=1_200,
+                               service_p50=200, service_p95=300, service_p99=400,
+                               lag_p50=5_000, lag_p95=9_000, lag_p99=40_000,
+                               invalid=True, reject_reason="lag_ceiling", lag_breached=True)
+    service_line = _latency_window(50.0, 50, requests=50, group_elapsed_us=200_000,
+                                   service_p50=150_000, service_p95=190_000, service_p99=200_000,
+                                   lag_p50=100, lag_p95=200, lag_p99=300,
+                                   invalid=True, reject_reason="service_ceiling",
+                                   service_breached=True)
+    recs = m.window_records([lag_line, service_line], window_ms=1000)
+    assert {r["reject_reason"] for r in recs} == {"lag_ceiling", "service_ceiling"}, \
+        "the two ceilings must be named differently"
+    row = m.summarize_curve(recs, ceiling_us=10_000)[0]
+    assert row["lag_ceiling_rejected_windows"] == 1
+    assert row["service_ceiling_rejected_windows"] == 1
+    assert row["ceiling_rejected_windows"] == 2
+    assert row["reject_reasons"] == {"lag_ceiling": 1, "service_ceiling": 1}
+    assert row["sustained"] is False

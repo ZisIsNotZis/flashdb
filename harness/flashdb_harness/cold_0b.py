@@ -176,6 +176,8 @@ def parse_load_summary(text: str) -> dict:
         elif line.startswith("load_summary "):
             for key in ("requests", "completed", "errors", "else_used", "elapsed_ms",
                         "invalid_windows", "ceiling_rejected_windows", "late_total",
+                        "early_dispatches", "service_ceiling_rejected_windows",
+                        "lag_ceiling_rejected_windows",
                         "compact_bytes_total", "compact_merges"):
                 v = _kv(line, key)
                 if v is not None:
@@ -245,12 +247,22 @@ def window_records(lines: list[str], window_ms: int) -> list[dict]:
                 "compaction_bytes": r.get("compaction_bytes", 0),
                 "compaction_merges": r.get("compaction_merges", 0),
             }
-        # The pacer marks a window invalid when its schedule lag ran away (saturation), its p99
-        # exceeded the declared ceiling, or a request errored. `--metrics-json` must carry those
-        # fields (it now does): before, only the human line had them, so a JSONL consumer read
-        # `invalid` as always false and could score a saturated rung as sustained. Keep them.
+        # The pacer marks a window invalid when its schedule lag ran away (saturation), its
+        # service-latency p99 exceeded `--ceiling-us`, its schedule-lag p99 exceeded
+        # `--lag-ceiling-us`, or a request errored, and it names WHICH rule fired in
+        # `reject_reason`. `--metrics-json` must carry those fields (it now does): before, only the
+        # human line had them, so a JSONL consumer read `invalid` as always false and could score a
+        # saturated rung as sustained. Keep them.
         invalid = bool(obj.get("invalid", False))
+        service_p50 = int(obj.get("service_p50_us", obj.get("p50_us", 0)))
+        service_p95 = int(obj.get("service_p95_us", obj.get("p95_us", 0)))
+        service_p99 = int(obj.get("service_p99_us", obj.get("p99_us", 0)))
+        lag_p50 = int(obj.get("lag_p50_us", 0))
+        lag_p95 = int(obj.get("lag_p95_us", 0))
         lag_p99 = int(obj.get("lag_p99_us", 0))
+        service_ceiling_us = obj.get("service_ceiling_us", obj.get("ceiling_us"))
+        service_ceiling_breached = bool(obj.get("service_ceiling_breached",
+                                               obj.get("ceiling_breached", False)))
         out.append({
             "window": int(obj.get("window", len(out))),
             "rate_rps": float(obj.get("rate_rps", 0.0)),
@@ -264,11 +276,29 @@ def window_records(lines: list[str], window_ms: int) -> list[dict]:
             "errors": int(obj.get("errors", 0)),
             "achieved_rps": max(0.0, delta / window_s),
             "invalid": invalid,
+            # PER-REQUEST service latency (completion minus the request's OWN due time) and
+            # PER-REQUEST schedule lag (issue minus due). `p50_us`/`p99_us` are the same service
+            # quantity under their old names, so existing consumers keep working.
+            "service_p50_us": service_p50,
+            "service_p95_us": service_p95,
+            "service_p99_us": service_p99,
+            "p50_us": service_p50,
+            "p95_us": service_p95,
+            "p99_us": service_p99,
+            "lag_p50_us": lag_p50,
+            "lag_p95_us": lag_p95,
             "lag_p99_us": lag_p99,
-            "ceiling_us": obj.get("ceiling_us"),
-            "ceiling_breached": bool(obj.get("ceiling_breached", False)),
-            "p50_us": int(obj.get("p50_us", 0)),
-            "p99_us": int(obj.get("p99_us", 0)),
+            # Diagnostic only: the largest group completion minus its first member's due time.
+            "group_elapsed_us": int(obj.get("group_elapsed_us", 0)),
+            "early_dispatches": int(obj.get("early_dispatches", 0)),
+            "reject_reason": obj.get("reject_reason"),
+            "service_ceiling_us": service_ceiling_us,
+            "service_ceiling_breached": service_ceiling_breached,
+            "lag_ceiling_us": obj.get("lag_ceiling_us"),
+            "lag_ceiling_breached": bool(obj.get("lag_ceiling_breached", False)),
+            # Back-compat aliases for consumers that predate the explicit ceiling names.
+            "ceiling_us": service_ceiling_us,
+            "ceiling_breached": service_ceiling_breached,
             "regions": regions,
             "policy": obj.get("policy"),
             # Slice 37 driver field: bytes merged by the `--compact-bytes` actuation call at this
@@ -281,11 +311,18 @@ def window_records(lines: list[str], window_ms: int) -> list[dict]:
 
 
 def _ceiling_rejected(w: dict, ceiling_us: int | None) -> bool:
-    """True when the window breached the latency ceiling: the driver's own flag, or (for windows
-    built without it) a p99 above the ceiling."""
-    if w.get("ceiling_breached", False):
+    """True when the window breached the SERVICE-latency ceiling: the driver's own flag, or (for
+    windows built without it) the per-request service p99 above the ceiling. The lag ceiling is a
+    separate quantity (see ``lag_ceiling_rejected``)."""
+    if w.get("service_ceiling_breached", w.get("ceiling_breached", False)):
         return True
-    return ceiling_us is not None and w["p99_us"] > ceiling_us
+    p99 = w.get("service_p99_us", w.get("p99_us", 0))
+    return ceiling_us is not None and p99 > ceiling_us
+
+
+def lag_ceiling_rejected(w: dict) -> bool:
+    """True when the window's per-request schedule-lag p99 exceeded `--lag-ceiling-us`."""
+    return bool(w.get("lag_ceiling_breached", False))
 
 
 def summarize_curve(windows: list[dict], ceiling_us: int | None = None) -> list[dict]:
@@ -293,9 +330,9 @@ def summarize_curve(windows: list[dict], ceiling_us: int | None = None) -> list[
 
     A level's ``achieved_rps`` is its attributed completions divided by the longer of its OFFERED
     schedule span (requests/rate) and the elapsed wall time they took, NOT the median of the
-    per-window rates. The grouped pacer (``--group-requests``) issues a whole group when its FIRST
-    request is due, so at a low offered rate one window carries a full 64 request burst (64 rps)
-    and the next carries none; the median then reports the burst size over the window (128% of a
+    per-window rates. The retired pacer (``--group-requests``) issued a whole group when its FIRST
+    request was due, so at a low offered rate one window carried a full 64 request burst (64 rps)
+    and the next carried none; the median then reported the burst size over the window (128% of a
     50 rps offer in the published slice-39 run) instead of the offered rate. Summed over the rung,
     completions over the offered span is the offered rate the engine actually held.
 
@@ -303,8 +340,9 @@ def summarize_curve(windows: list[dict], ceiling_us: int | None = None) -> list[
     offered rate; a value above it by more than ``RUNG_RATE_TOLERANCE`` is a measurement error and
     the level is never scored sustained (``rate_exceeded``). A level is ``sustained`` when the
     achieved rate is within ``SUSTAINED_TOLERANCE`` of the offered rate, no window had an error,
-    no window was rejected by the pacer (schedule lag ran away, i.e. the engine was not keeping
-    up), and no window breached the latency ceiling.
+    and no window was rejected by either ceiling (the per-request service-latency p99 against
+    ``ceiling_us`` or the per-request schedule-lag p99 against the lag ceiling). ``reject_reasons``
+    counts the windows each rule fired for, so a report can state WHICH ceiling rejected them.
     """
     by_rate: dict[float, list[dict]] = {}
     for w in windows:
@@ -314,9 +352,9 @@ def summarize_curve(windows: list[dict], ceiling_us: int | None = None) -> list[
         ws = by_rate[rate]
         valid = [w for w in ws if not w.get("invalid", False)]
         # Achieved rate = completions attributed to the rung / the longer of its OFFERED schedule
-        # span (requests/rate) and its actual elapsed wall time. The grouped pacer commits a whole
-        # group when its first request is due, so the last members land ahead of their scheduled
-        # time and the rung's wall time can be SHORTER than its offered span (which is why the old
+        # span (requests/rate) and its actual elapsed wall time. The pacer dispatches a group as
+        # soon as its first request is ready, so the last members are never ahead of schedule and
+        # the rung's wall time is bounded below by its offered span (which is why the old
         # per-window median reported 128%). Dividing by at least the offered span bounds achieved
         # by the offered rate; a saturated rung's wall time exceeds the offered span and shows up
         # as a lower achieved rate.
@@ -325,26 +363,51 @@ def summarize_curve(windows: list[dict], ceiling_us: int | None = None) -> list[
         span_s = max(offered_s, wall_s)
         completions = sum(w.get("completed_delta", 0) for w in ws)
         achieved = (completions / span_s) if span_s > 0 else 0.0
-        p99 = max(w["p99_us"] for w in valid) if valid else max(w["p99_us"] for w in ws)
+        # PER-REQUEST service-latency and schedule-lag percentiles. The rung's service p99 is the
+        # max over its VALID windows (a rejected window states no latency for the rung) and falls
+        # back to all windows when every window was rejected. `p50_us`/`p99_us` are the service
+        # quantity under their old names. The group elapsed is a separate diagnostic.
+        p99 = (max(w.get("service_p99_us", w.get("p99_us", 0)) for w in valid) if valid
+               else max(w.get("service_p99_us", w.get("p99_us", 0)) for w in ws))
         rejected = any(w["errors"] > 0 for w in ws) or any(w.get("invalid", False) for w in ws)
-        ceiling_rejected_windows = sum(1 for w in ws if _ceiling_rejected(w, ceiling_us))
+        service_rejected_windows = sum(1 for w in ws if _ceiling_rejected(w, ceiling_us))
+        lag_rejected_windows = sum(1 for w in ws if lag_ceiling_rejected(w))
+        # A window rejected by EITHER ceiling (a window can breach both unnamed once here).
+        ceiling_rejected_windows = sum(1 for w in ws
+                                       if _ceiling_rejected(w, ceiling_us) or lag_ceiling_rejected(w))
+        # How many windows each rejection rule fired for, keyed by the driver's `reject_reason`
+        # (0/None excluded), so a report can say WHICH ceiling rejected a window.
+        reject_reasons: dict[str, int] = {}
+        for w in ws:
+            reason = w.get("reject_reason")
+            if reason:
+                reject_reasons[reason] = reject_reasons.get(reason, 0) + 1
         rate_exceeded = achieved > rate * (1.0 + RUNG_RATE_TOLERANCE)
         curve.append({
             "offered_rps": rate,
             "windows": len(ws),
             "achieved_rps": achieved,
-            "p50_us": median(w["p50_us"] for w in ws),
+            "p50_us": median(w.get("service_p50_us", w.get("p50_us", 0)) for w in ws),
+            "p95_us": max((w.get("service_p95_us", 0) for w in ws), default=0),
             "p99_us": p99,
+            "lag_p50_us": median(w.get("lag_p50_us", 0) for w in ws),
+            "lag_p95_us": max((w.get("lag_p95_us", 0) for w in ws), default=0),
+            "lag_p99_us": max((w.get("lag_p99_us", 0) for w in ws), default=0),
+            "group_elapsed_us": max((w.get("group_elapsed_us", 0) for w in ws), default=0),
+            "early_dispatches": sum(w.get("early_dispatches", 0) for w in ws),
             "achieved_fraction": achieved / rate if rate else 0.0,
             "invalid_windows": sum(1 for w in ws if w.get("invalid", False)),
             "error_windows": sum(1 for w in ws if w["errors"] > 0),
+            "service_ceiling_rejected_windows": service_rejected_windows,
+            "lag_ceiling_rejected_windows": lag_rejected_windows,
             "ceiling_rejected_windows": ceiling_rejected_windows,
+            "reject_reasons": reject_reasons,
             "valid_windows": len(valid),
-            "lag_p99_us": max(w.get("lag_p99_us", 0) for w in ws),
             "compact_bytes": sum(w.get("compact_bytes", 0) for w in ws),
             "rate_exceeded": rate_exceeded,
             "sustained": (achieved >= SUSTAINED_TOLERANCE * rate and not rejected
-                          and ceiling_rejected_windows == 0 and not rate_exceeded),
+                          and service_rejected_windows == 0 and lag_rejected_windows == 0
+                          and not rate_exceeded),
         })
     return curve
 
@@ -770,7 +833,8 @@ class LiveLoad:
 def flashdb_load_command(bins: dict, target: Path, trace: Path, plan: WorkloadPlan,
                          policy_path: Path, *, reload: bool, checkpoint_bytes: int,
                          rotate_bytes: int, group_requests: int, window_ms: int,
-                         ceiling_us: int | None, compact_bytes: int | None) -> str:
+                         ceiling_us: int | None, lag_ceiling_us: int,
+                         compact_bytes: int | None) -> str:
     rates = ",".join(str(r) for r in plan.rates)
     cmd = [bins["load"], str(target), str(trace),
            "--rate-rps", rates, "--segment-requests", str(plan.segment_requests),
@@ -787,6 +851,9 @@ def flashdb_load_command(bins: dict, target: Path, trace: Path, plan: WorkloadPl
         cmd.append("--policy-reload")
     if ceiling_us is not None:
         cmd += ["--ceiling-us", str(ceiling_us)]
+    # The lag ceiling is explicit (the pre-registration's 10 ms by default); the driver also
+    # defaults to it, but naming it here makes the run self-describing.
+    cmd += ["--lag-ceiling-us", str(lag_ceiling_us)]
     return " ".join(cmd)
 
 
@@ -805,7 +872,7 @@ def run_arm(name: str, workload: str, base: Path, workroot: Path, bins: dict,
         bins, engine_dir, trace, plan, policy_path, reload=controller is not None,
         checkpoint_bytes=args.checkpoint_bytes, rotate_bytes=args.rotate_bytes,
         group_requests=args.group_requests, window_ms=args.window_ms, ceiling_us=args.ceiling_us,
-        compact_bytes=args.compact_bytes)
+        lag_ceiling_us=args.lag_ceiling_us, compact_bytes=args.compact_bytes)
     print(f"+ [{workload}/{name}] {payload}", flush=True)
     live = LiveLoad(scope_command(cap_bytes, payload), env, controller=controller,
                     policy_path=policy_path, stderr_path=workroot / f"{workload}-{name}.stderr",
@@ -1068,10 +1135,14 @@ def main(argv: list[str]) -> int:
                     help="requests per level in the pre-flight ladder that --drift-rate auto runs")
     ap.add_argument("--segment-requests", type=int, default=2000)
     ap.add_argument("--ceiling-us", type=int, required=True,
-                    help="latency ceiling in microseconds; REQUIRED. The pre-registration validity "
-                         "rule scores a level sustained only if its p99 stays under the declared "
-                         "ceiling, so a run that supplies none is not scored (fail closed) rather "
-                         "than defaulting to a permissive value.")
+                    help="service-latency ceiling in microseconds; REQUIRED. The pre-registration "
+                         "validity rule scores a level sustained only if its PER-REQUEST service p99 "
+                         "stays under the declared ceiling, so a run that supplies none is not "
+                         "scored (fail closed) rather than defaulting to a permissive value.")
+    ap.add_argument("--lag-ceiling-us", type=int, default=10_000,
+                    help="schedule-lag ceiling in microseconds (default 10000, the pre-registration's "
+                         "own 'lag p99 <= 10 ms' bound); a window whose PER-REQUEST schedule-lag p99 "
+                         "exceeds it is rejected and named separately from the service ceiling.")
     ap.add_argument("--arm-timeout-s", type=float, default=1200.0)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--customers", type=int, default=2_000_000)
@@ -1273,6 +1344,7 @@ def main(argv: list[str]) -> int:
         "mix": {"win": dict(WIN_MIX), "adversarial": dict(UNIFORM_MIX)},
         "compact_bytes": a.compact_bytes,
         "ceiling_us": a.ceiling_us,
+        "lag_ceiling_us": a.lag_ceiling_us,
         "lambdas": a.lambdas,
         "noise_band_relative": noise_band,
         "workloads": {wl: plans[wl].to_dict() for wl in a.workloads},
@@ -1498,9 +1570,10 @@ def render_report(result: dict) -> str:
     w("")
     w("## Per-arm capacity curve")
     w("")
-    w("| workload | arm | lambda | offered | achieved rps | achieved % | p50 us | p99 us | "
-      "sustained | commit | else | active tiles | reorg bytes |")
-    w("|---|---|---|---:|---:|---:|---:|---:|:--:|---:|---:|---:|---:|")
+    w("| workload | arm | lambda | offered | achieved rps | achieved % | svc p50 | svc p95 | "
+      "svc p99 | lag p50 | lag p95 | lag p99 | group us | sustained | commit | else | "
+      "active tiles | reorg bytes |")
+    w("|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|:--:|---:|---:|---:|---:|")
     for key, rec in sorted(result["arms"].items()):
         summary = rec.get("summary", {})
         ti = rec.get("engine_open", {}) or {}
@@ -1508,33 +1581,50 @@ def render_report(result: dict) -> str:
         rows = rec.get("curve") or []
         if not rows:
             w(f"| {rec['workload']} | {rec['arm']} | {_fmt(rec.get('lambda_ns_per_byte'))} | - | - | "
-              f"- | - | - | - | {_fmt(summary.get('commit_rate'), '.3f')} | "
+              f"- | - | - | - | - | - | - | - | - | {_fmt(summary.get('commit_rate'), '.3f')} | "
               f"{_fmt(summary.get('else_used'))} | {_fmt(ti.get('active_tiles'))} | {reorg} |")
         for row in rows:
             w(f"| {rec['workload']} | {rec['arm']} | {_fmt(rec.get('lambda_ns_per_byte'))} | "
               f"{row['offered_rps']:.0f} | {row['achieved_rps']:.1f} | {row['achieved_fraction']:.0%} | "
-              f"{row['p50_us']} | {row['p99_us']} | {'yes' if row['sustained'] else 'no'} | "
+              f"{row['p50_us']} | {row.get('p95_us', 0)} | {row['p99_us']} | "
+              f"{row.get('lag_p50_us', 0)} | {row.get('lag_p95_us', 0)} | {row.get('lag_p99_us', 0)} | "
+              f"{row.get('group_elapsed_us', 0)} | {'yes' if row['sustained'] else 'no'} | "
               f"{_fmt(summary.get('commit_rate'), '.3f')} | {_fmt(summary.get('else_used'))} | "
               f"{_fmt(ti.get('active_tiles'))} | {reorg} |")
     w("")
-    w("`commit` is completed/requests (1.0 = every offered request committed); `else` is the stock "
+    w("`svc p50`/`svc p95`/`svc p99` are PER-REQUEST service-latency percentiles (group completion "
+      "minus each request's OWN due time); `lag p50`/`lag p95`/`lag p99` are PER-REQUEST schedule-lag "
+      "percentiles (issue minus due). `group us` is a separate diagnostic (the largest group "
+      "completion minus its first member's due time); it bounds the per-request latencies and is "
+      "never one of them. `commit` is completed/requests (1.0 = every offered request committed); "
+      "`else` is the stock "
       "guard's else/backorder branch count; `reorg bytes` is the summed per-region "
       "`compaction_bytes` over the run. `achieved rps` is the rung's attributed completions over "
       "the longer of its offered schedule span and its elapsed wall time (not a median of the "
-      "group-quantised per-window rate), so it cannot exceed the offered rate; a row is "
+      "per-window rate), so it cannot exceed the offered rate; a row is "
       f"`sustained` when it is within "
-      f"{1 - SUSTAINED_TOLERANCE:.0%} of the offered rate with no error, no window the pacer "
-      "rejected (schedule lag ran away), and no window over the latency ceiling.")
+      f"{1 - SUSTAINED_TOLERANCE:.0%} of the offered rate with no error and no window rejected by "
+      "either ceiling (service latency or schedule lag).")
     ceiling_us = result.get("ceiling_us")
-    if ceiling_us is not None:
-        per_arm = {key: sum(r.get("ceiling_rejected_windows", 0) for r in (rec.get("curve") or []))
+    lag_ceiling_us = result.get("lag_ceiling_us")
+    if ceiling_us is not None or lag_ceiling_us is not None:
+        service_arm = {key: sum(r.get("service_ceiling_rejected_windows", 0)
+                                for r in (rec.get("curve") or []))
+                       for key, rec in sorted(result["arms"].items())}
+        lag_arm = {key: sum(r.get("lag_ceiling_rejected_windows", 0)
+                            for r in (rec.get("curve") or []))
                    for key, rec in sorted(result["arms"].items())}
-        total = sum(per_arm.values())
-        detail = ", ".join(f"`{k}` {v}" for k, v in per_arm.items() if v) or "none"
+        service_total, lag_total = sum(service_arm.values()), sum(lag_arm.values())
+        service_detail = ", ".join(f"`{k}` {v}" for k, v in service_arm.items() if v) or "none"
+        lag_detail = ", ".join(f"`{k}` {v}" for k, v in lag_arm.items() if v) or "none"
         w("")
-        w(f"**Latency ceiling:** `--ceiling-us {ceiling_us}` per window. A window whose p99 exceeds "
-          f"it is rejected and its rung cannot be scored sustained. Windows the ceiling rejected "
-          f"this run: **{total}** ({detail}). A run without a ceiling is not scored.")
+        w(f"**Latency ceilings (per window, named separately):** "
+          f"`--ceiling-us {_fmt(ceiling_us)}` bounds the PER-REQUEST service-latency p99 and "
+          f"`--lag-ceiling-us {_fmt(lag_ceiling_us)}` bounds the PER-REQUEST schedule-lag p99. A "
+          f"window over either is rejected (`reject_reason` names which) and its rung cannot be "
+          f"scored sustained. Windows the SERVICE ceiling rejected: **{service_total}** "
+          f"({service_detail}); windows the LAG ceiling rejected: **{lag_total}** ({lag_detail}). "
+          "A run without a service ceiling is not scored.")
     w("")
     w("## Compaction actuation (`compact_bytes`, driver field summed per offered level)")
     w("")
