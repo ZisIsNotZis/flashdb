@@ -24,7 +24,7 @@ Motivating case: ~10 TB of data, ~128 GB RAM, heavily joined lookups. In that re
 
 - Highest throughput on a single modern Linux node; correctness and crash-atomicity never traded away for it.
 - Layout, encoding and scheduling derived from the observed workload at per-tile granularity.
-- One round trip per business request, with the request itself the unit of atomicity, learning and attribution.
+- One round trip per business request, with the **block** the unit of atomicity and the **request** the unit of learning and attribution.
 - A relational model with no SQL: JSON schema for create/update, a QBE-like structured query surface, single-source-of-truth query canonicity.
 - Continuous background adaptation with no migration project and no downtime.
 
@@ -64,7 +64,7 @@ Invariants are load-bearing. A change that breaks one of these is an architectur
 - **I7 — No locks.** Read-set validation by tile version gives serializability for the single-round-trip model. The only failure mode is retry; deadlock is impossible by construction.
 - **I8 — Tiles are immutable and self-describing.** Reorg is: write a new tile, fsync, flip the root, garbage-collect the old tile. A tile header describes its own layout so any reader can consume any tile.
 - **I9 — Speculate reads, never writes.** A wasted read is free on an unsaturated device; a speculative write requires undo and would reintroduce the machinery this design removes.
-- **I10 — One scalar objective.** Angriness (`objective.md`) is the only currency and the cost model is its predictor. Any new mechanism must express its cost and benefit in angriness.
+- **I10 — One scalar objective, a constrained program at the top.** The governing objective is a constrained program: maximise sustained offered load under hard feasibility conditions (the latency ceiling and the write-amplitude budget, `objective.md`), and angriness (`objective.md`) is the internal pricing form and cost-model predictor used to compare candidates inside it. Any new mechanism must express its cost and benefit in angriness. **Corrected (author, 2026-10-06):** the earlier wording — "angriness is the only currency" — contradicted the hard constraint and is superseded (`review-01` F5).
 - **I11 — Promotions are funded, proven and deployed.** Every promotion draws from one shared finite budget, requires weight **and** stability **and** a demonstrated win, rolls out as a canary with an O(1) rollback, is recorded in the changelog, and stops at the knee.
 - **I12 — The server normalizer is authoritative.** Clients may normalize as a convenience; the server's canonical form is the pattern key. Requests are trees, never text.
 - **I13 — Reserved interfaces.** The list is stated **once**, in `contracts.md` under "Reserved interfaces (frozen now)". It was previously duplicated here with four items while the contract listed six, and an invariant list that disagrees with the contract it summarizes is a live source-of-truth conflict (`review-04` L-23). Freezing `harmless-if-not-applicable` before its semantics are coherent (L-01, L-21) is also the wrong thing to freeze.
@@ -83,7 +83,7 @@ Honest list of what is not settled. Each is a real design fork, not a research n
 The optimisation and learning-theory review (`review-01`) added the following, all of which block implementation of the learner rather than of the engine:
 
 - **The estimand and the anchor.** Which functional of latency is penalised (mean / p95 / p99 / CVaR), whether the SLO anchor is a capability model for *that* functional, and what `k` is. Until this is settled the objective cannot be implemented (`objective.md`; `review-01` F1–F4).
-- **Aggregation and scalarisation.** Which window aggregator, and whether the objective is a pure sum or a constrained program with a shadow price. The current cap contradicts I10 (`review-01` F5, D1–D3).
+- **Aggregation and scalarisation.** **Resolved for the objective form (author, 2026-10-06):** it is a constrained program — highest sustained offered load under hard feasibility conditions (latency ceiling, write-amplitude budget) — with the tie-break order and the empty-feasible-set rule stated in `objective.md`. Still open: the *angriness* window aggregator (worst regime / CVaR / which percentile — `review-01` F8), which only matters once angriness is well-posed (`review-01` F5, D1–D3).
 - **Identification for off-policy evaluation.** Estimator, overlap / ignorability / SUTVA / stationarity assumptions, and a randomisation scheme independent of the policy under test (`review-01` F9).
 - **Regret and the oracle.** Normalisation, static-versus-dynamic framing, and how the oracle can be made independent of the learner's own cost model (`review-01` F10).
 - **Per-tile estimation.** With ~10⁶ tiles and few pulls per arm, what pooling or shrinkage makes per-tile decisions statistically defensible (`review-01` F16).

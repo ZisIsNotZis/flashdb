@@ -1,4 +1,4 @@
-# Status and handoff — 2026-10-05
+# Status and handoff — 2026-10-06
 
 Written for the author's return. Everything below is measured unless it says otherwise; every
 number names its conditions (cold/warm, instance size, seeds), and the open decisions are listed at
@@ -44,11 +44,17 @@ Findings that are *not* thesis verdicts but matter:
   the access pattern - and still buys no throughput while costing ~4x the writes. On this workload
   the declared default is simply strong.
 - **`lambda` cannot make endurance decisive, structurally**: the write term is 0.003% of the service
-  term for ingest and 0.083-0.669% for reorganisation, so no lambda sweep can move a candidate's
-  argmin. This is an objective-design decision (raise the weight ~100x, normalise the terms, or make
-  endurance a constraint), not a calibration fix.
-- **Churn control works**: per-region cooldown plus a per-window reorganisation budget cut the
-  learner's reorganissation bytes from 402,984,851 to 28,191,940 (14x) under drift.
+  term for ingest and 0.083% (declared) to 0.669% (learned@1.0) for reorganisation on the slice-39
+  adversarial arms, so no lambda sweep can move a candidate's argmin. **Resolved 2026-10-06 (see §5):
+  endurance is a constraint, not a price** — the alternative options (raise the weight ~100x,
+  normalise the terms, or make endurance a constraint) are superseded.
+- **Churn control works on the adversarial arm**: per-region cooldown plus a per-window
+  reorganisation budget moved the learner's reorganisation bytes from 33,141,775 (slice-38
+  adversarial arm, `learned@1.0`) to 28,191,940 (slice-39 adversarial arm, `learned@1.0`), ~1.18x.
+  **Retracted:** the earlier "402,984,851 to 28,191,940 (14x) under drift" paired the slice-38
+  **drift** arm with the slice-39 **adversarial** arm; the churn control's effect under drift is
+  **not yet measured** — slice 39 ran the adversarial arm only. Counters observed on the adversarial
+  arm: 52 restarts, 45 gated switches, 10 budget blocks, 42 cooldown holds.
 - **The learning unit is the request, not the block** (`docs/learning.md`): the co-occurrence signal
   lives at the request boundary; block-granular aggregation would split one pattern into several.
 
@@ -72,7 +78,8 @@ Findings that are *not* thesis verdicts but matter:
 
 ## 4. Measurement defects found and their state
 
-Each of these was found because a number looked too good, and each is fixed or recorded:
+Items 1–7 were each found because a number looked too good; item 8 is a spec-versus-implementation
+mismatch. Each is fixed or recorded:
 
 1. scan-rate claim derived from probe timings (mine) - corrected.
 2. device probe that truncated without writing (reported a 0 us device) - fixed, and the earlier
@@ -88,11 +95,14 @@ Each of these was found because a number looked too good, and each is fixed or r
    credited with the previous rung's drain), and the runs carry no `--ceiling-us` so the latency
    constraint is not evaluated - **OPEN**, recorded, and the reason no per-rung number from this
    runner is quoted above.
-8. **One unique conflict rejects the whole commit group**, and a deferred-barrier group spans
-   independent requests (slice 23's `--group-requests`), so the contract's validation unit is the
-   request while the implementation's is the group. Latent in every 0b run (all report `commit =
-   1.000`); it bites under a hot unique key. Contract: `docs/contracts.md`; fix ticket:
-   `.scratch/41-request-level-commit/issues.md`.
+8. **A unique conflict in `Engine::commit_batch` rejected the whole batch** (the `--commit-batch`
+   path), so a request's verdict depended on its neighbours. The `--group-requests` deferred-barrier
+   path was **not** affected — it already committed each request's blocks in order and reported a
+   conflict per request. The contract's validation unit is the request. Fixed in `4a348d7`
+   (uniqueness resolved per request in a group) plus the follow-up P0 fix (a duplicate `block_id`
+   inside one request is now refused fail-closed); final state in
+   `.scratch/41-request-level-commit/issues.md`. Contract: `docs/contracts.md`. Latent in every 0b
+   run (all report `commit = 1.000`); it bites under a hot unique key.
 
 ## 5. What the author needs to decide
 
@@ -100,9 +110,10 @@ Each of these was found because a number looked too good, and each is fixed or r
    written: the 15% / 5% thresholds, the 10-seed requirement, and the **2-window drift recovery**
    (the current parameters need 6 windows - `drift_reexplore_candidates * min_samples` - so either
    the target or the parameters must change).
-2. **`lambda` semantics — resolved 2026-10-06.** Endurance is a constraint, not a price: the
-   reorganisation write term is 0.083-0.669% of the service-time term (ingest 0.003%), so no lambda
-   sweep can move an argmin and endurance is not the scarce resource. See `docs/objective.md`.
+2. **`lambda` semantics — resolved 2026-10-06.** Endurance is a constraint, not a price: on the
+   slice-39 adversarial arms the reorganisation write term is 0.083% (declared) to 0.669%
+   (learned@1.0) of the service-time term (ingest 0.003%), so no lambda sweep can move an argmin and
+   endurance is not the scarce resource. See `docs/objective.md`.
 3. **Whether 0b's win workload should be the current inventory flow** (where the declared default is
    strong and the learner cannot win) **or the motivating join-heavy shapes** from `docs/dev-loop.md`
    (star-schema fan-out, multi-hop, as-of, anti-join), which have still never been generated - ticket

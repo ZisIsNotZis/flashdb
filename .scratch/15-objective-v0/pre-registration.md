@@ -77,8 +77,10 @@ model-uncalibrated, and only real-engine arms may decide the thresholds above.
 
 ## What is NOT claimed
 
-No absolute-throughput claim against other engines (Postgres is a passive scoreboard with its tuning
-protocol fixed in advance; no tuning race). No bounded-memory claim beyond what is measured. No
+No absolute-throughput claim against other engines **in the design currently run** (Postgres is a
+passive scoreboard with its tuning protocol fixed in advance; no tuning race; the proposed B1/T5–T7
+below would supersede this clause by adding external baselines as measured arms, if signed off). No
+bounded-memory claim beyond what is measured. No
 claim about key-family co-location (L2) or cross-entity clustering, which this layout space cannot
 express. No claim that the learner beats a per-tile prescient oracle - that space is combinatorial
 and the relaxed oracle over the published candidate set is the stated reference.
@@ -92,6 +94,8 @@ and the relaxed oracle over the published candidate set is the stated reference.
    reference-load p99) or a fixed absolute number.
 5. That a rejected verdict on this layout space is publishable as a negative result (the design docs
    require publishing the null, and this space's read-side knobs already measured only ~3%).
+6. The external-baseline proposals appended below (B1 + T5/T6/T7), which would supersede the
+   "no absolute-throughput claim" clause if signed off — they add external baselines as measured arms.
 
 ## Proposed additions (2026-10-06, awaiting sign-off; nothing has been run against them)
 

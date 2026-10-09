@@ -8,6 +8,8 @@ Angriness is a **rate**, not a total: angriness per unit of offered load, or per
 
 > **Status: not yet well-posed.** 设备层校准常量已由实验 0a-redo 取得（见 `docs/engine.md` 与 `.scratch/05-engine-v0/evidence/0a-redo/analysis.md`）：依赖点读 89–174 µs（按粒度）、批量摊薄 4.9 µs/读、带宽 827 MiB/s、安静设备尾 1.26× 均值。**仍然未决的是 estimand/锚定/聚合**——常量就位不改变 F1–F5 的未决状态。 An adversarial review (aspect: optimisation and learning theory) found that the estimand, the anchor, the parameterisation, the aggregation, the oracle and the estimators are all undefined or self-contradictory. Findings and dispositions are recorded as `review-01` in `.scratch/01-design/issues/01-design.md`. The defects are marked `Open` inline below rather than deleted, because the decisions they need are the author's, not the reviewer's. **The objective cannot be implemented or falsified until F1–F5 are resolved.**
 
+**How these statements relate (2026-10-06).** The **governing objective** — what the pre-registered comparison scores — is a **constrained program**: maximise the **highest sustained offered load**, subject to the latency ceiling and the write-amplitude budget as **hard feasibility conditions** (`Endurance is a constraint, not a price`). **Angriness is the internal pricing / soft-penalty form**, not a competing objective, and is **not yet well-posed** (F1–F5 open; the banner above stays true). The *soft-penalty* section below explains why the internal form is priced; the *endurance* section explains why the ceiling and the budget are feasibility, not prices. The tie-breaks and the empty-feasible-set rule are stated with the endurance decision.
+
 ## Why a soft penalty and not a hard constraint
 
 A constraint returns a binary signal — feasible or not — that a search cannot trade against. A penalty returns a magnitude. The optimizer needs magnitudes: it must decide whether saving one byte is worth 2 µs of p99, and only a priced penalty makes that question answerable.
@@ -105,15 +107,15 @@ minimize   total angriness(load distribution)
 subject to worst-regime angriness ≤ cap
 ```
 
-**Open — this form contradicts the rest of the document (`review-01` F5, F7; D1–D3).**
+**Partly resolved (author, 2026-10-06); the rest remains open (`review-01` F5, F7; D1–D3).**
 
-- **The aggregation is unspecified and self-contradictory.** "Either the worst regime, or a chosen percentile of windows" is not a definition, and the constraint uses a third (worst-regime). If angriness is integrated over the load distribution, the total is dominated by whichever regime occupies the most *time* — the long quiet periods, which is exactly the average this document calls actively wrong.
-- **The cap contradicts Invariant I10.** "Angriness is the only currency" and a second, non-currency criterion cannot both hold, and the cap is precisely the non-tradeable binary constraint argued against in the first section. Either the cap goes, or the objective is a constrained program that must state its scalarisation (shadow price) and its behaviour when the feasible set is empty.
+- **The aggregation is unspecified and self-contradictory.** "Either the worst regime, or a chosen percentile of windows" is not a definition, and the constraint uses a third (worst-regime). If angriness is integrated over the load distribution, the total is dominated by whichever regime occupies the most *time* — the long quiet periods, which is exactly the average this document calls actively wrong. **Still open:** this is the *angriness* aggregator, which only bites once angriness is well-posed.
+- **The cap is now a constrained program, not a contradiction (resolved 2026-10-06).** The objective *is* a constrained program: highest sustained offered load under the latency ceiling and the write-amplitude budget as hard feasibility conditions, with I10 corrected (`design.md`) and the scalarisation and empty-feasible-set rule stated in *Endurance is a constraint, not a price*. The `minimize total angriness subject to a worst-regime cap` form above is superseded; angriness remains the internal pricing form and stays not-well-posed.
 - **The convexity → fairness claim is false for this form.** `d²σ/dx² ∝ σ'(z)(1 − 2σ(z))`, so the penalty is convex for `x < SLO + a` and **concave for `x > SLO + a`** — concave in the far violation region. The load-spreading argument requires global convexity and does not apply. Fairness must be supplied separately, or the penalty form changed.
 
 ## Endurance is a constraint, not a price (author, 2026-10-06)
 
-Measured on the inventory workload: the reorganisation write term is **0.083–0.669%** of the service-time term, and ingest writes **0.003%**. A priced term of that size cannot move any candidate's argmin however `lambda` is swept, so lambda was never a calibration problem — on this workload endurance is **not** the scarce resource; device service time is.
+Measured on the slice-39 **adversarial** workload (service-time term): the reorganisation write term is **0.083%** for the `declared` arm, **0.669%** for `learned@1.0`, and **0.118%** for `static-derived`; ingest writes are **0.003%** on every arm. No drift-arm ratio was reported — slice 39 ran the adversarial arm only. A priced term of that size cannot move any candidate's argmin however `lambda` is swept, so lambda was never a calibration problem — on these arms endurance is **not** the scarce resource; device service time is.
 
 The form therefore becomes:
 
@@ -123,7 +125,11 @@ subject to latency ceiling       (hard)
            write-amplitude budget (hard)
 ```
 
-The budget is enforced as a **per-window reorganisation allowance**, and the slice-39 churn control is already that mechanism: it cut the learner's reorganisation bytes from 402,984,851 to 28,191,940. The deliverable is a **capacity-versus-budget curve** ("under a reorganisation budget of B bytes/window, sustained load is X"), not a lambda. A small lambda may remain only as a tie-break, and must be described as such.
+**Scalarisation.** Among candidates that satisfy both hard conditions, rank by **highest sustained offered load**; break ties first by **latency headroom** (the larger measured margin below the ceiling), then by the **reported efficiency metrics** in the pre-registered order (write amplification, bytes read per op per pattern, RSS per data byte, CPU per op, recovery time — `pre-registration.md`). Angriness does not enter this ordering until it is well-posed.
+
+**Empty feasible set.** If no candidate satisfies both hard conditions, the program has no solution: the comparison reports infeasibility and names the binding constraint, and no arm is scored as a winner — the metric cannot be won by abandoning a condition (matching the pre-registration's rule that invalid windows are not counted).
+
+The budget is enforced as a **per-window reorganisation allowance** — the window is the load window the objective aggregates over (1 s in the reported slice-39 runs). The slice-39 churn control is that mechanism: on the adversarial arm it moved `learned@1.0` reorganisation bytes from **33,141,775** (slice-38 adversarial arm) to **28,191,940** (slice-39 adversarial arm), about **1.18×**. (The slice-38 **drift** arm's `learned@1.0` figure was 402,984,851, but the churn control's effect **under drift is not yet measured** — slice 39 ran the adversarial arm only; what was observed on the adversarial arm are the control's counters: **52 restarts, 45 gated switches, 10 budget blocks, 42 cooldown holds**.) The deliverable is a **capacity-versus-budget curve** ("under a reorganisation budget of B bytes per load window, sustained load is X"), not a lambda. A small lambda may remain only as a tie-break, and must be described as such.
 
 ## Worked example
 

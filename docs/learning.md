@@ -29,7 +29,7 @@ Two rules:
 
 ### The learning unit is the request, not the block
 
-The request boundary is where the access-pattern signal lives (confirmed by the author 2026-10-06): one business action reads and writes a set of keys together and that co-occurrence is the pattern. Blocks inside a request are execution units with declared relations (`needs`, `else`, `parallel`), so aggregating the trace at block granularity would split one pattern into several and destroy the signal a layout decision needs.
+The request boundary is where the access-pattern signal lives (confirmed by the author 2026-10-06): one business action reads and writes a set of keys together and that co-occurrence is the pattern. Blocks inside a request are execution units with declared relations (`needs`, `else`; no edge = parallel), so aggregating the trace at block granularity would split one pattern into several and destroy the signal a layout decision needs.
 
 **What the learned surface must be able to act on.** The request level supplies co-occurrence; the physical decision that can exploit it is placement — which key families share a tile and where region boundaries fall. The surface learned today (per-region merge threshold, page size, bloom bits) decides only the shape of a region's storage, while region boundaries and key-family placement are fixed rules, so co-occurrence has no action to influence. This is the leading explanation of the measured zero throughput gain (slice 39: the learner produced a plausible differentiated policy, bought **+0.0%**, and wrote **4.13–4.27×** more). A new axis is added only after its headroom is measured with deterministic counts (dependent block reads per request), never by intuition.
 
