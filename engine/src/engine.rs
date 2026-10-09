@@ -2507,8 +2507,11 @@ impl Engine {
     /// its own CSN and the same framing, taking ONE `fdatasync` instead of one per
     /// block. Durability is a group property only at the barrier: a crash before
     /// it can leave a valid prefix of the group's records, exactly as the
-    /// deferred-barrier path states, and that prefix still has at most one live
-    /// owner per prefix because every appended block was validated in order.
+    /// deferred-barrier path states. The at-most-one-live-owner-per-prefix
+    /// invariant holds at REQUEST granularity after a successful call; a prefix
+    /// torn inside a request was never itself validated as a state and follows
+    /// the pre-existing block-atomicity rule (docs/design.md I6: a block is
+    /// all-or-nothing, a request is not).
     ///
     /// The promise is bounded on purpose: a `Conflict` drops one request with
     /// nothing of it appended, but like every append path, if the single
@@ -2542,7 +2545,8 @@ impl Engine {
         // (csn, block_id, ops) of the accepted blocks, in input order.
         let mut pending: Vec<(u64, &[u8], &[Op])> = Vec::new();
         // block_id -> CSN for blocks newly committed within this group, so a
-        // block_id repeated inside the group replays its first occurrence.
+        // block_id repeated ACROSS the group's requests replays its first
+        // occurrence. A repeat WITHIN one request is refused up front.
         let mut seen: HashMap<&[u8], u64> = HashMap::new();
         let mut last_csn = self.csn;
         let mut results: Vec<RequestOutcome> = Vec::with_capacity(requests.len());
@@ -2553,9 +2557,21 @@ impl Engine {
             // barrier so `apply_op`'s unwraps can never fire after a successful sync.
             let mut overlay: HashMap<Vec<u8>, PrefixEffect> = HashMap::new();
             let mut slots: Vec<Slot<'_>> = Vec::with_capacity(request.len());
+            // Block ids are names in the request's `blocks` object, so a request
+            // that reached the engine through the request surface has them unique
+            // by construction. A duplicate inside one request can only come from
+            // a programmatic caller; the engine refuses what it cannot order, so
+            // reject it here - before any overlay fold or append, consuming no
+            // CSN and leaving no state. Retry dedup is unchanged for a block id
+            // repeated ACROSS the group's requests (`seen`) or across calls
+            // (`self.dedup`).
+            let mut request_ids: HashSet<&[u8]> = HashSet::with_capacity(request.len());
             for (block_id, ops) in request {
                 if block_id.is_empty() {
                     return Err(io::Error::new(io::ErrorKind::InvalidInput, "empty block_id"));
+                }
+                if !request_ids.insert(block_id.as_slice()) {
+                    return Err(io::Error::new(io::ErrorKind::InvalidInput, "duplicate block_id within one request"));
                 }
                 if let Some(&csn) = self.dedup.get(block_id).or_else(|| seen.get(block_id.as_slice())) {
                     slots.push(Slot::Retry(csn));
@@ -2589,6 +2605,16 @@ impl Engine {
                 }
                 slots.push(Slot::New(block_id.as_slice(), ops.as_slice()));
             }
+
+            // INVARIANT: `overlay` is the net unique effect of exactly the blocks
+            // this request will append (its `Slot::New` blocks). A retry folds
+            // nothing, and a duplicate block_id inside the request was refused
+            // above, so overlay and the append plan cannot disagree by
+            // construction. The `debug_assert_eq!` after CSN assignment pins it; a
+            // pre-fix defect folded EVERY non-retry block into the overlay while
+            // the same-request duplicate check later dropped one from `pending`,
+            // so the request could be accepted after only half-applying.
+            let folded = slots.iter().filter(|s| matches!(s, Slot::New(..))).count();
 
             // Uniqueness against the request's projected post-state: each touched
             // prefix's live set (published + earlier accepted) overlaid with this
@@ -2633,18 +2659,15 @@ impl Engine {
                 live.get_mut(&pfx).expect("touched prefix was initialized during validation")
                     .owners.extend(effect.owners);
             }
+            // Every `Slot::New` block is appended: a duplicate block_id inside
+            // the request was refused before the overlay fold, and a block id
+            // already committed (this group or a prior call) is a `Slot::Retry`.
+            let pending_before = pending.len();
             let mut block_outcomes = Vec::with_capacity(slots.len());
             for slot in slots {
                 match slot {
                     Slot::Retry(csn) => block_outcomes.push(Outcome::AlreadyCommitted { csn }),
                     Slot::New(block_id, ops) => {
-                        // A block_id repeated inside one request replays its first
-                        // occurrence (the slot plan checked `seen` before the first
-                        // occurrence was registered, so this is the same request).
-                        if let Some(&csn) = seen.get(block_id) {
-                            block_outcomes.push(Outcome::AlreadyCommitted { csn });
-                            continue;
-                        }
                         let csn = last_csn.checked_add(1)
                             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "CSN exhausted"))?;
                         last_csn = csn;
@@ -2654,6 +2677,10 @@ impl Engine {
                     }
                 }
             }
+            debug_assert_eq!(
+                folded, pending.len() - pending_before,
+                "overlay must be built from exactly the blocks this request appends",
+            );
             results.push(RequestOutcome::Committed(block_outcomes));
         }
 

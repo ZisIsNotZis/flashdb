@@ -140,8 +140,9 @@ pub fn replay_jsonl(
 /// one group must not both pass a guard sequential execution would fail on the
 /// second). The whole group shares one `fdatasync`; see [`Engine::begin_group`]
 /// for the durability rule - the group becomes durable only when the barrier
-/// returns `Ok`, and a crash before it can lose the whole group, none of which
-/// was acknowledged.
+/// returns `Ok`, and a crash before it can leave a durable PREFIX of the
+/// group's records (recovery replays every complete, CRC-valid frame), none of
+/// which was acknowledged.
 ///
 /// The returned vector has one entry per input request, in order. A per-request
 /// error (a unique conflict, a malformed request) is reported at its own index

@@ -147,3 +147,140 @@ Silent (exit 0, no whitespace errors).
 - A dropped request's reserved handle in `flashdb-load --commit-batch` is not reused within the
   run; handles are opaque and only applied ops advance the watermark, so this is not a correctness
   issue.
+
+## Review of 4a348d7 (2026-10-09): P0 half-applied accept, fixed
+
+### Correction to the change description
+
+The defect this ticket really was lived in `Engine::commit_batch`, reached by the
+`--commit-batch` path. The `--group-requests` deferred-barrier path
+(`replay::execute_requests_grouped`) already executed each request sequentially against the
+immediately applied serving state and already reported a conflict per request; it never had this
+defect and is unchanged. So all of the P0 work below is in `commit_batch` and its tests.
+
+### P0 finding (verbatim from the independent review of 4a348d7)
+
+> a request can be accepted with only half its blocks applied, producing two live owners for one
+> unique prefix in the durable state. In `commit_batch` the ops of EVERY non-retry block are folded
+> into the request's uniqueness overlay, but a block whose `block_id` was already used by an earlier
+> block OF THE SAME REQUEST is later converted to `AlreadyCommitted` and excluded from `pending`
+> (the `seen` check around lines 2640-2652, populated only after the slot-plan loop). The overlay
+> therefore contains an effect that is never applied, so validation accepts a request that only
+> half-applies. Counterexample: seed `PutUnique{P,h1}`; then `commit_batch` with ONE request of two
+> blocks sharing block_id `b'x'`: first `PutUnique{P,h2}`, second `DelUnique{P,h1}`. Overlay =
+> `{h2 live, h1 dead}` so `leaves_two_owners` is false and the call is ACCEPTED, returning
+> `Committed` for block 1 and `AlreadyCommitted` for block 2, while only block 1 is appended.
+> Durable and recovered state then has BOTH h1 and h2 live for P, and `unique_lookup` fails with
+> `InvalidData` dual/master owners. This is a regression: the pre-change code checked the
+> same-request duplicate BEFORE accumulating the overlay.
+
+Reproduced against the pre-fix tree: `commit_batch` returned
+`Ok([Committed([Committed { csn: 2 }, AlreadyCommitted { csn: 2 }])])` (the new a1 test panicked on
+`unwrap_err()`).
+
+### Disposition (chosen, fail-closed)
+
+A repeated `block_id` INSIDE one request is now rejected as `io::ErrorKind::InvalidInput`,
+"duplicate block_id within one request", **before any overlay fold and before any append**,
+consuming no CSN and leaving no state. Rationale: block ids are keys in the request's `blocks`
+object, so they are unique by construction for any request that came through the request surface
+(and `replay.rs`'s `UniqueValue` rejects duplicate object keys, so a duplicate can only come from a
+programmatic caller). The engine refuses what it cannot order. Retry dedup ACROSS calls
+(`self.dedup`) and ACROSS the group's requests (`seen`) is unchanged.
+
+Structural fix so overlay and pending cannot disagree by construction:
+
+- the duplicate check runs in the slot-plan loop, so every `Slot::New` block is distinct within its
+  request;
+- the now-dead same-request `seen` branch in the CSN-assignment loop is removed (a `Slot::New`
+  block is always appended; a block already committed this group/call is a `Slot::Retry`);
+- a comment states the invariant ("`overlay` is the net unique effect of exactly the blocks this
+  request will append") and a `debug_assert_eq!(folded, pending.len() - pending_before, ...)` pins it -
+  that assertion fails on the pre-fix code (folded = 2, appended = 1).
+
+### New tests and relabelling (`engine/tests/request_commit.rs`)
+
+Added, each asserting the DURABLE post-state via reopen:
+
+- a1 `duplicate_block_id_within_one_request_is_refused_and_changes_nothing` - the review's exact
+  counterexample; asserts `InvalidInput`, no CSN consumed, no WAL growth, and exactly one live owner
+  for P after reopen. Discriminating: it fails on the pre-fix code.
+- a2 `repeated_block_id_across_two_requests_replays_the_first_and_costs_no_csn` - a `block_id`
+  repeated in a LATER request of the group replays the first occurrence and costs no CSN.
+- a3 `one_request_deleting_then_adding_an_owner_for_the_same_prefix_commits` - overlay/pending
+  agreement: one request that deletes owner h1 and adds owner h2 for the same prefix still commits
+  and both blocks are durable with their own CSNs.
+
+Relabelled (kept, not deleted): t1/t2/t3 are now marked in a code comment as **regression pins**,
+because an independent reconstruction showed the pre-change implementation produced their durable
+assertions too. They guard against future regressions but do NOT evidence the per-request unit;
+only t4, t5 and a1 discriminate it.
+
+### P2 fixes
+
+- p1 `engine.rs` `commit_batch` doc: the crash-prefix sentence no longer claims the invariant holds
+  for a torn prefix. It now states the invariant holds at REQUEST granularity after a successful
+  call, and that a prefix torn inside a request was never validated as a state and follows the
+  pre-existing block-atomicity rule (docs/design.md I6: a block is all-or-nothing, a request is
+  not).
+- p2 `engine/src/replay.rs`: the `execute_requests_grouped` doc said a crash before the barrier
+  "can lose the whole group"; it now says a crash can leave a durable PREFIX of the group's records
+  (recovery replays every complete, CRC-valid frame), matching the `Engine::end_group` rule.
+- p3 the relabelling above, recorded here and in the test file's code comment.
+
+### Gates (verbatim, post-fix tree)
+
+`cargo test --workspace --offline`:
+
+```
+test result: ok. 113 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.77s
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.13s
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.14s
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.17s
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.22s
+test result: ok. 33 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 8.59s
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.47s
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.58s
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.18s
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.20s
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.20s
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.21s
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.88s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+```
+
+Total: **258 passed; 0 failed** (was 255; +3 new tests).
+
+`cargo build --workspace --offline` (after `cargo clean -p flashdb-engine`, so it really compiled):
+
+```
+   Compiling flashdb-engine v0.1.0 (/home/z/vibe/flashdb/engine)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 4.75s
+```
+
+Zero warnings. (The `cargo test` run emits two pre-existing "variable does not need to be mutable"
+warnings in the untouched `engine/tests/manifest_engine.rs` at lines 48 and 77; they are not part
+of the build gate and are not introduced by this change.)
+
+`git diff --check`: silent (exit 0, no whitespace errors).
+
+### Residual risk
+
+- The fix changes the verdict for a request that repeats a `block_id` inside itself: from
+  `Ok(Committed/AlreadyCommitted)` to `Err(InvalidInput)`. No request produced by the request
+  surface can hit this (a JSON object cannot repeat a key; `replay.rs` rejects duplicate keys), so
+  only a programmatic caller passing a hand-built request can observe the change - which is the
+  intended fail-closed behaviour.
+- The `debug_assert_eq!` invariant check is debug-only; release builds rely on the structural
+  argument (duplicate refused up front, retries skip the fold).
+- p1/p2 are comment corrections only; the durable block-atomicity behaviour was already as now
+  documented (docs/design.md I6), so no runtime change accompanies them.

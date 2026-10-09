@@ -10,9 +10,18 @@
 //! Every test asserts the DURABLE post-state (reopening the engine from the WAL),
 //! not only the return value. The invariant after every call: at most one live
 //! owner per unique prefix.
+//!
+//! Evidence map: only `t4`, `t5` and `duplicate_block_id_within_one_request_is_refused`
+//! discriminate the per-request contract from the pre-change whole-group code, and
+//! `duplicate_block_id_within_one_request_is_refused` (a1) is the specific regression
+//! test for the half-applied-accept defect fixed on top of it. `t1`/`t2`/`t3` are
+//! REGRESSION PINS: an independent reconstruction showed the pre-change
+//! implementation produced their durable assertions too, so they guard against future
+//! regressions but do NOT evidence the per-request unit.
 
 use flashdb_engine::engine::{Conflict, Engine, Op, Outcome, RequestOutcome};
 use std::fs;
+use std::io;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -41,7 +50,7 @@ fn one(block_id: &str, ops: Vec<Op>) -> Vec<(Vec<u8>, Vec<Op>)> {
     vec![(block_id.as_bytes().to_vec(), ops)]
 }
 
-// t1: one block, two rows swapping a value under a unique key, commits.
+// t1 (regression pin, not per-request evidence): one block, two rows swapping a value under a unique key, commits.
 #[test]
 fn swap_a_value_between_two_rows_in_one_block_commits() {
     let files = Files::new();
@@ -57,7 +66,7 @@ fn swap_a_value_between_two_rows_in_one_block_commits() {
     assert_eq!(e.unique_lookup(b"E", b"u", b"Y").unwrap(), Some(1), "Y is now owned by row 1");
 }
 
-// t2: one block, delete then re-insert the same unique value with a new handle, commits.
+// t2 (regression pin, not per-request evidence): one block, delete then re-insert the same unique value with a new handle, commits.
 #[test]
 fn delete_then_reinsert_the_same_value_with_a_new_handle_commits() {
     let files = Files::new();
@@ -72,7 +81,7 @@ fn delete_then_reinsert_the_same_value_with_a_new_handle_commits() {
     assert_eq!(e.get(b"E", 2).unwrap(), Some(b"row2".to_vec()));
 }
 
-// t3: one group, two independent requests; the first releases X, the second takes it.
+// t3 (regression pin, not per-request evidence): one group, two independent requests; the first releases X, the second takes it.
 #[test]
 fn earlier_request_releases_a_value_a_later_request_takes() {
     let files = Files::new();
@@ -147,4 +156,83 @@ fn two_requests_inserting_the_same_value_first_in_input_order_wins() {
     assert_eq!(e.unique_lookup(b"E", b"u", b"dup").unwrap(), Some(1), "the first request in input order owns the value");
     assert_eq!(e.get(b"E", 1).unwrap(), Some(b"row1".to_vec()));
     assert_eq!(e.get(b"E", 2).unwrap(), None, "the dropped request's row is not durable");
+}
+
+// a1 (P0 regression for the half-applied-accept defect): a repeat of one block_id
+// INSIDE one request is refused as invalid input, before the overlay fold and
+// before any append. The review's counterexample: before the fix the overlay
+// folded BOTH blocks of the request (h2 live, h1 dead) while only the first block
+// was appended, so the request was ACCEPTED and the durable state ended with two
+// live owners for P (unique_lookup then failed with InvalidData).
+#[test]
+fn duplicate_block_id_within_one_request_is_refused_and_changes_nothing() {
+    let files = Files::new();
+    let mut e = Engine::create(&files.wal).unwrap();
+    e.commit_block(b"seed", &[put_doc(1, "row1"), put_u(1, "P")]).unwrap();
+    let len = fs::metadata(&files.wal).unwrap().len();
+
+    let err = e.commit_batch(&[vec![
+        (b"x".to_vec(), vec![put_u(2, "P")]),
+        (b"x".to_vec(), vec![del_u(1, "P")]),
+    ]]).unwrap_err();
+    assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "a duplicate block_id inside one request is invalid input");
+    assert_eq!(e.csn(), 1, "a refused call consumes no CSN");
+    assert_eq!(fs::metadata(&files.wal).unwrap().len(), len, "a refused call appends nothing");
+    drop(e);
+
+    let e = Engine::open(&files.wal).unwrap();
+    assert_eq!(e.csn(), 1);
+    assert_eq!(e.unique_lookup(b"E", b"u", b"P").unwrap(), Some(1), "exactly one live owner for P after reopen");
+    assert_eq!(e.get(b"E", 2).unwrap(), None, "the second block's handle is not durable");
+}
+
+// a2: retry dedup ACROSS the group's requests is unchanged - a block_id repeated
+// in a later request replays the first occurrence and consumes no new CSN. Only a
+// repeat WITHIN one request is refused.
+#[test]
+fn repeated_block_id_across_two_requests_replays_the_first_and_costs_no_csn() {
+    let files = Files::new();
+    let mut e = Engine::create(&files.wal).unwrap();
+    let out = e.commit_batch(&[
+        one("x", vec![put_doc(1, "row1"), put_u(1, "P")]),
+        one("x", vec![put_doc(1, "row1"), put_u(1, "P")]),
+    ]).unwrap();
+    assert_eq!(out, vec![
+        RequestOutcome::Committed(vec![Outcome::Committed { csn: 1 }]),
+        RequestOutcome::Committed(vec![Outcome::AlreadyCommitted { csn: 1 }]),
+    ]);
+    assert_eq!(e.csn(), 1, "the replayed block consumes no new CSN");
+    drop(e);
+
+    let e = Engine::open(&files.wal).unwrap();
+    assert_eq!(e.csn(), 1);
+    assert_eq!(e.unique_lookup(b"E", b"u", b"P").unwrap(), Some(1));
+    assert_eq!(e.committed_block_csn(b"x"), Some(1), "one durable record for the replayed block id");
+}
+
+// a3: overlay/pending agreement - one request whose blocks delete one owner and
+// add another for the SAME prefix still commits (the case the per-request
+// contract exists for). Both blocks are appended and the overlay reflects both.
+#[test]
+fn one_request_deleting_then_adding_an_owner_for_the_same_prefix_commits() {
+    let files = Files::new();
+    let mut e = Engine::create(&files.wal).unwrap();
+    e.commit_block(b"seed", &[put_doc(1, "row1"), put_u(1, "P")]).unwrap();
+    let out = e.commit_batch(&[vec![
+        (b"release".to_vec(), vec![del_u(1, "P")]),
+        (b"claim".to_vec(), vec![put_doc(2, "row2"), put_u(2, "P")]),
+    ]]).unwrap();
+    assert_eq!(out, vec![RequestOutcome::Committed(vec![
+        Outcome::Committed { csn: 2 },
+        Outcome::Committed { csn: 3 },
+    ])]);
+    drop(e);
+
+    let e = Engine::open(&files.wal).unwrap();
+    assert_eq!(e.csn(), 3);
+    assert_eq!(e.unique_lookup(b"E", b"u", b"P").unwrap(), Some(2), "P moved from handle 1 to handle 2");
+    assert_eq!(e.get(b"E", 1).unwrap(), Some(b"row1".to_vec()));
+    assert_eq!(e.get(b"E", 2).unwrap(), Some(b"row2".to_vec()));
+    assert_eq!(e.committed_block_csn(b"release"), Some(2));
+    assert_eq!(e.committed_block_csn(b"claim"), Some(3));
 }
