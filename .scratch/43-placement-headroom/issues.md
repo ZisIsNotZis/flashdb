@@ -43,12 +43,18 @@ assumption and every result is printed for a sweep.
 
 Placements:
 
-- **(a) today** - keys ordered by their key-family prefix, with the region
-  boundaries the engine actually uses: one tile per `(marker, entity)` region per
-  publish (`RegionMode::PerRegion`, `keys.rs::region_prefix`), split further every
-  `tile_entries` entries. (`RegionMode::Global` differs only by letting a tile
-  straddle a region boundary; no request reads two keys of one region, so it does
-  not change any count here.)
+- **(a) today** - the baseline. Keys ordered by their key-family prefix, cut at
+  per-region `(marker, entity)` boundaries: one tile starts at every region change
+  and every `tile_entries` entries within a region (`RegionMode::PerRegion`-style,
+  `keys.rs::region_prefix`). **This is not the shipped default** - the shipped
+  default is `RegionMode::Global` (`engine/src/engine.rs:57`), one whole-keyspace
+  tile per publish. The per-region construction is kept because it encodes the
+  region-axis placement decision that co-location would change and is the
+  conservative (highest-count) baseline, so it cannot inflate the measured
+  reduction. The verifier confirmed the reduction is invariant to the choice:
+  recomputed as a Global-style whole-key-order placement the baseline is still
+  **94,798** at every tile size and the co-location reduction is unchanged
+  (34.76 / 34.76 / 34.77 / 34.82 / 37.08% at 64 / 256 / 1024 / 4096 / 16384).
 - **(b) colocate** - family co-location: a row's derived `U|X` and `R|X` entries
   are placed in the same tile as its `P|X` row, so the row's keys are adjacent.
   Rows are grouped by entity; a tile is a contiguous run of rows.
@@ -78,7 +84,12 @@ the test docstrings) and pins the measured verdict.
    Customer/Stock row, every StockMovement/Order row written by the trace, and
    every (would-be) unique key the flow probes. Composition shifts positions; it
    does not change the conclusion, because every request reads keys of distinct
-   regions, so (a) is a region count and is independent of composition.
+   regions, so (a) is a region count and is independent of composition. **It is
+   also degenerate:** because the module starts a new tile at every region change
+   and zero of 20,000 requests reads two keys of one region, the `today` baseline
+   is mathematically forced to equal the raw read count (94,798) and is flat at
+   every tile size. That is a property of the modelled workload, not an
+   independent measurement of today's layout.
 3. **Modeled, not measured on the engine.** This is a deterministic count of tile
    touches under a stated layout model, not an engine run. No device or latency
    constants enter; the metric is placement structure only.
@@ -110,7 +121,10 @@ Sensitivity to tile size (reduction vs today, same trace):
 | 16384 | 37.08% | 28.43% | 19 |
 
 Reading: (a) is flat in `tile_entries` (94,798 -> 4.740 reads/request) because no
-request reads two keys of one region. (b) is flat and large - family co-location
+request reads two keys of one region; that makes the baseline degenerate - it is
+mathematically forced to the raw read count and is flat at every tile size (a
+property of the modelled workload, not an independent measurement of today's
+layout). (b) is flat and large - family co-location
 collapses every lookup's `U` -> `P` pair, which is every read of the three probe
 shapes; only `movements_scan` (one region) cannot move. (c) is strongly tile-size
 sensitive: ordering by access count separates a `U` from its `P` unless a tile is
@@ -118,8 +132,15 @@ large enough to hold both.
 
 ## Verdict
 
-**Family co-location (b) clears the pre-registration's 15% threshold (34.76-34.82%
-at both headline tile sizes, 34.8-37.1% across the sweep); distribution-chosen
-boundaries (c) clear it only at the larger tile sizes (23.4% at 4096 entries,
-28.4% at 16384) and are below it at 256 entries (7.7%); today's layout (a) is the
-baseline (0%).**
+**Family co-location (b) would cut dependent random reads per request by about 35%
+(34.76-34.82% at both headline tile sizes, 34.8-37.1% across the sweep), stable in
+tile size. Whether that converts into a sustained-load (throughput) gain is NOT
+established by this count and requires an engine-side experiment. No claim is made
+against the pre-registration's 15% threshold: that threshold is defined on
+sustained offered load - a throughput quantity - not on dependent reads, so this
+count can neither clear nor fail it.** If a read-level criterion is wanted, the
+34.8-37.1% reduction clears a 15% read-level bar at every tile size, but that bar
+is explicitly a read-level criterion and is NOT the pre-registration's threshold.
+Distribution-chosen boundaries (c) clear a 15% read-level bar only at the larger
+tile sizes (23.4% at 4096 entries, 28.4% at 16384) and fall below it at 256 entries
+(7.7%); today's layout (a) is the baseline (0%).

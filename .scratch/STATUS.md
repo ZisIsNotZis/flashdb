@@ -137,3 +137,7 @@ mismatch. Each is fixed or recorded:
   write-side number.
 - Cold runs need `MemoryMax` (it counts page cache), a rotate cadence small enough that the 5.15x
   suffix replay fits, and a fully checkpointed instance before the load.
+- **Reviewer hygiene:** do not use the oracle agent as a reviewer - it runs with forked context,
+  inherits the supervisor's framing, and twice produced narration instead of a review (including a
+  fabricated sub-run id); use a read-only worker-as-verifier that must paste command output and
+  write `CANNOT-VERIFY` rather than guess.

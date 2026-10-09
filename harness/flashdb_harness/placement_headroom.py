@@ -28,14 +28,26 @@ sequence anywhere.
 
 Placements compared
 -------------------
-(a) ``today``     keys ordered by their key-family prefix, with the region
-                  boundaries the engine actually uses: one tile per
-                  ``(marker, entity)`` region per publish (`RegionMode::PerRegion`,
-                  `engine/src/keys.rs::region_prefix`), split further every
-                  ``tile_entries`` entries. The shipped `RegionMode::Global`
-                  differs only by letting a tile straddle a region boundary, which
-                  changes nothing here because no request reads two keys of one
-                  region (see ``.scratch/43-placement-headroom/issues.md``).
+(a) ``today``     the baseline. Keys ordered by their key-family prefix, cut at
+                  per-region ``(marker, entity)`` boundaries: one tile starts at
+                  every region change and every ``tile_entries`` entries within a
+                  region (`RegionMode::PerRegion`-style,
+                  `engine/src/keys.rs::region_prefix`). This is NOT the shipped
+                  default - that is `RegionMode::Global` (`engine/src/engine.rs:57`),
+                  one whole-keyspace tile per publish. The per-region construction
+                  is kept because it encodes the region-axis placement decision that
+                  co-location would change and is the conservative (highest-count)
+                  baseline, so it cannot inflate the measured reduction. The verifier
+                  confirmed the reduction does not depend on the choice: recomputed
+                  as a Global-style whole-key-order placement the baseline is still
+                  94,798 at every tile size and the reduction is unchanged
+                  (34.76/34.76/34.77/34.82/37.08% at 64/256/1024/4096/16384). It is
+                  also degenerate: because the module starts a new tile at every
+                  region change and zero of 20,000 requests reads two keys of one
+                  region, the baseline is mathematically forced to equal the raw
+                  read count (94,798) and is flat at every tile size - a property of
+                  the modelled workload, not an independent measurement of today's
+                  layout (see ``.scratch/43-placement-headroom/issues.md``).
 (b) ``colocate``  family co-location: a row's derived ``U|X`` and ``R|X`` entries
                   are placed in the same tile as its ``P|X`` row, so the row's
                   keys are adjacent. Rows are grouped by entity; a tile holds a
@@ -61,7 +73,11 @@ enumerated deterministically: every seeded Customer/Stock row and every
 StockMovement/Order written by the trace, plus the (would-be) unique keys the
 flow probes. The store composition is a documented assumption: it only shifts
 positions, and every request reads keys of distinct regions, so the ``today``
-count is a region count and is insensitive to composition and tile size.
+count is a region count and is insensitive to composition and tile size. That also
+makes it degenerate: with zero of 20,000 requests reading two keys of one region,
+the ``today`` count is mathematically forced to the raw read count (94,798) at
+every tile size - a property of the modelled workload, not an independent
+measurement of today's layout.
 
 Usage (from the harness directory)::
 
@@ -83,6 +99,11 @@ from flashdb_harness.load_profile import classify
 # tile at ~2 KiB/entry is ~4096 entries; 256 is the small-tile end.
 TILE_ENTRIES = (256, 4096)
 TILE_SWEEP = (64, 256, 1024, 4096, 16384)
+
+# A read-level willingness-to-pursue bar, explicitly NOT the pre-registration's
+# throughput threshold: the pre-registration's 15% is on sustained offered load (a
+# throughput quantity), which this count of dependent reads cannot evaluate.
+READ_LEVEL_BAR = 15.0
 
 # Byte order of the engine's key markers: P 0x50 < R 0x52 < U 0x55.
 MARKER_RANK = {"P": 0, "R": 1, "U": 2}
@@ -222,10 +243,10 @@ def sort_key(k: Key, placement: str, counts: Counter) -> tuple:
 def tile_map(universe, placement: str, tile_entries: int, counts: Counter) -> dict[Key, int]:
     """Assign every key a tile id under one placement and one tile capacity.
 
-    ``today`` honours the engine's fixed region boundaries: a new tile starts at
-    every new ``(marker, entity)`` region and every ``tile_entries`` entries
-    within a region. ``colocate``/``freq`` are derived arrangements (a reordered
-    key space), so a tile is simply every ``tile_entries`` consecutive entries.
+    ``today`` uses per-region boundaries: a new tile starts at every new
+    ``(marker, entity)`` region and every ``tile_entries`` entries within a region.
+    ``colocate``/``freq`` are derived arrangements (a reordered key space), so a
+    tile is simply every ``tile_entries`` consecutive entries.
     """
     if tile_entries < 1:
         raise ValueError("tile_entries must be >= 1")
@@ -333,8 +354,12 @@ def main(argv: list[str] | None = None) -> int:
         ]
     report(rows_by_tile)
 
-    # Verdict on the pre-registration's 15% threshold, at every tile size shown.
-    print("\n## verdict (pre-registration threshold = 15%)")
+    # Verdict, read-level only. The pre-registration's 15% threshold is on
+    # sustained offered load - a throughput quantity - not on dependent reads, so
+    # this count can neither clear nor fail it. The bar below is a read-level
+    # criterion and is explicitly NOT the pre-registration's threshold.
+    print(f"\n## verdict (dependent random reads per request; read-level bar = "
+          f"{READ_LEVEL_BAR:g}%, not the pre-registration threshold)")
     for tile_entries in a.tile_entries:
         rows = rows_by_tile[tile_entries]
         base = next(r for r in rows if r["placement"] == "today")
@@ -343,7 +368,12 @@ def main(argv: list[str] | None = None) -> int:
                 continue
             gain = reduction(r["total_dependent_reads"], base["total_dependent_reads"])
             print(f"  tile_entries={tile_entries} {r['placement']:<10} "
-                  f"{gain:+.2f}% vs today -> {'CLEARS' if gain >= 15.0 else 'below'} 15%")
+                  f"{gain:+.2f}% vs today -> {'above' if gain >= READ_LEVEL_BAR else 'below'} "
+                  f"{READ_LEVEL_BAR:g}% read-level bar")
+    print("  verdict: family co-location would cut dependent random reads per request "
+          "by about 35%, stable across tile sizes; whether that converts into a "
+          "sustained-load gain is NOT established by this count and requires an "
+          "engine-side experiment.")
     return 0
 
 

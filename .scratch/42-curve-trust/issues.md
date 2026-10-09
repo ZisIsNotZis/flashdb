@@ -99,7 +99,8 @@ The pre-registration validity rule needs a latency ceiling; the published runs c
 **Verification that it fails on the old logic:** with only `cold_0b.py` reverted to HEAD
 (`git stash push -- harness/flashdb_harness/cold_0b.py`), the regression test fails with
 `AssertionError: assert 64.0 == 50.0` (the 128% median); restored, the suite passes. New logic
-verified: 119 passed.
+verified: **126 passed on master** (this slice reported 119; the 7 extra tests were added by later
+slices, not by a defect in this work).
 
 ### Synthetic driver run (not a cold arm)
 `/tmp/cold33/per_region-mixed` no longer exists, so no cold arm could be re-run (under the 10-minute
@@ -120,7 +121,8 @@ windows, not a re-run: it does not include the group clamp / window split / trai
 - `cargo test --workspace --offline`: 259 passed, 0 failed across 23 targets
   (e.g. `113 passed; 0 failed`, `13 passed; 0 failed`, `8 passed; 0 failed`, ...).
 - `cargo build --workspace --offline`: `Finished dev profile`; 0 warning lines.
-- `cd harness && uv run --with pytest pytest -q`: `119 passed in 2.48s`.
+- `cd harness && uv run --with pytest pytest -q`: `126 passed` (this slice reported `119 passed in
+  2.48s`; the drift is later-added tests, not a defect in this work).
 - `git diff --check`: silent.
 
 ## 6. Residual risk

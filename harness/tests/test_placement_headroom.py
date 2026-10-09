@@ -1,9 +1,10 @@
 """Tests for the placement-headroom measurement.
 
 Two things are pinned: the counting logic (dependent reads = 1 + tile changes,
-hand-computed below) and the measured verdict (family co-location clears the
-pre-registration 15% threshold; today's layout is a region count, so it is
-insensitive to tile size).
+hand-computed below) and the measured verdict (family co-location cuts dependent
+random reads per request by ~35%, above a 15% read-level bar that is NOT the
+pre-registration's throughput threshold; today's layout is a region count, so it
+is insensitive to tile size).
 """
 
 from __future__ import annotations
@@ -78,15 +79,17 @@ def _counts(read_seqs):
 
 
 def test_today_is_a_region_count_per_request():
-    """today, tile_entries=2. Region order (marker, entity): P|Customer, P|Stock, U|Customer, U|Stock.
+    """today, tile_entries=2. Region order (marker, entity): P|Customer, P|Order, P|Stock, U|Customer, U|Order, U|Stock.
 
     Hand computation of tile ids (a new tile at each region, split every 2):
       P|Customer[a]=0  P|Customer[b]=0   (two entries fill tile 0)
-      P|Stock[s]   =1  (new region -> tile 1)
-      U|Customer[a]=2  U|Customer[b]=2   (new region, two entries -> tile 2)
-      U|Stock[s]   =3  (new region -> tile 3)
-    req1 [U|Cust[a], P|Cust[a], U|Stock[s], P|Stock[s]] = [2,0,3,1] -> 1 + 3 changes = 4
-    req2 [U|Cust[b], P|Cust[b]]                         = [2,0]     -> 1 + 1 change  = 2
+      P|Order[o]   =1  (new region -> tile 1)
+      P|Stock[s]   =2  (new region -> tile 2)
+      U|Customer[a]=3  U|Customer[b]=3   (new region, two entries -> tile 3)
+      U|Order[o]   =4  (new region -> tile 4)
+      U|Stock[s]   =5  (new region -> tile 5)
+    req1 [U|Cust[a], P|Cust[a], U|Stock[s], P|Stock[s]] = [3,0,5,2] -> 1 + 3 changes = 4
+    req2 [U|Cust[b], P|Cust[b]]                         = [3,0]     -> 1 + 1 change  = 2
     """
     universe, read_seqs = _synth_store(), _synth_reads()
     tiles = ph.tile_map(universe, "today", 2, _counts(read_seqs))
@@ -96,12 +99,12 @@ def test_today_is_a_region_count_per_request():
 
 
 def test_colocate_adjacent_row_keys_collapse():
-    """colocate, tile_entries=2. Order (entity, row, marker): Customer rows a,b then Stock row s.
+    """colocate, tile_entries=2. Order (entity, row, marker): Customer rows a,b then Order row o then Stock row s.
 
     Hand computation of tile ids:
-      [P|Cust[a], U|Cust[a], P|Cust[b], U|Cust[b], P|Stock[s], U|Stock[s]] -> positions 0..5
-      tile_entries=2 -> tiles [0, 0, 1, 1, 2, 2]
-    req1 [U|Cust[a], P|Cust[a], U|Stock[s], P|Stock[s]] = [0,0,2,2] -> 2
+      [P|Cust[a], U|Cust[a], P|Cust[b], U|Cust[b], P|Order[o], U|Order[o], P|Stock[s], U|Stock[s]] -> positions 0..7
+      tile_entries=2 -> tiles [0, 0, 1, 1, 2, 2, 3, 3]
+    req1 [U|Cust[a], P|Cust[a], U|Stock[s], P|Stock[s]] = [0,0,3,3] -> 2
     req2 [U|Cust[b], P|Cust[b]]                         = [1,1]     -> 1
     total 3, i.e. 50% below today's 6.
     """
@@ -118,8 +121,8 @@ def test_freq_boundaries_need_no_co_occurrence_here():
     Hand computation of the read-key order (count-1 block; count-0 keys follow and
     never enter the two requests' tiles):
       P|Cust[a], P|Cust[b], P|Stock[s], U|Cust[a], U|Cust[b], U|Stock[s] -> positions 0..5
-      tile_entries=2 -> tiles [0, 0, 1, 2, 2, 3]
-    req1 [U|Cust[a], P|Cust[a], U|Stock[s], P|Stock[s]] = [2,0,3,1] -> 4
+      tile_entries=2 -> tiles [0, 0, 1, 1, 2, 2]
+    req1 [U|Cust[a], P|Cust[a], U|Stock[s], P|Stock[s]] = [1,0,2,1] -> 4
     req2 [U|Cust[b], P|Cust[b]]                         = [2,0]     -> 2
     total 6: a pure access-count order cannot collapse a U->P pair whose members
     are ordered apart, which is exactly why family co-location is its own rule.
@@ -157,8 +160,10 @@ def test_colocate_clears_the_15pct_threshold_at_both_headline_tile_sizes():
 
     Family co-location collapses each lookup's U->P pair, which is every read of
     order_flow (70%), stock_lookup (15%) and customer_lookup (10%); movements_scan
-    is a single region read and cannot move. That is ~35%, well above 15%, at both
-    headline tile sizes.
+    is a single region read and cannot move. That is ~35% at both headline tile
+    sizes, above the 15% read-level bar. That bar is a read-level criterion, NOT
+    the pre-registration's threshold: the pre-registration's 15% is on sustained
+    offered load (a throughput quantity), which this count cannot evaluate.
     """
     universe, reads = ph.build_store_and_trace(seed=42, requests=8_000, customers=5_000, skus=2_000, locs=8)
     counts = _counts(reads)
