@@ -71,7 +71,7 @@ use std::path::Path;
 use std::io::{self, BufRead, BufReader, Write};
 use std::time::{Duration, Instant};
 
-use flashdb_engine::engine::{BatchOutcome, CompactShape, Engine, LayoutPolicy, Op, Outcome, RegionMode};
+use flashdb_engine::engine::{CompactShape, Engine, LayoutPolicy, Op, Outcome, RegionMode, RequestOutcome};
 use flashdb_engine::metrics::WindowSnapshot;
 use flashdb_engine::replay::execute_requests_grouped;
 use flashdb_engine::request::execute_request;
@@ -587,17 +587,23 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
             } else {
                 // Batch mode: plan every write block in the group first (reads see pre-batch
-                // state), then make the whole group durable with ONE barrier. Read-shaped
-                // requests still execute immediately and commit nothing.
+                // state), then make the accepted requests durable with ONE barrier. Each write
+                // request is its own commit group, so a unique conflict drops that request alone
+                // instead of the whole batch. Read-shaped requests still execute immediately and
+                // commit nothing.
                 let base = engine.next_handle()?;
-                let mut blocks: Vec<(Vec<u8>, Vec<Op>)> = Vec::new();
+                let mut requests: Vec<Vec<(Vec<u8>, Vec<Op>)>> = Vec::new();
+                let mut request_indices: Vec<u64> = Vec::new();
                 for i in index..end {
                     let request: Value = serde_json::from_str(&lines[i as usize])?;
                     let order_flow = request.get("blocks").and_then(Value::as_object)
                         .is_some_and(|b| b.contains_key("take"));
                     if order_flow {
-                        match batch_write_block(&request, base + blocks.len() as u64) {
-                            Ok(block) => blocks.push(block),
+                        match batch_write_block(&request, base + requests.len() as u64) {
+                            Ok(block) => {
+                                requests.push(vec![block]);
+                                request_indices.push(i);
+                            }
                             Err(e) => {
                                 errors += 1;
                                 if first_error.is_none() { first_error = Some(format!("request {i}: {e}")); }
@@ -613,29 +619,38 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                 }
-                if !blocks.is_empty() {
-                    match engine.commit_batch(&blocks) {
-                        Ok(BatchOutcome::Committed(outcomes)) => {
-                            for outcome in outcomes {
+                if !requests.is_empty() {
+                    match engine.commit_batch(&requests) {
+                        Ok(outcomes) => {
+                            // One outcome per request, in input order; each batch request carries
+                            // exactly one block, so a dropped request is its own failure, not a
+                            // group failure.
+                            for (outcome, &i) in outcomes.into_iter().zip(&request_indices) {
                                 match outcome {
-                                    Outcome::Committed { .. } | Outcome::AlreadyCommitted { .. } => completed += 1,
-                                    Outcome::Conflict(_) => {
+                                    RequestOutcome::Committed(blocks) => {
+                                        for block in blocks {
+                                            match block {
+                                                Outcome::Committed { .. } | Outcome::AlreadyCommitted { .. } => completed += 1,
+                                                Outcome::Conflict(_) => {
+                                                    errors += 1;
+                                                    if first_error.is_none() {
+                                                        first_error = Some(format!("request {i}: commit_batch conflict"));
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    RequestOutcome::Conflict(conflict) => {
                                         errors += 1;
                                         if first_error.is_none() {
-                                            first_error = Some(format!("request group at {index}: commit_batch conflict"));
+                                            first_error = Some(format!("request {i}: {} conflict", conflict.kind));
                                         }
                                     }
                                 }
                             }
                         }
-                        Ok(BatchOutcome::Conflict { index: bad, conflict }) => {
-                            errors += blocks.len() as u64;
-                            if first_error.is_none() {
-                                first_error = Some(format!("request group at {index}: block {bad} {} conflict", conflict.kind));
-                            }
-                        }
                         Err(e) => {
-                            errors += blocks.len() as u64;
+                            errors += requests.len() as u64;
                             if first_error.is_none() { first_error = Some(format!("request group at {index}: {e}")); }
                         }
                     }

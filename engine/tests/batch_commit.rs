@@ -1,21 +1,21 @@
-//! Batch/group commit (Slice 22): N blocks validated against the batch's
-//! projected post-state, appended as N records, and made durable by ONE WAL
-//! barrier.
+//! Batch/group commit (Slice 22): a group of requests (each one or more blocks)
+//! validated request by request against the projected post-state, appended as
+//! one record per accepted block, and made durable by ONE WAL barrier.
 //!
-//! The single durable unit is the block, as in `commit_block`; the batch only
+//! The single durable unit is the block, as in `commit_block`; the group only
 //! amortizes the barrier. These tests pin the contract that matters:
 //!
-//! - a batch of one is byte-identical to `commit_block` (same WAL bytes);
-//! - a batch of N commits every block with its own CSN;
-//! - uniqueness is evaluated against the batch post-state, so an intra-batch
-//!   release + reuse is legal;
-//! - an intra-batch duplicate is a whole-batch conflict with nothing durable;
+//! - a group of one request is byte-identical to `commit_block` (same WAL bytes);
+//! - a request of N blocks commits every block with its own CSN;
+//! - uniqueness is evaluated per request against the projected post-state, so an
+//!   intra-request release + reuse is legal;
+//! - an intra-request duplicate drops the whole request with nothing durable;
 //! - an idempotent retry returns its existing CSN without re-appending and
 //!   contributes no post-state;
 //! - a batch-appended WAL replays in order, tolerating a torn tail;
 //! - the republish guard and WAL rotation keep working after a batch.
 
-use flashdb_engine::engine::{BatchOutcome, Engine, Op, Outcome};
+use flashdb_engine::engine::{Engine, Op, Outcome, RequestOutcome};
 use flashdb_engine::wal;
 use std::fs;
 use std::path::PathBuf;
@@ -57,8 +57,8 @@ fn batch_of_one_is_byte_identical_to_commit_block() {
 
     let batched = Files::new();
     let mut b = Engine::create(&batched.wal).unwrap();
-    let out = b.commit_batch(&[(b"b1".to_vec(), vec![put_doc(1, "doc1"), put_u(1, "v1")])]).unwrap();
-    assert_eq!(out, BatchOutcome::Committed(vec![Outcome::Committed { csn: 1 }]));
+    let out = b.commit_batch(&[vec![(b"b1".to_vec(), vec![put_doc(1, "doc1"), put_u(1, "v1")])]]).unwrap();
+    assert_eq!(out, vec![RequestOutcome::Committed(vec![Outcome::Committed { csn: 1 }])]);
     drop(b);
 
     assert_eq!(fs::read(&one.wal).unwrap(), fs::read(&batched.wal).unwrap(),
@@ -68,8 +68,8 @@ fn batch_of_one_is_byte_identical_to_commit_block() {
     // A second identical batch is an idempotent retry: same CSN, no new bytes.
     let mut b = Engine::open(&batched.wal).unwrap();
     let len = fs::metadata(&batched.wal).unwrap().len();
-    let out = b.commit_batch(&[(b"b1".to_vec(), vec![put_doc(1, "doc1"), put_u(1, "v1")])]).unwrap();
-    assert_eq!(out, BatchOutcome::Committed(vec![Outcome::AlreadyCommitted { csn: 1 }]));
+    let out = b.commit_batch(&[vec![(b"b1".to_vec(), vec![put_doc(1, "doc1"), put_u(1, "v1")])]]).unwrap();
+    assert_eq!(out, vec![RequestOutcome::Committed(vec![Outcome::AlreadyCommitted { csn: 1 }])]);
     assert_eq!(fs::metadata(&batched.wal).unwrap().len(), len, "a retry-only batch must not append");
     assert_eq!(b.csn(), 1);
 }
@@ -87,7 +87,7 @@ fn batch_of_n_is_byte_identical_to_n_single_commits() {
     let batched = Files::new();
     let mut all = Engine::create(&batched.wal).unwrap();
     let blocks: Vec<_> = (1..=4u64).map(block).collect();
-    all.commit_batch(&blocks).unwrap();
+    all.commit_batch(&[blocks]).unwrap();
     drop(all);
 
     assert_eq!(fs::read(&single.wal).unwrap(), fs::read(&batched.wal).unwrap(),
@@ -99,12 +99,12 @@ fn batch_of_n_commits_all_blocks_with_n_csns() {
     let files = Files::new();
     let mut e = Engine::create(&files.wal).unwrap();
     let blocks = vec![block(1), block(2), block(3)];
-    let out = e.commit_batch(&blocks).unwrap();
-    assert_eq!(out, BatchOutcome::Committed(vec![
+    let out = e.commit_batch(&[blocks]).unwrap();
+    assert_eq!(out, vec![RequestOutcome::Committed(vec![
         Outcome::Committed { csn: 1 },
         Outcome::Committed { csn: 2 },
         Outcome::Committed { csn: 3 },
-    ]));
+    ])]);
     assert_eq!(e.csn(), 3, "the batch advances the CSN by one per block");
     for n in 1..=3u64 {
         assert_eq!(e.get(b"E", n).unwrap(), Some(format!("doc{n}").into_bytes()));
@@ -115,18 +115,18 @@ fn batch_of_n_commits_all_blocks_with_n_csns() {
 }
 
 /// The batch analogue of the author's intra-block release-then-reuse: no single
-/// block of the pair is legal against the pre-state, but the batch's post-state
+/// block of the pair is legal against the pre-state, but the request's post-state
 /// is consistent. The owner (handle 1) releases `v` in block A; block B claims it.
 #[test]
 fn intra_batch_release_then_reuse_is_legal() {
     let files = Files::new();
     let mut e = Engine::create(&files.wal).unwrap();
     e.commit_block(b"seed", &[put_doc(1, "doc1"), put_u(1, "v")]).unwrap();
-    let out = e.commit_batch(&[
+    let out = e.commit_batch(&[vec![
         (b"release".to_vec(), vec![del_u(1, "v")]),
         (b"reuse".to_vec(), vec![put_doc(2, "doc2"), put_u(2, "v")]),
-    ]).unwrap();
-    assert_eq!(out, BatchOutcome::Committed(vec![Outcome::Committed { csn: 2 }, Outcome::Committed { csn: 3 }]));
+    ]]).unwrap();
+    assert_eq!(out, vec![RequestOutcome::Committed(vec![Outcome::Committed { csn: 2 }, Outcome::Committed { csn: 3 }])]);
     assert_eq!(e.unique_lookup(b"E", b"u", b"v").unwrap(), Some(2), "the batch transfers the value to handle 2");
 }
 
@@ -136,28 +136,29 @@ fn intra_batch_duplicate_is_rejected_and_persists_nothing() {
     let mut e = Engine::create(&files.wal).unwrap();
     e.commit_block(b"seed", &[put_doc(1, "doc1")]).unwrap();
     let len = wal_file_len(&files);
-    let out = e.commit_batch(&[
+    // Two blocks of ONE request both claim `v`, so the request's projected
+    // post-state has two live owners: the request is dropped whole.
+    let out = e.commit_batch(&[vec![
         (b"first".to_vec(), vec![put_u(1, "v")]),
         (b"second".to_vec(), vec![put_doc(2, "doc2"), put_u(2, "v")]),
-    ]).unwrap();
-    match out {
-        BatchOutcome::Conflict { index, conflict } => {
-            assert_eq!(index, 1, "the later block leaves the second live owner");
+    ]]).unwrap();
+    match out.as_slice() {
+        [RequestOutcome::Conflict(conflict)] => {
             assert_eq!(conflict.kind, "x_unique");
             assert_eq!(conflict.value, b"v".to_vec());
         }
-        other => panic!("expected a whole-batch conflict, got {other:?}"),
+        other => panic!("expected a request-level conflict, got {other:?}"),
     }
-    assert_eq!(e.csn(), 1, "a conflicted batch must not advance the CSN");
-    assert_eq!(wal_file_len(&files), len, "a conflicted batch must not reach the WAL");
+    assert_eq!(e.csn(), 1, "a dropped request must not advance the CSN");
+    assert_eq!(wal_file_len(&files), len, "a dropped request must not reach the WAL");
     assert_eq!(e.unique_lookup(b"E", b"u", b"v").unwrap(), None);
-    assert_eq!(e.get(b"E", 2).unwrap(), None, "no block of a rejected batch survives");
+    assert_eq!(e.get(b"E", 2).unwrap(), None, "no block of a dropped request survives");
 }
 
 /// A retry inside a batch is an idempotent replay: existing CSN, no re-append,
-/// and no contribution to the batch overlay. The last point is load-bearing: the
-/// retried block's old effect is already published, so re-including it could
-/// reject a batch the sequential order accepts.
+/// and no contribution to the request overlay. The last point is load-bearing:
+/// the retried block's old effect is already published, so re-including it could
+/// reject a request the sequential order accepts.
 #[test]
 fn retry_inside_a_batch_returns_existing_csn_without_appending() {
     let files = Files::new();
@@ -165,23 +166,29 @@ fn retry_inside_a_batch_returns_existing_csn_without_appending() {
     e.commit_block(b"done", &[put_doc(1, "doc1"), put_u(1, "v")]).unwrap();
     let len = wal_file_len(&files);
     let out = e.commit_batch(&[
-        (b"done".to_vec(), vec![put_doc(1, "doc1"), put_u(1, "v")]),
-        (b"next".to_vec(), vec![put_doc(2, "doc2")]),
+        vec![(b"done".to_vec(), vec![put_doc(1, "doc1"), put_u(1, "v")])],
+        vec![(b"next".to_vec(), vec![put_doc(2, "doc2")])],
     ]).unwrap();
-    assert_eq!(out, BatchOutcome::Committed(vec![Outcome::AlreadyCommitted { csn: 1 }, Outcome::Committed { csn: 2 }]));
+    assert_eq!(out, vec![
+        RequestOutcome::Committed(vec![Outcome::AlreadyCommitted { csn: 1 }]),
+        RequestOutcome::Committed(vec![Outcome::Committed { csn: 2 }]),
+    ]);
     assert_eq!(e.csn(), 2, "only the new block consumes a CSN");
     assert_eq!(wal_records(&files), 2, "the retry is not re-appended");
     assert!(wal_file_len(&files) > len, "the new block did append");
 
     // The retried block's effect was released by a later commit; excluding the
-    // retry from the overlay lets the batch re-claim the value.
+    // retry from the overlay lets the request re-claim the value.
     let mut e = Engine::open(&files.wal).unwrap();
     e.commit_block(b"release", &[del_u(1, "v")]).unwrap();
     let out = e.commit_batch(&[
-        (b"done".to_vec(), vec![put_doc(1, "doc1"), put_u(1, "v")]),
-        (b"taker".to_vec(), vec![put_doc(3, "doc3"), put_u(3, "v")]),
+        vec![(b"done".to_vec(), vec![put_doc(1, "doc1"), put_u(1, "v")])],
+        vec![(b"taker".to_vec(), vec![put_doc(3, "doc3"), put_u(3, "v")])],
     ]).unwrap();
-    assert_eq!(out, BatchOutcome::Committed(vec![Outcome::AlreadyCommitted { csn: 1 }, Outcome::Committed { csn: 4 }]));
+    assert_eq!(out, vec![
+        RequestOutcome::Committed(vec![Outcome::AlreadyCommitted { csn: 1 }]),
+        RequestOutcome::Committed(vec![Outcome::Committed { csn: 4 }]),
+    ]);
     assert_eq!(e.unique_lookup(b"E", b"u", b"v").unwrap(), Some(3));
 }
 
@@ -189,7 +196,7 @@ fn retry_inside_a_batch_returns_existing_csn_without_appending() {
 fn empty_batch_is_a_no_op() {
     let files = Files::new();
     let mut e = Engine::create(&files.wal).unwrap();
-    assert_eq!(e.commit_batch(&[]).unwrap(), BatchOutcome::Committed(vec![]));
+    assert_eq!(e.commit_batch(&[]).unwrap(), vec![]);
     assert_eq!(e.csn(), 0);
     assert_eq!(wal_file_len(&files), 0, "an empty batch must not append or sync");
 }
@@ -201,7 +208,7 @@ fn crash_recovery_replays_a_batch_appended_wal_in_order() {
     for n in 1..=3u64 { blocks.push(block(n)); }
     {
         let mut e = Engine::create(&files.wal).unwrap();
-        e.commit_batch(&blocks).unwrap();
+        e.commit_batch(&[blocks]).unwrap();
     }
     let e = Engine::open(&files.wal).unwrap();
     assert_eq!(e.csn(), 3);
@@ -227,7 +234,7 @@ fn crash_recovery_replays_a_batch_appended_wal_in_order() {
 fn republish_guard_and_rotation_work_after_a_batch() {
     let files = Files::new();
     let mut e = Engine::create(&files.wal).unwrap();
-    e.commit_batch(&[block(1), block(2)]).unwrap();
+    e.commit_batch(&[vec![block(1), block(2)]]).unwrap();
     // The republish guard compares the WAL against the state the batch published;
     // the tile build would fail if segment_suffix_csn had not followed the batch.
     e.publish_tile(files.dir.join("tile-2.tile"), 2).unwrap();
@@ -238,7 +245,7 @@ fn republish_guard_and_rotation_work_after_a_batch() {
 
     // A second batch appends to the new segment, and a republish after it still
     // passes the guard.
-    e.commit_batch(&[block(3), block(4)]).unwrap();
+    e.commit_batch(&[vec![block(3), block(4)]]).unwrap();
     assert_eq!(e.csn(), 4);
     e.publish_tile(files.dir.join("tile-4.tile"), 4).unwrap();
     drop(e);

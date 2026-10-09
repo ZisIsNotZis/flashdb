@@ -344,7 +344,7 @@ fn grouped_api_fails_closed_outside_and_around_a_group() {
     e.begin_group().unwrap();
     assert!(e.begin_group().is_err(), "a group cannot be nested");
     assert!(e.commit_block(b"y", &[put_doc(2, "d")]).is_err(), "the single-block path refuses during a group");
-    assert!(e.commit_batch(&[(b"z".to_vec(), vec![put_doc(3, "d")])]).is_err(), "commit_batch refuses during a group");
+    assert!(e.commit_batch(&[vec![(b"z".to_vec(), vec![put_doc(3, "d")])]]).is_err(), "commit_batch refuses during a group");
     assert!(e.publish_tile(files.dir.join("t.tile"), 0).is_err(), "publish refuses during a group");
     assert!(e.rotate_wal(0).is_err(), "rotation refuses during a group");
     assert!(e.compact().is_err(), "compaction refuses during a group");

@@ -13,6 +13,7 @@
 //! 强制执行本切片未实现，已记录在 ticket 04/03。
 
 use std::cell::RefCell;
+use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io;
@@ -503,31 +504,58 @@ pub enum Outcome {
     Conflict(Conflict),
 }
 
-/// Result of [`Engine::commit_batch`].
+/// Result of one request inside a [`Engine::commit_batch`] group.
 ///
-/// A batch is all-or-nothing: a unique conflict anywhere rejects the *whole*
-/// batch before a record is appended, so a `Conflict` here means the WAL did
-/// not grow and no CSN was consumed. `Committed` carries one [`Outcome`] per
-/// input block, in input order (each `Committed { csn }` is that block's own
-/// CSN; an idempotent retry is `AlreadyCommitted { csn }`).
+/// The unit of a uniqueness verdict is the request, not the group: a request
+/// whose projected post-state leaves more than one live owner for a touched
+/// unique prefix is dropped alone ([`RequestOutcome::Conflict`]) while the rest
+/// of the group commits. `Committed` carries one [`Outcome`] per block of that
+/// request, in input order (each `Committed { csn }` is that block's own CSN; an
+/// idempotent retry is `AlreadyCommitted { csn }`).
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum BatchOutcome {
+pub enum RequestOutcome {
     Committed(Vec<Outcome>),
-    /// `index` is the highest-index input block that contributed a unique op
-    /// under the conflicted prefix, i.e. the block whose op leaves more than one
-    /// live owner in the batch's projected post-state.
-    Conflict { index: usize, conflict: Conflict },
+    /// The request was dropped entirely: no block was appended and no CSN was
+    /// consumed. The conflict names the unique prefix that could not be proven
+    /// to have at most one live owner.
+    Conflict(Conflict),
 }
 
-/// One touched unique prefix inside a batch: the constraint identity, the
-/// batch's per-handle net effect (later ops win, exactly as [`Memtable::apply`]
-/// leaves them), and the highest-index input block that contributed to it.
-struct BatchUnique {
+/// One touched unique prefix inside a commit group: the constraint identity and
+/// the request's per-handle net effect (later ops win, exactly as
+/// [`Memtable::apply`] leaves them).
+struct PrefixEffect {
     entity: Vec<u8>,
     field: Vec<u8>,
     value: Vec<u8>,
     owners: HashMap<u64, bool>,
-    last_block: usize,
+}
+
+/// A unique prefix's live-owner set: the published owners, updated with the net
+/// effect of every earlier ACCEPTED request in the group (a dropped request
+/// leaves no trace, so a later request is validated against exactly the prefix
+/// of the group that actually commits).
+struct LivePrefix {
+    owners: HashMap<u64, bool>,
+}
+
+/// Whether the published owners overlaid with a request's net effect leave more
+/// than one live owner for one unique prefix. The effect wins per handle (as
+/// [`Memtable::apply`] would leave it); a handle only in the published set keeps
+/// its published state.
+fn leaves_two_owners(published: &HashMap<u64, bool>, effect: &HashMap<u64, bool>) -> bool {
+    let mut alive = 0usize;
+    for (&handle, &is_alive) in published {
+        if is_alive && !effect.contains_key(&handle) {
+            alive += 1;
+        }
+    }
+    for &is_alive in effect.values() {
+        if is_alive {
+            alive += 1;
+        }
+    }
+    alive > 1
 }
 
 pub struct Engine {
@@ -2454,128 +2482,187 @@ impl Engine {
         Ok(Outcome::Committed { csn })
     }
 
-    /// Atomically commit many blocks with ONE WAL barrier.
+    /// Commit a group of requests with ONE WAL barrier.
     ///
-    /// Uniqueness is validated against the batch's **projected post-state**: one
-    /// overlay collects the net unique effect of every new block in input order
-    /// (later ops win, exactly as [`Memtable::apply`] leaves them), and is merged
-    /// once per touched unique prefix over the published owners. At most one live
-    /// owner per prefix is required, so "block A releases value v and block B
-    /// takes it" inside one batch is legal, exactly as inside one block today;
-    /// two blocks leaving two live owners for one prefix is a conflict.
+    /// `requests` is a slice of requests, each request a slice of its blocks
+    /// `(block_id, ops)`. The unit of a uniqueness verdict is the REQUEST, not
+    /// the group and not the block. Requests are resolved in input order: a
+    /// request is validated against the published state plus the net effect of
+    /// every earlier ACCEPTED request, merged with the request's own projected
+    /// post-state (one overlay over all its blocks, later ops win exactly as
+    /// [`Memtable::apply`] leaves them). At most one live owner per touched
+    /// unique prefix is required, so "the request deletes owner A and adds owner
+    /// B for the same prefix" is legal; a request that leaves two live owners is
+    /// **dropped entirely** ([`RequestOutcome::Conflict`]): none of its blocks is
+    /// appended, none consumes a CSN, and the other requests commit normally,
+    /// each block consuming its own CSN in input order. By induction the durable
+    /// state keeps at most one live owner per unique prefix.
     ///
-    /// **Conflict rule: whole-batch rejection.** Any conflict rejects the entire
-    /// batch before a record is appended, so [`BatchOutcome::Conflict`] means
-    /// nothing durable (the WAL did not grow and no CSN advanced). This is chosen
-    /// over "skip the conflicting block while the rest commit" because a unique
-    /// violation is a terminal business error for its block, not an `else`: the
-    /// batch is a single durability unit, and silently absorbing one member would
-    /// make the durable set depend on which block lost, i.e. on evaluation order.
+    /// Because a dropped request leaves no trace, a later request sees only the
+    /// effects of the requests that actually commit - the durable set does not
+    /// depend on an evaluation order the caller cannot see, only on input order.
     ///
-    /// The durable bytes are byte-for-byte what committing the same new blocks
+    /// The durable bytes are byte-for-byte what committing the accepted blocks
     /// one at a time would leave: one record per block in input order, each with
     /// its own CSN and the same framing, taking ONE `fdatasync` instead of one per
-    /// block.
+    /// block. Durability is a group property only at the barrier: a crash before
+    /// it can leave a valid prefix of the group's records, exactly as the
+    /// deferred-barrier path states, and that prefix still has at most one live
+    /// owner per prefix because every appended block was validated in order.
     ///
-    /// The promise is bounded on purpose: a `Conflict` returns with nothing appended,
-    /// but like every append path, if the single `fdatasync` itself fails then complete
-    /// frames may already be in the filesystem, and recovery replays what is complete.
-    /// The caller gets `Err`, so nothing is acknowledged and a retry is idempotent
-    /// through the business unique key - the same rule the deferred-barrier group path
-    /// states. A block already in `dedup` (an idempotent retry) returns its existing
-    /// CSN, is not re-appended, and contributes no overlay entry - its effect is
-    /// already in the published state, so re-including it could only reject a batch
-    /// the sequential order accepts. CSN, `segment_suffix_csn`, `dedup` and the
-    /// handle watermark advance exactly as a sequence of single commits would. An
-    /// empty batch is a no-op.
-    pub fn commit_batch(&mut self, blocks: &[(Vec<u8>, Vec<Op>)]) -> io::Result<BatchOutcome> {
+    /// The promise is bounded on purpose: a `Conflict` drops one request with
+    /// nothing of it appended, but like every append path, if the single
+    /// `fdatasync` itself fails then complete frames may already be in the
+    /// filesystem, and recovery replays what is complete. The caller gets `Err`,
+    /// so nothing is acknowledged and a retry is idempotent through the business
+    /// unique key. A block already in `dedup` (an idempotent retry) returns its
+    /// existing CSN, is not re-appended, and contributes no overlay entry - its
+    /// effect is already in the published state, so re-including it could only
+    /// reject a request the sequential order accepts. CSN, `segment_suffix_csn`,
+    /// `dedup` and the handle watermark advance exactly as a sequence of single
+    /// commits would. An empty group, or a group whose requests are all retries
+    /// or empty, is a no-op (no append, no sync).
+    pub fn commit_batch(&mut self, requests: &[Vec<(Vec<u8>, Vec<Op>)>]) -> io::Result<Vec<RequestOutcome>> {
         self.ensure_no_group("commit_batch")?;
         let t0 = self.timing();
         let id = self.metrics.borrow_mut().resolve_commit();
         let _sample = MetricsSample { metrics: &self.metrics, id, region: metrics::DISABLED, started: t0 };
         self.ensure_attached()?;
 
-        let mut overlay: HashMap<Vec<u8>, BatchUnique> = HashMap::new();
-        let mut outcomes: Vec<Outcome> = Vec::with_capacity(blocks.len());
-        // block_id -> CSN for blocks newly committed within this batch, so a
-        // block_id repeated inside the batch replays its first occurrence.
-        let mut seen: HashMap<&[u8], u64> = HashMap::new();
-        // (csn, block_id, ops) of the blocks that will be appended, in order.
-        let mut pending: Vec<(u64, &[u8], &[Op])> = Vec::new();
-        let mut last_csn = self.csn;
-        for (index, (block_id, ops)) in blocks.iter().enumerate() {
-            if block_id.is_empty() {
-                return Err(io::Error::new(io::ErrorKind::InvalidInput, "empty block_id"));
-            }
-            if let Some(&csn) = self.dedup.get(block_id).or_else(|| seen.get(block_id.as_slice())) {
-                outcomes.push(Outcome::AlreadyCommitted { csn });
-                continue;
-            }
-            // Validate every key name before the barrier (so `apply_op`'s unwraps
-            // can never fire after a successful sync) and build the batch overlay.
-            for op in ops {
-                match op {
-                    Op::PutDoc { entity, doc, .. } => {
-                        check_name(entity)?;
-                        if doc.is_empty() {
-                            return Err(io::Error::new(io::ErrorKind::InvalidInput, "empty document"));
-                        }
-                    }
-                    Op::DelDoc { entity, .. } => { check_name(entity)?; }
-                    Op::PutReverse { entity, field, .. } | Op::DelReverse { entity, field, .. } => {
-                        check_name(entity)?;
-                        check_name(field)?;
-                    }
-                    Op::PutUnique { entity, field, value, handle }
-                    | Op::DelUnique { entity, field, value, handle } => {
-                        let pfx = keys::unique_prefix(entity, field, value)?;
-                        let entry = overlay.entry(pfx).or_insert_with(|| BatchUnique {
-                            entity: entity.clone(),
-                            field: field.clone(),
-                            value: value.clone(),
-                            owners: HashMap::new(),
-                            last_block: index,
-                        });
-                        entry.owners.insert(*handle, matches!(op, Op::PutUnique { .. }));
-                        entry.last_block = index;
-                    }
-                }
-            }
-            let csn = last_csn.checked_add(1).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "CSN exhausted"))?;
-            last_csn = csn;
-            seen.insert(block_id.as_slice(), csn);
-            pending.push((csn, block_id.as_slice(), ops.as_slice()));
-            outcomes.push(Outcome::Committed { csn });
+        // One request block's slot before CSN assignment: a retry keeps its
+        // recorded CSN, a new block gets one only if the request is accepted.
+        enum Slot<'a> {
+            Retry(u64),
+            New(&'a [u8], &'a [Op]),
         }
 
-        // Uniqueness against the projected post-state: the published owners of
-        // each touched prefix, overlaid with the batch's own net effect, must
-        // leave at most one live owner.
-        for (pfx, entry) in overlay {
-            let mut live: HashMap<u64, bool> = HashMap::new();
-            let region = self.region_of_prefix(&pfx);
-            self.scan_merged(&pfx, region, |key, val| {
-                if key.len() != pfx.len() + 16 {
-                    return Err(io::Error::new(io::ErrorKind::InvalidData, "malformed unique key in merged view"));
+        // Published owners plus the net effect of every earlier accepted request,
+        // per touched unique prefix. A dropped request never enters this map.
+        let mut live: HashMap<Vec<u8>, LivePrefix> = HashMap::new();
+        // (csn, block_id, ops) of the accepted blocks, in input order.
+        let mut pending: Vec<(u64, &[u8], &[Op])> = Vec::new();
+        // block_id -> CSN for blocks newly committed within this group, so a
+        // block_id repeated inside the group replays its first occurrence.
+        let mut seen: HashMap<&[u8], u64> = HashMap::new();
+        let mut last_csn = self.csn;
+        let mut results: Vec<RequestOutcome> = Vec::with_capacity(requests.len());
+
+        for request in requests {
+            // The request's net unique effect (over all its blocks) and its
+            // per-block plan in input order. Validate every key name before the
+            // barrier so `apply_op`'s unwraps can never fire after a successful sync.
+            let mut overlay: HashMap<Vec<u8>, PrefixEffect> = HashMap::new();
+            let mut slots: Vec<Slot<'_>> = Vec::with_capacity(request.len());
+            for (block_id, ops) in request {
+                if block_id.is_empty() {
+                    return Err(io::Error::new(io::ErrorKind::InvalidInput, "empty block_id"));
                 }
-                let handle = u64::from_be_bytes(key[pfx.len()..pfx.len() + 8].try_into().unwrap());
-                live.entry(handle).or_insert(!val.is_empty());
-                Ok(true)
-            })?;
-            live.extend(entry.owners);
-            if live.values().filter(|&&alive| alive).take(2).count() > 1 {
-                return Ok(BatchOutcome::Conflict {
-                    index: entry.last_block,
-                    conflict: Conflict { kind: "x_unique", entity: entry.entity, field: entry.field, value: entry.value },
-                });
+                if let Some(&csn) = self.dedup.get(block_id).or_else(|| seen.get(block_id.as_slice())) {
+                    slots.push(Slot::Retry(csn));
+                    continue;
+                }
+                for op in ops {
+                    match op {
+                        Op::PutDoc { entity, doc, .. } => {
+                            check_name(entity)?;
+                            if doc.is_empty() {
+                                return Err(io::Error::new(io::ErrorKind::InvalidInput, "empty document"));
+                            }
+                        }
+                        Op::DelDoc { entity, .. } => { check_name(entity)?; }
+                        Op::PutReverse { entity, field, .. } | Op::DelReverse { entity, field, .. } => {
+                            check_name(entity)?;
+                            check_name(field)?;
+                        }
+                        Op::PutUnique { entity, field, value, handle }
+                        | Op::DelUnique { entity, field, value, handle } => {
+                            let pfx = keys::unique_prefix(entity, field, value)?;
+                            let entry = overlay.entry(pfx).or_insert_with(|| PrefixEffect {
+                                entity: entity.clone(),
+                                field: field.clone(),
+                                value: value.clone(),
+                                owners: HashMap::new(),
+                            });
+                            entry.owners.insert(*handle, matches!(op, Op::PutUnique { .. }));
+                        }
+                    }
+                }
+                slots.push(Slot::New(block_id.as_slice(), ops.as_slice()));
             }
+
+            // Uniqueness against the request's projected post-state: each touched
+            // prefix's live set (published + earlier accepted) overlaid with this
+            // request's net effect must leave at most one live owner. Any prefix
+            // that does not drops the whole request.
+            let mut conflict: Option<Conflict> = None;
+            for (pfx, effect) in &overlay {
+                let published = match live.entry(pfx.clone()) {
+                    Entry::Occupied(e) => e.into_mut(),
+                    Entry::Vacant(v) => {
+                        let mut owners: HashMap<u64, bool> = HashMap::new();
+                        let region = self.region_of_prefix(pfx);
+                        self.scan_merged(pfx, region, |key, val| {
+                            if key.len() != pfx.len() + 16 {
+                                return Err(io::Error::new(io::ErrorKind::InvalidData, "malformed unique key in merged view"));
+                            }
+                            let handle = u64::from_be_bytes(key[pfx.len()..pfx.len() + 8].try_into().unwrap());
+                            owners.entry(handle).or_insert(!val.is_empty());
+                            Ok(true)
+                        })?;
+                        v.insert(LivePrefix { owners })
+                    }
+                };
+                if leaves_two_owners(&published.owners, &effect.owners) {
+                    conflict = Some(Conflict {
+                        kind: "x_unique",
+                        entity: effect.entity.clone(),
+                        field: effect.field.clone(),
+                        value: effect.value.clone(),
+                    });
+                    break;
+                }
+            }
+            if let Some(conflict) = conflict {
+                results.push(RequestOutcome::Conflict(conflict));
+                continue;
+            }
+
+            // Accepted: fold the request's effect into the running live view, then
+            // assign each new block its own CSN in input order.
+            for (pfx, effect) in overlay {
+                live.get_mut(&pfx).expect("touched prefix was initialized during validation")
+                    .owners.extend(effect.owners);
+            }
+            let mut block_outcomes = Vec::with_capacity(slots.len());
+            for slot in slots {
+                match slot {
+                    Slot::Retry(csn) => block_outcomes.push(Outcome::AlreadyCommitted { csn }),
+                    Slot::New(block_id, ops) => {
+                        // A block_id repeated inside one request replays its first
+                        // occurrence (the slot plan checked `seen` before the first
+                        // occurrence was registered, so this is the same request).
+                        if let Some(&csn) = seen.get(block_id) {
+                            block_outcomes.push(Outcome::AlreadyCommitted { csn });
+                            continue;
+                        }
+                        let csn = last_csn.checked_add(1)
+                            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "CSN exhausted"))?;
+                        last_csn = csn;
+                        seen.insert(block_id, csn);
+                        pending.push((csn, block_id, ops));
+                        block_outcomes.push(Outcome::Committed { csn });
+                    }
+                }
+            }
+            results.push(RequestOutcome::Committed(block_outcomes));
         }
 
         if pending.is_empty() {
-            // Every block was an idempotent retry: nothing to append or sync.
-            return Ok(BatchOutcome::Committed(outcomes));
+            // Every block was an idempotent retry (or every request was empty):
+            // nothing to append or sync.
+            return Ok(results);
         }
-        // Append every record, take the single barrier, then publish.
+        // Append every accepted record, take the single barrier, then publish.
         for &(csn, block_id, ops) in &pending {
             let payload = encode_payload(csn, block_id, ops);
             self.wal.append(&payload)?;
@@ -2595,7 +2682,7 @@ impl Engine {
         for &(csn, block_id, _) in &pending {
             self.dedup.insert(block_id.to_vec(), csn);
         }
-        Ok(BatchOutcome::Committed(outcomes))
+        Ok(results)
     }
 }
 
