@@ -282,15 +282,23 @@ fn read_policy(path: &str) -> io::Result<LayoutPolicy> {
     LayoutPolicy::from_json_file(Path::new(path))
 }
 
-/// Frozen machine-readable window line for `--metrics-json`. Top-level fields:
-/// `window`, `rate_rps`, `requests` (this window), `completed`/`errors`
-/// (cumulative), `p50_us`/`p99_us` (this window), `policy` (the active
-/// per-region policy, see [`LayoutPolicy::to_json`]), then `current` and
-/// `previous` window snapshots. A window snapshot is `{"patterns", "regions"}`
-/// as frozen by [`WindowSnapshot::to_json`]; `previous` is `null` for the first
-/// window. Object key order is serde_json's sorted map, so two identical runs
-/// emit identical lines.
-fn metrics_json_line(
+/// One `--metrics-json` window line. A struct rather than a long positional argument list, so it
+/// is obvious which measurement each field carries.
+///
+/// Frozen top-level fields: `window`, `rate_rps`, `requests` (this window),
+/// `completed`/`errors` (cumulative), `p50_us`/`p99_us` (this window), `window_us` (the window's
+/// actual wall time), `lag_p99_us` (schedule-lag p99), `invalid` (the pacer's rejection flag),
+/// `ceiling_us` (`null` when none was supplied) and `ceiling_breached` (the ceiling's own
+/// per-window decision), `compact_bytes` (this window's actuation output), `policy` (the active
+/// per-region policy, see [`LayoutPolicy::to_json`]), then `current` and `previous` window
+/// snapshots. A window snapshot is `{"patterns", "regions"}` as frozen by
+/// [`WindowSnapshot::to_json`]; `previous` is `null` for the first window. Object key order is
+/// serde_json's sorted map, so two identical runs emit identical lines.
+///
+/// `invalid`, `lag_p99_us` and `window_us` must be on the JSON line, not only the human
+/// `window=` line: a `--metrics-json` consumer builds the capacity curve from these lines, and
+/// without the rejection flag it can score a saturated rung as sustained.
+struct WindowLine<'a> {
     window: u64,
     rate: f64,
     requests: u64,
@@ -299,22 +307,34 @@ fn metrics_json_line(
     compact_bytes: u64,
     p50_us: u64,
     p99_us: u64,
+    window_us: u64,
+    lag_p99_us: u64,
+    invalid: bool,
+    ceiling_us: Option<u64>,
+    ceiling_breached: bool,
     policy: serde_json::Value,
-    current: &WindowSnapshot,
-    previous: Option<&WindowSnapshot>,
-) -> String {
+    current: &'a WindowSnapshot,
+    previous: Option<&'a WindowSnapshot>,
+}
+
+fn metrics_json_line(w: WindowLine) -> String {
     serde_json::json!({
-        "window": window,
-        "rate_rps": rate,
-        "requests": requests,
-        "completed": completed,
-        "errors": errors,
-        "compact_bytes": compact_bytes,
-        "p50_us": p50_us,
-        "p99_us": p99_us,
-        "policy": policy,
-        "current": current.to_json(),
-        "previous": previous.map(WindowSnapshot::to_json),
+        "window": w.window,
+        "rate_rps": w.rate,
+        "requests": w.requests,
+        "completed": w.completed,
+        "errors": w.errors,
+        "compact_bytes": w.compact_bytes,
+        "p50_us": w.p50_us,
+        "p99_us": w.p99_us,
+        "window_us": w.window_us,
+        "lag_p99_us": w.lag_p99_us,
+        "invalid": w.invalid,
+        "ceiling_us": w.ceiling_us,
+        "ceiling_breached": w.ceiling_breached,
+        "policy": w.policy,
+        "current": w.current.to_json(),
+        "previous": w.previous.map(WindowSnapshot::to_json),
     })
     .to_string()
 }
@@ -514,6 +534,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut window_rate: f64 = rate_for(0, total, &args.rates, args.segment_requests);
     let mut late_growth_windows: u32 = 0;
     let mut invalid_windows: u64 = 0;
+    // The ceiling's own rejection count, separate from `invalid_windows` (which also folds in lag
+    // and request errors), so the report can state how many windows the latency ceiling rejected.
+    let mut ceiling_rejected_windows: u64 = 0;
     let mut last_valid_rate: f64 = 0.0;
     let mut saturated_at: Option<f64> = None;
     // Compaction actuation accounting (Slice 37): driver-side bytes and merges
@@ -528,8 +551,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         let now_us = t0.elapsed().as_secs_f64() * 1e6;
         if due_us <= now_us {
             let size = args.group_requests.or(args.commit_batch).unwrap_or(1).max(1);
-            let end = (index + size).min(total);
             window_rate = rate_for(index, total, &args.rates, args.segment_requests);
+            // Never let a group straddle an offered-rate boundary: every request in the group must
+            // be offered at the same rate, so its completions are attributed to the rung they were
+            // OFFERED under. Before this, a group starting under 50 rps could carry the first 100
+            // rps requests and credit them to the 50 rps rung.
+            let mut end = (index + size).min(total);
+            while end > index + 1
+                && rate_for(end - 1, total, &args.rates, args.segment_requests) != window_rate
+            {
+                end -= 1;
+            }
             let started = Instant::now();
             if args.group_requests.is_some() {
                 // Grouped request mode: the real adapter flow (`cust -> take` with its stock
@@ -689,7 +721,24 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             std::thread::sleep(Duration::from_secs_f64(chunk / 1e6));
         }
 
-        if window_start.elapsed() >= Duration::from_millis(args.window_ms) {
+        // A window must not span two offered rates: with `--segment-requests` the ladder steps at
+        // request-count boundaries, and a wall-clock window that straddles one would credit the
+        // previous rung's completions to the new rung (and vice versa). Close early at the
+        // boundary so every completion in a window was offered at that window's rate. The
+        // `latencies` guard means the split happens on the group that ENDS the rung, not on every
+        // idle iteration while waiting for the next rung's first request (which must not emit
+        // empty windows).
+        let next_rate = if index < total {
+            rate_for(index, total, &args.rates, args.segment_requests)
+        } else {
+            window_rate
+        };
+        // `index >= total` flushes the trailing partial window: without it the last group's
+        // completions were dropped from the curve (the summary counted them, the windows did not).
+        if index >= total
+            || window_start.elapsed() >= Duration::from_millis(args.window_ms)
+            || (next_rate != window_rate && !latencies.is_empty())
+        {
             // Compaction actuation (Slice 37), BEFORE the policy reload and the
             // snapshot: the merge threshold that governed this window is the one
             // that governs its compaction, and the merged bytes are attributed to
@@ -702,6 +751,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     compact_merges += 1;
                 }
             }
+            // Actual wall time the window covered, emitted so a consumer can compare it with the
+            // window's offered schedule span. The grouped pacer commits a whole group when its
+            // first request is due, so the per-window delta over a nominal `--window-ms` is not
+            // the offered rate; the harness divides a rung's completions by the LONGER of its
+            // offered span and its summed wall time, which the offered rate bounds.
+            let window_us = window_start.elapsed().as_micros() as u64;
             latencies.sort_unstable();
             let p50 = percentile_us(&latencies, 0.50).unwrap_or(0);
             let p99 = percentile_us(&latencies, 0.99).unwrap_or(0);
@@ -718,6 +773,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let rejected = window_error_count > 0;
             let invalid = ceiling_breached || saturated || rejected;
             if invalid { invalid_windows += 1 } else { last_valid_rate = last_valid_rate.max(window_rate) }
+            if ceiling_breached { ceiling_rejected_windows += 1 }
             if saturated && saturated_at.is_none() { saturated_at = Some(window_rate) }
             if args.metrics_json {
                 // Machine-readable window line: the window just measured is
@@ -737,10 +793,24 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 let current = engine.metrics_snapshot();
                 let previous = engine.metrics_previous_window();
-                writeln!(out, "{}", metrics_json_line(
-                    window_index, window_rate, latencies.len() as u64, completed, errors,
-                    compact_bytes_window, p50, p99, engine.layout_policy().to_json(), &current,
-                    previous.as_ref()))?;
+                writeln!(out, "{}", metrics_json_line(WindowLine {
+                    window: window_index,
+                    rate: window_rate,
+                    requests: latencies.len() as u64,
+                    completed,
+                    errors,
+                    compact_bytes: compact_bytes_window,
+                    p50_us: p50,
+                    p99_us: p99,
+                    window_us,
+                    lag_p99_us: lag_p99,
+                    invalid,
+                    ceiling_us: args.ceiling_us,
+                    ceiling_breached,
+                    policy: engine.layout_policy().to_json(),
+                    current: &current,
+                    previous: previous.as_ref(),
+                }))?;
                 engine.metrics_rotate_window();
             } else {
                 writeln!(out, "window={window_index} rate_rps={:.0} requests={} completed={completed} \
@@ -764,6 +834,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             window_index += 1;
             window_start = Instant::now();
             window_late_start = late_total;
+            // Deliberately do NOT relabel the window with the upcoming rung: an idle window while
+            // the next rung's first group is still pending belongs to the rung that is still on
+            // the offered schedule, so its wall time is not charged to the next rung.
         }
     }
 
@@ -780,6 +853,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let achieved_rps = if elapsed.as_secs_f64() > 0.0 { completed as f64 / elapsed.as_secs_f64() } else { 0.0 };
     writeln!(out, "load_summary requests={total} completed={completed} errors={errors} \
         else_used={else_used} late_total={late_total} windows={window_index} invalid_windows={invalid_windows} \
+        ceiling_rejected_windows={ceiling_rejected_windows} \
         last_valid_rate_rps={last_valid_rate:.0} saturated_at_rps={} commit_batch={} group_requests={} \
         elapsed_ms={elapsed_ms} achieved_rps={achieved_rps:.0} compact_bytes_total={compact_bytes_total} \
         compact_merges={compact_merges} first_error={:?}",
@@ -922,10 +996,34 @@ mod tests {
                 count: 0, p50_ns: 0.0, p99_ns: 0.0, mean_ns: 0.0,
             }],
         };
-        let line = metrics_json_line(1, 100.0, 1, 1, 0, 0, 10, 20,
-            LayoutPolicy::declared_default().to_json(), &snap, None);
+        let line = metrics_json_line(WindowLine {
+            window: 1, rate: 100.0, requests: 1, completed: 1, errors: 0, compact_bytes: 0,
+            p50_us: 10, p99_us: 20, window_us: 1_000_000, lag_p99_us: 0, invalid: false,
+            ceiling_us: None, ceiling_breached: false,
+            policy: LayoutPolicy::declared_default().to_json(), current: &snap, previous: None,
+        });
         assert!(line.contains(r#""compaction_bytes":4288,"compaction_merges":1"#), "got {line}");
         assert!(line.contains(r#""bytes_written":40"#), "got {line}");
+    }
+
+    /// The rejection inputs must be ON the JSON line: a `--metrics-json` consumer builds the
+    /// capacity curve from these lines, and before this the `invalid`/`lag_p99_us` fields were
+    /// only on the human `window=` line, so the consumer silently read them as `false`/`0` and
+    /// could score a saturated rung as sustained.
+    #[test]
+    fn metrics_json_line_carries_the_rejection_and_wall_time_fields() {
+        let empty = WindowSnapshot::default();
+        let line = metrics_json_line(WindowLine {
+            window: 7, rate: 50.0, requests: 64, completed: 128, errors: 0, compact_bytes: 0,
+            p50_us: 100, p99_us: 999_999, window_us: 1_280_000, lag_p99_us: 5_000_000,
+            invalid: true, ceiling_us: Some(250_000), ceiling_breached: true,
+            policy: LayoutPolicy::declared_default().to_json(), current: &empty, previous: None,
+        });
+        assert!(line.contains(r#""invalid":true"#), "got {line}");
+        assert!(line.contains(r#""lag_p99_us":5000000"#), "got {line}");
+        assert!(line.contains(r#""window_us":1280000"#), "got {line}");
+        assert!(line.contains(r#""ceiling_us":250000"#), "got {line}");
+        assert!(line.contains(r#""ceiling_breached":true"#), "got {line}");
     }
 
     #[test]
@@ -934,13 +1032,23 @@ mod tests {
         let policy = LayoutPolicy::declared_default().to_json();
         // `compact_bytes` is the slice-37 driver-side field: the bytes merged by the
         // `--compact-bytes` actuation call at this window's boundary (0 when unset).
-        let line = metrics_json_line(3, 120.0, 10, 9, 1, 0, 500, 1500, policy.clone(), &empty, None);
+        let line = metrics_json_line(WindowLine {
+            window: 3, rate: 120.0, requests: 10, completed: 9, errors: 1, compact_bytes: 0,
+            p50_us: 500, p99_us: 1500, window_us: 1_000_000, lag_p99_us: 0, invalid: false,
+            ceiling_us: None, ceiling_breached: false,
+            policy: policy.clone(), current: &empty, previous: None,
+        });
         assert_eq!(
             line,
-            r#"{"compact_bytes":0,"completed":9,"current":{"patterns":[],"regions":[]},"errors":1,"p50_us":500,"p99_us":1500,"policy":{"default":{"bloom_bits_per_key":10,"merge_min_tiles":2,"page_size":4096},"regions":{}},"previous":null,"rate_rps":120.0,"requests":10,"window":3}"#
+            r#"{"ceiling_breached":false,"ceiling_us":null,"compact_bytes":0,"completed":9,"current":{"patterns":[],"regions":[]},"errors":1,"invalid":false,"lag_p99_us":0,"p50_us":500,"p99_us":1500,"policy":{"default":{"bloom_bits_per_key":10,"merge_min_tiles":2,"page_size":4096},"regions":{}},"previous":null,"rate_rps":120.0,"requests":10,"window":3,"window_us":1000000}"#
         );
         // A previous window is embedded as an object, not a string.
-        let with_prev = metrics_json_line(4, 120.0, 10, 19, 1, 4288, 500, 1500, policy, &empty, Some(&empty));
+        let with_prev = metrics_json_line(WindowLine {
+            window: 4, rate: 120.0, requests: 10, completed: 19, errors: 1, compact_bytes: 4288,
+            p50_us: 500, p99_us: 1500, window_us: 1_000_000, lag_p99_us: 0, invalid: false,
+            ceiling_us: None, ceiling_breached: false,
+            policy, current: &empty, previous: Some(&empty),
+        });
         assert!(with_prev.contains(r#""compact_bytes":4288"#), "got {with_prev}");
         assert!(with_prev.contains(r#""previous":{"patterns":[],"regions":[]}"#), "got {with_prev}");
     }

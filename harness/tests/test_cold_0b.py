@@ -7,12 +7,27 @@ hand-built arm record. The long run itself is a nohup experiment; its logic must
 from __future__ import annotations
 
 import json
+import statistics
 import sys
 from pathlib import Path
+
+import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from flashdb_harness import cold_0b as m  # noqa: E402
+
+
+def _curve_window(rate: float, completed_delta: int, *, requests: int | None = None,
+                  window_s: float = 1.0, errors: int = 0, invalid: bool = False,
+                  p50: int = 10, p99: int = 20, lag_p99: int = 0,
+                  ceiling_breached: bool = False) -> dict:
+    """A window record shaped like `window_records` output, for `summarize_curve` tests."""
+    offered = completed_delta if requests is None else requests
+    return {"rate_rps": rate, "requests": offered, "completed": completed_delta,
+            "completed_delta": completed_delta, "window_s": window_s, "errors": errors,
+            "invalid": invalid, "p50_us": p50, "p99_us": p99, "lag_p99_us": lag_p99,
+            "ceiling_breached": ceiling_breached, "ceiling_us": None}
 
 
 def _window_line(window: int, rate: float, requests: int, completed: int, *,
@@ -91,10 +106,10 @@ def test_window_records_compute_per_window_throughput_and_region_totals() -> Non
 
 def test_summarize_curve_marks_sustained_and_invalid() -> None:
     windows = [
-        {"rate_rps": 50.0, "achieved_rps": 49.0, "p50_us": 10, "p99_us": 20, "errors": 0},
-        {"rate_rps": 50.0, "achieved_rps": 50.0, "p50_us": 10, "p99_us": 20, "errors": 0},
-        {"rate_rps": 100.0, "achieved_rps": 60.0, "p50_us": 10, "p99_us": 20, "errors": 0},
-        {"rate_rps": 200.0, "achieved_rps": 199.0, "p50_us": 10, "p99_us": 20, "errors": 1},
+        _curve_window(50.0, 49.0),
+        _curve_window(50.0, 50.0),
+        _curve_window(100.0, 60.0),
+        _curve_window(200.0, 199.0, errors=1),
     ]
     curve = m.summarize_curve(windows)
     by_rate = {row["offered_rps"]: row for row in curve}
@@ -105,12 +120,13 @@ def test_summarize_curve_marks_sustained_and_invalid() -> None:
 
 
 def test_ceiling_breach_invalidates_the_level() -> None:
-    windows = [{"rate_rps": 50.0, "achieved_rps": 50.0, "p50_us": 10, "p99_us": 9000, "errors": 0},
-               {"rate_rps": 100.0, "achieved_rps": 100.0, "p50_us": 10, "p99_us": 100, "errors": 0}]
+    windows = [_curve_window(50.0, 50.0, p99=9000),
+               _curve_window(100.0, 100.0, p99=100)]
     curve = m.summarize_curve(windows, ceiling_us=5000)
     by_rate = {row["offered_rps"]: row for row in curve}
     assert by_rate[50.0]["sustained"] is False
     assert by_rate[100.0]["sustained"] is True
+    assert by_rate[50.0]["ceiling_rejected_windows"] == 1
 
 
 # ---------------------------------------------------------------------------
@@ -396,37 +412,98 @@ def test_coldness_evidence_flags_cache_evicting_at_the_cap() -> None:
 def test_summarize_curve_excludes_invalid_windows_from_sustained():
     """Regression for the bug that made a saturated arm score as sustained at every rung.
 
-    The first window of a ladder step can carry completions drained from the previous step, so it
-    can look like it achieved the new offered rate. The pacer marks such a window invalid (its
-    schedule lag ran away); that flag was not parsed, so the step was scored sustained anyway.
+    A window the pacer marked invalid (its schedule lag ran away) must make the step unsustained.
+    The flag is now on the `--metrics-json` line and parsed into the window records; before, the
+    JSON line omitted it, so a JSONL reader defaulted it to false and scored the step sustained.
     """
-    from flashdb_harness.cold_0b import summarize_curve
-
     windows = [
         # a genuinely sustained rung: two valid windows at 100 rps
-        {"rate_rps": 100.0, "achieved_rps": 100.0, "p50_us": 100, "p99_us": 200,
-         "errors": 0, "invalid": False, "lag_p99_us": 1000},
-        {"rate_rps": 100.0, "achieved_rps": 99.0, "p50_us": 100, "p99_us": 200,
-         "errors": 0, "invalid": False, "lag_p99_us": 1000},
+        _curve_window(100.0, 100.0, p50=100, p99=200, lag_p99=1000),
+        _curve_window(100.0, 99.0, p50=100, p99=200, lag_p99=1000),
         # a saturated rung: the draining window "achieves" the offered rate but is invalid, while
         # the other window is still valid (the lag rule needs consecutive windows) and shows the
-        # engine honestly far behind
-        {"rate_rps": 400.0, "achieved_rps": 400.0, "p50_us": 100, "p99_us": 200,
-         "errors": 0, "invalid": True, "lag_p99_us": 5_000_000},
-        {"rate_rps": 400.0, "achieved_rps": 120.0, "p50_us": 100, "p99_us": 200,
-         "errors": 0, "invalid": False, "lag_p99_us": 2_000_000},
+        # engine honestly far behind.
+        _curve_window(400.0, 400.0, p50=100, p99=200, invalid=True, lag_p99=5_000_000),
+        _curve_window(400.0, 120.0, p50=100, p99=200, lag_p99=2_000_000),
     ]
-    curve = summarize_curve(windows)
+    curve = m.summarize_curve(windows)
     by_rate = {row["offered_rps"]: row for row in curve}
     assert by_rate[100.0]["sustained"] is True
     assert by_rate[400.0]["sustained"] is False, (
         "a rung whose windows the pacer marked invalid must never be scored sustained, even if one "
         "of them appears to achieve the offered rate by draining a previous step's backlog")
     assert by_rate[400.0]["invalid_windows"] == 1
-    assert by_rate[400.0]["achieved_rps"] == 120.0, "the invalid windows are excluded from the median"
+    # The rung's achieved rate is its total completions over its total wall time (both windows are
+    # real time): (400 + 120) / 2 s, never a >offered figure. The invalid flag is what fails it.
+    assert by_rate[400.0]["achieved_rps"] == 260.0
+    assert m.highest_sustained_rate(curve) == 100.0
 
-    from flashdb_harness.cold_0b import highest_sustained_rate
-    assert highest_sustained_rate(curve) == 100.0
+
+def test_group_bursts_cannot_inflate_a_rung_above_its_offered_rate():
+    """Regression for the 128% per-rung figures in .scratch/39-0b-measurable/adversarial.md.
+
+    `--group-requests 64` issues a whole group when its FIRST request is due, so a 50 rps rung's
+    windows carry a 64-request burst (64 rps) or nothing. The old estimator took the MEDIAN of the
+    per-window delta over the nominal window and reported 64 rps = 128% of the offered 50. The fix
+    attributes completions to the rung and divides by its elapsed wall time instead.
+    """
+    lines = []
+    completed = 0
+    # A 2000-request 50 rps rung: 31 bursts of 64 + one of 16, spread over 40 one-second windows.
+    for i, n in enumerate([64] * 31 + [16] + [0] * 8):
+        completed += n
+        lines.append(json.dumps({
+            "window": i, "rate_rps": 50.0, "requests": n, "completed": completed,
+            "errors": 0, "p50_us": 100, "p99_us": 200, "window_us": 1_000_000,
+            "invalid": False, "lag_p99_us": 0, "ceiling_breached": False,
+            "policy": {"default": {"page_size": 4096, "merge_min_tiles": 2}, "regions": {}},
+            "current": {"patterns": [], "regions": []},
+        }, sort_keys=True))
+    recs = m.window_records(lines, window_ms=1000)
+    # The burst really is in the input: the OLD median-of-window-rates estimator returns 64 rps.
+    assert statistics.median(r["achieved_rps"] for r in recs) == 64.0, (
+        "the synthetic rung must reproduce the 128% burst the old estimator reported")
+
+    row = {r["offered_rps"]: r for r in m.summarize_curve(recs)}[50.0]
+    assert row["achieved_rps"] == 50.0, "completions over the rung's wall time is the offered rate"
+    assert row["achieved_fraction"] <= 1.0 + m.RUNG_RATE_TOLERANCE
+    assert row["rate_exceeded"] is False
+    assert row["sustained"] is True
+
+
+def test_a_rung_that_exceeds_its_offered_rate_fails_closed():
+    # 60 completions attributed to a rung that offered only 30 requests is physically impossible
+    # (a drain or a bookkeeping bug). The guard must refuse to quote it rather than score it.
+    windows = [_curve_window(50.0, 60, requests=30)]
+    row = {r["offered_rps"]: r for r in m.summarize_curve(windows)}[50.0]
+    assert row["achieved_rps"] == 60.0
+    assert row["rate_exceeded"] is True
+    assert row["sustained"] is False
+
+
+def test_json_window_invalid_flag_reaches_the_curve():
+    # The driver must put `invalid` on the --metrics-json line; a JSONL reader that defaults it to
+    # false would score a saturated rung as sustained (the pre-fix behaviour).
+    lines = [
+        json.dumps({"window": 0, "rate_rps": 400.0, "requests": 400, "completed": 400,
+                    "errors": 0, "p50_us": 10, "p99_us": 20, "window_us": 1_000_000,
+                    "invalid": False, "lag_p99_us": 0, "ceiling_breached": False,
+                    "policy": {}, "current": {"patterns": [], "regions": []}}, sort_keys=True),
+        json.dumps({"window": 1, "rate_rps": 400.0, "requests": 0, "completed": 400,
+                    "errors": 0, "p50_us": 10, "p99_us": 20, "window_us": 1_000_000,
+                    "invalid": True, "lag_p99_us": 5_000_000, "ceiling_breached": False,
+                    "policy": {}, "current": {"patterns": [], "regions": []}}, sort_keys=True),
+    ]
+    row = {r["offered_rps"]: r for r in m.summarize_curve(m.window_records(lines, 1000))}[400.0]
+    assert row["invalid_windows"] == 1
+    assert row["sustained"] is False
+
+
+def test_a_scored_run_requires_a_latency_ceiling():
+    # The pre-registration validity rule needs a ceiling; the scored runner must fail closed when
+    # one is not supplied rather than silently defaulting to something permissive.
+    with pytest.raises(SystemExit):
+        m.main([])
 
 
 # ---------------------------------------------------------------------------

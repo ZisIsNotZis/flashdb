@@ -117,6 +117,13 @@ RATE_MULTIPLES = (1, 2, 4, 8)
 # lag-growth rule did not reject it (the pacer marks invalid windows; none here).
 SUSTAINED_TOLERANCE = 0.95
 
+# A rung's achieved rate is its attributed completions over the longer of its OFFERED schedule
+# span (requests/rate) and its elapsed wall time. The pacer is open loop, so the offered span is a
+# floor that keeps achieved <= offered; a value above offered by more than this tolerance is a
+# measurement error and the rung is never scored sustained. See `summarize_curve` for why the
+# per-window median is NOT the right estimator (the grouped pacer emits a whole group in a burst).
+RUNG_RATE_TOLERANCE = 0.02
+
 # Slice 39: the default `--drift-rate auto` sets the fixed drift rate to this fraction of the
 # pre-drift mix's highest sustained level (measured by a short pre-flight ladder on the win mix).
 DRIFT_RATE_FRACTION = 0.70
@@ -168,7 +175,8 @@ def parse_load_summary(text: str) -> dict:
                 out["load_hwm_kb"] = None if v in (None, "none") else int(v)
         elif line.startswith("load_summary "):
             for key in ("requests", "completed", "errors", "else_used", "elapsed_ms",
-                        "invalid_windows", "late_total", "compact_bytes_total", "compact_merges"):
+                        "invalid_windows", "ceiling_rejected_windows", "late_total",
+                        "compact_bytes_total", "compact_merges"):
                 v = _kv(line, key)
                 if v is not None:
                     out[key] = int(v)
@@ -211,7 +219,6 @@ def window_records(lines: list[str], window_ms: int) -> list[dict]:
     """
     out: list[dict] = []
     prev_completed = 0
-    window_s = window_ms / 1000.0
     for line in lines:
         if not line.startswith("{"):
             continue
@@ -220,6 +227,11 @@ def window_records(lines: list[str], window_ms: int) -> list[dict]:
         except json.JSONDecodeError:
             continue
         completed = int(obj.get("completed", 0))
+        # The window's ACTUAL wall time (driver field `window_us`). Older dumps omit it, so fall
+        # back to the nominal `--window-ms`; a rung's achieved rate must divide by the actual time.
+        window_us = int(obj.get("window_us", 0))
+        window_s = window_us / 1e6 if window_us > 0 else window_ms / 1000.0
+        delta = completed - prev_completed
         regions = {}
         for r in obj.get("current", {}).get("regions", []):
             regions[r["region"]] = {
@@ -233,11 +245,10 @@ def window_records(lines: list[str], window_ms: int) -> list[dict]:
                 "compaction_bytes": r.get("compaction_bytes", 0),
                 "compaction_merges": r.get("compaction_merges", 0),
             }
-        # The pacer marks a window invalid when its schedule lag ran away (saturation) or its p99
-        # exceeded the declared ceiling, and prints the lag distribution. These were NOT parsed
-        # before, which is why a saturated arm could be scored as "sustained": the FIRST window of
-        # each ladder step carries completions drained from the previous step, so it can look like
-        # it achieved the new offered rate. Keep the signals.
+        # The pacer marks a window invalid when its schedule lag ran away (saturation), its p99
+        # exceeded the declared ceiling, or a request errored. `--metrics-json` must carry those
+        # fields (it now does): before, only the human line had them, so a JSONL consumer read
+        # `invalid` as always false and could score a saturated rung as sustained. Keep them.
         invalid = bool(obj.get("invalid", False))
         lag_p99 = int(obj.get("lag_p99_us", 0))
         out.append({
@@ -245,10 +256,17 @@ def window_records(lines: list[str], window_ms: int) -> list[dict]:
             "rate_rps": float(obj.get("rate_rps", 0.0)),
             "requests": int(obj.get("requests", 0)),
             "completed": completed,
+        # This window's own completions and the wall time it took; `summarize_curve` sums both per
+        # offered rate and divides by the longer of the offered span and this wall time, instead of
+        # taking a median of the group-quantised per-window rate.
+            "completed_delta": delta,
+            "window_s": window_s,
             "errors": int(obj.get("errors", 0)),
-            "achieved_rps": max(0.0, (completed - prev_completed) / window_s),
+            "achieved_rps": max(0.0, delta / window_s),
             "invalid": invalid,
             "lag_p99_us": lag_p99,
+            "ceiling_us": obj.get("ceiling_us"),
+            "ceiling_breached": bool(obj.get("ceiling_breached", False)),
             "p50_us": int(obj.get("p50_us", 0)),
             "p99_us": int(obj.get("p99_us", 0)),
             "regions": regions,
@@ -262,15 +280,31 @@ def window_records(lines: list[str], window_ms: int) -> list[dict]:
     return out
 
 
+def _ceiling_rejected(w: dict, ceiling_us: int | None) -> bool:
+    """True when the window breached the latency ceiling: the driver's own flag, or (for windows
+    built without it) a p99 above the ceiling."""
+    if w.get("ceiling_breached", False):
+        return True
+    return ceiling_us is not None and w["p99_us"] > ceiling_us
+
+
 def summarize_curve(windows: list[dict], ceiling_us: int | None = None) -> list[dict]:
     """Aggregate windows by offered rate into the capacity curve (one row per rate level).
 
-    A level is ``sustained`` when, over its VALID windows only, the median achieved throughput is
-    within ``SUSTAINED_TOLERANCE`` of the offered rate, no window had an error, and no window's p99
-    exceeded ``ceiling_us``. A window the pacer marked invalid (schedule lag ran away, i.e. the
-    engine was not keeping up) is EXCLUDED from the median and makes the level unsustained: the
-    first window of a step can otherwise be credited with completions drained from the previous
-    step, which is how a saturated arm previously scored as "sustained" at every rung.
+    A level's ``achieved_rps`` is its attributed completions divided by the longer of its OFFERED
+    schedule span (requests/rate) and the elapsed wall time they took, NOT the median of the
+    per-window rates. The grouped pacer (``--group-requests``) issues a whole group when its FIRST
+    request is due, so at a low offered rate one window carries a full 64 request burst (64 rps)
+    and the next carries none; the median then reports the burst size over the window (128% of a
+    50 rps offer in the published slice-39 run) instead of the offered rate. Summed over the rung,
+    completions over the offered span is the offered rate the engine actually held.
+
+    The offered span is a floor on the denominator, so a rung's achieved rate cannot exceed its
+    offered rate; a value above it by more than ``RUNG_RATE_TOLERANCE`` is a measurement error and
+    the level is never scored sustained (``rate_exceeded``). A level is ``sustained`` when the
+    achieved rate is within ``SUSTAINED_TOLERANCE`` of the offered rate, no window had an error,
+    no window was rejected by the pacer (schedule lag ran away, i.e. the engine was not keeping
+    up), and no window breached the latency ceiling.
     """
     by_rate: dict[float, list[dict]] = {}
     for w in windows:
@@ -279,11 +313,22 @@ def summarize_curve(windows: list[dict], ceiling_us: int | None = None) -> list[
     for rate in sorted(by_rate):
         ws = by_rate[rate]
         valid = [w for w in ws if not w.get("invalid", False)]
-        measured = valid or ws
-        achieved = median(w["achieved_rps"] for w in measured)
+        # Achieved rate = completions attributed to the rung / the longer of its OFFERED schedule
+        # span (requests/rate) and its actual elapsed wall time. The grouped pacer commits a whole
+        # group when its first request is due, so the last members land ahead of their scheduled
+        # time and the rung's wall time can be SHORTER than its offered span (which is why the old
+        # per-window median reported 128%). Dividing by at least the offered span bounds achieved
+        # by the offered rate; a saturated rung's wall time exceeds the offered span and shows up
+        # as a lower achieved rate.
+        offered_s = sum(w["requests"] for w in ws) / rate if rate else 0.0
+        wall_s = sum(w.get("window_s", 0.0) for w in ws)
+        span_s = max(offered_s, wall_s)
+        completions = sum(w.get("completed_delta", 0) for w in ws)
+        achieved = (completions / span_s) if span_s > 0 else 0.0
         p99 = max(w["p99_us"] for w in valid) if valid else max(w["p99_us"] for w in ws)
         rejected = any(w["errors"] > 0 for w in ws) or any(w.get("invalid", False) for w in ws)
-        ceiling_breached = ceiling_us is not None and p99 > ceiling_us
+        ceiling_rejected_windows = sum(1 for w in ws if _ceiling_rejected(w, ceiling_us))
+        rate_exceeded = achieved > rate * (1.0 + RUNG_RATE_TOLERANCE)
         curve.append({
             "offered_rps": rate,
             "windows": len(ws),
@@ -293,10 +338,13 @@ def summarize_curve(windows: list[dict], ceiling_us: int | None = None) -> list[
             "achieved_fraction": achieved / rate if rate else 0.0,
             "invalid_windows": sum(1 for w in ws if w.get("invalid", False)),
             "error_windows": sum(1 for w in ws if w["errors"] > 0),
+            "ceiling_rejected_windows": ceiling_rejected_windows,
             "valid_windows": len(valid),
             "lag_p99_us": max(w.get("lag_p99_us", 0) for w in ws),
             "compact_bytes": sum(w.get("compact_bytes", 0) for w in ws),
-            "sustained": achieved >= SUSTAINED_TOLERANCE * rate and not rejected and not ceiling_breached,
+            "rate_exceeded": rate_exceeded,
+            "sustained": (achieved >= SUSTAINED_TOLERANCE * rate and not rejected
+                          and ceiling_rejected_windows == 0 and not rate_exceeded),
         })
     return curve
 
@@ -1019,7 +1067,11 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--drift-preflight-segment-requests", type=int, default=1000,
                     help="requests per level in the pre-flight ladder that --drift-rate auto runs")
     ap.add_argument("--segment-requests", type=int, default=2000)
-    ap.add_argument("--ceiling-us", type=int, default=None)
+    ap.add_argument("--ceiling-us", type=int, required=True,
+                    help="latency ceiling in microseconds; REQUIRED. The pre-registration validity "
+                         "rule scores a level sustained only if its p99 stays under the declared "
+                         "ceiling, so a run that supplies none is not scored (fail closed) rather "
+                         "than defaulting to a permissive value.")
     ap.add_argument("--arm-timeout-s", type=float, default=1200.0)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--customers", type=int, default=2_000_000)
@@ -1220,6 +1272,7 @@ def main(argv: list[str]) -> int:
         "learner_reorg_budget_factor": a.learner_reorg_budget_factor,
         "mix": {"win": dict(WIN_MIX), "adversarial": dict(UNIFORM_MIX)},
         "compact_bytes": a.compact_bytes,
+        "ceiling_us": a.ceiling_us,
         "lambdas": a.lambdas,
         "noise_band_relative": noise_band,
         "workloads": {wl: plans[wl].to_dict() for wl in a.workloads},
@@ -1466,8 +1519,22 @@ def render_report(result: dict) -> str:
     w("")
     w("`commit` is completed/requests (1.0 = every offered request committed); `else` is the stock "
       "guard's else/backorder branch count; `reorg bytes` is the summed per-region "
-      "`compaction_bytes` over the run. A row is `sustained` when the median window completed "
-      f">= {SUSTAINED_TOLERANCE:.0%} of the offered rate with no rejected window.")
+      "`compaction_bytes` over the run. `achieved rps` is the rung's attributed completions over "
+      "the longer of its offered schedule span and its elapsed wall time (not a median of the "
+      "group-quantised per-window rate), so it cannot exceed the offered rate; a row is "
+      f"`sustained` when it is within "
+      f"{1 - SUSTAINED_TOLERANCE:.0%} of the offered rate with no error, no window the pacer "
+      "rejected (schedule lag ran away), and no window over the latency ceiling.")
+    ceiling_us = result.get("ceiling_us")
+    if ceiling_us is not None:
+        per_arm = {key: sum(r.get("ceiling_rejected_windows", 0) for r in (rec.get("curve") or []))
+                   for key, rec in sorted(result["arms"].items())}
+        total = sum(per_arm.values())
+        detail = ", ".join(f"`{k}` {v}" for k, v in per_arm.items() if v) or "none"
+        w("")
+        w(f"**Latency ceiling:** `--ceiling-us {ceiling_us}` per window. A window whose p99 exceeds "
+          f"it is rejected and its rung cannot be scored sustained. Windows the ceiling rejected "
+          f"this run: **{total}** ({detail}). A run without a ceiling is not scored.")
     w("")
     w("## Compaction actuation (`compact_bytes`, driver field summed per offered level)")
     w("")
