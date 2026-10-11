@@ -45,7 +45,7 @@ fn publish_survives_reopen_via_manifest_and_ignores_unreferenced_tiles() {
 
     // Crash after tile sync but before manifest publish: the leftover file is
     // unreferenced and ignored on discovery; WAL alone still recovers.
-    let mut e = Engine::open_discover(&files.dir).unwrap();
+    let e = Engine::open_discover(&files.dir).unwrap();
     let leftover = files.dir.join("leftover.tile");
     fs::write(&leftover, b"half-written candidate").unwrap();
     drop(e);
@@ -74,7 +74,7 @@ fn torn_or_corrupt_manifest_fails_closed_and_wal_only_open_still_works() {
     // to the older but fully valid seq-0 empty root. Data stays safe because the
     // full WAL is retained and replayed; the tile becomes unreferenced.
     fs::write(&manifest, &pristine[..pristine.len() - 100]).unwrap();
-    let mut e = Engine::open_discover(&files.dir).unwrap();
+    let e = Engine::open_discover(&files.dir).unwrap();
     assert_eq!(e.csn(), 1);
     assert_eq!(e.serving_memtable_entries(), 1, "no tile root: full WAL replay serves everything");
     assert_eq!(e.get(b"E", 1).unwrap(), Some(b"covered".to_vec()));

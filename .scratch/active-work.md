@@ -1,8 +1,17 @@
 # Active work
 
-> **START HERE ON RETURN: [`.scratch/STATUS.md`](STATUS.md)** - consolidated engine state, the 0b
-> verdicts so far (T1 tie, T2 unmeasured, T3 FAIL 4.1-4.3x, T4 unmeasurable), the eight measurement
-> defects found and their state, and the five decisions the author needs to make.
+> **START HERE ON RETURN: [`.scratch/STATUS.md`](STATUS.md)** - consolidated engine state, the
+> trustworthy measurement instrument, the first valid primary-metric evaluation, the twelve defects
+> found and their state, the decisions already adopted, and the staged resume plan
+> (`.scratch/52-program/wave1.js`).
+>
+> **Verdicts are provisional until re-derived.** Every per-rung number published before commit
+> `744caaa` is unusable (median-of-window-deltas, `invalid` never reaching the JSON, an unflushed
+> trailing window, and a ceiling applied to group-aggregated latency). T1 and T2 are therefore
+> **underived**, T4 is underived, and T3 (4.13-4.27x) stands because it is a byte sum. The first
+> valid evaluation, `adversarial`/`declared` at 8.17x, gives **zero sustained rungs** on a latency-tail
+> failure (99.4-100% of offered achieved, 0 errors). Instance is 8.17x, below the 10x floor, which is
+> now a requirement rather than a qualification.
 
 **Retraction (2026-10-06 review):** the 14x churn claim (402,984,851 → 28,191,940) is retracted — it
 paired the slice-38 **drift** arm with the slice-39 **adversarial** arm. Like for like on the

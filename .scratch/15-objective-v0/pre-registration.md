@@ -22,9 +22,14 @@ bytes read per op per pattern, RSS per data byte, CPU per op, recovery time).
 Deterministic metrics are the tie-break for policy comparisons (this box is shared; wall-clock
 varies run to run - recorded in `.scratch/12`).
 
-Validity rule (from objective v1): a window is INVALID if its p99 exceeds the pre-registered
-ceiling, if the schedule lag grows across three consecutive windows, or if any request is rejected.
-Throughput from invalid windows is not counted, so the metric cannot be won by abandoning latency.
+Validity rule (from objective v1, made explicit 2026-10-09): a window is INVALID if the per-request
+**schedule lag** p99 exceeds the **lag ceiling** (``--lag-ceiling-us``, default 10,000 us — the number
+this document's primary metric is written with), if the per-request **service-latency** p99 exceeds
+the separate service ceiling, if the schedule lag grows across three consecutive windows, or if any
+request is rejected. Each rejection carries its named reason. Throughput from invalid windows is not
+counted, so the metric cannot be won by abandoning latency. Service latency is reported separately
+as the latency/efficiency measure; the relative variant offered in the sign-off list (two times the
+reference-load p99) becomes concrete only once a reference-load p99 has been measured.
 
 ## Arms (all at equal durability: same group-commit batch-size distribution)
 
@@ -77,12 +82,10 @@ model-uncalibrated, and only real-engine arms may decide the thresholds above.
 
 ## What is NOT claimed
 
-No absolute-throughput claim against other engines **in the design currently run** (Postgres is a
-passive scoreboard with its tuning protocol fixed in advance; no tuning race; the proposed B1/T5–T7
-below would supersede this clause by adding external baselines as measured arms, if signed off). No
-bounded-memory claim beyond what is measured. No
-claim about key-family co-location (L2) or cross-entity clustering, which this layout space cannot
-express. No claim that the learner beats a per-tile prescient oracle - that space is combinatorial
+Absolute comparison against other engines is made **only** through the request-level harness at
+matched durability (B1 below), never by tuning a baseline into a race. No
+bounded-memory claim beyond what is measured. Family co-location (L2) is being made expressible
+(ticket 50); no claim is made about it until it is measured on a real run. No claim that the learner beats a per-tile prescient oracle - that space is combinatorial
 and the relaxed oracle over the published candidate set is the stated reference.
 
 ## Sign-off list for the author
@@ -90,21 +93,25 @@ and the relaxed oracle over the published candidate set is the stated reference.
 1. The 15% / 5% / 3x thresholds and the 10-seed count.
 2. The instance size (10x cache; 512 MiB cap + 5 GiB data as the engineering scale).
 3. The reference rate used to define the load steps.
-4. Whether the latency ceiling is the p99 SLO from `provisional-objective.md` sec. 2 (2x the
-   reference-load p99) or a fixed absolute number.
+4. ~~Whether the latency ceiling is the p99 SLO from `provisional-objective.md` sec. 2 (2x the
+   reference-load p99) or a fixed absolute number.~~ **Resolved 2026-10-09:** the primary metric is
+   judged on the lag ceiling at this document's own 10,000 us; service latency has its own ceiling and
+   is reported separately; the relative variant is deferred until a reference-load p99 exists.
 5. That a rejected verdict on this layout space is publishable as a negative result (the design docs
    require publishing the null, and this space's read-side knobs already measured only ~3%).
-6. The external-baseline proposals appended below (B1 + T5/T6/T7), which would supersede the
-   "no absolute-throughput claim" clause if signed off — they add external baselines as measured arms.
+6. ~~The external-baseline proposals (B1 + T5/T6/T7).~~ **Adopted 2026-10-09** (see the section
+   below); the request-level baseline harness does not exist yet, so the thresholds are agreed but
+   not yet evaluable.
 
-## Proposed additions (2026-10-06, awaiting sign-off; nothing has been run against them)
+## External baselines and thresholds (adopted 2026-10-09)
 
-**Proposal B1 — external baselines as arms.** `sqlite` (WAL enabled, `synchronous` setting stated explicitly, one writer), `postgres` (a frozen disclosed config, no tuning race), `lmdb` and `rocksdb` (the honest comparisons named in the design log). Equal durability as closely as each product allows, and the difference disclosed. One request-level harness drives every arm, because flashdb has no SQL and its payload is opaque. Every arm runs in the same memory-constrained regime, and the same latency rule is applied to the baselines when computing their sustained level.
+**B1 — external baselines as arms.** `sqlite` (WAL enabled, `synchronous` setting stated explicitly, one writer), `postgres` (a frozen disclosed config, no tuning race), `lmdb` and `rocksdb` (the honest comparisons named in the design log). Equal durability as closely as each product allows, and the difference disclosed. One request-level harness drives every arm, because flashdb has no SQL and its payload is opaque. Every arm runs in the same memory-constrained regime, and the same latency rule is applied to the baselines when computing their sustained level.
 
-**Proposal T5 — low-load non-inferiority.** At the 1x rung flashdb must be within **1.5x** of the slower of sqlite/postgres; **2x** is the fail line; a **10x** gap is a design failure.
+**T5 — low-load non-inferiority.** At the 1x rung flashdb must be within **1.5x** of the slower of sqlite/postgres; **2x** is the fail line; a **10x** gap is a design failure.
 
-**Proposal T6 — high-load superiority.** At the highest common offered level flashdb must reach at least **3x** the best baseline's sustained throughput under the same latency rule.
+**T6 — high-load superiority.** At the highest common offered level flashdb must reach at least **3x** the best baseline's sustained throughput under the same latency rule.
 
-**Proposal T7 — initial-policy quality.** The declared arm alone must already pass T5, which turns "the initial policy must not be absurd" into a number on a design deliverable.
+**T7 — initial-policy quality.** The declared arm alone must already pass T5, which turns "the initial policy must not be absurd" into a number on a design deliverable.
 
-The current pre-registration compares arms only against each other (T1–T4: learned vs declared / static-derived / oracle); this external claim is therefore untested.
+T1–T4 compare arms only against each other (learned vs declared / static-derived / oracle); T5–T7 add
+the external claim, which is **untested** until the request-level baseline harness exists.

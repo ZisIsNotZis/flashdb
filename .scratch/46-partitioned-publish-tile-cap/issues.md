@@ -93,3 +93,11 @@ run aborts (`rc=1`), so no throughput/latency verdict can be produced under that
 per-region capacity curve must either use a cadence that keeps the publish count under the cap or be
 produced after the cap is raised; until then, the slice-44 per-region numbers are not reproducible at
 the shipped cadence.
+
+## Decision (adopted 2026-10-09)
+
+Fixed on both sides, under the author's standing autonomy grant: raise and make the tile cap
+configurable, make the run harness's default checkpoint/rotate cadence compatible with per-region
+publishing, and make a scored run refuse an incompatible cadence loudly instead of aborting mid-run.
+Rationale: the shipped default must be able to run the shipped engine in the documented regime.
+The two candidate fixes recorded above are therefore both required, not alternatives.
