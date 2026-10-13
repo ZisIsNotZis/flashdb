@@ -462,3 +462,43 @@ No failures, no conflicts.
   runs (below 3x but non-reproducible); (d) run-to-run throughput spread 38-71% (win) vs 1%
   (adversarial). The thesis is blocked on the win scan path and a quiet-box 10-seed run, not yet
   derivable.
+
+## Integration record: wave8/eval
+
+- Timestamp: 2026-10-14T01:47:19+08:00
+- Actor: integrator worker (single writer on master)
+- Base at integration start: master `29d7658e6751d34db3dc0ee169aac10bce669d62`
+- Merge: `git merge --no-ff wave8/eval` (WP-H eval-pilot ticket + artifacts; docs only)
+  - Merge commit: `59b01bc9f0f1366d2fbe9e0f0e9283c1e2c0b093`
+  - Parents: `29d7658e6751d34db3dc0ee169aac10bce669d62` + `d1fa28391d2ad5b8f7f7a75b0d2bbd79009e2cc5`
+  - Conflict resolution: none. The branch's file set is disjoint from master's current tree and merged cleanly with the ort strategy.
+- Final HEAD after integration (this record commit): `git rev-parse HEAD` on master (reported to the orchestrator).
+- Lane worktrees created from integrated master (`59b01bc`):
+  - `git worktree add -b wave9/scanwarm /home/z/vibe/worktrees/flashdb/wave9-scanwarm master`
+    - Path: `/home/z/vibe/worktrees/flashdb/wave9-scanwarm`, branch `wave9/scanwarm`, HEAD `59b01bc9f0f1366d2fbe9e0f0e9283c1e2c0b093`
+  - `git worktree add -b wave9/churn /home/z/vibe/worktrees/flashdb/wave9-churn master`
+    - Path: `/home/z/vibe/worktrees/flashdb/wave9-churn`, branch `wave9/churn`, HEAD `59b01bc9f0f1366d2fbe9e0f0e9283c1e2c0b093`
+
+Combined gates (run at merge `59b01bc9f0f1366d2fbe9e0f0e9283c1e2c0b093`; 0 warnings throughout):
+
+1. `cargo build --workspace --offline` — 0 warnings:
+```
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.07s
+```
+
+2. `cargo test --workspace --offline` — totals: **291 passed; 0 failed; 0 ignored**
+   (124 lib + 22 flashdb-load + 9 batch_commit + 5 compaction_job + 4 constraints +
+   3 family_colocation + 11 group_commit + 6 manifest_engine + 7 merge_threshold +
+   14 metrics + 33 multi_tile + 7 order_flow + 1 partitioned_publish_cap + 5 read_requests +
+   3 region_compaction + 6 region_partition + 3 replay_trace + 8 request_commit + 2 scale_bin +
+   3 tile_format + 3 tile_layout + 12 tile_read + 0 flashdb-replay + 0 flashdb-scale + 0 main + 0 doc-tests)
+
+3. `cd harness && uv run --with pytest pytest -q`:
+```
+warning: `VIRTUAL_ENV=/home/z/.venv` does not match the project environment path `.venv` and will be ignored; use `--active` to target the active environment instead
+132 passed in 4.18s
+```
+
+4. `git diff --check` — silent (exit 0).
+
+No failures, no conflicts.
