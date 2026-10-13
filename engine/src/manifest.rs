@@ -645,9 +645,12 @@ impl Manifest {
 
     /// [`Manifest::publish`] without the file and parent-directory syncs. The
     /// in-memory root still flips, so a later durable publish carries this page
-    /// with it; until then a crash can revert to the previous durable root (whose
-    /// tiles are all still present), which is the documented lazy-compaction
-    /// trade: reorganisation may be lost, never data.
+    /// with it. The caller must have already made every tile the page references
+    /// durable (file content and directory entry) before calling, so OS writeback
+    /// of this page cannot name a missing tile; until a durable publish, a crash
+    /// can still revert to the previous durable root (whose tiles are all still
+    /// present), which is the documented lazy-compaction trade: reorganisation
+    /// may be lost, never data.
     pub(crate) fn publish_lazy(&mut self, tiles: Vec<TileRef>, checkpoint: Checkpoint, segment: Option<SegmentRef>) -> io::Result<()> {
         if self.poisoned {
             return Err(io::Error::new(io::ErrorKind::Other, "manifest writer poisoned; reopen to recover"));
@@ -725,7 +728,8 @@ impl Manifest {
     }
 
     /// [`Manifest::publish_replacing`] without the file and parent-directory
-    /// syncs; see [`Manifest::publish_lazy`].
+    /// syncs; see [`Manifest::publish_lazy`] for the caller's durability
+    /// obligation on the replacement tile.
     pub(crate) fn publish_replacing_lazy(
         &mut self,
         retire: &[&str],

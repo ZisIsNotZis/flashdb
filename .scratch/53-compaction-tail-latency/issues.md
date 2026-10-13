@@ -54,10 +54,14 @@ a lazy (no-fsync, no-unlink) flip.
   lazy-flip half that removes that floor from the request path.
 
 Durability trade (documented, not hidden): the apply flip is LAZY — the manifest page is
-written but not fsynced and the retired inputs are not unlinked. Compaction is only a read
-optimisation; the WAL remains the durability authority. A crash before the next durable
-publish (checkpoint/rotation) reverts to the previous durable root, whose tiles are still
-on disk, so a merge is lost but never corrupts. The next durable publish carries every
+written but not fsynced and the retired inputs are not unlinked. The build half, however,
+makes the replacement tile durable (tile file `sync_data` + parent-directory `sync_all`)
+off the request path before the outcome can be applied, so a lazy manifest page that the
+OS later writes back references only a durable tile: a crash can no longer leave a
+CRC-valid manifest page naming a missing tile. Compaction is only a read optimisation;
+the WAL remains the durability authority. A crash before the next durable publish
+(checkpoint/rotation) reverts to the previous durable root, whose tiles are still on
+disk, so a merge is lost but never corrupts. The next durable publish carries every
 lazy page with it.
 
 ## Change
@@ -171,3 +175,72 @@ Write amp (rewrite factor = compaction output bytes / ingested bytes; ingested 9
 `/tmp/cold53/`: `flashdb-load-pre`, `flashdb-load-fix`, `adversarial.jsonl`,
 `declared.policy.json`, `baseline.stdout/.stderr`, `fix.stdout/.stderr`,
 `fix2.stdout/.stderr`, `baseline-instance/`, `fix-instance/`, `fix2-instance/`.
+
+## Verifier finding (independent review, blocking)
+
+`build_compaction_job` (`engine.rs`) writes and file-syncs the replacement tile
+(`TileWriter::finish` -> `tile.rs` `sync_data`, "No parent-directory durability
+claim") but never fsyncs the parent directory. `apply_compaction_job` then
+installs the reference via `manifest_publish_lazy` -> `Manifest::publish_lazy` /
+`publish_replacing_lazy`, which write the A/B slot with `durable=false` (no
+manifest file sync, no parent-dir sync). After a crash the OS may have written
+back the CRC-valid manifest page (seq N+1) while the replacement tile's directory
+entry is not durable, so `Manifest::open` selects seq N+1, `open_discover` then
+`Tile::open` fails `NotFound`, and the engine cannot open. Data is not silently
+lost (WAL + orphan tile content survive) but recovery is not automatic, which
+falsifies "a crash loses the merge never data / reopen recovers".
+
+## Fix chosen (option a) + rationale + rejected alternative
+
+Chosen (a): in the off-request-path build, after `writer.finish()`, also
+`File::open(dir)?.sync_all()` so the replacement tile's directory entry is
+durable before the outcome can be applied. The request-path apply stays lazy
+(no manifest file/dir sync, no unlink); every fsync stays off the request path,
+so the WP-B latency gain is not regressed.
+
+Ordering now: tile file sync (`TileWriter::finish`) -> parent-directory sync
+(build, off-path) -> lazy manifest page write (apply, on-path). Any OS writeback
+of the lazy page therefore references a tile whose data and dirent are already
+durable.
+
+Rejected (b): durable manifest publish on the background worker with only the
+in-memory root swap on the request path. Rejected because it would move the
+manifest file/dir fsyncs onto the worker and require the worker to hold a
+`&mut` engine/manifest (or a second manifest writer), which widens the change
+and still leaves the in-memory swap to coordinate; (a) is strictly smaller and
+keeps the exact same request-path apply already shipped.
+
+Defense in depth added in `apply_compaction_job`: the opened replacement tile's
+`cutoff()`/`digest()` are re-verified against `outcome` before the `TileRef` is
+installed.
+
+Driver fix: `flashdb-load.rs` `take_done` now propagates a disconnected worker
+channel as an error instead of `Ok(None)`.
+
+## New/updated tests
+
+`engine/tests/compaction_job.rs`:
+- `job_build_apply_matches_sync_merge_and_reopens` now builds a reference merged
+  state with `maybe_compact_shape(CheapestPair)` on an identical twin engine and
+  compares readings, active cutoffs, and reopen, so a wrong-pair selection fails.
+- `apply_compaction_job_rejects_mismatched_digest_or_cutoff` — defense in depth.
+- `lazy_apply_can_be_made_manifest_durable_and_still_reopens` — strongest
+  available crash-consistency approximation: forces the lazy manifest page
+  durable after apply and reopens. Precise limits: same-process, no dropping of
+  not-yet-durable writes, so it cannot by itself fail if the build-side dir sync
+  is removed; it proves the page can become durable and still name a matching
+  tile, not real power-loss durability.
+- `missing_replacement_tile_fails_reopen_after_manifest_writeback` — negative
+  control showing the harness detects the `NotFound` failure mode.
+
+## Gates (verbatim, run at the repair commit)
+
+`cargo test --workspace --offline` — 277 passed; 0 failed; 0 ignored.
+
+`cargo build --workspace --offline` — 0 warnings.
+
+`cargo test --offline -p flashdb-engine --test compaction_job` — 5 passed; 0 failed.
+
+`cd harness && uv run --with pytest pytest -q` — `132 passed in 4.66s`.
+
+`git diff --check` — silent (exit 0).

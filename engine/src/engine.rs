@@ -1335,8 +1335,11 @@ impl Engine {
     /// [`Engine::manifest_publish`] without the manifest file and parent-
     /// directory syncs, for a lazy compaction flip (see
     /// [`Engine::apply_compaction_job`]). The in-memory root still flips and the
-    /// next durable publish carries it; a crash before then can revert to the
-    /// previous durable root whose tiles are all still present.
+    /// next durable publish carries it. Callers must have already made any tile
+    /// the page references durable (file and directory entry), so OS writeback of
+    /// the page cannot name a missing tile; a crash before a durable publish can
+    /// still revert to the previous durable root whose tiles are all still
+    /// present.
     fn manifest_publish_lazy(&mut self, refs: Vec<TileRef>, checkpoint: Checkpoint, segment: Option<SegmentRef>) -> io::Result<()> {
         match &mut self.manifest {
             Some(m) => m.publish_lazy(refs, checkpoint, segment)?,
@@ -1624,11 +1627,12 @@ impl Engine {
     /// [`CompactionJob`]: flip the manifest root and the in-memory tile list to
     /// install the replacement, and record the per-merge observability. The flip
     /// is LAZY (no manifest file/dir sync) and the retired inputs are NOT
-    /// unlinked: compaction reorganisation is only an optimisation, the WAL
-    /// stays the durability authority, and a crash before the next durable
-    /// manifest publish (checkpoint/rotation) simply reverts to the previous
-    /// durable root whose tiles are still on disk. Returns the replacement's
-    /// output size.
+    /// unlinked: the build side already made the replacement tile and its
+    /// directory entry durable, and the WAL stays the durability authority, so
+    /// even an OS writeback of the lazy manifest page can only reference a
+    /// durable tile. A crash before the next durable manifest publish
+    /// (checkpoint/rotation) simply reverts to the previous durable root whose
+    /// tiles are still on disk. Returns the replacement's output size.
     pub fn apply_compaction_job(&mut self, outcome: &CompactionOutcome) -> io::Result<u64> {
         self.ensure_no_group("apply_compaction_job")?;
         if self.manifest.as_ref().is_some_and(|m| m.poisoned()) {
@@ -1645,6 +1649,13 @@ impl Engine {
             indices.push(i);
         }
         let replacement_tile = Tile::open(&self.dir.join(&outcome.name))?;
+        // Defense in depth: the worker already verified the tile against the WAL
+        // and the inputs, but re-bind the opened tile's own header to the outcome
+        // before it is installed, so a swapped or stale file cannot be flipped in.
+        if replacement_tile.cutoff() != outcome.cutoff || replacement_tile.digest() != &outcome.digest {
+            return Err(io::Error::new(io::ErrorKind::InvalidData,
+                "compaction replacement tile disagrees with the built outcome"));
+        }
         let replacement = TileRef { name: outcome.name.clone(), cutoff: outcome.cutoff, digest: outcome.digest };
         let checkpoint = Checkpoint { csn: self.tiles.last().unwrap().cutoff(), handle_watermark: self.max_handle };
         let segment = self.segment.clone();
@@ -3169,17 +3180,21 @@ fn wal_digest_finish(hash: Sha256, last: u64, cutoff: u64, floor: u64) -> io::Re
 /// Build ONE compaction replacement tile from a self-contained [`CompactionJob`],
 /// entirely off the live engine: open the named input tiles read-only, replay the
 /// WAL suffix bounded by the job's captured valid length, stream the same
-/// reduction [`Engine::write_compacted_tile`] performs, sync the output tile, and
-/// run both fail-closed verification passes. Returns the replacement's identity
-/// and phase split. Nothing here touches the manifest or the engine's in-memory
-/// tile list; the caller applies the result with [`Engine::apply_compaction_job`].
+/// reduction [`Engine::write_compacted_tile`] performs, sync the output tile and
+/// its parent directory entry, and run both fail-closed verification passes.
+/// Returns the replacement's identity and phase split. Nothing here touches the
+/// manifest or the engine's in-memory tile list; the caller applies the result
+/// with [`Engine::apply_compaction_job`].
 ///
-/// The output tile's directory entry is deliberately NOT parent-directory-synced
-/// here: the apply side installs the flip lazily and the next durable manifest
-/// publish (checkpoint/rotation) makes both the entry and the flip durable, at
-/// which point the tile becomes referenced. A crash before then reverts to the
-/// previous durable root, whose tiles are all still present (the lazy apply never
-/// unlinks), so compaction is only ever lost, never corrupted.
+/// The tile file is synced by [`TileWriter::finish`] and the parent directory is
+/// synced here, off the request path, BEFORE the outcome can be applied. That is
+/// the crash-consistency ordering the lazy apply relies on: a manifest page that
+/// references this tile can never become durable (even by OS writeback of the
+/// lazy apply page) before both the tile data and its directory entry are
+/// durable. The apply side stays lazy (no manifest file/dir sync, no unlink), so
+/// every fsync remains off the request path; a crash before the next durable
+/// publish simply reverts to the previous durable root, whose tiles are all
+/// still present, so compaction is only ever lost, never corrupt.
 pub fn build_compaction_job(dir: &Path, job: &CompactionJob) -> io::Result<CompactionOutcome> {
     let t0 = Instant::now();
     let (records, _) = wal::replay_file(&job.wal_file, job.wal_valid_len)?;
@@ -3231,6 +3246,15 @@ pub fn build_compaction_job(dir: &Path, job: &CompactionJob) -> io::Result<Compa
     Engine::verify_compacted_tile(&tile, &refs, job.lower, &wal_entries, job.cutoff)?;
     Engine::verify_compacted_against_wal(&tile, &wal_entries, job.lower.max(job.wal_floor), job.cutoff)?;
     let verify_us = verify_t0.elapsed().as_micros() as u64;
+    // Make the tile's directory entry durable now, before the outcome can be
+    // applied. `TileWriter::finish` synced the file itself but not its dirent;
+    // without this ordering a lazy manifest page could be written back by the OS
+    // and name a tile whose dirent was lost by a crash. Placed after the two
+    // verification passes so a tile that fails validation is never made durable,
+    // matching the synchronous merge path's verify-then-dir-sync order.
+    let dir_sync_t0 = Instant::now();
+    File::open(dir)?.sync_all()?;
+    let dir_sync_us = dir_sync_t0.elapsed().as_micros() as u64;
     let output_bytes = fs::metadata(&path)?.len();
     let input_bytes = refs.iter().fold(0u64, |acc, t| {
         acc.saturating_add(fs::metadata(dir.join(&t.name)).map(|m| m.len()).unwrap_or(0))
@@ -3249,7 +3273,7 @@ pub fn build_compaction_job(dir: &Path, job: &CompactionJob) -> io::Result<Compa
             output_bytes,
             elapsed_us,
             build: CompactionBuildStats { stream_us, finish_us, verify_us },
-            dir_sync_us: 0,
+            dir_sync_us,
             manifest_us: 0,
             unlink_us: 0,
         },

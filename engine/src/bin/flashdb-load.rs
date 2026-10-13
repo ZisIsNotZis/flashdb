@@ -600,12 +600,14 @@ impl CompactionWorker {
     }
 
     /// Blocking variant used only at the end of the run, to apply the last
-    /// in-flight build before the summary.
+    /// in-flight build before the summary. A disconnected sender at this point
+    /// means the worker thread is gone (it panicked or exited), so it is
+    /// propagated as an error rather than silently treated as "no outcome".
     fn take_done(&mut self) -> io::Result<Option<CompactionOutcome>> {
         match self.rx.recv() {
             Ok(Ok(outcome)) => { self.in_flight = false; Ok(Some(outcome)) }
             Ok(Err(e)) => { self.in_flight = false; Err(e) }
-            Err(_) => { self.in_flight = false; Ok(None) }
+            Err(_) => { self.in_flight = false; Err(io::Error::other("compaction worker disconnected")) }
         }
     }
 }
@@ -619,9 +621,9 @@ fn compact_actuation_print(window_index: u64, select_us: u64, apply_us: u64, out
     eprintln!(
         "compact_actuation window={window_index} input_bytes={} output_bytes={} \
          select_us={select_us} apply_us={apply_us} build_elapsed_us={} \
-         stream_us={} finish_us={} verify_us={}",
+         stream_us={} finish_us={} verify_us={} dir_sync_us={}",
         outcome.input_bytes, outcome.output_bytes, s.elapsed_us,
-        s.build.stream_us, s.build.finish_us, s.build.verify_us);
+        s.build.stream_us, s.build.finish_us, s.build.verify_us, s.dir_sync_us);
 }
 
 /// Return already-freed heap pages to the OS. The load path streams large transient buffers (each
