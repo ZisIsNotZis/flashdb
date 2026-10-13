@@ -16,7 +16,7 @@
 //! - a grouped commit outside a group, a second `end_group`, and a nested
 //!   `begin_group` all fail closed, as do the other mutating paths.
 
-use flashdb_engine::engine::{Engine, Op, Outcome};
+use flashdb_engine::engine::{Engine, GroupPhase, Op, Outcome};
 use flashdb_engine::replay::execute_requests_grouped;
 use flashdb_engine::request::execute_request;
 use flashdb_engine::wal;
@@ -358,24 +358,26 @@ fn grouped_api_fails_closed_outside_and_around_a_group() {
     assert_eq!(wal_records(&files), 1);
 }
 
-/// `take_group_fsync_us` attributes the group's single WAL barrier (slice 54): an
-/// empty group takes no sync, and the accumulator resets exactly after it is read.
-/// The barrier's absolute elapsed time is not asserted (it depends on the file
-/// system and this machine), only the accounting contract the load driver's
-/// per-window attribution relies on. A non-zero-accumulation assertion on the
-/// non-empty group is deliberately omitted: the counter is
-/// `Instant::elapsed().as_micros()`, which truncates a sub-microsecond
-/// `fdatasync` to 0, and on a fast `fdatasync` (e.g. a tmpfs-backed temp dir)
-/// that makes `> 0` flaky rather than a property of the accounting.
+/// `take_group_phase_us` attributes the group's WAL append, memtable apply and
+/// single barrier (slice 55): an empty group accumulates nothing and the
+/// accumulator resets exactly after it is read. The phase's absolute elapsed
+/// times are not asserted (they depend on the file system and this machine),
+/// only the accounting contract the load driver's per-group attribution relies
+/// on. A non-zero-accumulation assertion on the non-empty group is deliberately
+/// omitted: the counters are `Instant::elapsed().as_micros()`, which truncates a
+/// sub-microsecond step to 0, and on a fast `fdatasync` (e.g. a tmpfs-backed
+/// temp dir) that makes `> 0` flaky rather than a property of the accounting.
 #[test]
-fn group_fsync_accounting_attributes_the_barrier_and_resets() {
+fn group_phase_accounting_attributes_and_resets() {
     let files = Files::new();
     let mut e = Engine::create(&files.wal).unwrap();
 
-    // An empty group appended nothing, so `end_group` owes no barrier.
+    // An empty group appended nothing, so `end_group` owes no barrier and the
+    // accumulated append/apply/fsync are all zero.
     e.begin_group().unwrap();
     e.end_group().unwrap();
-    assert_eq!(e.take_group_fsync_us(), 0, "an empty group takes no WAL sync");
+    assert_eq!(e.take_group_phase_us(), GroupPhase { append_us: 0, apply_us: 0, fsync_us: 0 },
+        "an empty group accumulates no WAL append/apply/barrier");
 
     // A group with one block takes one barrier; the elapsed time is accumulated
     // and then reset by the read, and a second read sees exactly zero.
@@ -383,7 +385,8 @@ fn group_fsync_accounting_attributes_the_barrier_and_resets() {
     let (id, ops) = block(1);
     assert_eq!(e.commit_block_grouped(&id, &ops).unwrap(), Outcome::Committed { csn: 1 });
     e.end_group().unwrap();
-    let _barrier_us = e.take_group_fsync_us(); // not asserted > 0: as_micros() truncates sub-us fsync on fast filesystems
-    assert_eq!(e.take_group_fsync_us(), 0, "the accumulator resets after it is read");
+    let _phase = e.take_group_phase_us(); // not asserted > 0: as_micros() truncates sub-us steps on fast filesystems
+    assert_eq!(e.take_group_phase_us(), GroupPhase { append_us: 0, apply_us: 0, fsync_us: 0 },
+        "the accumulator resets after it is read");
     assert_eq!(wal_records(&files), 1);
 }
