@@ -130,9 +130,12 @@ Non-stationarity (drift) is what makes the learner adapt and the
 ``flashdb-static-derived`` control not. **Drift trigger (per region):** the
 active candidate's per-request window cost deviates from the region's reference
 cost (the active arm's median per-request cost, set when the gate first opened)
-by more than ``drift_margin`` (default ``0.5`` = 50% relative) for
+by more than ``drift_margin`` (default ``2.0`` = 200% relative) for
 ``drift_windows`` (default 2) consecutive windows (the pre-registration's drift
-workload changes the access shape, so the active region's cost moves).
+workload changes the access shape, so the active region's cost moves). The
+200% floor is set above the device-saturation latency rise the rate ladder
+produces at high offered rungs (2-9x per-request cost on a shared box): that is
+a *load* artifact, not an access-shape change, and must not re-open exploration.
 
 The response is **targeted**. First, it is scoped to the region that triggered:
 only that region re-explores, and every other region keeps its committed
@@ -492,7 +495,7 @@ class LayoutLearner:
     stability_window: int = 2
     exploration_c: float = math.sqrt(2)
     ceilings_ns: Mapping[str, float] = field(default_factory=dict)
-    drift_margin: float = 0.5
+    drift_margin: float = 2.0
     drift_windows: int = 2
     # Targeted drift response: re-explore the incumbent plus the best K-1
     # challengers (None = the full candidate set, the correctness fallback).
