@@ -48,6 +48,44 @@ impl TileReadView {
         TileReadView { tiles, key_encoding }
     }
 
+    /// The key spelling this view's tiles were written under. The derived-index
+    /// builder uses it so its index keys probe the same spelling the engine's
+    /// authoritative reads accept.
+    pub(crate) fn key_encoding(&self) -> keys::KeyEncoding {
+        self.key_encoding
+    }
+
+    /// Tile-only walk of an entity's whole primary prefix (the exact prefix
+    /// [`crate::engine::Engine::scan_primary`] walks, minus the serving
+    /// memtable), yielding each live document's `(handle, csn, doc bytes)` once.
+    /// Used by the off-request-path secondary-access-path builder (WP-M): the
+    /// rows are exactly the tile-resident documents the authoritative scan would
+    /// visit, so an index built from them maps the right handles. Purely
+    /// observational; results never feed a correctness decision directly.
+    pub(crate) fn scan_primary(
+        &self,
+        entity: &[u8],
+        mut visit: impl FnMut(u64, u64, &[u8]) -> io::Result<()>,
+    ) -> io::Result<()> {
+        let mut prefix = keys::primary_prefix_with(self.key_encoding, entity, 0)?;
+        prefix.truncate(prefix.len() - 8);
+        let mut last_handle: Option<u64> = None;
+        for t in self.tiles.iter() {
+            if !t.could_contain_prefix(&prefix) { continue; }
+            let mut cursor = t.prefix_cursor(&prefix)?;
+            while let Some((key, value)) = cursor.next()? {
+                let Some((key_entity, handle, csn)) = keys::decode_primary(key) else { continue; };
+                if key_entity != entity { continue; }
+                if last_handle == Some(handle) { continue; }
+                last_handle = Some(handle);
+                if !value.is_empty() {
+                    visit(handle, csn, value)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Warm the unique-index block(s) for `(entity, field, value)` and, when the
     /// handle is found in a tile, the matching primary document block. The exact
     /// tile scan mirrors the authoritative read path (`scan_merged` for the

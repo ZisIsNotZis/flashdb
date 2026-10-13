@@ -116,13 +116,16 @@ pub const DEFAULT_MERGE_MIN_TILES: u8 = 2;
 
 /// One region's declared physical parameters: page size and bloom bits per key
 /// (per-tile values, written into each tile's superblock) plus the region's
-/// merge threshold (`merge_min_tiles`).
+/// merge threshold (`merge_min_tiles`) and its derived secondary-access-path
+/// request (`index_order_no`, WP-M: build the off-path `order_no -> handle`
+/// index for the StockMovement entity).
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct RegionLayout {
     name: String,
     page_size: u32,
     bloom_bits_per_key: u8,
     merge_min_tiles: u8,
+    index_order_no: bool,
 }
 
 /// Provisional per-prefix-region layout declaration (slice 17; per-region merge
@@ -226,6 +229,21 @@ impl LayoutPolicy {
             .unwrap_or(self.default_merge_min_tiles)
     }
 
+    /// WP-M actuator: whether `region` requests the derived `order_no ->
+    /// StockMovement handle` secondary access path (built off the request path).
+    /// Only the movement primary region (`P|StockMovement`) is acted on; a request
+    /// on any other region is a harmless no-op, and `false` everywhere is today's
+    /// behaviour (a full-entity scan). Never on the correctness path: the driver
+    /// merely builds the index off-path, and the read path falls back to the scan
+    /// whenever it is absent.
+    pub fn index_order_no_for_region(&self, region: &str) -> bool {
+        self.regions
+            .iter()
+            .find(|r| r.name == region)
+            .map(|r| r.index_order_no)
+            .unwrap_or(false)
+    }
+
     /// The policy-wide default, returned for every region without an override.
     pub fn default_layout(&self) -> (u32, u8) { self.default }
 
@@ -246,7 +264,7 @@ impl LayoutPolicy {
             return Some(previous);
         }
         let merge_min_tiles = self.default_merge_min_tiles;
-        self.regions.push(RegionLayout { name: region.to_string(), page_size, bloom_bits_per_key, merge_min_tiles });
+        self.regions.push(RegionLayout { name: region.to_string(), page_size, bloom_bits_per_key, merge_min_tiles, index_order_no: false });
         None
     }
 
@@ -258,7 +276,7 @@ impl LayoutPolicy {
             return Some(std::mem::replace(&mut entry.merge_min_tiles, merge_min_tiles));
         }
         let (page_size, bloom_bits_per_key) = self.default;
-        self.regions.push(RegionLayout { name: region.to_string(), page_size, bloom_bits_per_key, merge_min_tiles });
+        self.regions.push(RegionLayout { name: region.to_string(), page_size, bloom_bits_per_key, merge_min_tiles, index_order_no: false });
         None
     }
 
@@ -275,6 +293,7 @@ impl LayoutPolicy {
                 "page_size": r.page_size,
                 "bloom_bits_per_key": r.bloom_bits_per_key,
                 "merge_min_tiles": r.merge_min_tiles,
+                "index_order_no": r.index_order_no,
             }));
         }
         serde_json::json!({
@@ -318,6 +337,7 @@ impl LayoutPolicy {
                 page_size: policy.default.0,
                 bloom_bits_per_key: policy.default.1,
                 merge_min_tiles: policy.default_merge_min_tiles,
+                index_order_no: false,
             };
             if let Some(page) = entry.page_size {
                 validate_page_size(page)?;
@@ -330,6 +350,9 @@ impl LayoutPolicy {
             if let Some(min) = entry.merge_min_tiles {
                 validate_merge_min_tiles(min)?;
                 layout.merge_min_tiles = min;
+            }
+            if let Some(index) = entry.index_order_no {
+                layout.index_order_no = index;
             }
             if let Some(existing) = policy.regions.iter_mut().find(|r| r.name == *name) {
                 *existing = layout;
@@ -388,6 +411,8 @@ struct PolicyEntry {
     bloom_bits_per_key: Option<u8>,
     #[serde(default)]
     merge_min_tiles: Option<u8>,
+    #[serde(default)]
+    index_order_no: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -742,6 +767,11 @@ pub struct Engine {
     /// and `LayoutPolicy`): recovery must be told the encoding used to write
     /// (slice 50), and reads accept both spellings regardless.
     key_encoding: keys::KeyEncoding,
+    /// Derived secondary access path (WP-M): an off-request-path `order_no ->
+    /// StockMovement handle` index tile, built from the `P|StockMovement` tiles.
+    /// `None` until the driver adopts a built index. Never on the correctness
+    /// path: a miss, mismatch or absent index falls back to the full scan.
+    order_no_index: Option<crate::index::OrderNoIndex>,
     /// Per-pattern latency telemetry (slice 16). Observational only: never
     /// persisted, never read on the correctness path. `RefCell` is required
     /// because read paths take `&self`; it is the only interior mutability here.
@@ -903,6 +933,7 @@ impl Engine {
             layout: LayoutPolicy::declared_default(),
             region_mode: RegionMode::Global,
             key_encoding: keys::KeyEncoding::FamilyFirst,
+            order_no_index: None,
             metrics: RefCell::new(Metrics::new()),
             last_compaction: None,
         })
@@ -1104,7 +1135,7 @@ impl Engine {
         drop(records);
         drop(covered);
         Self::trim_retained_heap();
-        Ok(Engine { wal, mt, tiles, wal_path: wal_path.to_path_buf(), dir: parent_dir(wal_path), manifest: None, segment: None, segment_suffix_csn: csn, wal_detached: false, csn, dedup, max_handle, group_open: false, group_pending: false, group_append_us: 0, group_apply_us: 0, group_fsync_us: 0, barrier_worker: None, barrier_in_flight: 0, layout: LayoutPolicy::declared_default(), region_mode: RegionMode::Global, key_encoding: encoding, metrics: RefCell::new(Metrics::new()), last_compaction: None })
+        Ok(Engine { wal, mt, tiles, wal_path: wal_path.to_path_buf(), dir: parent_dir(wal_path), manifest: None, segment: None, segment_suffix_csn: csn, wal_detached: false, csn, dedup, max_handle, group_open: false, group_pending: false, group_append_us: 0, group_apply_us: 0, group_fsync_us: 0, barrier_worker: None, barrier_in_flight: 0, layout: LayoutPolicy::declared_default(), region_mode: RegionMode::Global, key_encoding: encoding, order_no_index: None, metrics: RefCell::new(Metrics::new()), last_compaction: None })
     }
 
     /// The CSN floor below which the active WAL file holds no records: the
@@ -2747,6 +2778,51 @@ impl Engine {
         out.sort();
         self.metrics.borrow_mut().region_probe(region, !out.is_empty());
         Ok(out)
+    }
+
+    /// Adopt a derived secondary access path built off the request path (WP-M).
+    /// The index tile and its parent-directory entry must already be durable (the
+    /// builder syncs the file; the driver syncs the directory before calling
+    /// this). The index is never on the correctness path: the movement scan
+    /// cross-checks every hit and falls back to the full scan on a miss.
+    pub fn adopt_order_no_index(&mut self, index: crate::index::OrderNoIndex) {
+        self.order_no_index = Some(index);
+    }
+
+    /// Retire the derived secondary access path (the policy toggled it off). The
+    /// read path then falls back to the full scan until a fresh index is built
+    /// and adopted.
+    pub fn clear_order_no_index(&mut self) {
+        self.order_no_index = None;
+    }
+
+    /// Whether a derived secondary access path is currently installed.
+    pub fn has_order_no_index(&self) -> bool {
+        self.order_no_index.is_some()
+    }
+
+    /// Attribute the derived index tile's output bytes to the movement primary
+    /// region's reorganisation counter, so the learner's reorg-priced reward
+    /// charges the off-path index build exactly like a merge (WP-M).
+    /// Observational only; never read on a correctness path.
+    pub fn record_order_no_index_build(&self, output_bytes: u64) {
+        let prefix = keys::primary_prefix_with(self.key_encoding, crate::index::INDEX_ENTITY, 0)
+            .expect("index entity is a valid name");
+        let region = self.region_of_prefix(&prefix);
+        if region != metrics::DISABLED {
+            self.metrics.borrow_mut().region_index_output(region, output_bytes);
+        }
+    }
+
+    /// Probe the derived `order_no -> StockMovement handle` index for `order_no`.
+    /// `None` when the index is absent or does not contain the key. Never
+    /// authoritative: a hit is cross-checked against the returned document, and a
+    /// miss falls back to the full scan.
+    pub fn lookup_movement_by_order_no(&self, order_no: &[u8]) -> io::Result<Option<u64>> {
+        match &self.order_no_index {
+            Some(index) => index.lookup(order_no),
+            None => Ok(None),
+        }
     }
 
     /// 按已声明唯一字段解析句柄（最新提交状态，无历史读）。

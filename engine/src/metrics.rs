@@ -595,6 +595,18 @@ impl Metrics {
         s.compaction_bytes = s.compaction_bytes.saturating_add(output_bytes);
     }
 
+    /// WP-M: attribute the derived secondary-access-path tile's output bytes to
+    /// the region's reorganisation (`compaction_bytes`) counter, so the learner's
+    /// reorg-priced reward charges the index build exactly like a merge. It does
+    /// NOT increment `compaction_merges` (an index build is not a merge).
+    pub fn region_index_output(&mut self, id: usize, output_bytes: u64) {
+        if !self.enabled || id == DISABLED {
+            return;
+        }
+        let s = self.region_stats_mut(id);
+        s.compaction_bytes = s.compaction_bytes.saturating_add(output_bytes);
+    }
+
     fn build_snapshot(&self) -> WindowSnapshot {
         let mut patterns = Vec::with_capacity(self.keys.len() + 1);
         for (i, k) in self.keys.iter().enumerate() {
