@@ -107,10 +107,154 @@ after each invocation, into `.scratch/62-eval-rerun/load.log`.
   against this load.
 - Disk: 211 GB free on `/tmp` (same volume).
 
-## Results
+## Results (4 runs = 3 independent access seeds 42/43/44 + seed 42 repeated, 12.25x c51)
 
-(To be filled after the runs.)
+Runs completed: **24 arm-runs** = 4 invocations × 6 arm-runs
+(win {declared, learned@1.0, static-derived} + adversarial {declared, learned@1.0, static-derived}).
+Raw artifacts: `seed42.json`, `seed43.json`, `seed44.json`, `seed42-repeat.json` (plus rendered `.md`
+and per-invocation `.stdout.log`), committed here. Load recorded at every run boundary in
+`load.log`.
 
-## Verbatim project verification
+### Environment during the runs (shared, noisy box)
 
-(To be filled at final HEAD.)
+Load average over the four invocations: **4.59 -> 8.82 -> 5.49 -> 7.17 -> 6.77** on 12 cores
+(snapshots at `.scratch/62-eval-rerun/load.log`). Present throughout: `llama-server` (95-371% CPU,
+7.8-16.4 GB RSS), `mpv` (~83% CPU), `wdavdaemon`/mdatp (41-58% CPU), `ghostty` (~30% CPU). A
+`chrome-headless` batch appeared during seed44. Every timing-derived number below must be read
+against this load; the lag ceiling is not uniformly destroyed by it (adversarial static-derived
+still holds 0/40 at rung 50 on all four runs), which is what lets the win-vs-adversarial contrast
+be read as a workload property rather than box noise alone.
+
+### Primary metric, both judging views
+
+`lag-only sustained` (STATUS §7.1) = a rung with achieved >= 95% of offered, no error window, and
+0 lag-ceiling-rejected windows, computed by hand from the committed JSON. `both-ceilings
+sustained` = the harness's own `sustained` flag (additionally 0 service-ceiling-rejected windows).
+The service ceiling rejects ~34-40/40 windows at every rung on every arm (the per-group `fdatasync`
+durability floor, STATUS §3), so **both-ceilings sustained = 0 rps everywhere** — the same open
+§7.1 reconciliation as WP-G/WP-H, not resolved here.
+
+**win (T1 workload), rung-50 lag-rejections:**
+
+| arm | seed42 | seed43 | seed44 | seed42-repeat |
+|---|---:|---:|---:|---:|
+| declared | 40/40 | 40/40 | 40/40 | 39/39 |
+| learned@1.0 | 40/40 | 40/40 | 40/40 | 39/39 |
+| static-derived | 39/40 | 40/40 | 40/40 | 39/39 |
+
+**No arm lag-sustains rung 50 on win.** Achieved throughput at rung 50 is near-offered for every
+arm (frac 0.997-1.000), but every rung-50 window is lag-rejected. Higher rungs also fail
+(declared frac 0.76-0.91 at rung 100, ~0.18-0.22 at rung 400). This is the WP-I exact remaining
+cause, unchanged: the win mix's ~30% `movements_scan` share runs a full-entity
+`P|StockMovement` primary scan (10.86 GB logical reads per run) whose inline CPU cost (cursor walk
++ per-document JSON parse + `order_no` filter on the single pacer) saturates the pacer. The scan
+warm (WP-I) warms pages, not CPU, so it does not close the gap.
+
+**adversarial (T2 workload), rung-50 lag-rejections:**
+
+| arm | seed42 | seed43 | seed44 | seed42-repeat |
+|---|---:|---:|---:|---:|
+| declared | 1/40 | 0/40 | 1/40 | 1/40 |
+| learned@1.0 | 1/40 | 0/40 | 1/40 | 0/40 |
+| static-derived | 0/40 | 0/40 | 0/40 | 0/40 |
+
+learned **matches declared** at rung 50 on every run (0-1/40), versus the pre-fix pilot's 8-9/40.
+The rung-50 lag churn the pre-registration disqualifies is gone. The residual 1/40 on seeds 42/44 is
+box noise: declared itself shows it, and static-derived holds 0/40 on the same runs.
+
+### T1 verdict (learned beats declared by >15% on win)
+
+**STILL UNDERIVABLE.** No arm sustains any rung on win under lag-only (all arms 0 rps), so the T1
+comparison cannot be drawn from 0-vs-0. The scan gap WP-I found is NOT closed. 3 independent seeds
++ 1 repeat, 1 lambda (1.0). This is a readiness gap, not a thesis verdict: the win workload must
+first be made measurable (an `order_no` index or an overlapped scan — both recorded by WP-I as
+out of scope for a read-ahead package).
+
+### T2 verdict (learned must not lose >5% on adversarial-uniform)
+
+**PARTIAL at 3 seeds + 1 repeat.** Two sub-questions:
+
+1. **Rung-50 lag: FIXED.** learned rung-50 lag-rej 0-1/40 = declared 0-1/40 on all 4 runs (the
+   pilot's 8-9/40 vs 0/40 disqualifying gap is gone). Under lag-only, learned's rung-50
+   sustainability now tracks declared's exactly (both fail the same 1/40 noise windows on seeds
+   42/44, both pass on seed 43).
+2. **Reorganisation band: NOT robustly met.** learned/declared reorg ratio on adversarial:
+
+   | seed42 | seed43 | seed44 | seed42-repeat | median |
+   |---:|---:|---:|---:|---:|
+   | 2.88x | 0.13x | 0.24x | 2.09x | 1.16x |
+
+   Two of four runs (both seed 42) exceed the 1.5x band (2.09x, 2.88x). The churn is a **single
+   region**: `P|Customer` oscillates its `merge_min_tiles` and writes 51-62 MB (5-6 merges) versus
+   declared's ~25-29 MB. On seed 42 the episode is late-run (52 MB at rung 100 + 15.7 MB at rung
+   200), and it leaks into higher-rung lag: learned rung-100 lag-rej 9/20 vs declared 1/20. So
+   rung 50 is clean but the WP-J residual (device-saturation drift re-committing a different
+   `P|Customer` threshold) is still live and still measurable.
+
+The harness's own `T2` line prints `PASS, learned loses +0.0%` — that is the both-ceilings 0/0
+artifact (both arms `sustained` = 0 because the service ceiling rejects every rung), NOT a real
+no-loss verdict. It must not be quoted as one.
+
+### Slice-39 zero-gain problem — persists (numbers)
+
+win learned/declared reorg ratio:
+
+| seed42 | seed43 | seed44 | seed42-repeat | median |
+|---:|---:|---:|---:|---:|
+| 0.28x | 0.38x | 8.37x | 0.38x | 0.38x |
+
+Three of four runs put learned **below** declared (0.28-0.38x — a mild reorganisation efficiency
+win), but that gives **no lag/throughput gain** (both arms still fail rung 50, see T1). One run
+(seed44) churns: `P|Customer` writes 72.5 MB (7 merges) — 63.6 MB of it **during rung 50** plus
+10.5 MB at rung 400 — for an 8.37x declared ratio, a **T3 FAIL** (`learned reorg 74,143,790 B vs
+declared 8,859,979 B`). So the slice-39 finding has changed shape: it is no longer a systematic
+4.13-4.27x, it is now a mostly-below-declared baseline with a **rare but severe churn blowup** that
+can land in the acceptance rung itself.
+
+### New defect introduced by the fixes?
+
+No new defect class. WP-I's scan-warm is inert on adversarial (no regression, matches WP-I's
+record) and necessary-but-insufficient on win. WP-J's churn is reduced in frequency but not
+eliminated: the same `P|Customer` threshold oscillation persists, and the win seed44 case shows it
+can fire at rung 50 (the acceptance rung) rather than only late-run. The 200% drift margin makes
+the episodes rarer but does not remove the underlying single-region oscillation.
+
+### Wall-clock cost per seed, and the full-campaign estimate
+
+Per seed (6 arm-runs = 3 arms x 2 workloads): seed42 10m01s, seed43 9m36s, seed44 10m10s,
+seed42-repeat 10m17s — **~10 min per seed**, i.e. ~1.6 min per arm-run (win ~2 min, adversarial
+~1.3 min, each including the `cp -a` of the 1.6 GB instance). Release build is one-time (~13 s).
+
+Full 10-seed pre-registered campaign: 10 seeds x {win, adversarial, drift} x
+{declared, learned, static-derived} = 90 arm-runs ≈ **~2.5 hours**, plus the drift pre-flight
+ladder; with a lambda sweep (0.1/1.0/10.0) it rises to ~150 arm-runs ≈ **~4-6 hours**. The
+binding prerequisite is unchanged from the pilot: a quiet box (the lag metric is not usable under
+llama-server + mpv + parallel evaluations for a 10-seed verdict).
+
+### Honest verdict
+
+NOT a 10-seed verdict. At 3 independent access seeds + 1 repeat on the 12.25x c51 instance, under
+shared-box load: (a) **T1 is still underivable** — the win scan gap is not closed (no arm sustains
+rung 50, 39-40/40 lag-rej); (b) **T2's disqualifying rung-50 lag churn is fixed** (learned 0-1/40
+= declared), but **the reorganisation churn is not robustly fixed** — learned exceeds declared's
+band (2.09x, 2.88x) on both seed-42 runs via a single-region `P|Customer` oscillation, and one win
+run (seed44) churns to 8.37x during rung 50 (T3 FAIL). The learner still does not beat declared on
+win, and its reorg cost is still not reliably within declared's band on adversarial.
+
+## Verbatim project verification (final HEAD, run after the matrix)
+
+1. `cargo build --workspace --offline` — 0 warnings:
+```
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 10.37s
+```
+2. `cargo test --workspace --offline` — totals: **293 passed; 0 failed; 0 ignored**
+(126 lib + 22 flashdb-load + 9 batch_commit + 5 compaction_job + 4 constraints + 3 family_colocation
++ 11 group_commit + 6 manifest_engine + 7 merge_threshold + 14 metrics + 33 multi_tile + 7 order_flow
++ 1 partitioned_publish_cap + 5 read_requests + 3 region_compaction + 6 region_partition +
+3 replay_trace + 8 request_commit + 2 scale_bin + 3 tile_format + 3 tile_layout + 12 tile_read +
+0 flashdb-replay + 0 flashdb-scale + 0 main + 0 doc-tests).
+3. `cd harness && uv run --with pytest pytest -q`:
+```
+134 passed in 5.23s
+```
+4. `git diff --check` — silent (exit 0).

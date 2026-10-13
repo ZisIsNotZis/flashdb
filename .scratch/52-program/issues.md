@@ -540,3 +540,21 @@ No failures, no conflicts.
   device-saturation drift episode — the exact remaining cause, labelled not-resolved); on win the
   learner still adapts (12/12 regions non-default both seeds, decision count > 0). Gates: 291 Rust
   + 134 Python tests green, cargo build 0 warnings, `git diff --check` silent.
+
+## wave10 WP-K dispatch record (T1/T2 re-run after WP-I + WP-J)
+
+- Timestamp: 2026-10-14T03:40:00+08:00.
+- Action: dispatched work package K "re-run the T1/T2 evaluation on the integrated engine after the
+  WP-I scan-readahead fix and the WP-J learner-churn fix" to the single-writer `wave10/eval`
+  worktree (isolated worktree, branch `wave10/eval`, based on integrated master `66e43c1`).
+  Contract, exact commands, per-arm/rung tables, both judging views, T1/T2 verdicts with seed
+  counts and noise band, residual gaps and cost estimate are in `.scratch/62-eval-rerun/issues.md`;
+  plan committed (`c821716d`) before any long run.
+- Result (pilot-grade, 3 independent access seeds 42/43/44 + seed 42 repeated, 12.25x c51, shared
+  box load avg 4.6-8.8): **T1 still underivable** (no arm lag-sustains rung 50 on win, 39-40/40
+  lag-rej — the scan gap is not closed); **T2 rung-50 lag churn fixed** (learned 0-1/40 = declared
+  on all 4 runs) but **T2 reorg churn not robustly fixed** (learned/declared ratio 0.13-2.88x,
+  median 1.16x; both seed-42 runs exceed 1.5x via a single-region `P|Customer` oscillation); win
+  seed44 churns `P|Customer` to 8.37x declared during rung 50 (T3 FAIL). The harness's both-ceilings
+  `T2 PASS` is a 0/0 artifact and must not be quoted. Gates: 293 Rust + 134 Python tests green,
+  cargo build 0 warnings, `git diff --check` silent.
