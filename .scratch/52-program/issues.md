@@ -540,3 +540,46 @@ No failures, no conflicts.
   device-saturation drift episode — the exact remaining cause, labelled not-resolved); on win the
   learner still adapts (12/12 regions non-default both seeds, decision count > 0). Gates: 291 Rust
   + 134 Python tests green, cargo build 0 warnings, `git diff --check` silent.
+
+## Integration record: wave9/scanwarm + wave9/churn
+
+- Timestamp: 2026-10-14T02:53:20+08:00
+- Actor: integrator worker (single writer on master)
+- Base at integration start: master `e0545aa8dc55e7464c4b12bbba09919bd08d0bb7`
+- Merge 1: `git merge --no-ff wave9/scanwarm` (WP-I scan read-ahead; engine code + dispatch record)
+  - Merge commit: `dc812bf2e6477151cb0decf1df682615a20c3e66`
+  - Parents: `e0545aa8dc55e7464c4b12bbba09919bd08d0bb7` + `de22471d2c12f8af6ad988715b7982343705cc70`
+  - Conflict resolution: `.scratch/52-program/issues.md` had a content conflict (master's wave8/eval integration record and the branch's wave9 WP-I dispatch record both appended at the same EOF location). Resolved by keeping both sections in chronological order (wave8 record first, then WP-I dispatch record).
+- Merge 2: `git merge --no-ff wave9/churn` (WP-J learner-churn fix; harness code + dispatch record + run artifacts)
+  - Merge commit: `66e43c133f33ba9d6f5317a690af33ee2a9b58a5`
+  - Parents: `dc812bf2e6477151cb0decf1df682615a20c3e66` + `ff6aa8cca66fc02328a42c9c1e07b39d60912aa1`
+  - Conflict resolution: `.scratch/52-program/issues.md` again conflicted at the same EOF location (integrated master's two existing sections vs the branch's wave9 WP-J dispatch record). Resolved by appending the WP-J dispatch record after the existing sections.
+- Final HEAD after integration: `66e43c133f33ba9d6f5317a690af33ee2a9b58a5`
+- Re-evaluation worktree created from integrated master:
+  - `git worktree add -b wave10/eval /home/z/vibe/worktrees/flashdb/wave10-eval master`
+    - Path: `/home/z/vibe/worktrees/flashdb/wave10-eval`, branch `wave10/eval`, HEAD `66e43c133f33ba9d6f5317a690af33ee2a9b58a5`
+
+Combined gates (run at merge `66e43c133f33ba9d6f5317a690af33ee2a9b58a5`; 0 warnings throughout):
+
+1. `cargo build --workspace --offline` — 0 warnings:
+```
+   Compiling flashdb-engine v0.1.0 (/home/z/vibe/flashdb/engine)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.58s
+```
+
+2. `cargo test --workspace --offline` — totals: **293 passed; 0 failed; 0 ignored**
+   (126 lib + 22 flashdb-load + 9 batch_commit + 5 compaction_job + 4 constraints +
+   3 family_colocation + 11 group_commit + 6 manifest_engine + 7 merge_threshold +
+   14 metrics + 33 multi_tile + 7 order_flow + 1 partitioned_publish_cap + 5 read_requests +
+   3 region_compaction + 6 region_partition + 3 replay_trace + 8 request_commit + 2 scale_bin +
+   3 tile_format + 3 tile_layout + 12 tile_read + 0 flashdb-replay + 0 flashdb-scale + 0 main + 0 doc-tests)
+
+3. `cd harness && uv run --with pytest pytest -q`:
+```
+warning: `VIRTUAL_ENV=/home/z/.venv` does not match the project environment path `.venv` and will be ignored; use `--active` to target the active environment instead
+134 passed in 4.12s
+```
+
+4. `git diff --check` — silent (exit 0).
+
+No failures.
