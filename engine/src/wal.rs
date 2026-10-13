@@ -59,7 +59,7 @@ impl Wal {
     /// 返回句柄与恢复出的记录（按序）。
     pub fn open_or_recover(path: impl AsRef<Path>) -> io::Result<(Wal, Vec<Vec<u8>>)> {
         let (records, valid_len) = replay(path.as_ref())?;
-        let mut file = OpenOptions::new().write(true).open(path.as_ref())?;
+        let mut file = OpenOptions::new().read(true).write(true).open(path.as_ref())?;
         file.set_len(valid_len)?;
         file.seek(SeekFrom::Start(valid_len))?;
         Ok((Wal { file, path: path.as_ref().to_path_buf(), valid_len, poisoned: false,
@@ -123,6 +123,13 @@ impl Wal {
         self.valid_len
     }
 
+    /// A duplicated handle to the live WAL file (for off-request-path workers
+    /// that must read a bounded suffix without reopening the path, which a
+    /// concurrent rotation may have renamed or unlinked).
+    pub(crate) fn file_clone(&self) -> io::Result<File> {
+        self.file.try_clone()
+    }
+
     /// Test-only: arm the injected partial-append fault, so an engine-level test
     /// can exercise a failed append. Compiled only under `cfg(test)` and
     /// `pub(crate)`, so it is unreachable from the shipping API.
@@ -144,9 +151,92 @@ pub fn replay(path: impl AsRef<Path>) -> io::Result<(Vec<Vec<u8>>, u64)> {
 /// 流式读取 WAL：逐条把完整载荷交给 `visit`，不收集整段后缀，因此一次遍历的
 /// 调用方不必再持有一份 replay 记录向量。分帧、CRC、全零尾与失败即拒绝的规则
 /// 与 [`replay`] 完全一致；返回有效字节数。
-pub fn replay_each(path: impl AsRef<Path>, mut visit: impl FnMut(&[u8]) -> io::Result<()>) -> io::Result<u64> {
+pub fn replay_each(path: impl AsRef<Path>, visit: impl FnMut(&[u8]) -> io::Result<()>) -> io::Result<u64> {
     let file = File::open(path.as_ref())?;
     let mut r = BufReader::with_capacity(1 << 16, file);
+    replay_reader(&mut r, visit)
+}
+
+/// 从已经打开的 WAL 句柄流式读取前 `limit` 个有效字节，规则与 [`replay`] 完全
+/// 一致。供离请求路径的压缩工作线程使用：把压缩任务创建时的 `valid_len` 作为
+/// 上界，工作线程就绝不会看到快照之后才追加的记录（也绝不会撞上并发追加的
+/// 撕裂尾之外的、父线程尚未确认的数据）。
+///
+/// 用 `pread`（`FileExt::read_at`）按显式偏移读，绝不动用共享的文件偏移：
+/// `file` 通常来自 `Wal::file_clone`（dup），它与写路径共享同一个文件描述，
+/// 若用带偏移的 `Read` 会把写游标一起搅乱。
+pub fn replay_file_each(file: &File, limit: u64, mut visit: impl FnMut(&[u8]) -> io::Result<()>) -> io::Result<u64> {
+    let mut offset: u64 = 0;
+    let mut valid: u64 = 0;
+    loop {
+        if offset >= limit { break; }
+        if limit - offset < HEADER as u64 { break; }
+        let mut header = [0u8; HEADER];
+        read_at_exact(file, &mut header, offset)?;
+        let len = u32::from_le_bytes(header[..4].try_into().unwrap()) as usize;
+        if len == 0 {
+            // Only an entirely zero remainder is a preallocated tail. A
+            // zeroed acknowledged frame header followed by its old payload
+            // must fail closed instead of truncating that committed record.
+            if header[4..].iter().any(|&b| b != 0) {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "WAL zero-length header has nonzero CRC"));
+            }
+            let mut pos = offset + HEADER as u64;
+            while pos < limit {
+                let n = (limit - pos).min(8192) as usize;
+                let mut buf = vec![0u8; n];
+                read_at_exact(file, &mut buf, pos)?;
+                if buf.iter().any(|&b| b != 0) {
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, "WAL zero tail contains data"));
+                }
+                pos += n as u64;
+            }
+            break;
+        }
+        if len > MAX_RECORD {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "WAL record length exceeds limit"));
+        }
+        offset = offset.checked_add(HEADER as u64).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "WAL offset overflow"))?;
+        if limit - offset < len as u64 { break; }
+        let mut payload = vec![0u8; len];
+        read_at_exact(file, &mut payload, offset)?;
+        if crc32c(&payload) != u32::from_le_bytes(header[4..].try_into().unwrap()) {
+            // A complete bad frame might be an acknowledged record corrupted
+            // after sync. Never silently truncate it as an unacknowledged tail.
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "WAL record CRC mismatch"));
+        }
+        visit(&payload)?;
+        offset = offset.checked_add(len as u64).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "WAL offset overflow"))?;
+        valid += (HEADER + len) as u64;
+    }
+    Ok(valid)
+}
+
+/// `pread` 精确读：显式偏移读满 `bytes`，不依赖也不改动共享文件偏移。
+fn read_at_exact(file: &File, mut bytes: &mut [u8], mut offset: u64) -> io::Result<()> {
+    use std::os::unix::fs::FileExt;
+    while !bytes.is_empty() {
+        match file.read_at(bytes, offset) {
+            Ok(0) => return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "WAL truncated during read")),
+            Ok(n) => {
+                offset = offset.checked_add(n as u64).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "WAL offset overflow"))?;
+                bytes = &mut bytes[n..];
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+/// [`replay_file_each`] 的收集版本，返回（完整记录, 有效字节数）。
+pub fn replay_file(file: &File, limit: u64) -> io::Result<(Vec<Vec<u8>>, u64)> {
+    let mut records = Vec::new();
+    let valid = replay_file_each(file, limit, |payload| { records.push(payload.to_vec()); Ok(()) })?;
+    Ok((records, valid))
+}
+
+fn replay_reader(mut r: impl Read, mut visit: impl FnMut(&[u8]) -> io::Result<()>) -> io::Result<u64> {
     let mut valid: u64 = 0;
     loop {
         let mut header = [0u8; HEADER];
