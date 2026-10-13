@@ -1241,6 +1241,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         // block records only service latency, never lag twice.
         let mut lag_recorded = false;
         let now_us = t0.elapsed().as_secs_f64() * 1e6;
+        // Finalize any barriers that completed since the last iteration, without
+        // blocking: this frees in-flight slots AND records each group's service
+        // samples in the window where it actually completed, so the ordinary
+        // window-boundary drain only has to account for the sliver that finished
+        // since the previous iteration (and never waits on a slow fsync).
+        drain_completed_groups(
+            &mut engine, &mut pending, total, &args.rates, args.segment_requests,
+            window_index,
+            &mut completed, &mut errors, &mut else_used, &mut first_error,
+            &mut latencies, &mut group_elapseds,
+            &mut window_fsync_sum, &mut stall_group)?;
         if due_us <= now_us {
             let size = args.group_requests.or(args.commit_batch).unwrap_or(1).max(1);
             window_rate = rate_for(index, total, &args.rates, args.segment_requests);
