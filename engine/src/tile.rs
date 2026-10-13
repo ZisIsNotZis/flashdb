@@ -73,16 +73,28 @@ fn invalid(message: &'static str) -> io::Error { io::Error::new(ErrorKind::Inval
 
 fn valid_key(key: &[u8]) -> bool {
     if key.len() < 18 { return false; }
-    match key[0] {
-        keys::P => keys::decode_primary(key).is_some_and(|(name, _, _)| !name.is_empty()),
+    let Some(region) = keys::region_prefix(key) else { return false };
+    // `region` is `MARKER | entity | 0`; a nonempty entity needs at least 3 bytes,
+    // which also rejects the empty-entity spelling.
+    if region.len() < 3 { return false; }
+    let (family, body) = match region[0] {
+        // Family-first: the marker IS the family, and the body is the remainder
+        // after `entity | 0`.
+        keys::P | keys::U | keys::R => (region[0], &key[region.len()..]),
+        // Entity-first: after `entity | 0` comes the family byte, then the body.
+        keys::ENTITY_FIRST => match key.get(region.len()) {
+            Some(&f) if f == keys::P || f == keys::U || f == keys::R => (f, &key[region.len() + 1..]),
+            _ => return false,
+        },
+        _ => return false,
+    };
+    match family {
+        keys::P => body.len() == 16,
         keys::U | keys::R => {
-            let Some(first) = key[1..].iter().position(|&b| b == 0) else { return false };
-            if first == 0 { return false; }
-            let Some(tail) = key.get(first + 2..) else { return false };
-            let Some(second) = tail.iter().position(|&b| b == 0) else { return false };
-            if second == 0 { return false; }
-            let rest = &tail[second + 1..];
-            if key[0] == keys::R { rest.len() == 24 }
+            let Some(field_end) = body.iter().position(|&b| b == 0) else { return false };
+            if field_end == 0 { return false; }
+            let rest = &body[field_end + 1..];
+            if family == keys::R { rest.len() == 24 }
             else {
                 rest.len() >= 20 && usize::try_from(u32::from_be_bytes(rest[..4].try_into().unwrap()))
                     .ok().and_then(|n| n.checked_add(20)) == Some(rest.len())
