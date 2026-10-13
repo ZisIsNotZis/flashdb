@@ -171,3 +171,42 @@ Combined gates (run at merged master `112f96a`):
   durability, so no latency fix was applied: the ticket states the smallest honest blocker and
   proposes (not implements) how the pre-registration can treat the 10 ms service ceiling.
   279 Rust tests and 132 Python tests green; 0 build warnings; `git diff --check` silent.
+
+## Integration record: wave3/residual
+
+- Timestamp: 2026-10-13T21:16:00+08:00
+- Actor: integrator worker (single writer on master)
+- Base at integration start: master `af86df186d6c49a4e5c3c8816a85b48c43e19d62`
+- Merge: `git merge --no-ff wave3/residual` (residual-tail attribution + honesty repair; independently verified PASS at `55c26ae`)
+  - Merge commit: `5fbc229e1f1e7a65d175ce10a2c4eff6ecd9e30a`
+  - Parents: `af86df186d6c49a4e5c3c8816a85b48c43e19d62` + `55c26aeccef23c8c2da6b2e8fe97be0c81779ef5`
+  - Conflict resolution: one content conflict in `.scratch/52-program/issues.md` (both branches appended a section after the same line). Resolved by keeping both `Integration record: wave2/tailfix` and `wave3 WP-C dispatch record` in chronological order; no content dropped.
+- Control scripts committed separately: `6cc177a` "52: wave2/wave3 orchestration control scripts" (3 untracked *.js under `.scratch/52-program/`).
+- Final HEAD before this record: `6cc177abca879dc70370b0b3d1eba00d0777dbe3`
+- Next lane worktree: `git worktree add -b wave4/lag /home/z/vibe/worktrees/flashdb/wave4-lag master`
+  - Worktree path: `/home/z/vibe/worktrees/flashdb/wave4-lag`
+  - Branch: `wave4/lag`
+  - HEAD: `6cc177abca879dc70370b0b3d1eba00d0777dbe3`
+
+Combined gates (run at merged master `6cc177a`):
+
+1. `source $HOME/.cargo/env; cargo build --workspace --offline` — 0 warnings:
+```
+   Compiling flashdb-engine v0.1.0 (/home/z/vibe/flashdb/engine)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.60s
+```
+
+2. `cargo test --workspace --offline` — totals: 279 passed; 0 failed; 0 ignored.
+(117 lib + 19 flashdb-load + 9 batch_commit + 5 compaction_job + 4 constraints +
+3 family_colocation + 9 group_commit + 6 manifest_engine + 7 merge_threshold +
+14 metrics + 33 multi_tile + 7 order_flow + 1 partitioned_publish_cap + 5 read_requests +
+3 region_compaction + 6 region_partition + 3 replay_trace + 8 request_commit + 2 scale_bin +
+3 tile_format + 3 tile_layout + 12 tile_read + 0 flashdb-replay + 0 flashdb-scale + 0 main + 0 doc-tests)
+
+3. `cd harness && uv run --with pytest pytest -q`:
+```
+warning: `VIRTUAL_ENV=/home/z/.venv` does not match the project environment path `.venv` and will be ignored; use `--active` to target the active environment instead
+132 passed in 5.57s
+```
+
+4. `git diff --check` — silent (exit 0).
