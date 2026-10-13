@@ -443,3 +443,22 @@ warning: `VIRTUAL_ENV=/home/z/.venv` does not match the project environment path
 4. `git diff --check` — silent (exit 0).
 
 No failures, no conflicts.
+
+## wave8 WP-H dispatch record (eval pilot)
+
+- Timestamp: 2026-10-14T01:40:00+08:00.
+- Action: dispatched work package H "T1/T2/T4 evaluation PILOT under the fixed engine" to the
+  single-writer `wave8/eval` worktree. Contract, exact commands, per-arm/per-rung tables, both
+  judging views, T1-T4 directions with seed counts and noise band, readiness gaps, and the full
+  campaign cost estimate are in `.scratch/59-eval-pilot/issues.md` (plan committed `8a3c059` before
+  any long run; results and the four JSON/`md` artifacts committed after).
+- Result: NOT a 10-seed verdict. 13 arm-runs = 2 access seeds (42/43) per (arm, workload) on the
+  12.25x c51 instance, win declared seed-42 repeated. Under heavy external box load (llama-server
+  92-95% CPU + a parallel 6-way evaluation, load avg 5-16): (a) the win (T1) workload is
+  unmeasurable — no arm sustains rung 50 because the 30% movement-scan share does cold reads on the
+  pacer (the read-ahead worker warms only unique-prefix lookups); (b) on adversarial-uniform the
+  learned arm LOSES the rung-50 lag ceiling to declared (8-9/40 vs 0/40) while writing 3.6-4.4x
+  declared's reorganisation bytes — the T2 failure direction; (c) win T3 ratio 0.19-2.71x across 3
+  runs (below 3x but non-reproducible); (d) run-to-run throughput spread 38-71% (win) vs 1%
+  (adversarial). The thesis is blocked on the win scan path and a quiet-box 10-seed run, not yet
+  derivable.
