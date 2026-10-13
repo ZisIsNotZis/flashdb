@@ -29,12 +29,12 @@ C = ll.LayoutCandidate(4096, 200)
 
 def stats(region: str, *, count: int = 100, mean_ns: float = 1000.0,
           bytes_written: int = 0, compaction_bytes: int = 0,
-          p99_ns: float = 0.0) -> ll.RegionStats:
+          index_output_bytes: int = 0, p99_ns: float = 0.0) -> ll.RegionStats:
     return ll.RegionStats(
         region=region, probes=count, probe_misses=0, bytes_read=0,
         bytes_written=bytes_written, commit_blocks=count, commit_ops=count,
         count=count, mean_ns=mean_ns, p50_ns=mean_ns, p99_ns=p99_ns,
-        compaction_bytes=compaction_bytes,
+        compaction_bytes=compaction_bytes, index_output_bytes=index_output_bytes,
     )
 
 
@@ -119,6 +119,19 @@ def test_reward_proxy_is_service_time_plus_lambda_times_bytes():
     assert ll.region_cost_ns(row, 1.0) == 10 * 200.0 + 500
     # lambda prices endurance: a bigger lambda makes a write-heavy candidate costlier
     assert ll.region_cost_ns(row, 4.0) == 10 * 200.0 + 4 * 500
+
+
+def test_reward_prices_the_order_no_index_build_output_but_not_as_merge_churn():
+    row = stats("P|StockMovement", count=10, mean_ns=200.0, bytes_written=500,
+                index_output_bytes=2_000_000)
+    assert ll.region_cost_ns(row, 1.0) == 10 * 200.0 + 500 + 2_000_000
+    # The index build output is priced in the reward but does NOT enter the
+    # churn budget, which keys off the merge reorganisation mean only.
+    arm = ll._Arm()
+    arm.n = 1
+    arm.compaction_n = 1
+    arm.sum_compaction_bytes = 0.0
+    assert arm.mean_compaction_bytes == 0.0
 
 
 def test_reward_prices_reorganisation_bytes_at_the_device_cost_unit():

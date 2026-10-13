@@ -39,14 +39,15 @@ For one region in one window, from the slice-26 telemetry row, define the
 region's **cost** (LOWER is better), in nanoseconds of service time::
 
     cost_ns = count * mean_ns
-              + lambda_ns_per_byte * (bytes_written + compaction_bytes)
+              + lambda_ns_per_byte * (bytes_written + compaction_bytes + index_output_bytes)
 
 Both terms are **nanoseconds of service time**. ``count * mean_ns`` is the
 region's total service time in the window -- the throughput term the objective
 scores (objective v1: sustained throughput under offered load). The second term
 is the **endurance** price of the bytes the region wrote to storage in the
 window: its WAL ingest (``bytes_written``) *plus* the reorganisation output the
-merge knob actually moves (``compaction_bytes``, slice 34). It is charged at the
+merge knob actually moves (``compaction_bytes``, slice 34) *plus* the derived
+secondary-access-path build output (``index_output_bytes``, WP-M). It is charged at the
 region's own device cost.
 
 **Unit derivation.**  ``lambda_ns_per_byte`` is the price of a written byte, in
@@ -199,9 +200,10 @@ What the learner CANNOT do here
   cost of a window is attributed to the candidate that was active for it, so a
   freshly switched-to page size is credited with a window it only partly
   affected. This is a stated bias, not compensated.
-* It prices the endurance term with **``bytes_written + compaction_bytes``**
-  (all bytes the region wrote to storage in the window) at the device-cost unit
-  (Slice 39). It still cannot see the engine's *global* compaction-selection
+* It prices the endurance term with **``bytes_written + compaction_bytes +
+  index_output_bytes``** (all bytes the region wrote to storage in the window) at
+  the device-cost unit (Slice 39). The WP-M `index_output_bytes` term is priced
+  for endurance but excluded from the churn budget. It still cannot see the engine's *global* compaction-selection
   interaction: which region's tiles are merged each window depends on every
   region's merge threshold (slice 37/38 measured deferral in one region funnelling
   merges into an eager neighbour), and the reward attributes each region only its
@@ -312,6 +314,9 @@ class RegionStats:
     # and the merge count). Absent from a pre-slice-34 dump, so defaulted to 0.
     compaction_bytes: int = 0
     compaction_merges: int = 0
+    # WP-M: derived secondary-access-path tile bytes built for this region.
+    # Priced in the reward (endurance) but NOT in the merge-churn budget.
+    index_output_bytes: int = 0
 
     @classmethod
     def from_json(cls, obj: Mapping) -> "RegionStats":
@@ -329,6 +334,7 @@ class RegionStats:
             p99_ns=float(obj.get("p99_ns", 0.0)),
             compaction_bytes=int(obj.get("compaction_bytes", 0)),
             compaction_merges=int(obj.get("compaction_merges", 0)),
+            index_output_bytes=int(obj.get("index_output_bytes", 0)),
         )
 
 
@@ -382,12 +388,14 @@ def region_cost_ns(stats: RegionStats, lambda_ns_per_byte: float = DEFAULT_LAMBD
     """The reward proxy: service time (``count * mean_ns``) plus the priced write term.
 
     Lower is better. The write term prices ALL bytes the region wrote to storage in the window
-    -- WAL ingest (``bytes_written``) plus reorganisation output (``compaction_bytes``) -- at
-    ``lambda_ns_per_byte`` ns/byte, whose default is the measured device write cost. See the
-    module docstring for the unit derivation and why the reorganisation bytes are priced.
+    -- WAL ingest (``bytes_written``), reorganisation output (``compaction_bytes``) and the
+    derived secondary-access-path build output (``index_output_bytes``) -- at
+    ``lambda_ns_per_byte`` ns/byte, whose default is the measured device write cost. The index
+    build output is priced here (endurance) but deliberately excluded from the churn budget.
     """
     return (stats.count * stats.mean_ns
-            + lambda_ns_per_byte * (stats.bytes_written + stats.compaction_bytes))
+            + lambda_ns_per_byte
+            * (stats.bytes_written + stats.compaction_bytes + stats.index_output_bytes))
 
 
 def region_rewrite_factor(stats: RegionStats) -> float | None:
