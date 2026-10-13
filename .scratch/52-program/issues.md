@@ -502,3 +502,23 @@ warning: `VIRTUAL_ENV=/home/z/.venv` does not match the project environment path
 4. `git diff --check` — silent (exit 0).
 
 No failures, no conflicts.
+
+## wave9 WP-I dispatch record (scan read-ahead)
+
+- Timestamp: 2026-10-14T02:08:00+08:00.
+- Action: dispatched work package I "make the win workload's SCAN reads part of the read-ahead warm
+  set" to the single-writer `wave9/scanwarm` worktree. Contract, diagnosis, rejected alternatives,
+  design, change, before/after tables, both judging views and verdict are in
+  `.scratch/60-scan-readahead/issues.md`.
+- Result: the scan-warm extension is implemented and sound (memoized per-snapshot full-prefix warm of
+  `P|StockMovement`, commits `d951522` checkpoint + `6695493` implementation), but it does NOT move
+  the win lag ceiling: rung-50 lag-rej is 38/38 before vs 39/40 after (box noise). The measured
+  exact remaining cause is that the win scan is CPU-bound on the pacer, not page-in-bound — the run
+  has a 98.9% page-cache hit rate before AND after (the scan re-reads the same ~4.8 MB entity every
+  ~67 ms and self-warms), while the inline `execute_request` read phase is ~103-117 s over the
+  ~117-125 s run (~89-94% of wall time) and unchanged by warming. Removing that inline CPU cost needs
+  an `order_no` index (write-path change) or an overlapped scan (breaks the authoritative-reads-stay-
+  inline invariant), both out of scope for a read-ahead package and recorded for the next work
+  package. No point-lookup regression mechanism (scan warm is inert for adversarial shapes) and no
+  read/write amplification blowup (+2.3% device reads). 293 Rust / 132 Python tests green; 0 build
+  warnings; `git diff --check` silent.

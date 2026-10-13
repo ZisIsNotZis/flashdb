@@ -547,6 +547,24 @@ pub fn request_read_lookups(req: &Value) -> Vec<ReadLookup> {
     Vec::new()
 }
 
+/// The full-entity primary-prefix scans a supported request's read path performs.
+/// The movement scan shape has no `order_no` index (the catalog indexes only
+/// `movement_no`), so its read is a whole `StockMovement` primary scan rather than
+/// a unique lookup; the read-ahead worker warms exactly that prefix. Every other
+/// shape is a bounded unique lookup (covered by [`request_read_lookups`]) and
+/// returns nothing here.
+pub fn request_scan_entities(req: &Value) -> Vec<&'static str> {
+    let Some(q) = req.get("blocks")
+        .and_then(Value::as_object)
+        .and_then(|blocks| blocks.get("q"))
+        .and_then(Value::as_object) else { return Vec::new() };
+    let Some(find) = q.get("find").and_then(Value::as_object) else { return Vec::new() };
+    if find.contains_key("StockMovement") {
+        return vec![MOVEMENT.entity];
+    }
+    Vec::new()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -582,5 +600,29 @@ mod tests {
             "blocks": {"q": {"find": {"StockMovement": {"where": {"order_no": "O9"}}, "order": ["movement_no"], "limit": 100}}}
         });
         assert!(request_read_lookups(&movements).is_empty(), "a movement scan has no unique prefix to warm");
+    }
+
+    #[test]
+    fn request_scan_entities_names_only_the_full_entity_scans() {
+        let movements = json!({
+            "blocks": {"q": {"find": {"StockMovement": {"where": {"order_no": "O9"}}, "order": ["movement_no"], "limit": 100}}}
+        });
+        assert_eq!(request_scan_entities(&movements), vec!["StockMovement"]);
+
+        let stock_get = json!({
+            "blocks": {"q": {"get": {"Stock": {"where": {"sku": "S2", "loc": "L2"}}}}}
+        });
+        assert!(request_scan_entities(&stock_get).is_empty(), "a point probe is not a scan");
+
+        let customer_find = json!({
+            "blocks": {"q": {"find": {"Customer": {"email": "b@y"}}}}
+        });
+        assert!(request_scan_entities(&customer_find).is_empty());
+
+        let order_flow = json!({
+            "blocks": {"cust": {"find": {"Customer": {"email": "$email"}}}, "take": {"needs": ["cust"]}},
+            "params": {"email": "a@x", "order_no": "O1", "sku": "S1", "loc": "L1", "qty": 1}
+        });
+        assert!(request_scan_entities(&order_flow).is_empty());
     }
 }
