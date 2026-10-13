@@ -397,10 +397,13 @@ def test_targeted_drift_response_window_count_and_the_two_window_gap():
 
     def measure(learner: ll.LayoutLearner, pre: dict, post: dict) -> int:
         selection: dict = {}
-        for i in range(8):
+        # Enough pre-drift windows for the burn-in to complete before the drift
+        # boundary, so the reference is a clean pre-drift baseline.
+        pre_windows = len(learner.candidates) * min_samples
+        for i in range(pre_windows):
             learner.observe(window(i, {region: pre}, selection))
             selection = learner.selections()
-        for i in range(8, 60):
+        for i in range(pre_windows, 60):
             learner.observe(window(i, {region: post}, selection))
             selection = learner.selections()
         assert region not in learner.reexploring_regions()
@@ -587,6 +590,55 @@ def test_no_churn_when_all_candidates_are_equal_with_controls_enabled():
     assert all(t == trace[-1] for t in trace[burn_in:])
     assert sum(learner.gated_switches().values()) == 0
     assert sum(learner.restarts().values()) == 0
+
+
+# ---------------------------------------------------------------------------
+# WP-J: the adversarial-uniform churn fix (per-request, median-scored bandit)
+# ---------------------------------------------------------------------------
+def test_drift_is_load_invariant_a_rate_step_does_not_fire():
+    """A rate-ladder step scales `count`, not per-request cost: it must not look like drift.
+
+    The pre-change learner keyed drift on TOTAL window cost (``count * mean_ns``), so doubling the
+    offered rate (and with it the region's request count) fired a spurious drift restart at every
+    rung boundary -- the WP-H churn on adversarial-uniform. Per-request cost makes the signal
+    load-invariant: a rate step now leaves it unchanged.
+    """
+    region = "P|Stock"
+    learner = ll.LayoutLearner(min_samples=2, stability_window=1, margin=0.05,
+                               drift_margin=0.5, drift_windows=2, seed=0)
+
+    def w(i: int, count: int) -> ll.WindowTelemetry:
+        return ll.WindowTelemetry(window=i, rate_rps=float(count), regions={
+            region: stats(region, count=count, mean_ns=5000.0)})
+
+    for i in range(24):
+        learner.observe(w(i, 100))          # burn-in completes and the gate opens at the low rung
+    assert learner.restarts().get(region, 0) == 0
+    for i in range(24, 30):
+        learner.observe(w(i, 200))          # offered rate doubles; per-request cost is unchanged
+    assert learner.restarts().get(region, 0) == 0, learner.restarts()
+
+
+def test_median_cost_holds_the_incumbent_through_a_one_window_spike():
+    """A single shared-device latency spike must not make the gate switch to a noise-cheaper rival.
+
+    The pre-change learner scored arms by MEAN cost, so one huge spike inflated the incumbent's
+    mean and made an otherwise-worse rival look cheaper by >margin. The MEDIAN ignores the outlier,
+    which is what lets a no-locality workload settle instead of churn.
+    """
+    region = "P|Stock"
+    learner = ll.LayoutLearner(candidates=(A, B), min_samples=3, margin=0.05,
+                               stability_window=1, drift_margin=10.0, seed=0)
+    for _ in range(3):
+        learner.record(region, A, stats(region, mean_ns=5000.0))
+    for _ in range(3):
+        learner.record(region, B, stats(region, mean_ns=5100.0))
+    learner.step([region], explore=False)   # gate open; B is not 5% cheaper than A
+    assert learner.selections()[region] == A
+    learner.record(region, A, stats(region, mean_ns=500_000.0))   # one stall window
+    learner.step([region], explore=False)
+    assert learner.selections()[region] == A
+    assert learner.gated_switches().get(region, 0) == 0
 
 
 # ---------------------------------------------------------------------------
