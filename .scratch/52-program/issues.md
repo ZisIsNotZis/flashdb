@@ -372,3 +372,17 @@ warning: `VIRTUAL_ENV=/home/z/.venv` does not match the project environment path
 ```
 
 4. `git diff --check` — silent (exit 0).
+
+## SSOT refresh record (waves 2-6)
+
+- Timestamp: 2026-10-14T00:01:33+08:00
+- Actor: SSOT (current-state) writer worker.
+- Scope: refresh the current-state SSOT after waves 2-6. Changed files and the source ticket for each change:
+
+| file | change | source ticket |
+|---|---|---|
+| `.scratch/STATUS.md` | rewrote to current facts: test counts 289 Rust / 132 Python; off-request-path compaction (`a59f703`+`ae1df85`, repair `f4539e4`); overlapped durability-preserving WAL barrier (`083da49`+`413176c`, `MAX_PENDING_BARRIERS=64`, ack-after-covering-fdatasync, fail-closed); non-blocking window-boundary drain (`ec47e25`+`76231d2`, `boundary=0`); rung-50 lag-rej cold44 6/40, c51 4/40, ef 15/40; device fsync 6.7/13.4 ms idle, 71-498 ms under load, reads 4.03 blocks/req; entity-first co-location −16.6% reads (4.03→3.36) but ~12x write amp (21 MB→265 MB) and worse tail; whole-run reorganisation 20.9-23.3 MB over 26-27 merges (was ~318 MB over 64); added the OPEN primary-vs-service ceiling reconciliation to §7 with its three options; removed the stale delegation note and compressed the §6 defect changelog | 53, 54, 55, 56, 57 |
+| `docs/engine.md` | foreground-commit section now states the overlapped barrier: append+apply before the covering `fdatasync`, ack only after it returns, memtable visible before durable, fail-closed, `MAX_PENDING_BARRIERS=64`; removed the stale "memtable applied after fsync" and "2 ms / 128 blocks flush" lines | 56 (design), 57 (cap/boundary fixes) |
+| `docs/objective.md` | latency statement now marks the lag-only primary as the adopted §7.1 decision and flags the open reconciliation with `pre-registration.md`'s either-ceiling validity rule | 54, 55, 56, 57 (residual proposals + open item) |
+
+- Not changed: `.scratch/15-objective-v0/pre-registration.md` (author-owned) and tickets 53-57 (verification records).

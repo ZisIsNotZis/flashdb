@@ -28,15 +28,23 @@ All four families live in the same LSM, so one WAL covers everything (see Correc
 block executes against snapshot + its own overlay (RAM)
   → validate: read-set versions + constraints on overlay final state + x-ref resolution
   → serialize: one WAL record = all keyspace mutations of the block (P/U/R, payloads included)
-  → group commit: batch pending blocks, assign CSNs, append in CSN order, ONE fdatasync(WAL)
-  → apply batch to memtable → publish CSNs → ack
+  → group commit: append in CSN order + apply to memtable immediately, ONE fdatasync(WAL) on a
+    background FIFO worker → ack only after that covering fdatasync returns
 ```
 
 - Exactly **one** durability barrier per commit group, and it is on a log — there is no foreground structure over tiles, so the SS-01 ordering hazard (root durable, tile not) cannot arise. Tiles are written only by background compaction.
-- The memtable is applied **after** the fsync returns: a reader can never see a block whose WAL record is not yet durable.
+- The memtable is applied **before** the covering `fdatasync` returns (a grouped commit appends and
+  applies immediately), so a reader can observe a block whose WAL record is not yet durable. That is
+  harmless: the memtable is only a cache — the **ack**, and every state-mutating
+  publish/compaction/rotation, waits for the barrier, so nothing non-durable is ever made durable.
 - Crash before fsync: an **incomplete** WAL tail is cut at the last valid record; the client may retry, while a complete but unacknowledged record may recover and dedup. A complete CRC-bad frame or impossible length fails closed instead of silently truncating possibly acknowledged data. This still does not distinguish externally truncated acknowledged data from an incomplete unacknowledged tail; the current prototype is not yet evidence of power-loss durability. CSN gaps are harmless.
 - `fdatasync` targets the WAL fd only — compaction barriers never delay the foreground (SS-11 resolved).
-- Group commit: flush when the oldest pending block has waited **2 ms** or 128 blocks are pending, whichever first. `durable` class = its own immediate flush.
+- The barrier is **overlapped, not weakened**: one FIFO background worker runs `fdatasync` on a
+  cloned WAL fd while the writer appends the next group, bounded by `MAX_PENDING_BARRIERS = 64` in
+  flight. A failed `fdatasync` fails the group closed (no ack) and poisons the WAL until reopen.
+  Group commit still owes exactly one covering barrier per group; the change is only who waits and
+  when. (The measurement driver forms a group from requests already due, capped at
+  `--group-requests`; it is never held open to fill.)
 
 ## Snapshots and validation (SS-05 resolved, honestly)
 

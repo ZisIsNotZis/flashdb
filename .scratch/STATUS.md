@@ -7,12 +7,35 @@ that are still open.
 ## 1. The engine
 
 Single-node, single-writer, IO-dense document store; physical layout is per-region and
-policy-driven; the durability protocol is fault-injected at every boundary.
+policy-driven; the durability protocol is fault-injected at every boundary. Three durability/latency
+facts changed in waves 2-6:
+
+- **Load-path compaction is off the request path** (ticket 53; commits `a59f703` + `ae1df85`, repair
+  `f4539e4`). One `CompactionWorker` thread builds the replacement tile in the background
+  (`build_compaction_job`: bounded WAL replay + stream/reduce/write/sync/verify), and the request
+  path applies only a lazy flip (`apply_compaction_job`: inactive manifest page write, no fsync, no
+  unlink). The build half makes the replacement tile durable (tile `sync_data` + parent-directory
+  `sync_all`) off the request path before it can be applied, so a lazy manifest page the OS later
+  writes back references only a durable tile: a crash loses the merge, never data.
+- **The WAL group barrier is overlapped and durability-preserving** (ticket 56; commits `083da49` +
+  `413176c`). The pacer appends+applies group N+1 while a single FIFO background worker runs group
+  N's `fdatasync` on a cloned WAL fd. A group is acked only after its covering `fdatasync` returns; a
+  failed `fdatasync` fails the group closed (no ack) and poisons the WAL until reopen. At most
+  `MAX_PENDING_BARRIERS = 64` barriers are in flight, and every state-mutating path asserts no
+  barrier is in flight, so a rotated/compacted snapshot is always a drained prefix.
+- **The driver's window-boundary drain is non-blocking** (ticket 57; commits `ec47e25` + `76231d2`).
+  Schedule-lag samples are recorded at dispatch and service samples at barrier completion, and the
+  boundary drains only already-completed barriers (`try_take_group_barrier`), so a cross-boundary
+  barrier contributes only its service sample to the completion window; `lag_breach_attribution`
+  reports `boundary=0` on every final-binary run. The blocking drain survives only for WAL
+  maintenance and end-of-run. Also fixed in `8cf9988`: at the in-flight cap a group is left OPEN for
+  retry (not closed/acked), and `end_group` refuses while a barrier is in flight.
 
 | property | measured | conditions |
 |---|---|---|
-| tests | **264 Rust, 129 Python, zero warnings** (both `cargo build` and `cargo test`) | `cargo test --workspace --offline`; `uv run --with pytest pytest -q` in `harness/` |
-| data:RAM | ~22-24:1 steady state | 5.16 GB, 1 KiB docs, 64 MiB window, **seed phase** |
+| tests | **289 Rust, 132 Python, zero warnings** (both `cargo build` and `cargo test`) | `cargo test --workspace --offline`; `uv run --with pytest pytest -q` in `harness/` |
+| evaluation instances | **8.17x** cold44 (1,643,933,528 B / 192 MiB), **12.25x** cold51 (1,643,925,811 B / 128 MiB), **8.14x** entity-first (1,638,234,253 B / 192 MiB) | seed-42 `adversarial` trace, `declared.policy.json` (4096/10/2) |
+| data:RAM (seed phase) | ~22-24:1 steady state | 5.16 GB, 1 KiB docs, 64 MiB window |
 | open footprint | ~5 MB + bloom/dir, independent of data and tile count | rotated WAL; the driver is the retained suffix (open replays it at 5.15x its bytes) |
 | scan | 605 MiB/s cold, 3,155 MiB/s warm at 64 KiB pages | 5 GB single pass |
 | unique probe | 0.46 us append-shaped, 1.59 us in-range absent | 12 active tiles |
@@ -21,10 +44,11 @@ policy-driven; the durability protocol is fault-injected at every boundary.
 
 NOT claimed: bounded recovery time (open is O(suffix), not O(data)); a bounded engine scan footprint
 (the request adapter streams into a bounded top-100 map — verified — but the engine's own scan path
-was not separately bounded); any absolute comparison against another engine yet (see the B1/T5-T7
-work below).
+was not separately bounded); any absolute comparison against another engine yet (the T5-T7 baseline
+harness does not exist); power-loss durability (the crash-consistency tests are same-process
+approximations, not real power-loss evidence).
 
-## 2. The 0b measurement instrument is now trustworthy (three defects fixed, all verified)
+## 2. The 0b measurement instrument is now trustworthy (four defects fixed, all verified)
 
 Every per-rung number published before commit `744caaa` was unusable. The causes, all now fixed and
 independently verified:
@@ -48,83 +72,88 @@ summary total (8000 = 8000); no rung exceeds its offered rate beyond the 2% tole
 (`max achieved/offered = 1.0000`); all 64 invalid windows carry a `reject_reason` (service ceiling 64,
 lag ceiling 63, union 64); `early_dispatches = 0` with zero tolerance; `error_windows = 0`.
 
-## 3. First valid evaluation of the primary metric
+## 3. Primary metric: rung 50 does not meet the lag ceiling
 
-Commit `9bae6fe`, verified. `adversarial` workload, `declared` arm, cold instance 1,643,933,528 B
-under a 192 MiB cap = **8.17x**
-(below the 10x floor; see §7), one seed. Per-request, microseconds; both ceilings 10,000 us.
+Final binary `76231d2` (ticket 57), `adversarial` trace (seed 42), `declared` arm, ceilings
+`--ceiling-us 10000 --lag-ceiling-us 10000`, `--group-requests 64`, checkpoint/rotate 8 MiB, compact
+64 MiB. Rung 50, lag-rejected windows:
 
-| offered | achieved | % | svc p50 | svc p95 | svc p99 | lag p50 | lag p95 | lag p99 | sustained | svc-rejected | lag-rejected |
-|---:|---:|---:|---:|---:|---:|---:|---:|---:|:--:|---:|---:|
-| 50 | 49.70 | 99.41 | 5,930 | 910,504 | 990,504 | 62 | 834,223 | 914,223 | no | 36 | 35 |
-| 100 | 98.95 | 98.95 | 6,153 | 549,290 | 609,290 | 76 | 517,769 | 577,769 | no | 16 | 16 |
-| 200 | 200.00 | 100.00 | 9,157 | 462,085 | 522,085 | 2,689 | 421,132 | 481,132 | no | 8 | 8 |
-| 400 | 400.00 | 100.00 | 19,638 | 412,788 | 445,288 | 7,992 | 374,784 | 407,284 | no | 4 | 4 |
+| instance | data:RAM | lag-rej | svc-rej | lag p99 med/max (us) | svc p99 med (us) |
+|---|---:|---:|---:|---:|---:|
+| cold44 (family-first) | 8.17x | **6/40** | 39/40 | 1,669 / 235,475 | 21,054 |
+| cold51 (family-first) | 12.25x | **4/40** | 38/40 | 2,410 / 82,565 | 16,626 |
+| cold57-ef (entity-first) | 8.14x | 15/40 | 38/40 | 4,542 / 153,009 | 20,836 |
 
-Whole run: 8000/8000 completed, 0 errors, 106.0 rps against an offered mean of 106.67, reorganisation
-317,915,511 B over 64 merges.
+**No rung is sustained.** The lag ceiling is blocked by **cold point reads on the request path under
+shared-device durability I/O** — not by the fsync-tail cascade (removed by the overlapped barrier)
+or the window boundary (non-blocking, `boundary=0` on every run):
 
-**Verdict: no rung is sustained.** The failure is a **latency tail**, not throughput: the per-request
-median is ~6 ms at rest (the same order as the session's device fsync p50 of 5-6.7 ms — a hypothesis,
-not a verified attribution) rising to 19.6 ms at 400 rps, while p95/p99 sit at 0.4-1.0 s at every
-rung. Under the pre-registration's own rule (lag p99 <= 10 ms, no rejected window) every one of the 64
-windows is invalid, so the primary metric for this arm is currently **zero sustained rungs**.
+- Each order-flow request does its `cust`/stock guard reads synchronously inside the group dispatch,
+  and a cold read blocks the single pacer and cascades into the next group's schedule lag. At 8-12x
+  data:RAM every request is a cold read (page cache ≈ 8% of data); the request path reads ~**4.03
+  blocks/req** (newest-first get, −2.5% from 4.13), ~2.3 ms mean tailing to 100-235 ms under device
+  contention.
+- The device's WAL `fdatasync` tail is **71-498 ms under load** (ticket 55); the idle 100-sample
+  probe is **6.7 ms p50 / 13.4 ms p99** (ticket 54). The 10 ms lag ceiling sits below the durability
+  barrier's own fsync p50-p99 (5-31 ms).
+- The **service ceiling** rejects 38-39/40 windows at rung 50 and 73-74/75 windows over the whole run
+  on every arm: a write group waits for its single WAL `fdatasync` (p50 6.7 ms, p99 13.4 ms on this
+  device) against a fixed 10 ms service ceiling, and at low offered load group commit cannot batch
+  writes (one write per group). It is **device-bound**: no engine that must `fdatasync` per write
+  group on this box can satisfy a fixed 10 ms service ceiling.
 
-## 4. Verdict board
+Whole run (final binary, all rungs): achieved ~106-107 rps, 0 errors. Family-first compaction output
+is now **20.9-23.3 MB over 26-27 merges** (cold44/c51; the off-path build + boundary-skip cadence),
+down from the pre-fix ~318 MB over 64 merges; entity-first is 265 MB over 26 merges (§4).
+Signal-to-noise: two runs of the same cold44 binary under identical caps disagree (lag-rej 4/40 vs
+6/40, `late_total` 221 vs 597), which bounds the honest noise band of the shared box.
+
+## 4. Co-location: the read win does not convert to a load gain
+
+Entity-first key encoding (`--key-encoding entity_first`, commit `5d90b93`) co-locates the P/U/R
+views of one entity in a single combined region (3 write regions instead of 6, half the tiles).
+
+| arm | blocks/req (4k) | compact_bytes | merges | rung-50 lag-rej | late_total |
+|---|---:|---:|---:|---:|---:|
+| family-first (newest-first get) | 4.03 | 20.9 MB | 26 | 6/40 (cold44) | 597 |
+| entity-first | 3.36 | 265 MB | 26 | 15/40 | 887 |
+
+- **Request read volume −16.6%** (4.03 → 3.36 blocks/req), and request-path read time is lower
+  (18,262 ms vs 19,278 ms over the run): fewer reads, not slower reads on average.
+- **Compaction write amp ~12x** (compact bytes ~21 MB → 265 MB, same `--compact-bytes 67108864`, same
+  26 merges): merging P/U/R into one region makes each compaction rewrite the combined dirty set (max
+  single actuation 8.58 MB vs 0.97 MB family-first), and the compaction worker saturates the shared
+  device.
+- **Tail worse:** 15/40 lag-rejected vs 6/40, `late_total` 887 vs 597 — the write amplification
+  dominates the read win.
+- The offline ticket-43 model's **−34.8%** dependent-read reduction (placement 4.740 → 3.092) was a
+  read-level result and **was not converted into a load gain**; the model also missed the
+  write-amplification cost that now dominates the tail.
+
+## 5. Verdict board
 
 | threshold | status |
 |---|---|
-| primary metric, `adversarial`/`declared` | **0 sustained rungs** at 8.17x (§3) |
-| T1 learned beats declared by >15% on the win workload | **underived** — the earlier "tie" rested on the broken aggregator and is retracted as a verdict |
-| T2 no >5% loss on adversarial-uniform | **underived** — the earlier "7.7% loss" rested on the broken aggregator and is retracted as a verdict |
-| T3 reorganisation writes <=3x declared | **FAIL, 4.13-4.27x** — byte sums, unaffected by the aggregator defects |
-| T4 drift recovery within 2 windows | **underived** — the earlier run saturated (drift rate above its mix's capacity); the default parameters need 6 windows, not 2 |
+| primary metric | **0 sustained rungs** — rung 50 fails the lag ceiling (cold44 4-6/40, c51 4/40, ef 15/40); the service ceiling rejects ~74/75 windows whole-run and is device-bound (§3) |
+| T1 learned beats declared by >15% on the win workload | **underived** — needs the learned arm, win workload, noise band, 10-seed median/IQR on the >=10x instance |
+| T2 no >5% loss on adversarial-uniform | **underived** — same |
+| T3 reorganisation writes <=3x declared | **FAIL, 4.13-4.27x** — byte sums, unaffected by the aggregator defects and unchanged by waves 2-6 |
+| T4 drift recovery within 2 windows | **underived** — the default parameters need 6 windows, not 2 |
 | T5/T6/T7 external baselines | **adopted** (§7); the request-level baseline harness does not exist yet |
 
 Still missing for T1/T2/T4: the other arms (learned, static-derived), the win and drift workloads, a
-measured noise band, the 10-seed median/IQR, and a >=10x instance.
+measured noise band, and the 10-seed median/IQR (the >=10x instance now exists: cold51, 12.25x).
 
-## 5. The one remaining learnable axis has measured headroom
+## 6. Defects — current state
 
-An offline measurement over the repository's own generator (ticket 43, verified) gives dependent
-random reads per request: today's placement 4.740; **family co-location** (`U|X` and `R|X` in the
-same tile as the `P|X` row) **3.092** = **-34.8%**, stable across tile sizes 64-16384 (-34.8 to
--37.1%); distribution-chosen region boundaries -7.7% at 256 and -23.4% at 4096.
+All twelve measurement/implementation defects catalogued through wave 1 are fixed or recorded; none
+is open. The load-bearing current facts:
 
-This is a **read-level** result. It is explicitly **not** the pre-registration's 15% threshold (that
-is defined on sustained offered load and this count cannot clear or fail it), so no load gain is
-claimed. Co-location is currently inexpressible because tiles are monotone key-range fenced and the
-key encoding orders by family prefix; ticket 50 makes it expressible. This is the leading explanation
-of the measured zero throughput gain: the request level supplies co-occurrence, but the learner's
-action space (per-region merge threshold, page size, bloom bits) contains no placement action.
-
-## 6. Defects found and their state
-
-Each of items 1-12 was found because a number looked too good, or a specification and an
-implementation disagreed. All are fixed or recorded.
-
-1. scan rate inferred from probe timings — corrected.
-2. device probe that truncated without writing (reported a 0 us device) — fixed; the baseline it
-   invalidated is retracted.
-3. warm/cold conflation in every axis comparison — corrected; the axes were re-run cold (page size is
-   only +54% cold, and the "flat" era was a page-cache artefact).
-4. pacer timer granularity masquerading as saturation — fixed (burst pacing).
-5. `sustained=800` with `achieved=129` (the curve builder ignored `invalid` and lag) — fixed with a
-   regression test.
-6. "T3 = 0 vs 0, not measurable" was actually the knob never being driven — fixed by actuating
-   compaction on the load path.
-7. achieved > offered (128%) — **fixed** in `744caaa` (see §2).
-8. a unique conflict in `Engine::commit_batch` rejected the whole batch, so a request's verdict
-   depended on its neighbours (the `--group-requests` path was not affected) — fixed in `4a348d7`
-   plus a fail-closed P0 fix (a repeated `block_id` inside one request is refused); the validation
-   unit is the request (`docs/contracts.md`, ticket 41).
-9. the per-window `invalid`/ceiling fields never reaching the JSON — **fixed** in `744caaa`.
-10. the trailing window never flushed — **fixed** in `744caaa`.
-11. the ceiling was applied to a group-aggregated latency while the pre-registration names schedule
-    lag — **fixed** in `965adf4` (two named ceilings, per-request samples).
-12. a per-region publish emits one tile per region, so the runner's shipped 16 KiB checkpoint/rotate
-    cadence exhausts `MAX_TILES = 1024` and aborts a scored run mid-way — **pinned** by a regression
-    test in `bab567c`; the fix is adopted (§7; ticket `.scratch/46-partitioned-publish-tile-cap`).
+- The validation unit is the **request** (`docs/contracts.md`, ticket 41): a repeated `block_id`
+  inside one request is refused fail-closed, and a request's uniqueness verdict does not depend on
+  its neighbours.
+- The per-region publish tile-cap defect (the 16 KiB cadence exhausting `MAX_TILES = 1024`) is pinned
+  by regression test `bab567c` and fixed on both sides (§7.4).
 
 ## 7. Decisions adopted
 
@@ -157,42 +186,55 @@ philosophy rather than asked, and that work must not stop). Reviewable and rever
    0.083-0.669% of the service-time term, so no weight can move an argmin; the objective is maximise
    sustained load subject to the latency ceiling and a write-amplitude budget.
 
-Still open for the author (none of these blocks the plan in §9): the 15% / 5% / 3x numbers and the
-10-seed requirement as written for a shared box; the 2-window drift target against the 6 windows the
-current parameters need; ticket 13 (open-time corruption detection); D1-D5 (constraint surface);
-whether the request grammar gets a create/seed shape.
+**Still open for the author — primary-vs-service ceiling reconciliation (do NOT resolve here).** The
+pre-registration's validity rule invalidates a window on **either** the lag ceiling **or** the
+separate service ceiling (plus three-window lag growth or any request rejection), while the adopted
+decision above (§7.1, 2026-10-09) judges the primary metric on the **lag** ceiling with service
+latency reported separately. These conflict, and waves 3-6 left the reconciliation as a flagged open
+author item. The concrete options on the table:
+
+- (a) **Lag-only primary per §7.1** — judge the primary metric on the lag ceiling alone, report the
+  service-latency distribution as the efficiency measure. Today this still fails rung 50 (lag-rej
+  4-6/40 cold44, 4/40 c51).
+- (b) **Keep both ceilings and treat the host/device floor as the limit** — state the durability floor
+  explicitly (per-group `fdatasync`; the service ceiling is only met if the device fsync tail ≤ 10 ms,
+  which it is not on this box) or make the service ceiling relative to the measured device fsync
+  (e.g. `N × device_fsync_p99`).
+- (c) **Move the WAL to a sub-10 ms-fsync device** and re-derive the metric there.
+
+Other items still open for the author (none of these blocks the plan in §9): the 15% / 5% / 3x
+numbers and the 10-seed requirement as written for a shared box; the 2-window drift target against
+the 6 windows the current parameters need; ticket 13 (open-time corruption detection); D1-D5
+(constraint surface); whether the request grammar gets a create/seed shape.
 
 ## 8. Environment notes for re-running
 
 - The box is shared: the same 1 M-doc workload has measured 6,137 / 15,060 / 16,264 docs/s on
   different runs. Deterministic metrics (bytes, counts, block reads) are the primary evidence;
   timings must state their concurrency.
-- Device fsync p50 is 5-6.7 ms in session (p99 to 23 ms) and must accompany any write-side number.
+- Device fsync is **6.7 ms p50 / 13.4 ms p99** (100-sample idle probe), and under load the per-group
+  WAL `fdatasync` tail reaches **71-498 ms**; any write-side number must be read against this floor.
 - Cold runs need `MemoryMax` (it counts page cache), a rotate cadence large enough for the per-region
   publish to stay inside the tile cap, and a fully checkpointed instance before the load.
 - **Reviewer hygiene:** do not use the `oracle` agent as a reviewer — it runs with forked context,
   inherits the supervisor's framing, and twice produced narration instead of a review (once with a
   fabricated sub-run id). Use a read-only worker-as-verifier that must paste command output and must
   write `CANNOT-VERIFY` rather than guess.
-- **Delegation:** the work is executed by subagents. At this handoff the `subagent` tool was missing
-  from the session's tool list, which blocks all dispatch; a session with it available can run the
-  staged plan directly.
 
 ## 9. Resume plan
 
-The plan is staged as a runnable workflow script: `.scratch/52-program/wave1.js`. Its five lanes are
-independent and touch disjoint files:
+Waves 1-6 are integrated (instrumentation, compaction off-path, residual-tail attribution,
+lag-stall attribution, overlapped barrier, non-blocking boundary + read optimisation + co-location).
+The next steps, in dependency order:
 
-1. **latency instrumentation** — per-window group count/size, per-group max elapsed, `min_lag_us`, so
-   the tail can be attributed without a re-run;
-2. **tail attribution** — measure-only isolation runs (group size 1, compaction off, large rotation
-   cadence, doubled cap) to name the dominant tail mechanism instead of guessing;
-3. **family co-location** — implement the entity-major key encoding behind a selector so `P|X`/`U|X`/
-   `R|X` can share a tile, with a test asserting co-location, without measuring yet;
-4. **>=10x instance** — build and smoke-test an instance that meets the pre-registration's floor;
-5. **decision record** — write the §7 decisions into the pre-registration, objective and status docs.
-
-Then, in order: fix the dominant tail mechanism; re-run the three arms on the >=10x instance with the
-instrumented driver and re-derive T1/T2/T4 with a measured noise band; measure whether family
-co-location converts the -34.8% read reduction into a load gain; build the request-level baseline
-harness and evaluate T5/T6/T7; fix the tile cap on both sides; final polish and a consolidated report.
+1. **Resolve the §7 ceiling reconciliation with the author** — it decides how the primary metric is
+   judged and is the gate on every further verdict.
+2. **Move the request-path reads off the pacer** (async/overlapped reads or a read thread pool) — the
+   remaining dominant lag blocker; a read-count reduction alone (ticket 57) did not remove the
+   device-contention tail.
+3. **Re-derive T1/T2/T4** on the >=10x instance (cold51) with all three arms, the win and drift
+   workloads, a measured noise band, and the 10-seed median/IQR.
+4. **If co-location is pursued**, weigh its +~12x compaction write-amp regression (265 MB vs 21 MB)
+   against the −16.6% read win; the cost was not in the ticket-43 model.
+5. **Build the request-level baseline harness** and evaluate T5/T6/T7 against sqlite/postgres/lmdb/
+   rocksdb.
