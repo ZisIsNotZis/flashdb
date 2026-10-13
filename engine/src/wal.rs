@@ -38,6 +38,8 @@ pub struct Wal {
     inject_partial_append: bool,
     #[cfg(test)]
     inject_sync_error: bool,
+    #[cfg(test)]
+    inject_barrier_error: bool,
 }
 
 impl Wal {
@@ -52,7 +54,8 @@ impl Wal {
         let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
         File::open(parent)?.sync_all()?;
         Ok(Wal { file, path: path.to_path_buf(), valid_len: 0, poisoned: false,
-            #[cfg(test)] inject_partial_append: false, #[cfg(test)] inject_sync_error: false })
+            #[cfg(test)] inject_partial_append: false, #[cfg(test)] inject_sync_error: false,
+            #[cfg(test)] inject_barrier_error: false })
     }
 
     /// 打开已存在的 WAL：扫描到最后的完整记录，截断撕裂尾，定位到文件尾。
@@ -63,7 +66,8 @@ impl Wal {
         file.set_len(valid_len)?;
         file.seek(SeekFrom::Start(valid_len))?;
         Ok((Wal { file, path: path.as_ref().to_path_buf(), valid_len, poisoned: false,
-            #[cfg(test)] inject_partial_append: false, #[cfg(test)] inject_sync_error: false }, records))
+            #[cfg(test)] inject_partial_append: false, #[cfg(test)] inject_sync_error: false,
+            #[cfg(test)] inject_barrier_error: false }, records))
     }
 
     /// 追加一条记录（未持久化；调用方随后 `sync`）。拒绝空载荷和恢复器无法读取的超长载荷。
@@ -130,12 +134,48 @@ impl Wal {
         self.file.try_clone()
     }
 
+    /// A duplicated handle to the live WAL file for an overlapped-barrier worker
+    /// (slice 56). The clone shares the open file description, so `sync_data` on
+    /// it flushes the same inode the main writer appends to; the main writer is
+    /// NOT borrowed while the worker runs. A failed sync is observed on the
+    /// clone, so the caller must propagate it by [`Wal::poison`]ing the writer.
+    /// Refuses (and therefore fails closed) once the writer is poisoned, exactly
+    /// as [`Wal::sync`] does.
+    pub(crate) fn sync_handle(&mut self) -> io::Result<File> {
+        self.ensure_writable()?;
+        self.file.try_clone()
+    }
+
+    /// Mark the writer poisoned so every later append/sync fails closed until
+    /// reopen (recovery). Used when an overlapped barrier's `fdatasync` fails on
+    /// a cloned handle, where the main writer cannot observe the error itself.
+    pub(crate) fn poison(&mut self) {
+        self.poisoned = true;
+    }
+
     /// Test-only: arm the injected partial-append fault, so an engine-level test
     /// can exercise a failed append. Compiled only under `cfg(test)` and
     /// `pub(crate)`, so it is unreachable from the shipping API.
     #[cfg(test)]
     pub(crate) fn arm_partial_append_fault(&mut self) {
         self.inject_partial_append = true;
+    }
+
+    /// Test-only: arm the next overlapped barrier to fail its `fdatasync`, so an
+    /// engine-level test can exercise the fail-closed barrier path. The flag is
+    /// consumed by [`crate::engine::Engine::submit_group`] into the barrier job,
+    /// keeping the clone untouched.
+    #[cfg(test)]
+    pub(crate) fn arm_barrier_error(&mut self) {
+        self.inject_barrier_error = true;
+    }
+
+    /// Test-only: consume the armed overlapped-barrier fault.
+    #[cfg(test)]
+    pub(crate) fn take_barrier_error(&mut self) -> bool {
+        let armed = self.inject_barrier_error;
+        self.inject_barrier_error = false;
+        armed
     }
 }
 

@@ -18,6 +18,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
 use std::time::Instant;
 
 use serde::Deserialize;
@@ -32,6 +33,13 @@ use crate::tile::{Tile, TileCursor, TileWriter, DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE
 use crate::wal::{self, Wal};
 
 const MAGIC: &[u8; 4] = b"FDB1";
+
+/// Bounded overlapped-barrier cap (slice 56): an engine refuses to submit more
+/// than this many WAL `fdatasync` barriers in flight at once, which bounds the
+/// pending-group memory the load driver may retain while group N+1 is appended
+/// ahead of group N's barrier. Ordering is preserved regardless: the barrier
+/// worker drains its queue FIFO and completions are observed in submission order.
+pub const MAX_PENDING_BARRIERS: usize = 64;
 
 /// Bits per *expected* entry for a tile's unique-prefix bloom under
 /// [`LayoutPolicy::declared_default`]. The tile stores this value in its
@@ -708,6 +716,16 @@ pub struct Engine {
     /// persisted and never read on any correctness path; it attributes the
     /// request-path durability barrier separately from the read/allocator stalls.
     group_fsync_us: u64,
+    /// Overlapped WAL-barrier worker (slice 56). A single background thread that
+    /// runs one `fdatasync` at a time on cloned WAL handles, so the request path
+    /// can append group N+1 while group N's barrier is in flight. Lazily spawned
+    /// on the first overlapped submit; `None` until then. Observational only:
+    /// never persisted.
+    barrier_worker: Option<BarrierWorker>,
+    /// Number of submitted overlapped barriers whose completion has not yet been
+    /// drained. Bounded by [`MAX_PENDING_BARRIERS`] (enforced in
+    /// [`Engine::submit_group`]); the drain preserves submission order.
+    barrier_in_flight: usize,
     /// Provisional per-region layout the two tile write paths consult. Never
     /// persisted; the per-tile parameters live in each tile's superblock.
     layout: LayoutPolicy,
@@ -785,6 +803,65 @@ pub struct GroupPhase {
     pub fsync_us: u64,
 }
 
+/// One overlapped WAL-barrier job: a duplicated handle to the live WAL file the
+/// worker must `fdatasync`. The handle shares the open file description with the
+/// main writer, so flushing it covers every append the main writer made before
+/// the job was submitted.
+struct WalSyncJob {
+    handle: File,
+    /// Test-only: when armed, the worker reports an `fdatasync` failure instead
+    /// of calling the OS, so the fail-closed barrier path is exercisable
+    /// deterministically. Compiled out of the shipping API.
+    #[cfg(test)]
+    fail: bool,
+}
+
+impl WalSyncJob {
+    fn sync(self) -> io::Result<()> {
+        #[cfg(test)]
+        {
+            if self.fail {
+                return Err(io::Error::new(io::ErrorKind::Other, "injected overlapped WAL sync failure"));
+            }
+        }
+        self.handle.sync_data()
+    }
+}
+
+/// The worker's completion report for one barrier.
+struct BarrierResult {
+    result: io::Result<()>,
+    /// The `fdatasync` elapsed time (us) measured on the worker thread.
+    fsync_us: u64,
+}
+
+/// A single background thread that runs overlapped WAL barriers in FIFO order.
+/// The FIFO queue is what preserves barrier ordering: the main writer submits
+/// jobs in group order, the worker processes them one at a time, and completions
+/// are reported back in the same order.
+struct BarrierWorker {
+    job_tx: mpsc::Sender<WalSyncJob>,
+    result_rx: mpsc::Receiver<BarrierResult>,
+}
+
+impl BarrierWorker {
+    fn spawn() -> Self {
+        let (job_tx, job_rx) = mpsc::channel::<WalSyncJob>();
+        let (result_tx, result_rx) = mpsc::channel::<BarrierResult>();
+        std::thread::spawn(move || {
+            for job in job_rx {
+                let t0 = Instant::now();
+                let result = job.sync();
+                let fsync_us = t0.elapsed().as_micros() as u64;
+                if result_tx.send(BarrierResult { result, fsync_us }).is_err() {
+                    break;
+                }
+            }
+        });
+        BarrierWorker { job_tx, result_rx }
+    }
+}
+
 impl Engine {
     /// 新建（空库）。
     pub fn create(wal_path: impl AsRef<Path>) -> io::Result<Engine> {
@@ -806,6 +883,8 @@ impl Engine {
             group_append_us: 0,
             group_apply_us: 0,
             group_fsync_us: 0,
+            barrier_worker: None,
+            barrier_in_flight: 0,
             layout: LayoutPolicy::declared_default(),
             region_mode: RegionMode::Global,
             key_encoding: keys::KeyEncoding::FamilyFirst,
@@ -1010,7 +1089,7 @@ impl Engine {
         drop(records);
         drop(covered);
         Self::trim_retained_heap();
-        Ok(Engine { wal, mt, tiles, wal_path: wal_path.to_path_buf(), dir: parent_dir(wal_path), manifest: None, segment: None, segment_suffix_csn: csn, wal_detached: false, csn, dedup, max_handle, group_open: false, group_pending: false, group_append_us: 0, group_apply_us: 0, group_fsync_us: 0, layout: LayoutPolicy::declared_default(), region_mode: RegionMode::Global, key_encoding: encoding, metrics: RefCell::new(Metrics::new()), last_compaction: None })
+        Ok(Engine { wal, mt, tiles, wal_path: wal_path.to_path_buf(), dir: parent_dir(wal_path), manifest: None, segment: None, segment_suffix_csn: csn, wal_detached: false, csn, dedup, max_handle, group_open: false, group_pending: false, group_append_us: 0, group_apply_us: 0, group_fsync_us: 0, barrier_worker: None, barrier_in_flight: 0, layout: LayoutPolicy::declared_default(), region_mode: RegionMode::Global, key_encoding: encoding, metrics: RefCell::new(Metrics::new()), last_compaction: None })
     }
 
     /// The CSN floor below which the active WAL file holds no records: the
@@ -1066,6 +1145,21 @@ impl Engine {
         Ok(())
     }
 
+    /// Refuse a mutating operation that must not race an overlapped WAL barrier.
+    /// While a barrier is in flight the WAL has appended but not-yet-synced
+    /// bytes, so a synchronous commit, republish, rotation or compaction could
+    /// bind durable state to bytes the barrier has not yet covered (or, for
+    /// rotation, rebind the WAL away from a live barrier). The overlapped path
+    /// itself (`begin_group`/`commit_block_grouped`/`submit_group`/
+    /// `wait_group_barrier`) is the only one allowed with barriers in flight.
+    fn ensure_no_pending_barrier(&self, op: &str) -> io::Result<()> {
+        if self.barrier_in_flight > 0 {
+            return Err(io::Error::new(io::ErrorKind::Other, format!(
+                "cannot {op} while a WAL barrier is in flight; drain barriers first")));
+        }
+        Ok(())
+    }
+
     /// The republish guard: the WAL file being published from must still hold
     /// exactly the records the serving state was recovered from. Segment mode
     /// merges the checkpoint frontier below the segment floor into the engine
@@ -1095,6 +1189,7 @@ impl Engine {
     /// after the file is synced and verified.
     pub fn build_tile(&mut self, tile_path: impl AsRef<Path>, cutoff: u64) -> io::Result<()> {
         self.ensure_no_group("build_tile")?;
+        self.ensure_no_pending_barrier("build_tile")?;
         self.ensure_attached()?;
         if cutoff > self.csn {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "cutoff exceeds CSN"));
@@ -1277,6 +1372,7 @@ impl Engine {
     /// `AlreadyExists` error instead of silently reusing the leftover file.
     pub fn publish_tile(&mut self, tile_path: impl AsRef<Path>, cutoff: u64) -> io::Result<()> {
         self.ensure_no_group("publish_tile")?;
+        self.ensure_no_pending_barrier("publish_tile")?;
         if self.manifest.as_ref().is_some_and(|m| m.poisoned()) {
             return Err(io::Error::new(io::ErrorKind::Other, "manifest writer poisoned; reopen to recover"));
         }
@@ -1415,6 +1511,11 @@ impl Engine {
         if self.wal.valid_len() <= max_wal_bytes {
             return Ok(false);
         }
+        // A no-op rotation (no tiles, or below the threshold) must not refuse an
+        // in-flight barrier: the overlapped pacer calls this on every group while
+        // a barrier may legitimately be in flight. The refusal is only owed when
+        // this call will actually rebind the WAL away from a live barrier.
+        self.ensure_no_pending_barrier("rotate_wal")?;
         let cutoff = newest.cutoff();
         if cutoff != self.csn || self.mt.len() != 0 {
             return Err(io::Error::new(io::ErrorKind::InvalidInput,
@@ -1500,6 +1601,7 @@ impl Engine {
     /// until manually removed.
     pub fn compact(&mut self) -> io::Result<()> {
         self.ensure_no_group("compact")?;
+        self.ensure_no_pending_barrier("compact")?;
         if self.manifest.as_ref().is_some_and(|m| m.poisoned()) {
             return Err(io::Error::new(io::ErrorKind::Other, "manifest writer poisoned; reopen to recover"));
         }
@@ -1572,6 +1674,7 @@ impl Engine {
             return Ok(None);
         }
         self.ensure_no_group("maybe_compact_shape")?;
+        self.ensure_no_pending_barrier("maybe_compact_shape")?;
         if self.manifest.as_ref().is_some_and(|m| m.poisoned()) {
             return Err(io::Error::new(io::ErrorKind::Other, "manifest writer poisoned; reopen to recover"));
         }
@@ -1598,6 +1701,7 @@ impl Engine {
             return Ok(None);
         }
         self.ensure_no_group("compaction_job")?;
+        self.ensure_no_pending_barrier("compaction_job")?;
         if self.manifest.as_ref().is_some_and(|m| m.poisoned()) {
             return Err(io::Error::new(io::ErrorKind::Other, "manifest writer poisoned; reopen to recover"));
         }
@@ -1666,6 +1770,7 @@ impl Engine {
     /// tiles are still on disk. Returns the replacement's output size.
     pub fn apply_compaction_job(&mut self, outcome: &CompactionOutcome) -> io::Result<u64> {
         self.ensure_no_group("apply_compaction_job")?;
+        self.ensure_no_pending_barrier("apply_compaction_job")?;
         if self.manifest.as_ref().is_some_and(|m| m.poisoned()) {
             return Err(io::Error::new(io::ErrorKind::Other, "manifest writer poisoned; reopen to recover"));
         }
@@ -2713,6 +2818,7 @@ impl Engine {
     /// 原子提交一个块。唯一约束冲突 → `Outcome::Conflict`（未写 WAL，调用方直接报业务错误）。
     pub fn commit_block(&mut self, block_id: &[u8], ops: &[Op]) -> io::Result<Outcome> {
         self.ensure_no_group("commit_block")?;
+        self.ensure_no_pending_barrier("commit_block")?;
         self.commit_block_inner(block_id, ops, true)
     }
 
@@ -2819,6 +2925,144 @@ impl Engine {
         self.group_apply_us = 0;
         self.group_fsync_us = 0;
         phase
+    }
+
+    /// Per-group WAL `append` + memtable `apply` elapsed time (us) since the
+    /// previous call, then reset — the overlapped-barrier path drains this at
+    /// SUBMIT time, before group N+1's appends mix into the counters. The
+    /// barrier's own `fdatasync` elapsed is returned separately by
+    /// [`Engine::wait_group_barrier`] / [`Engine::try_take_group_barrier`], so
+    /// the two are never confused across groups.
+    pub fn take_group_append_apply_us(&mut self) -> (u64, u64) {
+        let phase = (self.group_append_us, self.group_apply_us);
+        self.group_append_us = 0;
+        self.group_apply_us = 0;
+        phase
+    }
+
+    /// Submit the open group's WAL barrier to the overlapped barrier worker and
+    /// close the group (slice 56).
+    ///
+    /// Returns `Ok(true)` when a barrier was submitted: the group performed at
+    /// least one grouped commit, so an `fdatasync` covering its appends is owed.
+    /// Returns `Ok(false)` for an empty/read-only group: nothing was appended,
+    /// so no barrier is owed and the group is already complete. In both cases
+    /// the group is closed (so `submit_group` twice fails, exactly like
+    /// `end_group` twice).
+    ///
+    /// The barrier runs on a single background worker, FIFO in submission
+    /// order, so the request path may begin and append group N+1 while group N's
+    /// `fdatasync` is in flight — but a request is NEVER durable until its own
+    /// covering barrier completes and is drained
+    /// ([`Engine::wait_group_barrier`] / [`Engine::try_take_group_barrier`]).
+    /// At most [`MAX_PENDING_BARRIERS`] barriers may be in flight; when the cap
+    /// is reached this call fails closed WITHOUT closing the group, so the
+    /// caller can drain barriers and retry. A failed submission (poisoned WAL,
+    /// detached WAL, or a dead worker) poisons the WAL exactly like a failed
+    /// synchronous barrier.
+    pub fn submit_group(&mut self) -> io::Result<bool> {
+        if !self.group_open {
+            return Err(io::Error::new(io::ErrorKind::Other, "no commit group is open; begin_group first"));
+        }
+        let owed = self.group_pending;
+        let mut result = Ok(());
+        if owed {
+            if self.barrier_in_flight >= MAX_PENDING_BARRIERS {
+                // Leave the group open: the caller must drain and retry.
+                result = Err(io::Error::new(io::ErrorKind::Other,
+                    "WAL barrier in-flight cap reached; drain barriers before submitting more"));
+            } else if let Err(e) = self.ensure_attached() {
+                result = Err(e);
+            } else if let Err(e) = self.wal.sync_handle().and_then(|handle| {
+                let worker = self.barrier_worker.get_or_insert_with(BarrierWorker::spawn);
+                let job = WalSyncJob {
+                    handle,
+                    #[cfg(test)]
+                    fail: self.wal.take_barrier_error(),
+                };
+                match worker.job_tx.send(job) {
+                    Ok(()) => {
+                        self.barrier_in_flight += 1;
+                        Ok(())
+                    }
+                    Err(_) => {
+                        self.wal.poison();
+                        Err(io::Error::new(io::ErrorKind::Other, "WAL barrier worker disconnected"))
+                    }
+                }
+            }) {
+                result = Err(e);
+            }
+        }
+        self.group_open = false;
+        self.group_pending = false;
+        result.map(|()| owed)
+    }
+
+    /// Number of submitted overlapped barriers whose completion has not yet been
+    /// drained. The overlapped driver caps this below
+    /// [`MAX_PENDING_BARRIERS`] by draining before submitting more.
+    pub fn pending_barriers(&self) -> usize {
+        self.barrier_in_flight
+    }
+
+    /// Block until the OLDEST in-flight overlapped barrier completes, drain it,
+    /// and return its `fdatasync` elapsed time (us). A failed `fdatasync`
+    /// poisons the WAL writer exactly like the synchronous path and is returned
+    /// as `Err`; nothing is acknowledged, and every later append fails until
+    /// reopen. Fails closed when no barrier is in flight.
+    pub fn wait_group_barrier(&mut self) -> io::Result<u64> {
+        let received = match self.barrier_worker.as_mut() {
+            Some(worker) => worker.result_rx.recv(),
+            None => return Err(io::Error::new(io::ErrorKind::Other, "no WAL barrier in flight")),
+        };
+        match received {
+            Ok(result) => {
+                self.barrier_in_flight = self.barrier_in_flight.saturating_sub(1);
+                self.observe_barrier_result(result)
+            }
+            Err(_) => {
+                self.barrier_in_flight = 0;
+                self.wal.poison();
+                Err(io::Error::new(io::ErrorKind::Other, "WAL barrier worker disconnected"))
+            }
+        }
+    }
+
+    /// Non-blocking variant of [`Engine::wait_group_barrier`]: drain the oldest
+    /// completed barrier (if one is ready) and return its `fdatasync` elapsed
+    /// time, or `Ok(None)` when no barrier has completed yet. A disconnected
+    /// worker or a failed `fdatasync` fails closed exactly as the blocking form.
+    pub fn try_take_group_barrier(&mut self) -> io::Result<Option<u64>> {
+        let Some(worker) = self.barrier_worker.as_mut() else {
+            return Ok(None);
+        };
+        match worker.result_rx.try_recv() {
+            Ok(result) => {
+                self.barrier_in_flight = self.barrier_in_flight.saturating_sub(1);
+                self.observe_barrier_result(result).map(Some)
+            }
+            Err(mpsc::TryRecvError::Empty) => Ok(None),
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.barrier_in_flight = 0;
+                self.wal.poison();
+                Err(io::Error::new(io::ErrorKind::Other, "WAL barrier worker disconnected"))
+            }
+        }
+    }
+
+    /// Fold one drained barrier completion into the engine: return the observed
+    /// `fdatasync` elapsed time, and on failure poison the WAL writer so every
+    /// later append fails closed (recovery required), exactly like a failed
+    /// synchronous [`Engine::end_group`].
+    fn observe_barrier_result(&mut self, result: BarrierResult) -> io::Result<u64> {
+        match result.result {
+            Ok(()) => Ok(result.fsync_us),
+            Err(e) => {
+                self.wal.poison();
+                Err(e)
+            }
+        }
     }
 
     /// Shared single-block commit core. `barrier` selects whether the WAL
@@ -2953,6 +3197,7 @@ impl Engine {
     /// or empty, is a no-op (no append, no sync).
     pub fn commit_batch(&mut self, requests: &[Vec<(Vec<u8>, Vec<Op>)>]) -> io::Result<Vec<RequestOutcome>> {
         self.ensure_no_group("commit_batch")?;
+        self.ensure_no_pending_barrier("commit_batch")?;
         let t0 = self.timing();
         let id = self.metrics.borrow_mut().resolve_commit();
         let _sample = MetricsSample { metrics: &self.metrics, id, region: metrics::DISABLED, started: t0 };
@@ -3784,6 +4029,71 @@ mod tests {
         assert_eq!(e.csn(), 1, "recovery truncates the torn frame; the acknowledged base survives");
         assert_eq!(get_ok(&e, "E", 1), Some(b"doc1".to_vec()));
         assert_eq!(get_ok(&e, "E", 2), None);
+        remove(&p);
+    }
+
+    /// An overlapped barrier's `fdatasync` failure must fail closed exactly like
+    /// the synchronous barrier: the completion is observed as `Err` (never a
+    /// silent ack), the WAL writer is poisoned so the next group cannot append,
+    /// and only a reopen can recover. The recovered prefix may include the
+    /// complete-but-unacknowledged frame (as with the synchronous path), so the
+    /// asserted invariant is the poison, not the on-disk truncation.
+    #[test]
+    fn overlapped_barrier_sync_error_fails_closed_and_poisons_the_wal() {
+        let p = tmp("overlapped_poison.wal");
+        let mut e = Engine::create(&p).unwrap();
+        e.commit_block(b"base", &[Op::PutDoc { entity: b"E".to_vec(), handle: 1, doc: b"doc1".to_vec() }]).unwrap();
+
+        e.begin_group().unwrap();
+        e.commit_block_grouped(b"b1", &[Op::PutDoc { entity: b"E".to_vec(), handle: 2, doc: b"doc2".to_vec() }]).unwrap();
+        e.wal.arm_barrier_error();
+        assert!(e.submit_group().unwrap(), "a write group submits a barrier");
+
+        let err = e.wait_group_barrier().unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::Other, "the injected fdatasync failure is observed");
+        assert_eq!(e.pending_barriers(), 0);
+
+        e.begin_group().unwrap();
+        assert!(e.commit_block_grouped(b"b2", &[Op::PutDoc { entity: b"E".to_vec(), handle: 3, doc: b"doc3".to_vec() }]).is_err(),
+            "the poisoned writer refuses the next grouped append");
+        assert!(e.submit_group().is_err(), "submit fails closed on the poisoned writer");
+        drop(e);
+
+        let e = Engine::open(&p).unwrap();
+        assert_eq!(get_ok(&e, "E", 1), Some(b"doc1".to_vec()), "the acknowledged base survives recovery");
+        remove(&p);
+    }
+
+    /// Barriers are drained in submission order, and a failing barrier only
+    /// poisons the writer once its own turn arrives: an earlier in-flight barrier
+    /// still completes and is acknowledged, while the failing one and everything
+    /// after it fail closed. This is the ordering guarantee the overlapped pacer
+    /// relies on.
+    #[test]
+    fn overlapped_barrier_failure_is_observed_in_submission_order() {
+        let p = tmp("overlapped_order.wal");
+        let mut e = Engine::create(&p).unwrap();
+        e.commit_block(b"base", &[Op::PutDoc { entity: b"E".to_vec(), handle: 1, doc: b"doc1".to_vec() }]).unwrap();
+
+        e.begin_group().unwrap();
+        e.commit_block_grouped(b"b1", &[Op::PutDoc { entity: b"E".to_vec(), handle: 2, doc: b"doc2".to_vec() }]).unwrap();
+        assert!(e.submit_group().unwrap());
+
+        e.begin_group().unwrap();
+        e.commit_block_grouped(b"b2", &[Op::PutDoc { entity: b"E".to_vec(), handle: 3, doc: b"doc3".to_vec() }]).unwrap();
+        e.wal.arm_barrier_error();
+        assert!(e.submit_group().unwrap());
+        assert_eq!(e.pending_barriers(), 2);
+
+        assert!(e.wait_group_barrier().is_ok(), "the first (healthy) barrier completes and is acknowledged");
+        assert_eq!(e.pending_barriers(), 1);
+        let err = e.wait_group_barrier().unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::Other, "the second (injected) barrier fails in its own turn");
+        assert_eq!(e.pending_barriers(), 0);
+
+        e.begin_group().unwrap();
+        assert!(e.commit_block_grouped(b"b3", &[Op::PutDoc { entity: b"E".to_vec(), handle: 4, doc: b"doc4".to_vec() }]).is_err(),
+            "the writer is poisoned after the failing barrier");
         remove(&p);
     }
 
