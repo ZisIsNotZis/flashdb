@@ -70,7 +70,7 @@ Mechanism:
   protocol; a much larger driver rewrite with many more ordering/durability failure modes. Rejected
   in favour of the additive warming worker, which keeps the entire existing loop and read path.
 
-## Change (implemented, commits `67c541f`)
+## Change (implemented, commits `67c541f` + `009ce3d`)
 
 1. `engine/src/engine.rs`: `TileHandle.tile` → `Arc<Tile>`; add `Engine::tile_read_view()`.
 2. `engine/src/readahead.rs` (new): `TileReadView`, `ReadAhead`, the worker thread and the tile-only

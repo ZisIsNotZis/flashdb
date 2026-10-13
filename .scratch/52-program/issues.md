@@ -393,7 +393,8 @@ warning: `VIRTUAL_ENV=/home/z/.venv` does not match the project environment path
 - Action: dispatched work package G "take the request-path reads off the pacer" to the
   single-writer `wave7/readsoverlap` worktree. Contract, diagnosis, rejected alternatives, design,
   tests, gates, before/after table and verdict are in `.scratch/58-overlapped-reads/issues.md`.
-- Result: commits `94c3027` (checkpoint) + `67c541f` (read-ahead tile warming). A background
+- Result: commits `94c3027` (checkpoint) + `67c541f` (read-ahead tile warming) + `009ce3d`
+  (pace the warm to avoid a startup read burst). A background
   read-ahead worker pre-reads the tile blocks for the next 64 requests (paced 4 ms/request), so the
   pacer's authoritative reads are page-cache hits and the cold page-in happens off the pacer;
   durability/ordering/read correctness are untouched (warming only). 291 Rust tests and 132 Python
