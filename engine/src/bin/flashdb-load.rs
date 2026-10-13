@@ -365,7 +365,10 @@ fn read_policy(path: &str) -> io::Result<LayoutPolicy> {
 /// per-request latencies and is NEVER presented as one.
 ///
 /// Frozen top-level fields: `window`, `rate_rps`, `requests` (this window), `completed`/`errors`
-/// (cumulative), the per-request service and lag percentiles above, `group_elapsed_us`,
+/// (cumulative), the per-request service and lag percentiles above, `min_lag_us` (the window's
+/// absolute minimum per-request lag), `group_elapsed_us`, `groups`/`mean_group_size`/
+/// `max_group_size` (the window's group statistics; `mean_group_size == requests / groups`),
+/// `groups_over_service_ceiling` (how many groups' elapsed exceeded `service_ceiling_us`),
 /// `early_dispatches`, `window_us` (the window's actual wall time), `invalid` (the pacer's
 /// rejection flag), `reject_reason` (WHICH rule rejected it, `null` when valid),
 /// `service_ceiling_us`/`service_ceiling_breached` and `lag_ceiling_us`/`lag_ceiling_breached`,
@@ -390,12 +393,24 @@ struct WindowLine<'a> {
     p50_us: u64,
     p95_us: u64,
     p99_us: u64,
-    /// Per-request schedule-lag (issue minus due) percentiles.
+    /// Per-request schedule-lag (issue minus due) percentiles, plus the window's ABSOLUTE
+    /// minimum lag. The percentiles are clamped at 0 so a negative (early) lag would be hidden;
+    /// `min_lag_us` is the smallest per-request sample and is emitted so the floor is verifiable.
     lag_p50_us: u64,
     lag_p95_us: u64,
     lag_p99_us: u64,
+    min_lag_us: u64,
     /// Largest group completion minus its first member's due time. Diagnostic, not a latency.
     group_elapsed_us: u64,
+    /// Groups dispatched this window, their mean and max size. `mean_group_size` is
+    /// `requests / groups` (0 when no group was dispatched), so a verifier can recompute it.
+    groups: u64,
+    mean_group_size: f64,
+    max_group_size: u64,
+    /// Groups whose elapsed (`group_elapsed_us` sample) exceeded `service_ceiling_us` this
+    /// window; 0 when no `--ceiling-us` was given. Distinguishes a single slow group from the
+    /// whole window stalling.
+    groups_over_service_ceiling: u64,
     /// Requests issued before their due time by more than `EARLY_TOLERANCE_US` (always 0).
     early_dispatches: u64,
     window_us: u64,
@@ -427,7 +442,12 @@ fn metrics_json_line(w: WindowLine) -> String {
         "lag_p50_us": w.lag_p50_us,
         "lag_p95_us": w.lag_p95_us,
         "lag_p99_us": w.lag_p99_us,
+        "min_lag_us": w.min_lag_us,
         "group_elapsed_us": w.group_elapsed_us,
+        "groups": w.groups,
+        "mean_group_size": w.mean_group_size,
+        "max_group_size": w.max_group_size,
+        "groups_over_service_ceiling": w.groups_over_service_ceiling,
         "early_dispatches": w.early_dispatches,
         "window_us": w.window_us,
         "invalid": w.invalid,
@@ -650,6 +670,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // consumes a not-yet-ready request). Emitted so a regression is visible in the output.
     let mut early_dispatches_total: u64 = 0;
     let mut early_dispatches_window: u64 = 0;
+    // Group formation statistics for the current window: how many groups were dispatched and the
+    // size of the largest. `requests` (the per-window latency sample count) is the group-size sum,
+    // so the window's mean group size is `requests / groups`.
+    let mut groups_window: u64 = 0;
+    let mut max_group_size_window: u64 = 0;
     let mut last_valid_rate: f64 = 0.0;
     let mut saturated_at: Option<f64> = None;
     // Compaction actuation accounting (Slice 37): driver-side bytes and merges
@@ -673,6 +698,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let (end, end_due_us) = ready_group(
                 index, total, size, due_us, now_us, &args.rates, args.segment_requests);
             debug_assert!(end > index);
+            groups_window += 1;
+            max_group_size_window = max_group_size_window.max(end - index);
             let started = Instant::now();
             if args.group_requests.is_some() {
                 // Grouped request mode: the real adapter flow (`cust -> take` with its stock
@@ -886,6 +913,22 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             // The group elapsed is a diagnostic (the largest group completion minus its first
             // member's due time); it bounds the per-request service latencies and is never one.
             let group_elapsed_us = group_elapseds.iter().copied().max().unwrap_or(0);
+            // Group statistics: the window's request count (`latencies.len()`) is the sum of its
+            // group sizes, so `mean_group_size == requests / groups`. `groups_over_service_ceiling`
+            // counts groups whose elapsed exceeded the service ceiling, so a reader can tell
+            // whether the p99 tail is one group's serial work or many independent stalls.
+            let groups = groups_window;
+            let mean_group_size = if groups > 0 {
+                latencies.len() as f64 / groups as f64
+            } else {
+                0.0
+            };
+            let max_group_size = max_group_size_window;
+            // The absolute minimum per-request lag, kept separately from the clamped percentiles.
+            let min_lag_us = lags.iter().copied().min().unwrap_or(0);
+            let groups_over_service_ceiling = group_elapseds.iter()
+                .filter(|&&g| args.ceiling_us.is_some_and(|c| g > c))
+                .count() as u64;
             let behind = lag_p99 > args.lag_ceiling_us;
             let window_late = late_total - window_late_start;
             let service_ceiling_breached = args.ceiling_us.is_some_and(|c| p99 > c);
@@ -932,7 +975,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     lag_p50_us: lag_p50,
                     lag_p95_us: lag_p95,
                     lag_p99_us: lag_p99,
+                    min_lag_us,
                     group_elapsed_us,
+                    groups,
+                    mean_group_size,
+                    max_group_size,
+                    groups_over_service_ceiling,
                     early_dispatches: early_dispatches_window,
                     window_us,
                     invalid,
@@ -950,7 +998,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 writeln!(out, "window={window_index} rate_rps={:.0} requests={} completed={completed} \
                     errors={errors} service_p50_us={p50} service_p95_us={p95} service_p99_us={p99} \
                     lag_p50_us={lag_p50} lag_p95_us={lag_p95} lag_p99_us={lag_p99} \
-                    group_elapsed_us={group_elapsed_us} early_dispatches={early_dispatches_window} \
+                    min_lag_us={min_lag_us} group_elapsed_us={group_elapsed_us} groups={groups} \
+                    mean_group_size={mean_group_size:.3} max_group_size={max_group_size} \
+                    groups_over_service_ceiling={groups_over_service_ceiling} \
+                    early_dispatches={early_dispatches_window} \
                     behind={behind} late_total={late_total} errors_window={window_error_count} \
                     invalid={invalid} reject_reason={} service_ceiling_us={} lag_ceiling_us={} \
                     compact_bytes={compact_bytes_window}",
@@ -969,6 +1020,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             latencies.clear();
             lags.clear();
             group_elapseds.clear();
+            groups_window = 0;
+            max_group_size_window = 0;
             early_dispatches_window = 0;
             // keep the process footprint flat across windows (scan results churn hundred-KB Vecs)
             trim_heap();
@@ -1143,8 +1196,9 @@ mod tests {
         let line = metrics_json_line(WindowLine {
             window: 1, rate: 100.0, requests: 1, completed: 1, errors: 0, compact_bytes: 0,
             p50_us: 10, p95_us: 15, p99_us: 20,
-            lag_p50_us: 0, lag_p95_us: 0, lag_p99_us: 0,
-            group_elapsed_us: 0, early_dispatches: 0,
+            lag_p50_us: 0, lag_p95_us: 0, lag_p99_us: 0, min_lag_us: 0,
+            group_elapsed_us: 0, groups: 1, mean_group_size: 1.0, max_group_size: 1,
+            groups_over_service_ceiling: 0, early_dispatches: 0,
             window_us: 1_000_000, invalid: false, reject_reason: None,
             service_ceiling_us: None, service_ceiling_breached: false,
             lag_ceiling_us: 10_000, lag_ceiling_breached: false,
@@ -1164,8 +1218,9 @@ mod tests {
         let line = metrics_json_line(WindowLine {
             window: 7, rate: 50.0, requests: 64, completed: 128, errors: 0, compact_bytes: 0,
             p50_us: 100, p95_us: 500, p99_us: 999_999,
-            lag_p50_us: 0, lag_p95_us: 0, lag_p99_us: 5_000_000,
-            group_elapsed_us: 200, early_dispatches: 0,
+            lag_p50_us: 0, lag_p95_us: 0, lag_p99_us: 5_000_000, min_lag_us: 3,
+            group_elapsed_us: 200, groups: 1, mean_group_size: 64.0, max_group_size: 64,
+            groups_over_service_ceiling: 1, early_dispatches: 0,
             window_us: 1_280_000, invalid: true,
             reject_reason: Some("service_ceiling".into()),
             service_ceiling_us: Some(250_000), service_ceiling_breached: true,
@@ -1174,10 +1229,40 @@ mod tests {
         });
         assert!(line.contains(r#""invalid":true"#), "got {line}");
         assert!(line.contains(r#""lag_p99_us":5000000"#), "got {line}");
+        assert!(line.contains(r#""min_lag_us":3"#), "got {line}");
+        assert!(line.contains(r#""groups_over_service_ceiling":1"#), "got {line}");
         assert!(line.contains(r#""window_us":1280000"#), "got {line}");
         assert!(line.contains(r#""service_ceiling_us":250000"#), "got {line}");
         assert!(line.contains(r#""service_ceiling_breached":true"#), "got {line}");
         assert!(line.contains(r#""reject_reason":"service_ceiling""#), "got {line}");
+    }
+
+    /// The per-window group statistics: `groups` counts the dispatched groups, `max_group_size`
+    /// is the largest, and `mean_group_size == requests / groups`; `min_lag_us` is the absolute
+    /// minimum per-request lag and `groups_over_service_ceiling` counts groups whose elapsed
+    /// exceeded `service_ceiling_us`. None of these fields existed before the fix.
+    #[test]
+    fn metrics_json_line_carries_group_statistics_and_min_lag() {
+        let empty = WindowSnapshot::default();
+        let line = metrics_json_line(WindowLine {
+            window: 2, rate: 100.0, requests: 96, completed: 96, errors: 0, compact_bytes: 0,
+            p50_us: 100, p95_us: 200, p99_us: 300,
+            lag_p50_us: 10, lag_p95_us: 20, lag_p99_us: 30, min_lag_us: 0,
+            group_elapsed_us: 900, groups: 3, mean_group_size: 32.0, max_group_size: 64,
+            groups_over_service_ceiling: 2, early_dispatches: 0,
+            window_us: 1_000_000, invalid: false, reject_reason: None,
+            service_ceiling_us: Some(500), service_ceiling_breached: false,
+            lag_ceiling_us: 10_000, lag_ceiling_breached: false,
+            policy: LayoutPolicy::declared_default().to_json(), current: &empty, previous: None,
+        });
+        let v: serde_json::Value = serde_json::from_str(&line).expect("valid json");
+        assert_eq!(v["groups"], 3);
+        assert_eq!(v["max_group_size"], 64);
+        assert_eq!(v["min_lag_us"], 0);
+        assert_eq!(v["groups_over_service_ceiling"], 2);
+        let mean = v["mean_group_size"].as_f64().expect("mean is numeric");
+        let derived = v["requests"].as_f64().unwrap() / v["groups"].as_f64().unwrap();
+        assert!((mean - derived).abs() < 1e-9, "mean {mean} must equal requests/groups {derived}");
     }
 
     #[test]
@@ -1189,8 +1274,9 @@ mod tests {
         let line = metrics_json_line(WindowLine {
             window: 3, rate: 120.0, requests: 10, completed: 9, errors: 1, compact_bytes: 0,
             p50_us: 500, p95_us: 1000, p99_us: 1500,
-            lag_p50_us: 0, lag_p95_us: 0, lag_p99_us: 0,
-            group_elapsed_us: 0, early_dispatches: 0,
+            lag_p50_us: 0, lag_p95_us: 0, lag_p99_us: 0, min_lag_us: 0,
+            group_elapsed_us: 0, groups: 2, mean_group_size: 5.0, max_group_size: 8,
+            groups_over_service_ceiling: 0, early_dispatches: 0,
             window_us: 1_000_000, invalid: false, reject_reason: None,
             service_ceiling_us: None, service_ceiling_breached: false,
             lag_ceiling_us: 10_000, lag_ceiling_breached: false,
@@ -1198,14 +1284,15 @@ mod tests {
         });
         assert_eq!(
             line,
-            r#"{"compact_bytes":0,"completed":9,"current":{"patterns":[],"regions":[]},"early_dispatches":0,"errors":1,"group_elapsed_us":0,"invalid":false,"lag_ceiling_breached":false,"lag_ceiling_us":10000,"lag_p50_us":0,"lag_p95_us":0,"lag_p99_us":0,"p50_us":500,"p95_us":1000,"p99_us":1500,"policy":{"default":{"bloom_bits_per_key":10,"merge_min_tiles":2,"page_size":4096},"regions":{}},"previous":null,"rate_rps":120.0,"reject_reason":null,"requests":10,"service_ceiling_breached":false,"service_ceiling_us":null,"service_p50_us":500,"service_p95_us":1000,"service_p99_us":1500,"window":3,"window_us":1000000}"#
+            r#"{"compact_bytes":0,"completed":9,"current":{"patterns":[],"regions":[]},"early_dispatches":0,"errors":1,"group_elapsed_us":0,"groups":2,"groups_over_service_ceiling":0,"invalid":false,"lag_ceiling_breached":false,"lag_ceiling_us":10000,"lag_p50_us":0,"lag_p95_us":0,"lag_p99_us":0,"max_group_size":8,"mean_group_size":5.0,"min_lag_us":0,"p50_us":500,"p95_us":1000,"p99_us":1500,"policy":{"default":{"bloom_bits_per_key":10,"merge_min_tiles":2,"page_size":4096},"regions":{}},"previous":null,"rate_rps":120.0,"reject_reason":null,"requests":10,"service_ceiling_breached":false,"service_ceiling_us":null,"service_p50_us":500,"service_p95_us":1000,"service_p99_us":1500,"window":3,"window_us":1000000}"#
         );
         // A previous window is embedded as an object, not a string.
         let with_prev = metrics_json_line(WindowLine {
             window: 4, rate: 120.0, requests: 10, completed: 19, errors: 1, compact_bytes: 4288,
             p50_us: 500, p95_us: 1000, p99_us: 1500,
-            lag_p50_us: 0, lag_p95_us: 0, lag_p99_us: 0,
-            group_elapsed_us: 0, early_dispatches: 0,
+            lag_p50_us: 0, lag_p95_us: 0, lag_p99_us: 0, min_lag_us: 0,
+            group_elapsed_us: 0, groups: 2, mean_group_size: 5.0, max_group_size: 8,
+            groups_over_service_ceiling: 0, early_dispatches: 0,
             window_us: 1_000_000, invalid: false, reject_reason: None,
             service_ceiling_us: None, service_ceiling_breached: false,
             lag_ceiling_us: 10_000, lag_ceiling_breached: false,

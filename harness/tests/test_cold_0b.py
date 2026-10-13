@@ -599,12 +599,16 @@ def _latency_window(rate: float, completed_delta: int, *, requests: int,
                     lag_p50: int = 0, lag_p95: int = 0, lag_p99: int = 0,
                     invalid: bool = False, reject_reason: str | None = None,
                     service_breached: bool = False, lag_breached: bool = False,
-                    early: int = 0, window_s: float = 1.0) -> str:
+                    early: int = 0, window_s: float = 1.0,
+                    min_lag: int = 0, groups: int = 1, max_group_size: int | None = None,
+                    groups_over_service_ceiling: int = 0) -> str:
     """A ``--metrics-json`` window from the fixed driver (per-request latencies + named ceilings).
 
     ``p50_us``/``p99_us`` are deliberately set to the GROUP elapsed to reproduce the pre-fix
     driver, while the explicit ``service_pNN_us`` fields carry the per-request values: a consumer
-    that reads the retired group-inflated ``p50_us`` reports the wrong number.
+    that reads the retired group-inflated ``p50_us`` reports the wrong number. `min_lag`, `groups`,
+    `max_group_size` and `groups_over_service_ceiling` are the slice-48 additions; the emitted
+    ``mean_group_size`` is derived as ``requests / groups`` so it is always consistent.
     """
     return json.dumps({
         "window": 0, "rate_rps": rate, "requests": requests, "completed": completed_delta,
@@ -612,7 +616,11 @@ def _latency_window(rate: float, completed_delta: int, *, requests: int,
         "service_p50_us": service_p50, "service_p95_us": service_p95, "service_p99_us": service_p99,
         "p50_us": group_elapsed_us, "p95_us": group_elapsed_us, "p99_us": group_elapsed_us,
         "lag_p50_us": lag_p50, "lag_p95_us": lag_p95, "lag_p99_us": lag_p99,
+        "min_lag_us": min_lag,
         "group_elapsed_us": group_elapsed_us, "early_dispatches": early,
+        "groups": groups, "mean_group_size": (requests / groups) if groups else 0.0,
+        "max_group_size": max_group_size if max_group_size is not None else requests,
+        "groups_over_service_ceiling": groups_over_service_ceiling,
         "window_us": int(window_s * 1e6), "invalid": invalid, "reject_reason": reject_reason,
         "service_ceiling_us": 10_000, "service_ceiling_breached": service_breached,
         "lag_ceiling_us": 10_000, "lag_ceiling_breached": lag_breached,
@@ -682,3 +690,65 @@ def test_t3_service_and_lag_ceilings_report_different_reasons() -> None:
     assert row["ceiling_rejected_windows"] == 2
     assert row["reject_reasons"] == {"lag_ceiling": 1, "service_ceiling": 1}
     assert row["sustained"] is False
+
+
+# ---------------------------------------------------------------------------
+# Slice 48: per-window group statistics, absolute minimum lag and group-over-ceiling count
+# ---------------------------------------------------------------------------
+def test_group_statistics_are_consistent_and_bounded() -> None:
+    """The window's ``requests`` is the sum of its group sizes, so ``requests / groups`` is the mean
+    group size. The driver now emits ``groups``, ``mean_group_size`` and ``max_group_size``; before
+    the fix none existed, so group formation could not be checked at all. Consistency: the per-window
+    requests sum to the run total, and each window's mean size lies between 1 and the group cap."""
+    cap = 64
+    lines = [
+        _latency_window(50.0, 64, requests=64, group_elapsed_us=108_282,
+                        service_p50=1_600, service_p95=2_100, service_p99=2_500,
+                        groups=1, max_group_size=64),
+        _latency_window(50.0, 64, requests=64, group_elapsed_us=20_000,
+                        service_p50=1_500, service_p95=2_000, service_p99=2_400,
+                        groups=2, max_group_size=40),
+        "load_summary requests=128 completed=128 errors=0 elapsed_ms=1000 achieved_rps=128",
+    ]
+    recs = m.window_records(lines, window_ms=1000)
+    summary = m.parse_load_summary(lines[-1])
+    assert sum(r["requests"] for r in recs) == summary["requests"] == 128, \
+        "per-window requests must sum to the run total"
+    for r in recs:
+        assert r["groups"] >= 1
+        assert abs(r["mean_group_size"] - r["requests"] / r["groups"]) < 1e-9, \
+            "mean group size must equal requests / groups"
+        assert 1.0 <= r["mean_group_size"] <= cap
+        assert 1 <= r["max_group_size"] <= cap
+    row = {r["offered_rps"]: r for r in m.summarize_curve(recs)}[50.0]
+    assert row["groups"] == 3, "the rung groups is the sum over its windows"
+    assert row["max_group_size"] == 64
+    assert abs(row["mean_group_size"] - 128 / 3) < 1e-9, "rung mean = total requests / total groups"
+
+
+def test_min_lag_is_present_and_non_negative() -> None:
+    """The percentile lags are clamped at 0, so only ``min_lag_us`` can show the window's actual
+    floor. It must be present and non-negative (a negative value would mean an early dispatch, which
+    the scheduler never does); before the fix the field did not exist."""
+    line = _latency_window(50.0, 1, requests=1, group_elapsed_us=1_600,
+                           service_p50=1_600, service_p95=1_600, service_p99=1_600,
+                           lag_p50=10, lag_p95=20, lag_p99=30, min_lag=7)
+    rec = m.window_records([line], window_ms=1000)[0]
+    assert rec["min_lag_us"] == 7
+    assert rec["min_lag_us"] >= 0
+    row = m.summarize_curve([rec])[0]
+    assert row["min_lag_us"] == 7, "the rung min lag is the min over its windows"
+
+
+def test_a_group_over_the_service_ceiling_is_counted() -> None:
+    """When the largest group elapsed exceeds the service ceiling, the window must report at least
+    one group over the ceiling, so a reader can tell one group's serial work from many independent
+    stalls. Before the fix the count did not exist and read as 0."""
+    line = _latency_window(50.0, 64, requests=64, group_elapsed_us=500_000,
+                           service_p50=10_000, service_p95=400_000, service_p99=480_000,
+                           service_breached=True, groups=8, groups_over_service_ceiling=2)
+    rec = m.window_records([line], window_ms=1000)[0]
+    assert rec["group_elapsed_us"] > rec["service_ceiling_us"], "the largest group exceeded the ceiling"
+    assert rec["groups_over_service_ceiling"] >= 1, "the exceeding group must be counted"
+    row = m.summarize_curve([rec], ceiling_us=10_000)[0]
+    assert row["groups_over_service_ceiling"] == 2, "the rung sums the per-window group counts"

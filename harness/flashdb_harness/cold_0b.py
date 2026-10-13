@@ -260,13 +260,28 @@ def window_records(lines: list[str], window_ms: int) -> list[dict]:
         lag_p50 = int(obj.get("lag_p50_us", 0))
         lag_p95 = int(obj.get("lag_p95_us", 0))
         lag_p99 = int(obj.get("lag_p99_us", 0))
+        # The window's ABSOLUTE minimum per-request lag. The percentiles above are clamped at 0,
+        # so this is the only field that would expose an early (negative) dispatch; the driver
+        # emits it because the clamped distribution cannot show its own floor.
+        min_lag = int(obj.get("min_lag_us", 0))
+        # Group statistics: how many groups were dispatched this window, their mean and max size,
+        # and how many groups' elapsed exceeded the service ceiling. `mean_group_size` is emitted
+        # by the driver as `requests / groups`; re-derive it when absent so the record is
+        # self-consistent and the mean is always present.
+        requests = int(obj.get("requests", 0))
+        groups = int(obj.get("groups", 0))
+        raw_mean = obj.get("mean_group_size")
+        mean_group_size = float(raw_mean) if raw_mean is not None else (
+            requests / groups if groups else 0.0)
+        max_group_size = int(obj.get("max_group_size", 0))
+        groups_over_service_ceiling = int(obj.get("groups_over_service_ceiling", 0))
         service_ceiling_us = obj.get("service_ceiling_us", obj.get("ceiling_us"))
         service_ceiling_breached = bool(obj.get("service_ceiling_breached",
                                                obj.get("ceiling_breached", False)))
         out.append({
             "window": int(obj.get("window", len(out))),
             "rate_rps": float(obj.get("rate_rps", 0.0)),
-            "requests": int(obj.get("requests", 0)),
+            "requests": requests,
             "completed": completed,
         # This window's own completions and the wall time it took; `summarize_curve` sums both per
         # offered rate and divides by the longer of the offered span and this wall time, instead of
@@ -288,8 +303,15 @@ def window_records(lines: list[str], window_ms: int) -> list[dict]:
             "lag_p50_us": lag_p50,
             "lag_p95_us": lag_p95,
             "lag_p99_us": lag_p99,
-            # Diagnostic only: the largest group completion minus its first member's due time.
+            "min_lag_us": min_lag,
+            # Diagnostic only: the largest group completion minus its first member's due time,
+            # plus the group-formation statistics (groups/mean/max size) and the count of groups
+            # whose elapsed exceeded the service ceiling (one slow group vs many stalls).
             "group_elapsed_us": int(obj.get("group_elapsed_us", 0)),
+            "groups": groups,
+            "mean_group_size": mean_group_size,
+            "max_group_size": max_group_size,
+            "groups_over_service_ceiling": groups_over_service_ceiling,
             "early_dispatches": int(obj.get("early_dispatches", 0)),
             "reject_reason": obj.get("reject_reason"),
             "service_ceiling_us": service_ceiling_us,
@@ -383,6 +405,16 @@ def summarize_curve(windows: list[dict], ceiling_us: int | None = None) -> list[
             if reason:
                 reject_reasons[reason] = reject_reasons.get(reason, 0) + 1
         rate_exceeded = achieved > rate * (1.0 + RUNG_RATE_TOLERANCE)
+        # Group statistics for the rung: total groups dispatched, the largest group seen, the mean
+        # size (total requests / total groups, so a verifier can re-derive it exactly), the
+        # ABSOLUTE minimum per-request lag across the rung's windows, and how many groups' elapsed
+        # exceeded the service ceiling (one group's serial work vs many independent stalls).
+        groups_total = sum(w.get("groups", 0) for w in ws)
+        requests_total = sum(w.get("requests", 0) for w in ws)
+        mean_group_size = (requests_total / groups_total) if groups_total else 0.0
+        max_group_size = max((w.get("max_group_size", 0) for w in ws), default=0)
+        min_lag_us = min((w.get("min_lag_us", 0) for w in ws), default=0)
+        groups_over_service_ceiling = sum(w.get("groups_over_service_ceiling", 0) for w in ws)
         curve.append({
             "offered_rps": rate,
             "windows": len(ws),
@@ -394,6 +426,11 @@ def summarize_curve(windows: list[dict], ceiling_us: int | None = None) -> list[
             "lag_p95_us": max((w.get("lag_p95_us", 0) for w in ws), default=0),
             "lag_p99_us": max((w.get("lag_p99_us", 0) for w in ws), default=0),
             "group_elapsed_us": max((w.get("group_elapsed_us", 0) for w in ws), default=0),
+            "groups": groups_total,
+            "mean_group_size": mean_group_size,
+            "max_group_size": max_group_size,
+            "min_lag_us": min_lag_us,
+            "groups_over_service_ceiling": groups_over_service_ceiling,
             "early_dispatches": sum(w.get("early_dispatches", 0) for w in ws),
             "achieved_fraction": achieved / rate if rate else 0.0,
             "invalid_windows": sum(1 for w in ws if w.get("invalid", False)),
@@ -1571,9 +1608,10 @@ def render_report(result: dict) -> str:
     w("## Per-arm capacity curve")
     w("")
     w("| workload | arm | lambda | offered | achieved rps | achieved % | svc p50 | svc p95 | "
-      "svc p99 | lag p50 | lag p95 | lag p99 | group us | sustained | commit | else | "
-      "active tiles | reorg bytes |")
-    w("|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|:--:|---:|---:|---:|---:|")
+      "svc p99 | lag p50 | lag p95 | lag p99 | group us | groups | grp mean | grp max | "
+      "min lag | grp>ceil | sustained | commit | else | active tiles | reorg bytes |")
+    w("|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:"
+      "|---:|---:|:--:|---:|---:|---:|---:|")
     for key, rec in sorted(result["arms"].items()):
         summary = rec.get("summary", {})
         ti = rec.get("engine_open", {}) or {}
@@ -1581,14 +1619,18 @@ def render_report(result: dict) -> str:
         rows = rec.get("curve") or []
         if not rows:
             w(f"| {rec['workload']} | {rec['arm']} | {_fmt(rec.get('lambda_ns_per_byte'))} | - | - | "
-              f"- | - | - | - | - | - | - | - | - | {_fmt(summary.get('commit_rate'), '.3f')} | "
+              f"- | - | - | - | - | - | - | - | - | - | - | - | - | - | "
+              f"{_fmt(summary.get('commit_rate'), '.3f')} | "
               f"{_fmt(summary.get('else_used'))} | {_fmt(ti.get('active_tiles'))} | {reorg} |")
         for row in rows:
             w(f"| {rec['workload']} | {rec['arm']} | {_fmt(rec.get('lambda_ns_per_byte'))} | "
               f"{row['offered_rps']:.0f} | {row['achieved_rps']:.1f} | {row['achieved_fraction']:.0%} | "
               f"{row['p50_us']} | {row.get('p95_us', 0)} | {row['p99_us']} | "
               f"{row.get('lag_p50_us', 0)} | {row.get('lag_p95_us', 0)} | {row.get('lag_p99_us', 0)} | "
-              f"{row.get('group_elapsed_us', 0)} | {'yes' if row['sustained'] else 'no'} | "
+              f"{row.get('group_elapsed_us', 0)} | {row.get('groups', 0)} | "
+              f"{_fmt(row.get('mean_group_size'), '.2f')} | {row.get('max_group_size', 0)} | "
+              f"{row.get('min_lag_us', 0)} | {row.get('groups_over_service_ceiling', 0)} | "
+              f"{'yes' if row['sustained'] else 'no'} | "
               f"{_fmt(summary.get('commit_rate'), '.3f')} | {_fmt(summary.get('else_used'))} | "
               f"{_fmt(ti.get('active_tiles'))} | {reorg} |")
     w("")
@@ -1596,7 +1638,11 @@ def render_report(result: dict) -> str:
       "minus each request's OWN due time); `lag p50`/`lag p95`/`lag p99` are PER-REQUEST schedule-lag "
       "percentiles (issue minus due). `group us` is a separate diagnostic (the largest group "
       "completion minus its first member's due time); it bounds the per-request latencies and is "
-      "never one of them. `commit` is completed/requests (1.0 = every offered request committed); "
+      "never one of them. `groups` is the number of groups dispatched over the rung, `grp mean` "
+      "their mean size (total requests / total groups) and `grp max` the largest group seen; "
+      "`min lag` is the ABSOLUTE minimum per-request lag over the rung's windows (the percentiles "
+      "are clamped at 0 and cannot show the floor); `grp>ceil` is how many groups' elapsed "
+      "exceeded the service ceiling. `commit` is completed/requests (1.0 = every offered request committed); "
       "`else` is the stock "
       "guard's else/backorder branch count; `reorg bytes` is the summed per-region "
       "`compaction_bytes` over the run. `achieved rps` is the rung's attributed completions over "
