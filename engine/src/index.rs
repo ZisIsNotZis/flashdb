@@ -52,11 +52,13 @@ pub struct OrderNoIndexBuild {
 /// Build the `order_no -> handle` index tile from the `P|StockMovement` tiles in
 /// `view`. Runs off the request path (the caller owns the thread): it streams
 /// the whole entity prefix once, JSON-parses each document once, sorts the
-/// `(order_no, handle, csn)` entries, and writes ONE 64 KiB-page, no-bloom tile
+/// `(order_no, handle, csn)` entries, and writes ONE 4 KiB-page, no-bloom tile
 /// with the existing [`crate::tile::TileWriter`] (which syncs the file). The
-/// caller must sync the parent directory before adopting the tile, matching the
-/// compaction apply ordering. Memory is bounded by the entity's index entries
-/// (one sort buffer), not the document set.
+/// tile is written to a scratch name and atomically renamed over the final
+/// `name`, so a rebuild after a retire replaces the previous sidecar file rather
+/// than failing on `create_new`. The caller must sync the parent directory before
+/// adopting the tile, matching the compaction apply ordering. Memory is bounded
+/// by the entity's index entries (one sort buffer), not the document set.
 pub fn build_order_no_index(
     dir: &Path,
     view: &TileReadView,
@@ -79,14 +81,21 @@ pub fn build_order_no_index(
     })?;
     entries.sort_by(|a, b| a.0.cmp(&b.0));
     let path = dir.join(name);
+    // Write to a scratch name and atomically rename over `name` so a rebuild
+    // after a retire replaces the stale sidecar (the writer itself refuses to
+    // overwrite an existing file). The `Tile` returned by `finish` holds an open
+    // fd, which stays valid across the rename.
+    let tmp_path = dir.join(format!(".{name}.tmp"));
+    let _ = std::fs::remove_file(&tmp_path);
     let digest = [0u8; 32];
     // 4 KiB pages: a point probe reads one 4 KiB block, and the one-time write
     // amplification stays at the data's own size (no 64 KiB block padding).
-    let mut writer = crate::tile::TileWriter::new(&path, coverage_csn, &digest, 4_096)?;
+    let mut writer = crate::tile::TileWriter::new(&tmp_path, coverage_csn, &digest, 4_096)?;
     for (key, value) in &entries {
         writer.push(key, value)?;
     }
     let tile = writer.finish()?;
+    std::fs::rename(&tmp_path, &path)?;
     let output_bytes = std::fs::metadata(&path)?.len();
     Ok(OrderNoIndexBuild {
         name: name.to_string(),
