@@ -283,3 +283,41 @@ warning: `VIRTUAL_ENV=/home/z/.venv` does not match the project environment path
   remain, neither the fsync tail: synchronous cold point reads on the request path (order-flow
   cust/stock probes, dominant) and the window-boundary barrier drain (secondary). Honest FAIL on
   that criterion; the primary blocker is a new, separately-scoped mechanism.
+
+## Integration record: wave5/overlap
+
+- Timestamp: 2026-10-13T22:55:08+08:00
+- Actor: integrator worker (single writer on master)
+- Base at integration start: master `56faf205380526f2ac6ec31942cd7ca94051721a`
+- Merge: `git merge --no-ff wave5/overlap` (durability-preserving overlapped WAL barrier; independently verified PASS at `1cc629a`)
+  - Merge commit: `539de6e9fa79eea2fee4cec380f6306974660baf`
+  - Parents: `56faf205380526f2ac6ec31942cd7ca94051721a` + `1cc629a2c20b1e967dc69f9f360aa7764d4dda9b`
+  - Conflict resolution: one content conflict in `.scratch/52-program/issues.md` (both branches appended a section after `## wave4 WP-D dispatch record`). Resolved by keeping both `Integration record: wave4/lag` (master) and `wave5 WP-E dispatch record` (wave5/overlap) in chronological order; no content dropped.
+- Final HEAD after merge (integrated revision under gate): `539de6e9fa79eea2fee4cec380f6306974660baf`
+- Next lane worktree: `git worktree add -b wave6/reads /home/z/vibe/worktrees/flashdb/wave6-reads master`
+  - Worktree path: `/home/z/vibe/worktrees/flashdb/wave6-reads`
+  - Branch: `wave6/reads`
+  - HEAD: `539de6e9fa79eea2fee4cec380f6306974660baf`
+
+Combined gates (run at merged master `539de6e`):
+
+1. `source $HOME/.cargo/env; cargo build --workspace --offline` — 0 warnings:
+```
+   Compiling flashdb-engine v0.1.0 (/home/z/vibe/flashdb/engine)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 3.59s
+```
+
+2. `cargo test --workspace --offline` — totals: 284 passed; 0 failed; 0 ignored.
+(119 lib + 20 flashdb-load + 9 batch_commit + 5 compaction_job + 4 constraints +
+3 family_colocation + 11 group_commit + 6 manifest_engine + 7 merge_threshold +
+14 metrics + 33 multi_tile + 7 order_flow + 1 partitioned_publish_cap + 5 read_requests +
+3 region_compaction + 6 region_partition + 3 replay_trace + 8 request_commit + 2 scale_bin +
+3 tile_format + 3 tile_layout + 12 tile_read + 0 flashdb-replay + 0 flashdb-scale + 0 main + 0 doc-tests)
+
+3. `cd harness && uv run --with pytest pytest -q`:
+```
+warning: `VIRTUAL_ENV=/home/z/.venv` does not match the project environment path `.venv` and will be ignored; use `--active` to target the active environment instead
+132 passed in 4.20s
+```
+
+4. `git diff --check` — silent (exit 0).
