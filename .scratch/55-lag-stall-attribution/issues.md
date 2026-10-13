@@ -219,7 +219,7 @@ are stated above.
 
 `cargo build --workspace --offline` — 0 warnings.
 
-`cd harness && uv run --with pytest pytest -q` — `132 passed in 4.49s`.
+`cd harness && uv run --with pytest pytest -q` — `132 passed in 4.16s`.
 
 `git diff --check` — silent (exit 0).
 
