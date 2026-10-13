@@ -233,7 +233,7 @@ channel as an error instead of `Ok(None)`.
 - `missing_replacement_tile_fails_reopen_after_manifest_writeback` — negative
   control showing the harness detects the `NotFound` failure mode.
 
-## Gates (verbatim, run at the repair commit)
+## Gates (verbatim, run at the repair commit f4539e4)
 
 `cargo test --workspace --offline` — 277 passed; 0 failed; 0 ignored.
 
