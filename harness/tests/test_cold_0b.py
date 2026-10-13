@@ -140,6 +140,20 @@ def test_policy_active_map_merges_default_and_region_entry() -> None:
     assert m.policy_active_map({}) == {}
 
 
+def test_policy_active_map_and_argmin_preserve_the_order_no_index_axis() -> None:
+    policy = {"default": {"page_size": 4096, "bloom_bits_per_key": 10, "merge_min_tiles": 2},
+              "regions": {"P|StockMovement": {"page_size": 65536, "merge_min_tiles": 2,
+                                              "index_order_no": True}}}
+    active = m.policy_active_map(policy)
+    assert active["P|StockMovement"].index_order_no is True
+    # argmin over a sweep that only saw the indexed candidate keeps the flag.
+    sweep = {"P|StockMovement": {
+        str(active["P|StockMovement"]): {"n": 1, "sum_cost": 1.0, "page_size": 65536,
+                                         "merge_min_tiles": 2, "index_order_no": True}}}
+    picks = m.argmin_from_sweep(sweep)
+    assert picks["P|StockMovement"].index_order_no is True
+
+
 def test_build_sweep_attributes_window_cost_to_the_echoed_candidate() -> None:
     policy_a = {"default": {"page_size": 4096, "bloom_bits_per_key": 10, "merge_min_tiles": 2},
                 "regions": {"P|Stock": {"page_size": 4096, "merge_min_tiles": 2}}}

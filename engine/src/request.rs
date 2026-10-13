@@ -311,6 +311,24 @@ pub fn execute_request(engine: &mut Engine, req: &Value) -> io::Result<RequestRe
         }
         ReadKind::Movements => {
             let order_no = req["blocks"]["q"]["find"]["StockMovement"]["where"]["order_no"].as_str().unwrap();
+            // Derived secondary access path (WP-M): a `order_no -> handle` index
+            // built off the request path. A hit short-circuits the full-entity
+            // scan; it is cross-checked against the document's own `order_no`, so
+            // a stale/corrupt/absent index can never return a wrong answer — a
+            // mismatch or a miss falls through to the authoritative scan below.
+            if let Some(handle) = engine.lookup_movement_by_order_no(order_no.as_bytes())? {
+                if let Some(doc) = engine.get(MOVEMENT.entity.as_bytes(), handle)? {
+                    if doc.len() <= MAX_MOVEMENT_DOC_BYTES {
+                        if let Ok(row) = document_row(&doc, MOVEMENT.entity) {
+                            if row["order_no"].as_str() == Some(order_no) {
+                                // Same shape as the scan path: a top-100 array
+                                // (one element here).
+                                return Ok(BTreeMap::from([("q".into(), result("ok", None, Some(Value::Array(vec![row]))))]));
+                            }
+                        }
+                    }
+                }
+            }
             let mut rows = BTreeMap::new();
             let mut retained_bytes = 0usize;
             engine.scan_primary(MOVEMENT.entity.as_bytes(), |handle, doc| {

@@ -1,5 +1,6 @@
 pub mod crc;
 pub mod engine;
+pub mod index;
 pub mod keys;
 mod manifest;
 pub mod memtable;

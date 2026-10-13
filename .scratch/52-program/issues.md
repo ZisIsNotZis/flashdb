@@ -646,3 +646,27 @@ warning: `VIRTUAL_ENV=/home/z/.venv` does not match the project environment path
 4. `git diff --check` — silent (exit 0).
 
 No failures.
+
+## wave12 WP-M dispatch record (learned secondary access path)
+
+- Timestamp: 2026-10-14T07:28:00+08:00.
+- Action: dispatched work package M "add the learned secondary access path keyed on the observed
+  `order_no` predicate (`P|StockMovement`) — the axis WP-K found missing" to the single-writer
+  `wave12/accesspath` worktree (branch `wave12/accesspath`, based on integrated master `65d8d3b`).
+  Contract, Stage-1 deterministic headroom, design, invariants argument, rejected alternatives,
+  Stage-2 before/after tables (both judging views) and residuals are in
+  `.scratch/64-learned-access-path/issues.md`; Stage-1 plan committed (`3fc776e`) before any build.
+- Result: Stage-1 GO (30,000 docs / 4.78 MB per scan -> 1 doc / ~70 KB). Stage-2 implemented
+  (engine `index.rs` derived `U|StockMovement.order_no` tile + read-path cross-check fallback;
+  driver off-path build/adopt/retire; harness 12-candidate indexed axis for the movement region) and
+  committed (`69d48f1`, `4f8d8c2`, `b28e86e`, `64cf940`, `9290822`, `6ef3f56`, `a8570fc`). The
+  learner **commits** the index (`P|StockMovement = 4096/200/index_order_no=true`) and
+  `static-derived` freezes it too. Win seed-42 ×2 (noise band), cap 128 MiB, lambda 1.0: achieved
+  throughput **declared 72-73 -> learned/static 107 rps** and ~100% achieved at rungs 100/200/400
+  (vs declared 85%/43%/21%), service p99 at 100+ rps ~4-36 ms -> ~9-197 us. Strict sustained rps
+  stays 0 for every arm under both the §7.1 lag-only view (1-4 fdatasync-floor lag breaches per rung
+  even with the index, plus rung-50 burn-in churn) and the pre-registered both-ceilings view; the
+  index is necessary but not sufficient — the remaining binding constraint is the per-group
+  `fdatasync` durability floor, a different (device-bound) axis. Gates: 299 Rust + 138 Python tests
+  green, cargo build 0 warnings, `git diff --check` silent. Residuals and the exact cause of the
+  remaining 0 are recorded in the ticket.

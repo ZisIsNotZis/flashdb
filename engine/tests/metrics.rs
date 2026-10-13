@@ -362,7 +362,7 @@ fn region_json_dump_is_deterministic_and_uses_frozen_field_names() {
     // The whole document is pinned, so a renamed field is a failing diff here.
     assert_eq!(
         a,
-        r#"{"patterns":[],"regions":[{"bytes_read":4096,"bytes_written":100,"commit_blocks":1,"commit_ops":1,"compaction_bytes":2048,"compaction_merges":1,"count":0,"mean_ns":0.0,"p50_ns":0.0,"p99_ns":0.0,"probe_misses":1,"probes":2,"region":"P|Stock"},{"bytes_read":0,"bytes_written":7,"commit_blocks":0,"commit_ops":0,"compaction_bytes":0,"compaction_merges":0,"count":0,"mean_ns":0.0,"p50_ns":0.0,"p99_ns":0.0,"probe_misses":0,"probes":0,"region":"U|Stock"}]}"#
+        r#"{"patterns":[],"regions":[{"bytes_read":4096,"bytes_written":100,"commit_blocks":1,"commit_ops":1,"compaction_bytes":2048,"compaction_merges":1,"count":0,"index_output_bytes":0,"mean_ns":0.0,"p50_ns":0.0,"p99_ns":0.0,"probe_misses":1,"probes":2,"region":"P|Stock"},{"bytes_read":0,"bytes_written":7,"commit_blocks":0,"commit_ops":0,"compaction_bytes":0,"compaction_merges":0,"count":0,"index_output_bytes":0,"mean_ns":0.0,"p50_ns":0.0,"p99_ns":0.0,"probe_misses":0,"probes":0,"region":"U|Stock"}]}"#
     );
 }
 
@@ -407,6 +407,18 @@ fn region_compaction_counters_attribute_the_merged_output_to_its_region() {
     assert!(m.snapshot().regions.is_empty(), "disabled region_compaction records nothing");
 
     let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn region_index_output_is_separate_from_compaction_bytes() {
+    let mut m = Metrics::new();
+    let id = m.resolve_region(b"PStockMovement\x00");
+    m.region_index_output(id, 2_139_927);
+    let snap = m.snapshot();
+    let row = region_of(&snap, "P|StockMovement").expect("index output makes the region non-idle");
+    assert_eq!(row.index_output_bytes, 2_139_927);
+    assert_eq!(row.compaction_bytes, 0, "index build is NOT merge reorganisation");
+    assert_eq!(row.compaction_merges, 0);
 }
 
 #[test]

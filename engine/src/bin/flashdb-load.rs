@@ -84,8 +84,10 @@ use std::io::{self, BufRead, BufReader, Write};
 use std::time::{Duration, Instant};
 
 use flashdb_engine::engine::{build_compaction_job, BarrierCompletion, CompactShape, CompactionJob, CompactionOutcome, Engine, LayoutPolicy, Op, Outcome, RegionMode, RequestOutcome, MAX_PENDING_BARRIERS};
+use flashdb_engine::index::{build_order_no_index, OrderNoIndexBuild};
 use flashdb_engine::keys::KeyEncoding;
 use flashdb_engine::metrics::WindowSnapshot;
+use flashdb_engine::readahead::TileReadView;
 use flashdb_engine::replay::submit_requests_grouped;
 use flashdb_engine::request::execute_request;
 use serde_json::Value;
@@ -1058,6 +1060,76 @@ impl CompactionWorker {
     }
 }
 
+/// Whether the policy requests the derived `order_no -> StockMovement` secondary
+/// access path (WP-M). Only the movement primary region is acted on by the
+/// builder; the read path always falls back to the scan when the index is absent.
+fn order_no_index_wanted(policy: &LayoutPolicy) -> bool {
+    policy.index_order_no_for_region("P|StockMovement")
+}
+
+/// Spawn the off-request-path `order_no` index build for the current tile
+/// snapshot and return the channel it reports through. The build writes
+/// `order-no-index.tile` in `dir`; the driver syncs the directory before
+/// adopting the result.
+fn spawn_order_no_index_build(
+    dir: std::path::PathBuf,
+    view: TileReadView,
+) -> std::sync::mpsc::Receiver<io::Result<OrderNoIndexBuild>> {
+    let (tx, rx) = std::sync::mpsc::channel::<io::Result<OrderNoIndexBuild>>();
+    std::thread::spawn(move || {
+        let _ = tx.send(build_order_no_index(&dir, &view, "order-no-index.tile"));
+    });
+    rx
+}
+
+/// Adopt a finished off-path index build and reconcile the desired state with
+/// the current policy (WP-M). Non-blocking: the read path falls back to the full
+/// scan until a build is adopted, so the index is never on the correctness path.
+fn manage_order_no_index(
+    engine: &mut Engine,
+    index_build_rx: &mut Option<std::sync::mpsc::Receiver<io::Result<OrderNoIndexBuild>>>,
+    index_dir: &std::path::Path,
+) -> io::Result<()> {
+    if let Some(rx) = index_build_rx.as_ref() {
+        match rx.try_recv() {
+            Ok(Ok(build)) => {
+                *index_build_rx = None;
+                // The tile file itself was synced by TileWriter::finish; make its
+                // directory entry durable before the engine references it, the
+                // same ordering the compaction apply path uses.
+                File::open(index_dir)?.sync_all()?;
+                engine.adopt_order_no_index(build.index);
+                engine.record_order_no_index_build(build.output_bytes);
+            }
+            Ok(Err(e)) => {
+                // Non-fatal: the authoritative scan still serves correctly. Log
+                // and clear the slot so a later policy toggle can retry.
+                *index_build_rx = None;
+                eprintln!("flashdb-load: order_no index build failed; falling back to scan: {e}");
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                *index_build_rx = None;
+                eprintln!("flashdb-load: order_no index builder disconnected; falling back to scan");
+            }
+        }
+    }
+    match (
+        order_no_index_wanted(engine.layout_policy()),
+        engine.has_order_no_index(),
+        index_build_rx.is_some(),
+    ) {
+        (true, false, false) => {
+            *index_build_rx = Some(spawn_order_no_index_build(index_dir.to_path_buf(), engine.tile_read_view()));
+        }
+        (false, true, _) => {
+            engine.clear_order_no_index();
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 /// Per-applied-actuation observability (slice 53): one `compact_actuation` line
 /// per merge, carrying the off-request-path build phase split plus the
 /// request-path run-selection and lazy-apply times, so the remaining stall can
@@ -1168,6 +1240,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             engine.tile_read_view(),
         ))
     };
+
+    // Derived secondary access path (WP-M): an off-request-path `order_no ->
+    // StockMovement handle` index, built only when the policy requests it. The
+    // build runs on a background thread from the current tile snapshot; the
+    // authoritative read path falls back to the full scan until the result is
+    // adopted (and on every miss/mismatch after). `None` = no build in flight.
+    let index_dir = probe_dir(&args.target);
+    let mut index_build_rx: Option<std::sync::mpsc::Receiver<io::Result<OrderNoIndexBuild>>> = None;
+    if !args.dry_run && order_no_index_wanted(&engine.layout_policy()) {
+        index_build_rx = Some(spawn_order_no_index_build(index_dir.clone(), engine.tile_read_view()));
+    }
 
     let t0 = Instant::now();
     // `due_us` is ALWAYS the due time of the next request to issue, so an unissued request never
@@ -1727,6 +1810,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                 }
+                // Adopt/spawn/retire the derived order_no index after the policy
+                // (possibly) changed, so the window reflects the learner's latest
+                // selection.
+                if !args.dry_run {
+                    manage_order_no_index(&mut engine, &mut index_build_rx, &index_dir)?;
+                }
                 let current = engine.metrics_snapshot();
                 let previous = engine.metrics_previous_window();
                 writeln!(out, "{}", metrics_json_line(WindowLine {
@@ -1762,6 +1851,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }))?;
                 engine.metrics_rotate_window();
             } else {
+                if !args.dry_run {
+                    manage_order_no_index(&mut engine, &mut index_build_rx, &index_dir)?;
+                }
                 writeln!(out, "window={window_index} rate_rps={:.0} requests={} completed={completed} \
                     errors={errors} service_p50_us={p50} service_p95_us={p95} service_p99_us={p99} \
                     lag_p50_us={lag_p50} lag_p95_us={lag_p95} lag_p99_us={lag_p99} \
@@ -2060,7 +2152,7 @@ mod tests {
                 region: "P|Stock".to_string(),
                 probes: 0, probe_misses: 0, bytes_read: 0, bytes_written: 40,
                 commit_blocks: 1, commit_ops: 1,
-                compaction_bytes: 4288, compaction_merges: 1,
+                compaction_bytes: 4288, compaction_merges: 1, index_output_bytes: 0,
                 count: 0, p50_ns: 0.0, p99_ns: 0.0, mean_ns: 0.0,
             }],
         };

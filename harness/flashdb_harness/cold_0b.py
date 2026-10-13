@@ -207,7 +207,11 @@ def policy_active_map(policy: dict) -> dict[str, LayoutCandidate]:
     out: dict[str, LayoutCandidate] = {}
     for region, entry in policy.get("regions", {}).items():
         merged = {**default, **entry}
-        out[region] = LayoutCandidate(int(merged["page_size"]), int(merged["merge_min_tiles"]))
+        out[region] = LayoutCandidate(
+            int(merged["page_size"]),
+            int(merged["merge_min_tiles"]),
+            bool(merged.get("index_order_no", False)),
+        )
     return out
 
 
@@ -246,6 +250,7 @@ def window_records(lines: list[str], window_ms: int) -> list[dict]:
                 "bytes_written": r.get("bytes_written", 0),
                 "compaction_bytes": r.get("compaction_bytes", 0),
                 "compaction_merges": r.get("compaction_merges", 0),
+                "index_output_bytes": r.get("index_output_bytes", 0),
             }
         # The pacer marks a window invalid when its schedule lag ran away (saturation), its
         # service-latency p99 exceeded `--ceiling-us`, its schedule-lag p99 exceeded
@@ -509,8 +514,10 @@ def region_compaction_totals(windows: list[dict]) -> dict[str, dict]:
         for region, r in w["regions"].items():
             t = totals.setdefault(region, {"bytes_read": 0, "bytes_written": 0,
                                            "compaction_bytes": 0, "compaction_merges": 0,
+                                           "index_output_bytes": 0,
                                            "count": 0, "service_ns": 0.0, "windows": 0})
-            for key in ("bytes_read", "bytes_written", "compaction_bytes", "compaction_merges"):
+            for key in ("bytes_read", "bytes_written", "compaction_bytes", "compaction_merges",
+                        "index_output_bytes"):
                 t[key] += r[key]
             t["count"] += r["count"]
             t["service_ns"] += r["count"] * r["mean_ns"]
@@ -554,17 +561,22 @@ def reward_term_totals(record: dict, lambda_ns_per_byte: float) -> dict:
     service_ns = sum(t.get("service_ns", 0.0) for t in regs.values())
     ingest_bytes = sum(t.get("bytes_written", 0) for t in regs.values())
     reorg_bytes = sum(t.get("compaction_bytes", 0) for t in regs.values())
+    index_bytes = sum(t.get("index_output_bytes", 0) for t in regs.values())
     ingest_ns = lambda_ns_per_byte * ingest_bytes
     reorg_ns = lambda_ns_per_byte * reorg_bytes
+    index_ns = lambda_ns_per_byte * index_bytes
     base = max(service_ns, 1.0)
     return {
         "service_ns": service_ns,
         "ingest_bytes": ingest_bytes,
         "reorg_bytes": reorg_bytes,
+        "index_output_bytes": index_bytes,
         "ingest_write_term_ns": ingest_ns,
         "reorg_write_term_ns": reorg_ns,
+        "index_write_term_ns": index_ns,
         "ingest_to_service_ratio": ingest_ns / base,
         "reorg_to_service_ratio": reorg_ns / base,
+        "index_to_service_ratio": index_ns / base,
     }
 
 
@@ -610,14 +622,17 @@ def build_sweep(windows: list[dict], max_rate: float | None = None) -> dict:
             key = str(active[region])
             acc = sweep.setdefault(region, {}).setdefault(
                 key, {"n": 0, "sum_cost": 0.0, "page_size": active[region].page_size,
-                      "merge_min_tiles": active[region].merge_min_tiles})
+                      "merge_min_tiles": active[region].merge_min_tiles,
+                      "index_order_no": active[region].index_order_no})
             acc["n"] += 1
             acc["sum_cost"] += region_cost_ns_from_window(r, 1.0)
     return sweep
 
 
 def region_cost_ns_from_window(r: dict, lambda_ns_per_byte: float) -> float:
-    return r["count"] * r["mean_ns"] + lambda_ns_per_byte * r["bytes_written"]
+    return (r["count"] * r["mean_ns"]
+            + lambda_ns_per_byte * (r["bytes_written"] + r["compaction_bytes"]
+                                    + r.get("index_output_bytes", 0)))
 
 
 def argmin_from_sweep(sweep: dict, seed: int = 0) -> dict[str, LayoutCandidate]:
@@ -629,7 +644,8 @@ def argmin_from_sweep(sweep: dict, seed: int = 0) -> dict[str, LayoutCandidate]:
             key=lambda k: (by_candidate[k]["sum_cost"] / by_candidate[k]["n"], k),
         )
         acc = by_candidate[best_key]
-        out[region] = LayoutCandidate(int(acc["page_size"]), int(acc["merge_min_tiles"]))
+        out[region] = LayoutCandidate(
+            int(acc["page_size"]), int(acc["merge_min_tiles"]), bool(acc.get("index_order_no", False)))
     return out
 
 
@@ -1558,13 +1574,14 @@ def render_report(result: dict) -> str:
                  if rec.get("reward_terms")]
     if term_rows:
         w("")
-        w("| arm | service ns | ingest write term ns | reorg write term ns | ingest/service | "
-          "reorg/service |")
-        w("|---|---:|---:|---:|---:|---:|")
+        w("| arm | service ns | ingest write term ns | reorg write term ns | index write term ns | "
+          "ingest/service | reorg/service | index/service |")
+        w("|---|---:|---:|---:|---:|---:|---:|---:|")
         for key, rt in term_rows:
             w(f"| {key} | {rt['service_ns']:.4g} | {rt['ingest_write_term_ns']:.4g} | "
-              f"{rt['reorg_write_term_ns']:.4g} | {rt['ingest_to_service_ratio']:.3%} | "
-              f"{rt['reorg_to_service_ratio']:.3%} |")
+              f"{rt['reorg_write_term_ns']:.4g} | {rt['index_write_term_ns']:.4g} | "
+              f"{rt['ingest_to_service_ratio']:.3%} | {rt['reorg_to_service_ratio']:.3%} | "
+              f"{rt['index_to_service_ratio']:.3%} |")
         w("")
         w("A write term whose ratio to the service term is a tiny fraction of a percent cannot "
           "move any candidate's `argmin` however lambda is swept; that is the pre-slice-39 "
@@ -1711,13 +1728,14 @@ def render_report(result: dict) -> str:
             continue
         w(f"### {key}")
         w("")
-        w("| region | windows | bytes_read | bytes_written | compaction_bytes | merges | "
-          "rewrite factor |")
-        w("|---|---:|---:|---:|---:|---:|---:|")
+        w("| region | windows | bytes_read | bytes_written | compaction_bytes | index_output_bytes | "
+          "merges | rewrite factor |")
+        w("|---|---:|---:|---:|---:|---:|---:|---:|")
         for region, t in sorted(regs.items()):
             rw = t["compaction_bytes"] / t["bytes_written"] if t["bytes_written"] else None
             w(f"| {region} | {t['windows']} | {t['bytes_read']:,} | {t['bytes_written']:,} | "
-              f"{t['compaction_bytes']:,} | {t['compaction_merges']} | {_fmt(rw, '.4f')} |")
+              f"{t['compaction_bytes']:,} | {t['index_output_bytes']:,} | "
+              f"{t['compaction_merges']} | {_fmt(rw, '.4f')} |")
         w("")
     w("## Learner decisions and drift")
     w("")

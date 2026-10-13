@@ -56,6 +56,7 @@
 //! | `commit_ops` | committed ops in this region | same |
 //! | `compaction_bytes` | merged output tile bytes written by compaction for this region | `merge_region_run` (write side) |
 //! | `compaction_merges` | compaction merges that included this region | same |
+//! | `index_output_bytes` | derived secondary-access-path tile bytes built for this region | `build_order_no_index` (write side) |
 //! | `count`/`mean_ns`/`p50_ns`/`p99_ns` | the same log-bucket latency histogram, per region | every instrumented read |
 //!
 //! `bytes_read` is attributed to the region being **served** (the probe/scan's
@@ -198,6 +199,10 @@ pub struct RegionSummary {
     pub compaction_bytes: u64,
     /// Compaction merges that included this region.
     pub compaction_merges: u64,
+    /// Derived secondary-access-path tile bytes built for this region (WP-M).
+    /// Distinct from `compaction_bytes`: it is a one-time off-path build, priced
+    /// in the learner's reward but not in the merge-churn budget.
+    pub index_output_bytes: u64,
     /// Latency samples recorded for this region (point lookups and scans), with
     /// the same bucket estimator as the per-pattern rows.
     pub count: u64,
@@ -216,6 +221,7 @@ struct RegionStats {
     commit_ops: u64,
     compaction_bytes: u64,
     compaction_merges: u64,
+    index_output_bytes: u64,
     count: u64,
     sum_ns: u128,
     buckets: [u32; BUCKETS],
@@ -232,6 +238,7 @@ impl Default for RegionStats {
             commit_ops: 0,
             compaction_bytes: 0,
             compaction_merges: 0,
+            index_output_bytes: 0,
             count: 0,
             sum_ns: 0,
             buckets: [0; BUCKETS],
@@ -248,6 +255,7 @@ impl RegionStats {
             && self.commit_blocks == 0
             && self.compaction_bytes == 0
             && self.compaction_merges == 0
+            && self.index_output_bytes == 0
     }
 }
 
@@ -280,7 +288,8 @@ impl WindowSnapshot {
     ///   "patterns": [ {"pattern", "count", "p50_ns", "p99_ns", "mean_ns"} ],
     ///   "regions":  [ {"region", "probes", "probe_misses", "bytes_read",
     ///                  "bytes_written", "commit_blocks", "commit_ops",
-    ///                  "compaction_bytes", "compaction_merges"} ]
+    ///                  "compaction_bytes", "compaction_merges",
+    ///                  "index_output_bytes"} ]
     /// }
     /// ```
     ///
@@ -305,6 +314,7 @@ impl WindowSnapshot {
                 "commit_ops": r.commit_ops,
                 "compaction_bytes": r.compaction_bytes,
                 "compaction_merges": r.compaction_merges,
+                "index_output_bytes": r.index_output_bytes,
                 "count": r.count,
                 "p50_ns": r.p50_ns,
                 "p99_ns": r.p99_ns,
@@ -326,9 +336,9 @@ impl fmt::Display for WindowSnapshot {
         for r in &self.regions {
             writeln!(
                 f,
-                "region={} probes={} probe_misses={} bytes_read={} bytes_written={} commit_blocks={} commit_ops={} compaction_bytes={} compaction_merges={} count={} p50_ns={:.0} p99_ns={:.0} mean_ns={:.0}",
+                "region={} probes={} probe_misses={} bytes_read={} bytes_written={} commit_blocks={} commit_ops={} compaction_bytes={} compaction_merges={} index_output_bytes={} count={} p50_ns={:.0} p99_ns={:.0} mean_ns={:.0}",
                 r.region, r.probes, r.probe_misses, r.bytes_read, r.bytes_written, r.commit_blocks, r.commit_ops,
-                r.compaction_bytes, r.compaction_merges, r.count, r.p50_ns, r.p99_ns, r.mean_ns
+                r.compaction_bytes, r.compaction_merges, r.index_output_bytes, r.count, r.p50_ns, r.p99_ns, r.mean_ns
             )?;
         }
         Ok(())
@@ -595,6 +605,20 @@ impl Metrics {
         s.compaction_bytes = s.compaction_bytes.saturating_add(output_bytes);
     }
 
+    /// WP-M: attribute the derived secondary-access-path tile's output bytes to
+    /// the region's own `index_output_bytes` counter. It is priced in the
+    /// learner's reward (endurance) but kept OUT of `compaction_bytes` so the
+    /// slice-39 merge-churn budget (which keys off `compaction_bytes`) does not
+    /// treat a one-time index build as recurring reorganisation. It does NOT
+    /// increment `compaction_merges` (an index build is not a merge).
+    pub fn region_index_output(&mut self, id: usize, output_bytes: u64) {
+        if !self.enabled || id == DISABLED {
+            return;
+        }
+        let s = self.region_stats_mut(id);
+        s.index_output_bytes = s.index_output_bytes.saturating_add(output_bytes);
+    }
+
     fn build_snapshot(&self) -> WindowSnapshot {
         let mut patterns = Vec::with_capacity(self.keys.len() + 1);
         for (i, k) in self.keys.iter().enumerate() {
@@ -720,6 +744,7 @@ fn region_summary(region: String, s: &RegionStats, bounds: &[u64; BUCKETS]) -> R
         commit_ops: s.commit_ops,
         compaction_bytes: s.compaction_bytes,
         compaction_merges: s.compaction_merges,
+        index_output_bytes: s.index_output_bytes,
         count: s.count,
         p50_ns: percentile(s.count, &s.buckets, bounds, 0.50),
         p99_ns: percentile(s.count, &s.buckets, bounds, 0.99),
