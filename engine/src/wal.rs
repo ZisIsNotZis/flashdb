@@ -59,7 +59,7 @@ impl Wal {
     /// 返回句柄与恢复出的记录（按序）。
     pub fn open_or_recover(path: impl AsRef<Path>) -> io::Result<(Wal, Vec<Vec<u8>>)> {
         let (records, valid_len) = replay(path.as_ref())?;
-        let mut file = OpenOptions::new().write(true).open(path.as_ref())?;
+        let mut file = OpenOptions::new().read(true).write(true).open(path.as_ref())?;
         file.set_len(valid_len)?;
         file.seek(SeekFrom::Start(valid_len))?;
         Ok((Wal { file, path: path.as_ref().to_path_buf(), valid_len, poisoned: false,
