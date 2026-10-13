@@ -17,7 +17,7 @@
 //!   `begin_group` all fail closed, as do the other mutating paths.
 
 use flashdb_engine::engine::{Engine, GroupPhase, Op, Outcome};
-use flashdb_engine::replay::execute_requests_grouped;
+use flashdb_engine::replay::{execute_requests_grouped, submit_requests_grouped};
 use flashdb_engine::request::execute_request;
 use flashdb_engine::wal;
 use serde_json::{json, Value};
@@ -389,4 +389,64 @@ fn group_phase_accounting_attributes_and_resets() {
     assert_eq!(e.take_group_phase_us(), GroupPhase { append_us: 0, apply_us: 0, fsync_us: 0 },
         "the accumulator resets after it is read");
     assert_eq!(wal_records(&files), 1);
+}
+
+/// Overlapped barriers (slice 56): two write groups are submitted while the
+/// first barrier is still in flight, drained in submission order, and both
+/// groups' records recover as durable bytes. An empty/read-only group submits no
+/// barrier and is already complete.
+#[test]
+fn overlapped_barriers_drain_in_order_and_recover() {
+    let files = Files::new();
+    let mut e = Engine::create(&files.wal).unwrap();
+    e.commit_block(b"base", &[put_doc(1, "doc1")]).unwrap();
+
+    e.begin_group().unwrap();
+    let (id2, ops2) = block(2);
+    e.commit_block_grouped(&id2, &ops2).unwrap();
+    assert!(e.submit_group().unwrap(), "a write group owes a barrier");
+
+    e.begin_group().unwrap();
+    let (id3, ops3) = block(3);
+    e.commit_block_grouped(&id3, &ops3).unwrap();
+    assert!(e.submit_group().unwrap());
+
+    // An empty group submits no barrier and closes cleanly.
+    e.begin_group().unwrap();
+    assert!(!e.submit_group().unwrap(), "an empty group owes no barrier");
+    assert_eq!(e.pending_barriers(), 2, "only the two write groups have barriers in flight");
+
+    assert!(e.wait_group_barrier().is_ok(), "the first barrier completes");
+    assert_eq!(e.pending_barriers(), 1);
+    assert!(e.wait_group_barrier().is_ok(), "the second barrier completes");
+    assert_eq!(e.pending_barriers(), 0);
+
+    assert_eq!(e.csn(), 3, "both grouped blocks consumed CSNs immediately");
+    drop(e);
+    let e = Engine::open(&files.wal).unwrap();
+    assert_eq!(e.csn(), 3);
+    assert_eq!(e.get(b"E", 2).unwrap(), Some(b"doc2".to_vec()));
+    assert_eq!(e.get(b"E", 3).unwrap(), Some(b"doc3".to_vec()));
+}
+
+/// The overlapped request path is the same per-request guard/durability contract
+/// as the synchronous grouped path, only the barrier is taken by the worker.
+#[test]
+fn submit_requests_grouped_reports_barrier_and_per_request_results() {
+    let files = Files::new();
+    let mut e = Engine::create(&files.wal).unwrap();
+    seed_flow(&mut e, 100);
+    let requests = [
+        flow_request("r-00000001", 3, "O00000001", "M00000001"),
+        flow_request("r-00000002", 4, "O00000002", "M00000002"),
+    ];
+    let (barrier, results) = submit_requests_grouped(&mut e, &requests).unwrap();
+    assert!(barrier, "the flow writes, so a barrier is owed");
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0].as_ref().unwrap()["take"].status, "ok");
+    assert_eq!(results[1].as_ref().unwrap()["take"].status, "ok");
+    assert_eq!(e.pending_barriers(), 1);
+    e.wait_group_barrier().unwrap();
+    assert_eq!(e.pending_barriers(), 0);
+    assert_eq!(on_hand(&e), 93, "in-order guard semantics are unchanged (100 - 3 - 4)");
 }

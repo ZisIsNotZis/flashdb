@@ -266,3 +266,20 @@ warning: `VIRTUAL_ENV=/home/z/.venv` does not match the project environment path
 ```
 
 4. `git diff --check` — silent (exit 0).
+
+## wave5 WP-E dispatch record
+
+- Timestamp: 2026-10-13T22:42:00+08:00.
+- Action: dispatched work package E "overlapped durability-preserving WAL barrier" to the
+  single-writer `wave5/overlap` worktree. Contract, design, durability argument, tests, gates,
+  before/after table and verdict are in `.scratch/56-overlapped-barrier/issues.md`.
+- Result: commits `083da49` (engine stage 1) and `413176c` (load driver stage 2). The overlapped
+  barrier is durability-preserving (ack only after the covering `fdatasync` returns; a sync
+  failure fails the group closed and poisons the WAL) and removes the fsync-tail cascade that
+  ticket 55 named as the rung-50 blocker: `late_total` falls 649->299 (cold44) and 1,497->616
+  (c51), and per-group proof shows a 335 ms `fdatasync` now dispatching with 56 us of lag.
+  Throughput (106 rps) and write amp (identical compact bytes / 38 merges) are unchanged. Rung 50
+  still does NOT meet the lag ceiling (5/40 cold44, 2/40 c51) because two residual mechanisms
+  remain, neither the fsync tail: synchronous cold point reads on the request path (order-flow
+  cust/stock probes, dominant) and the window-boundary barrier drain (secondary). Honest FAIL on
+  that criterion; the primary blocker is a new, separately-scoped mechanism.
