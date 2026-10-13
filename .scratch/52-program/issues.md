@@ -84,3 +84,14 @@ Total: 272 passed; 0 failed; 0 ignored.
 4. `git diff --check` — silent (exit 0).
 
 No failures, no conflicts.
+
+## wave1b independent review outcomes
+
+Integrated HEAD: `183a0be140757a5784e196fbff22ca7b7d005044` (`git rev-parse HEAD`, 2026-10-13T18:58:52+08:00).
+
+- **rev-instr** — `VERDICT: CANNOT-VERIFY` — blocking findings: none (no P0/P1 by static inspection; CANNOT-VERIFY because the required pytest gate and cargo test/build gates could not be executed — reviewer had no shell tool).
+- **rev-coloc** — `VERDICT: CANNOT-VERIFY` — blocking findings: none (no P0/P1; CANNOT-VERIFY because `cargo test --offline -p flashdb-engine --test family_colocation` and `cargo test --workspace --offline` could not be executed — reviewer had no shell tool).
+- **rev-tenx** — `VERDICT: PASS` — blocking findings: none.
+- **rev-decisions** — `VERDICT: PASS` — blocking findings: none (finding 1 is a P1 stale reorganisation figure in STATUS.md §3, explicitly labelled non-blocking).
+- **rev-tails** — `VERDICT: PASS` — blocking findings: none.
+- **rev-integration** — `VERDICT: CANNOT-VERIFY` — blocking findings: 1 (full workspace build + Rust test + Python suite at `183a0be` unexecuted — no shell tool, so the decisive build/test/reproducibility gate is unrun). Non-blocking P2: `52-program/issues.md` "Final HEAD hash" labels `bef4f14` as final while the true final HEAD is `183a0be`.
