@@ -599,12 +599,12 @@ fn read_proc_counters() -> ProcCounters {
 /// page-in (`read_bytes`), a page-fault burst (`minflt`/`majflt`), or the request-path `trim_heap`
 /// call independently of the latency percentiles on stdout. Emitted to stderr so the frozen
 /// metrics-JSON schema on stdout is unchanged.
-fn window_stall_print(window_index: u64, c: ProcCounters, trim_us: u64,
+fn window_stall_print(window_index: u64, c: ProcCounters, trim_us: u64, group_fsync_us: u64,
                       max_latency_us: u64, max_lag_us: u64, max_group_us: u64) {
     eprintln!(
         "window_stall window={window_index} minflt={} majflt={} rchar={} read_bytes={} \
-         wchar={} write_bytes={} trim_us={trim_us} max_latency_us={max_latency_us} \
-         max_lag_us={max_lag_us} max_group_us={max_group_us}",
+         wchar={} write_bytes={} trim_us={trim_us} group_fsync_us={group_fsync_us} \
+         max_latency_us={max_latency_us} max_lag_us={max_lag_us} max_group_us={max_group_us}",
         c.minflt, c.majflt, c.rchar, c.read_bytes, c.wchar, c.write_bytes);
 }
 
@@ -1200,8 +1200,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let trim_t0 = Instant::now();
             trim_heap();
             let trim_us = trim_t0.elapsed().as_micros() as u64;
+            let group_fsync_us = engine.take_group_fsync_us();
             let proc_now = read_proc_counters();
-            window_stall_print(window_index, proc_now.since(proc_prev), trim_us,
+            window_stall_print(window_index, proc_now.since(proc_prev), trim_us, group_fsync_us,
                                max_latency_us, max_lag_us, group_elapsed_us);
             proc_prev = proc_now;
             window_index += 1;
@@ -1281,6 +1282,24 @@ mod tests {
         assert_eq!(percentile_us(&xs, 0.99), Some(1000));
         assert_eq!(percentile_us(&xs, 1.0), Some(1000));
         assert_eq!(percentile_us(&[], 0.99), None);
+    }
+
+    #[test]
+    fn proc_counters_since_differences_and_never_underflows() {
+        let prev = ProcCounters { minflt: 1, majflt: 2, rchar: 3, read_bytes: 4, wchar: 5, write_bytes: 6 };
+        let cur = ProcCounters { minflt: 11, majflt: 2, rchar: 103, read_bytes: 4, wchar: 5, write_bytes: 106 };
+        let d = cur.since(prev);
+        assert_eq!(d.minflt, 10);
+        assert_eq!(d.majflt, 0, "equal counters differ to zero");
+        assert_eq!(d.rchar, 100);
+        assert_eq!(d.read_bytes, 0);
+        assert_eq!(d.wchar, 0);
+        assert_eq!(d.write_bytes, 100);
+        // A counter that went backwards (e.g. a fresh /proc/self/io in a new
+        // pid namespace) must saturate to 0, never panic.
+        let back = prev.since(cur);
+        assert_eq!(back.minflt, 0);
+        assert_eq!(back.write_bytes, 0);
     }
 
     #[test]
