@@ -2781,13 +2781,36 @@ impl Engine {
         let region = self.region_of_prefix(&pfx);
         sample.region = region;
         let mut result = None;
-        self.scan_merged(&pfx, region, |key, value| {
-            if keys::key_csn(key).is_some() {
-                result = if value.is_empty() { None } else { Some(value.to_vec()) };
-                return Ok(false);
+        let mut bytes_read: u64 = 0;
+        // Newest-first point probe: the memtable holds every version above the
+        // newest tile cutoff, and the tiles are ordered by increasing cutoff with
+        // DISJOINT CSN ranges, so `handle`'s newest version is either in the
+        // memtable or in the NEWEST tile whose key range contains it. Probing
+        // newest-first stops at the first hit instead of opening a cursor on
+        // every tile that holds an older version (an updated Stock row spans
+        // several cutoffs), which is the dominant cold-read cost of the request
+        // path. Correctness is unchanged: the first hit is by construction the
+        // highest-CSN version, and a tombstone is a hit that returns `None`.
+        if let Some((_, value)) = self.mt.scan_iter(&pfx).next() {
+            result = if value.is_empty() { None } else { Some(value.to_vec()) };
+        } else {
+            for t in self.tiles.iter().rev() {
+                if !t.tile.could_contain_prefix(&pfx) { continue; }
+                let mut cursor = t.tile.prefix_cursor(&pfx)?;
+                let found = match cursor.next()? {
+                    Some((key, value)) if keys::key_csn(key).is_some() => {
+                        result = if value.is_empty() { None } else { Some(value.to_vec()) };
+                        true
+                    }
+                    _ => false,
+                };
+                bytes_read = bytes_read.saturating_add(cursor.bytes_read());
+                if found { break; }
             }
-            Ok(true)
-        })?;
+        }
+        if region != metrics::DISABLED {
+            self.metrics.borrow_mut().region_bytes_read(region, bytes_read);
+        }
         self.metrics.borrow_mut().region_probe(region, result.is_some());
         Ok(result)
     }
@@ -2920,6 +2943,11 @@ impl Engine {
         if !self.group_open {
             return Err(io::Error::new(io::ErrorKind::Other, "no commit group is open; begin_group first"));
         }
+        // The synchronous barrier path must not race an overlapped barrier still
+        // in flight: a synchronous `wal.sync()` would cover another group's
+        // appended-but-unacknowledged bytes out of order (and the overlapped path
+        // is the only one allowed to run with barriers in flight).
+        self.ensure_no_pending_barrier("end_group")?;
         let result = if self.group_pending {
             let t0 = Instant::now();
             let r = self.wal.sync();
@@ -2987,38 +3015,52 @@ impl Engine {
             return Err(io::Error::new(io::ErrorKind::Other, "no commit group is open; begin_group first"));
         }
         let owed = self.group_pending;
-        let mut result = Ok(());
         if owed {
             if self.barrier_in_flight >= MAX_PENDING_BARRIERS {
-                // Leave the group open: the caller must drain and retry.
-                result = Err(io::Error::new(io::ErrorKind::Other,
+                // Leave the group OPEN: the caller must drain barriers and retry.
+                // The group's commits are already appended to the WAL and applied
+                // to the memtable, so closing it here would strand them with no
+                // covering barrier owed and no way to retry. This is the one
+                // failure that does NOT close the group.
+                return Err(io::Error::new(io::ErrorKind::Other,
                     "WAL barrier in-flight cap reached; drain barriers before submitting more"));
-            } else if let Err(e) = self.ensure_attached() {
-                result = Err(e);
-            } else if let Err(e) = self.wal.sync_handle().and_then(|handle| {
-                let worker = self.barrier_worker.get_or_insert_with(BarrierWorker::spawn);
-                let job = WalSyncJob {
-                    handle,
-                    #[cfg(test)]
-                    fail: self.wal.take_barrier_error(),
-                };
-                match worker.job_tx.send(job) {
-                    Ok(()) => {
-                        self.barrier_in_flight += 1;
-                        Ok(())
-                    }
-                    Err(_) => {
-                        self.wal.poison();
-                        Err(io::Error::new(io::ErrorKind::Other, "WAL barrier worker disconnected"))
-                    }
-                }
-            }) {
-                result = Err(e);
+            }
+            let submitted = self.submit_overlapped_barrier();
+            self.group_open = false;
+            self.group_pending = false;
+            submitted?;
+            Ok(true)
+        } else {
+            self.group_open = false;
+            self.group_pending = false;
+            Ok(false)
+        }
+    }
+
+    /// Enqueue the open group's WAL barrier on the FIFO worker and increment
+    /// `barrier_in_flight`. Any failure poisons the WAL (or leaves it detached)
+    /// so the caller fails closed exactly like a failed synchronous barrier; the
+    /// caller still closes the group, because the poisoned writer refuses every
+    /// further commit until reopen.
+    fn submit_overlapped_barrier(&mut self) -> io::Result<()> {
+        self.ensure_attached()?;
+        let handle = self.wal.sync_handle()?;
+        let worker = self.barrier_worker.get_or_insert_with(BarrierWorker::spawn);
+        let job = WalSyncJob {
+            handle,
+            #[cfg(test)]
+            fail: self.wal.take_barrier_error(),
+        };
+        match worker.job_tx.send(job) {
+            Ok(()) => {
+                self.barrier_in_flight += 1;
+                Ok(())
+            }
+            Err(_) => {
+                self.wal.poison();
+                Err(io::Error::new(io::ErrorKind::Other, "WAL barrier worker disconnected"))
             }
         }
-        self.group_open = false;
-        self.group_pending = false;
-        result.map(|()| owed)
     }
 
     /// Number of submitted overlapped barriers whose completion has not yet been
@@ -4119,6 +4161,58 @@ mod tests {
         remove(&p);
     }
 
+    /// `submit_group` at the in-flight cap must fail closed WITHOUT closing the
+    /// group, so the caller can drain barriers and retry the SAME group: the
+    /// group's commits are already appended to the WAL and applied, and closing
+    /// it would strand them with no covering barrier owed and no way to retry.
+    #[test]
+    fn submit_group_at_the_in_flight_cap_leaves_the_group_open_for_retry() {
+        let p = tmp("overlapped_cap.wal");
+        let mut e = Engine::create(&p).unwrap();
+        for i in 0..MAX_PENDING_BARRIERS {
+            e.begin_group().unwrap();
+            e.commit_block_grouped(format!("cap{i}").as_bytes(),
+                &[Op::PutDoc { entity: b"E".to_vec(), handle: (i as u64) + 1, doc: b"d".to_vec() }]).unwrap();
+            assert!(e.submit_group().unwrap(), "barrier {i} submits below the cap");
+        }
+        assert_eq!(e.pending_barriers(), MAX_PENDING_BARRIERS);
+
+        e.begin_group().unwrap();
+        e.commit_block_grouped(b"blocked",
+            &[Op::PutDoc { entity: b"E".to_vec(), handle: 65, doc: b"d".to_vec() }]).unwrap();
+        assert!(e.submit_group().is_err(), "the cap reached is a fail-closed error");
+        assert!(e.group_open(), "the group stays open so the caller can drain and retry");
+
+        for _ in 0..MAX_PENDING_BARRIERS {
+            assert!(e.wait_group_barrier().is_ok(), "each earlier barrier completes in order");
+        }
+        assert_eq!(e.pending_barriers(), 0);
+        assert!(e.submit_group().unwrap(), "the retained group submits after the drain");
+        assert!(e.wait_group_barrier().is_ok());
+        assert_eq!(e.pending_barriers(), 0);
+        remove(&p);
+    }
+
+    /// The synchronous `end_group` barrier must refuse while an overlapped
+    /// barrier is still in flight: a synchronous `wal.sync()` would cover
+    /// another group's appended-but-unacknowledged bytes out of order.
+    #[test]
+    fn end_group_refuses_while_an_overlapped_barrier_is_in_flight() {
+        let p = tmp("end_group_guard.wal");
+        let mut e = Engine::create(&p).unwrap();
+        e.begin_group().unwrap();
+        e.commit_block_grouped(b"o", &[Op::PutDoc { entity: b"E".to_vec(), handle: 1, doc: b"d".to_vec() }]).unwrap();
+        assert!(e.submit_group().unwrap());
+        assert_eq!(e.pending_barriers(), 1);
+
+        e.begin_group().unwrap();
+        e.commit_block_grouped(b"s", &[Op::PutDoc { entity: b"E".to_vec(), handle: 2, doc: b"d".to_vec() }]).unwrap();
+        assert!(e.end_group().is_err(), "end_group refuses a barrier in flight");
+
+        assert!(e.wait_group_barrier().is_ok(), "the overlapped barrier still completes");
+        remove(&p);
+    }
+
     #[test]
     fn unique_tombstone_of_lower_handle_does_not_hide_live_higher_handle() {
         let p = tmp("unique_tombstone_shadow.wal");
@@ -4431,6 +4525,32 @@ mod tests {
         }]).unwrap();
         assert_eq!(e.reverse_lookup(b"ServiceTicket", b"order", 101).unwrap(), vec![202]);
         remove(&p);
+    }
+
+    /// The primary point read probes newest-first: the newest version lives in
+    /// the memtable or the NEWEST tile that contains the handle, so `get` must
+    /// return it without reading every older version, and a tombstone in a newer
+    /// tile must shadow a live version in an older one.
+    #[test]
+    fn get_probes_newest_first_across_tiles_and_memtable() {
+        let dir = tmp_dir("get-newest-first");
+        let put = |h: u64, v: &[u8]| Op::PutDoc { entity: b"E".to_vec(), handle: h, doc: v.to_vec() };
+        let mut e = Engine::create(&dir.join("data.wal")).unwrap();
+        e.commit_block(b"v1", &[put(1, b"v1")]).unwrap();       // csn 1
+        e.publish_tile(&dir.join("t1.tile"), 1).unwrap();       // tile covers (0,1]
+        e.commit_block(b"v2", &[put(1, b"v2")]).unwrap();       // csn 2
+        e.publish_tile(&dir.join("t2.tile"), 2).unwrap();       // tile covers (1,2]
+        e.commit_block(b"v3", &[put(1, b"v3")]).unwrap();       // csn 3, memtable
+        assert_eq!(e.get(b"E", 1).unwrap(), Some(b"v3".to_vec()), "memtable wins over every tile");
+        drop(e);
+
+        let mut e = Engine::open_discover(&dir).unwrap();
+        assert_eq!(e.get(b"E", 1).unwrap(), Some(b"v3".to_vec()));
+        e.commit_block(b"del", &[Op::DelDoc { entity: b"E".to_vec(), handle: 1 }]).unwrap(); // csn 4
+        e.publish_tile(&dir.join("t3.tile"), 4).unwrap();       // tombstone above v3
+        assert_eq!(e.get(b"E", 1).unwrap(), None, "a newer tombstone shadows the live version");
+        drop(e);
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

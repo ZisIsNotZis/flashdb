@@ -57,6 +57,7 @@ use std::path::Path;
 use std::time::Instant;
 
 use flashdb_engine::engine::{CompactShape, Engine, LayoutPolicy, Op, Outcome, RegionMode, MAX_ACTIVE_TILES};
+use flashdb_engine::keys::KeyEncoding;
 use serde::{Deserialize, Serialize};
 
 const ENTITY_A: &[u8] = b"EntityA";
@@ -128,6 +129,24 @@ fn region_mode() -> RegionMode {
             RegionMode::Global
         }),
         Err(_) => RegionMode::Global,
+    }
+}
+
+/// `FLASHDB_KEY_ENCODING=family_first|entity_first` selects the key spelling new
+/// keys are written with (slice 50). Unset or unknown keeps the shipped default
+/// [`KeyEncoding::FamilyFirst`]. The encoding is NOT persisted: a later reopen
+/// must pass the same value (the build scripts set it on every phase).
+fn key_encoding() -> KeyEncoding {
+    match std::env::var("FLASHDB_KEY_ENCODING") {
+        Ok(name) => match name.as_str() {
+            "family_first" | "family-first" => KeyEncoding::FamilyFirst,
+            "entity_first" | "entity-first" => KeyEncoding::EntityFirst,
+            other => {
+                eprintln!("unknown FLASHDB_KEY_ENCODING={other:?}; using family_first");
+                KeyEncoding::FamilyFirst
+            }
+        },
+        Err(_) => KeyEncoding::FamilyFirst,
     }
 }
 
@@ -456,6 +475,7 @@ fn cmd_seed(
     let layout = region_layout_policy();
     e.set_layout_policy(layout.clone());
     e.set_region_mode(region_mode());
+    e.set_key_encoding(key_encoding());
     let (layout_page_size, layout_bloom_bits) = layout.default_layout();
     e.set_metrics_enabled(metrics_enabled());
     emit_policy("seed", &layout);
@@ -691,17 +711,19 @@ fn seed_unique_value(
 fn cmd_seed_inventory(dir: &Path, trace: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let wal = dir.join("data.wal");
     let mut e = if wal.exists() {
-        Engine::open(&wal)?
+        Engine::open_with_encoding(&wal, key_encoding())?
     } else {
         fs::create_dir_all(dir)?;
         Engine::create(&wal)?
     };
-    // Same region/layout knobs as `seed`, so a per-region page assignment can be
-    // measured through this bootstrap too; the parameters land in each tile's
-    // own superblock, so the directory reads back without the env set.
+    // Same region/layout/encoding knobs as `seed`, so a per-region page
+    // assignment or the entity-first co-location can be measured through this
+    // bootstrap too; the parameters land in each tile's own superblock/keys, so
+    // the directory reads back under the same encoding.
     let layout = region_layout_policy();
     e.set_layout_policy(layout.clone());
     e.set_region_mode(region_mode());
+    e.set_key_encoding(key_encoding());
     e.set_metrics_enabled(metrics_enabled());
     emit_policy("seed-inventory", &layout);
     let (layout_page_size, layout_bloom_bits) = layout.default_layout();
@@ -788,11 +810,12 @@ fn cmd_seed_inventory(dir: &Path, trace: &Path) -> Result<(), Box<dyn std::error
         publishes += 1;
     }
     emit(&format!(
-        "phase=seed-inventory ok=true blocks={blocks} docs={docs} customers={customers} stocks={stocks} csn={} publishes={publishes} rotations={rotations} tiles={} serving_memtable_entries={} region_mode={} layout_page_size={layout_page_size} layout_bloom_bits={layout_bloom_bits} dir={} elapsed_s={:.3}",
+        "phase=seed-inventory ok=true blocks={blocks} docs={docs} customers={customers} stocks={stocks} csn={} publishes={publishes} rotations={rotations} tiles={} serving_memtable_entries={} region_mode={} key_encoding={:?} layout_page_size={layout_page_size} layout_bloom_bits={layout_bloom_bits} dir={} elapsed_s={:.3}",
         e.csn(),
         tile_files(dir)?.len(),
         e.serving_memtable_entries(),
         region_mode().name(),
+        key_encoding(),
         dir.display(),
         started.elapsed().as_secs_f64(),
     ));
@@ -807,7 +830,7 @@ fn cmd_seed_inventory(dir: &Path, trace: &Path) -> Result<(), Box<dyn std::error
 /// policy come from the same env knobs as `seed`. A no-op (published=false) when
 /// the newest active tile already covers the current CSN.
 fn cmd_checkpoint(dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    let mut e = Engine::open_discover(dir)?;
+    let mut e = Engine::open_discover_with_encoding(dir, key_encoding())?;
     let policy = region_layout_policy();
     e.set_layout_policy(policy.clone());
     e.set_region_mode(region_mode());
@@ -851,7 +874,7 @@ fn tiles_per_region(e: &Engine) -> Vec<(String, usize)> {
 /// exactly the actuator under test. Compaction output bytes are measured; the
 /// rewrite factor is `compaction_bytes / tile_bytes_before`.
 fn cmd_compact(dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    let mut e = Engine::open_discover(dir)?;
+    let mut e = Engine::open_discover_with_encoding(dir, key_encoding())?;
     let policy = region_layout_policy();
     e.set_layout_policy(policy.clone());
     e.set_region_mode(region_mode());
@@ -960,7 +983,7 @@ fn read_tile_meta(path: &Path) -> Result<TileMeta, Box<dyn std::error::Error>> {
 /// entries with a non-empty active tile list is the direct proof that reads
 /// cannot be served from RAM: the data is only readable through tiles.
 fn cmd_tileinfo(dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    let e = Engine::open_discover(dir)?;
+    let e = Engine::open_discover_with_encoding(dir, key_encoding())?;
     let active = e.active_tile_cutoffs();
     // The write-time region mode is not persisted; each tile's region is derived
     // from its own first key, which is what the per-tile lines report below.
@@ -1006,7 +1029,7 @@ fn cmd_tileinfo(dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
 /// `open_impl`'s allocator-hygiene trim returns the freed arenas). Purely
 /// diagnostic: it opens the directory and reports, and never mutates it.
 fn cmd_openinfo(dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    let e = Engine::open_discover(dir)?;
+    let e = Engine::open_discover_with_encoding(dir, key_encoding())?;
     let bytes = e.active_tile_bytes()?;
     emit(&format!(
         "phase=openinfo ok=true dir={} active_tiles={} serving_memtable_entries={} tile_bytes_total={} rss_kb={} vm_hwm_kb={} vsize_kb={}",
@@ -1058,7 +1081,7 @@ fn count_entity(e: &Engine, entity: &[u8]) -> io::Result<u64> {
 
 fn cmd_verify(dir: &Path, total_docs: u64) -> Result<(), Box<dyn std::error::Error>> {
     let meta = read_meta(dir, Some(total_docs))?;
-    let mut e = Engine::open_discover(dir)?;
+    let mut e = Engine::open_discover_with_encoding(dir, key_encoding())?;
     e.set_metrics_enabled(metrics_enabled());
     let expected_csn = meta.total_docs.div_ceil(meta.docs_per_commit);
     if e.csn() != expected_csn {
@@ -1146,7 +1169,7 @@ fn cmd_scanbench(dir: &Path, passes: u64) -> Result<(), Box<dyn std::error::Erro
         return Err("passes must be >= 1".into());
     }
     let meta = read_meta(dir, None)?;
-    let mut e = Engine::open_discover(dir)?;
+    let mut e = Engine::open_discover_with_encoding(dir, key_encoding())?;
     e.set_metrics_enabled(metrics_enabled());
     let started = Instant::now();
     let mut docs_total = 0u64;

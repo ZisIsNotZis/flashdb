@@ -321,3 +321,20 @@ warning: `VIRTUAL_ENV=/home/z/.venv` does not match the project environment path
 ```
 
 4. `git diff --check` — silent (exit 0).
+
+## wave6 WP-F dispatch record
+
+- Timestamp: 2026-10-13T23:40:00+08:00.
+- Action: dispatched work package F "non-blocking window boundary + cold-read optimization +
+  entity-first co-location" to the single-writer `wave6/reads` worktree. Contract, design, tests,
+  gates, before/after table and verdict are in `.scratch/57-cold-reads-and-colocation/issues.md`.
+- Result: commits `8cf9988` (engine fixes) + `ec47e25`/`76231d2` (non-blocking boundary) +
+  `44205d1` (newest-first get) + `5d90b93` (key-encoding selector). The window-boundary barrier
+  drain is now non-blocking and contributes **zero** lag breaches (`boundary=0` on all runs); the
+  two WP-E engine bugs are fixed (cap-reached leaves the group open for retry; end_group refuses
+  while a barrier is in flight). Rung 50 STILL does NOT meet the lag ceiling (cold44 4-6/40, c51
+  4/40): the remaining cause is read-attributed cold point reads under shared-device durability
+  I/O. Newest-first `get()` wins only -2.5% request-path bytes; entity-first co-location wins
+  -16.6% reads (4.03→3.36 blocks/req) but regresses compaction write amp ~12x (22→265 MB), so its
+  rung-50 tail is worse (15/40). Honest FAIL on the primary criterion; pre-registration ceiling
+  reconciliation left as the flagged OPEN AUTHOR ITEM.

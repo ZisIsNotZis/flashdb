@@ -83,7 +83,8 @@ use std::path::Path;
 use std::io::{self, BufRead, BufReader, Write};
 use std::time::{Duration, Instant};
 
-use flashdb_engine::engine::{build_compaction_job, CompactShape, CompactionJob, CompactionOutcome, Engine, LayoutPolicy, Op, Outcome, RegionMode, RequestOutcome, MAX_PENDING_BARRIERS};
+use flashdb_engine::engine::{build_compaction_job, BarrierCompletion, CompactShape, CompactionJob, CompactionOutcome, Engine, LayoutPolicy, Op, Outcome, RegionMode, RequestOutcome, MAX_PENDING_BARRIERS};
+use flashdb_engine::keys::KeyEncoding;
 use flashdb_engine::metrics::WindowSnapshot;
 use flashdb_engine::replay::submit_requests_grouped;
 use flashdb_engine::request::execute_request;
@@ -123,6 +124,7 @@ struct Args {
     checkpoint_bytes: Option<u64>,
     rotate_bytes: Option<u64>,
     region_mode: Option<RegionMode>,
+    key_encoding: KeyEncoding,
     compact_bytes: Option<u64>,
     /// Host-stall control (slice 55): `--dry-run` replaces a request's engine
     /// execution with a bounded busy-wait (`--dry-run-busy-us`) after parsing
@@ -155,6 +157,7 @@ fn parse_args(argv: Vec<String>) -> Result<Args, String> {
         checkpoint_bytes: None,
         rotate_bytes: None,
         region_mode: None,
+        key_encoding: KeyEncoding::FamilyFirst,
         compact_bytes: None,
         dry_run: false,
         dry_run_busy_us: 0,
@@ -247,6 +250,15 @@ fn parse_args(argv: Vec<String>) -> Result<Args, String> {
                     .ok_or_else(|| format!("unknown region mode {name:?} (global|per_region)"))?);
                 i += 2;
             }
+            "--key-encoding" => {
+                let name = argv.get(i + 1).ok_or("--key-encoding needs a value")?;
+                args.key_encoding = match name.as_str() {
+                    "family_first" | "family-first" => KeyEncoding::FamilyFirst,
+                    "entity_first" | "entity-first" => KeyEncoding::EntityFirst,
+                    _ => return Err(format!("unknown key encoding {name:?} (family_first|entity_first)")),
+                };
+                i += 2;
+            }
             "--no-tiles" => { args.discover = false; i += 1; }
             other => return Err(format!("unknown argument {other:?}")),
         }
@@ -283,12 +295,16 @@ fn rate_for(index: u64, total: u64, rates: &[f64], segment_requests: Option<u64>
 /// Resolve the CLI target. A directory opens tile-aware with `Engine::open_discover` unless
 /// `discover` is false, in which case (and for a WAL file path) the engine is opened by WAL
 /// path with tiles ignored: `--no-tiles` is the memtable-only control for the same data.
-fn open_target(target: &str, discover: bool) -> io::Result<Engine> {
+fn open_target(target: &str, discover: bool, encoding: KeyEncoding) -> io::Result<Engine> {
     let path = Path::new(target);
     if path.is_dir() {
-        if discover { Engine::open_discover(path) } else { Engine::open(path.join("data.wal")) }
+        if discover {
+            Engine::open_discover_with_encoding(path, encoding)
+        } else {
+            Engine::open_with_encoding(path.join("data.wal"), encoding)
+        }
     } else {
-        Engine::open(path)
+        Engine::open_with_encoding(path, encoding)
     }
 }
 
@@ -743,12 +759,17 @@ fn window_stall_print(window_index: u64, c: ProcCounters, trim_us: u64, group_fs
 /// covering barrier completes), so the two paths emit identical per-request
 /// semantics; only WHEN completion is known differs.
 #[allow(clippy::too_many_arguments)]
-fn record_group(
+/// Record one dispatched group's per-request schedule-lag samples (issue minus
+/// each member's own due time). Lag is fully determined AT DISPATCH, so the
+/// overlapped path records it here (in the dispatch window) rather than at
+/// barrier completion; that is what lets a window boundary stay non-blocking
+/// without mis-attributing a group's lag to the wrong window.
+#[allow(clippy::too_many_arguments)]
+fn record_group_lag(
     first_due_us: f64,
     index: u64,
     count: u64,
     issue_us: f64,
-    completion_us: f64,
     total: u64,
     rates: &[f64],
     segment_requests: Option<u64>,
@@ -757,8 +778,6 @@ fn record_group(
     early_dispatches_window: &mut u64,
     late_total: &mut u64,
     lags: &mut Vec<u64>,
-    latencies: &mut Vec<u64>,
-    group_elapseds: &mut Vec<u64>,
 ) {
     let mut member_due_us = first_due_us;
     for i in index..index + count {
@@ -768,43 +787,64 @@ fn record_group(
             *early_dispatches_window += 1;
         }
         let lag = raw_lag.max(0.0) as u64;
-        let latency = (completion_us - member_due_us).max(0.0) as u64;
         lags.push(lag);
-        latencies.push(latency);
         if lag > lag_ceiling_us { *late_total += 1; }
+        member_due_us += interval_us(i + 1, total, rates, segment_requests);
+    }
+}
+
+/// Record one dispatched group's per-request service-latency samples (each
+/// member's own due time to the group's completion) and the group's
+/// `group_elapsed_us` diagnostic. Service latency is completion-based, so the
+/// overlapped path records it when the covering barrier completes - which, for
+/// a rare cross-boundary barrier, is the NEXT window rather than the dispatch
+/// window. That is the intended attribution: schedule lag is dispatch-scoped,
+/// service latency is completion-scoped.
+#[allow(clippy::too_many_arguments)]
+fn record_group_service(
+    first_due_us: f64,
+    index: u64,
+    count: u64,
+    completion_us: f64,
+    total: u64,
+    rates: &[f64],
+    segment_requests: Option<u64>,
+    latencies: &mut Vec<u64>,
+    group_elapseds: &mut Vec<u64>,
+) {
+    let mut member_due_us = first_due_us;
+    for i in index..index + count {
+        let latency = (completion_us - member_due_us).max(0.0) as u64;
+        latencies.push(latency);
         member_due_us += interval_us(i + 1, total, rates, segment_requests);
     }
     group_elapseds.push((completion_us - first_due_us).max(0.0) as u64);
 }
 
-/// Drain the OLDEST completed overlapped barrier, ack its group's successful
-/// requests, and record its per-request samples. On a failed `fdatasync` the
-/// group is counted as errors (nothing acknowledged) and the error is returned;
-/// the caller must then stop dispatching because the engine is poisoned.
+/// Ack one completed overlapped group and record its per-request SERVICE
+/// samples (the lag samples were already recorded at dispatch). `completion` is
+/// either a barrier completion observed in FIFO order, or a failed `fdatasync`;
+/// a failure counts the whole group as errors (nothing acknowledged) and is
+/// returned so the caller stops dispatching on a poisoned engine.
 #[allow(clippy::too_many_arguments)]
-fn drain_one_pending_group(
-    engine: &mut Engine,
+fn finalize_one_pending_group(
     pending: &mut VecDeque<PendingGroup>,
+    completion: io::Result<BarrierCompletion>,
     total: u64,
     rates: &[f64],
     segment_requests: Option<u64>,
-    lag_ceiling_us: u64,
     window_index: u64,
     completed: &mut u64,
     errors: &mut u64,
     else_used: &mut u64,
     first_error: &mut Option<String>,
-    early_dispatches_total: &mut u64,
-    early_dispatches_window: &mut u64,
-    late_total: &mut u64,
-    lags: &mut Vec<u64>,
     latencies: &mut Vec<u64>,
     group_elapseds: &mut Vec<u64>,
     window_fsync_sum: &mut u64,
     stall_group: &mut GroupPhaseReport,
 ) -> io::Result<()> {
     let group = pending.pop_front().expect("a pending group matches an in-flight barrier");
-    let completion = match engine.wait_group_barrier() {
+    let completion = match completion {
         Ok(c) => c,
         Err(e) => {
             *errors += group.count;
@@ -821,15 +861,14 @@ fn drain_one_pending_group(
         *first_error = group.first_error.clone();
     }
     // The group's completion is the instant its barrier's `fdatasync` returned
-    // on the worker, NOT this drain call (the drain may be deferred to a window
-    // boundary). Service latency therefore includes the barrier and nothing
+    // on the worker, NOT this finalize call (the finalize may be deferred to a
+    // later window). Service latency therefore includes the barrier and nothing
     // after it.
     let group_us = completion.completed_at.duration_since(group.started).as_micros() as u64;
     let completion_us = group.issue_us + group_us as f64;
-    record_group(
-        group.first_due_us, group.index, group.count, group.issue_us, completion_us,
-        total, rates, segment_requests, lag_ceiling_us,
-        early_dispatches_total, early_dispatches_window, late_total, lags, latencies, group_elapseds,
+    record_group_service(
+        group.first_due_us, group.index, group.count, completion_us,
+        total, rates, segment_requests, latencies, group_elapseds,
     );
     *window_fsync_sum = window_fsync_sum.saturating_add(completion.fsync_us);
     let report = GroupPhaseReport {
@@ -847,9 +886,75 @@ fn drain_one_pending_group(
     Ok(())
 }
 
+/// Block until the OLDEST in-flight overlapped barrier completes, then ack its
+/// group and record its service samples. Used at the in-flight cap (memory
+/// bound), before WAL maintenance, and at the end of the run - never at the
+/// ordinary window boundary, which now drains non-blockingly so a slow barrier
+/// cannot delay the next window's first dispatch.
+#[allow(clippy::too_many_arguments)]
+fn drain_one_pending_group(
+    engine: &mut Engine,
+    pending: &mut VecDeque<PendingGroup>,
+    total: u64,
+    rates: &[f64],
+    segment_requests: Option<u64>,
+    window_index: u64,
+    completed: &mut u64,
+    errors: &mut u64,
+    else_used: &mut u64,
+    first_error: &mut Option<String>,
+    latencies: &mut Vec<u64>,
+    group_elapseds: &mut Vec<u64>,
+    window_fsync_sum: &mut u64,
+    stall_group: &mut GroupPhaseReport,
+) -> io::Result<()> {
+    let completion = engine.wait_group_barrier();
+    finalize_one_pending_group(
+        pending, completion, total, rates, segment_requests, window_index,
+        completed, errors, else_used, first_error, latencies, group_elapseds,
+        window_fsync_sum, stall_group,
+    )
+}
+
+/// Drain every ALREADY-COMPLETED overlapped barrier (non-blocking), acking and
+/// recording service samples without ever waiting for a still-in-flight
+/// `fdatasync`. Called on the ordinary window boundary: lag samples are already
+/// recorded at dispatch, so the window's schedule-lag statistics are complete
+/// without blocking, and a cross-boundary barrier contributes only its service
+/// samples to the window where it actually completes.
+#[allow(clippy::too_many_arguments)]
+fn drain_completed_groups(
+    engine: &mut Engine,
+    pending: &mut VecDeque<PendingGroup>,
+    total: u64,
+    rates: &[f64],
+    segment_requests: Option<u64>,
+    window_index: u64,
+    completed: &mut u64,
+    errors: &mut u64,
+    else_used: &mut u64,
+    first_error: &mut Option<String>,
+    latencies: &mut Vec<u64>,
+    group_elapseds: &mut Vec<u64>,
+    window_fsync_sum: &mut u64,
+    stall_group: &mut GroupPhaseReport,
+) -> io::Result<()> {
+    while !pending.is_empty() {
+        match engine.try_take_group_barrier()? {
+            Some(completion) => finalize_one_pending_group(
+                pending, Ok(completion), total, rates, segment_requests, window_index,
+                completed, errors, else_used, first_error, latencies, group_elapseds,
+                window_fsync_sum, stall_group,
+            )?,
+            None => break,
+        }
+    }
+    Ok(())
+}
+
 /// Block until every in-flight overlapped barrier has completed and been
-/// recorded, preserving submission order. Used at window boundaries (before
-/// compaction and the window stats) and at the end of the run.
+/// recorded, preserving submission order. Used before WAL maintenance (which
+/// rebinds the WAL) and at the end of the run (so the summary is complete).
 #[allow(clippy::too_many_arguments)]
 fn drain_all_pending_groups(
     engine: &mut Engine,
@@ -857,16 +962,11 @@ fn drain_all_pending_groups(
     total: u64,
     rates: &[f64],
     segment_requests: Option<u64>,
-    lag_ceiling_us: u64,
     window_index: u64,
     completed: &mut u64,
     errors: &mut u64,
     else_used: &mut u64,
     first_error: &mut Option<String>,
-    early_dispatches_total: &mut u64,
-    early_dispatches_window: &mut u64,
-    late_total: &mut u64,
-    lags: &mut Vec<u64>,
     latencies: &mut Vec<u64>,
     group_elapseds: &mut Vec<u64>,
     window_fsync_sum: &mut u64,
@@ -874,10 +974,9 @@ fn drain_all_pending_groups(
 ) -> io::Result<()> {
     while !pending.is_empty() {
         drain_one_pending_group(
-            engine, pending, total, rates, segment_requests, lag_ceiling_us, window_index,
-            completed, errors, else_used, first_error,
-            early_dispatches_total, early_dispatches_window, late_total,
-            lags, latencies, group_elapseds, window_fsync_sum, stall_group,
+            engine, pending, total, rates, segment_requests, window_index,
+            completed, errors, else_used, first_error, latencies, group_elapseds,
+            window_fsync_sum, stall_group,
         )?;
     }
     Ok(())
@@ -1015,7 +1114,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // depending on what else is running, so a load run without a device baseline cannot be
     // interpreted: "saturation" may be the device, not the engine. Same session, same directory.
     let device = probe_device(&probe_dir(&args.target), 100);
-    let mut engine = open_target(&args.target, args.discover)?;
+    let mut engine = open_target(&args.target, args.discover, args.key_encoding)?;
     // External policy control: apply the JSON policy file (CLI wins over the
     // `FLASHDB_POLICY_FILE` env var) before any work. A malformed file is a hard
     // error at start: the controller asked for a policy it did not get.
@@ -1092,6 +1191,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut max_sleep_us: u64 = 0;
     let mut max_sleep_request_us: u64 = 0;
     let mut window_late_start: u64 = 0;
+    // Boundary-vs-read lag-breach attribution (slice 57): the window-boundary
+    // drain is now non-blocking, so `boundary_drain_prev_us` (the time the
+    // PREVIOUS boundary's drain blocked the pacer) should be ~0; when it is
+    // large enough to breach the lag ceiling by itself, every breach in the
+    // first group of THIS window is attributed to the boundary, and everything
+    // else to the request-path reads. `window_read_us` is the measured
+    // request-path probe/read time (group dispatch elapsed minus append/apply).
+    let mut boundary_drain_prev_us: u64 = 0;
+    let mut window_boundary_drain_us: u64;
+    let mut first_group_count: u64 = 0;
+    let mut window_read_us: u64 = 0;
     let mut window_rate: f64 = rate_for(0, total, &args.rates, args.segment_requests);
     let mut late_growth_windows: u32 = 0;
     let mut invalid_windows: u64 = 0;
@@ -1121,11 +1231,27 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     while index < total {
         let errors_before = errors;
         // True when the group dispatched this iteration owes an overlapped WAL
-        // barrier still in flight: its per-request samples and acks are deferred
-        // until the barrier completes, so the shared inline measurement below is
-        // skipped for it.
+        // barrier still in flight: its per-request service samples and acks are
+        // deferred until the barrier completes, so the shared inline measurement
+        // below is skipped for it. Schedule-lag samples are still recorded AT
+        // DISPATCH (see `lag_recorded`), because lag is fully determined then.
         let mut deferred_group = false;
+        // True when this group's per-request schedule-lag samples were already
+        // recorded at dispatch (the grouped path), so the inline measurement
+        // block records only service latency, never lag twice.
+        let mut lag_recorded = false;
         let now_us = t0.elapsed().as_secs_f64() * 1e6;
+        // Finalize any barriers that completed since the last iteration, without
+        // blocking: this frees in-flight slots AND records each group's service
+        // samples in the window where it actually completed, so the ordinary
+        // window-boundary drain only has to account for the sliver that finished
+        // since the previous iteration (and never waits on a slow fsync).
+        drain_completed_groups(
+            &mut engine, &mut pending, total, &args.rates, args.segment_requests,
+            window_index,
+            &mut completed, &mut errors, &mut else_used, &mut first_error,
+            &mut latencies, &mut group_elapseds,
+            &mut window_fsync_sum, &mut stall_group)?;
         if due_us <= now_us {
             let size = args.group_requests.or(args.commit_batch).unwrap_or(1).max(1);
             window_rate = rate_for(index, total, &args.rates, args.segment_requests);
@@ -1141,6 +1267,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             max_group_size_window = max_group_size_window.max(end - index);
             let group_seq = groups_window;
             let started = Instant::now();
+            // `issue_us` is the dispatch instant shared by every per-request
+            // schedule-lag sample; it is branch-independent, so it is computed
+            // once here rather than re-derived in each dispatch path.
+            let issue_us = started.duration_since(t0).as_secs_f64() * 1e6;
+            if group_seq == 1 { first_group_count = end - index; }
             if args.dry_run {
                 // Host-stall control (slice 55): pace and parse the trace but do
                 // no engine I/O. A bounded busy-wait stands in for the request's
@@ -1164,10 +1295,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 while engine.pending_barriers() >= MAX_PENDING_BARRIERS {
                     drain_one_pending_group(
                         &mut engine, &mut pending, total, &args.rates, args.segment_requests,
-                        args.lag_ceiling_us, window_index,
+                        window_index,
                         &mut completed, &mut errors, &mut else_used, &mut first_error,
-                        &mut early_dispatches_total, &mut early_dispatches_window, &mut late_total,
-                        &mut lags, &mut latencies, &mut group_elapseds,
+                        &mut latencies, &mut group_elapseds,
                         &mut window_fsync_sum, &mut stall_group)?;
                 }
                 let mut requests: Vec<Value> = Vec::with_capacity((end - index) as usize);
@@ -1177,6 +1307,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 let (barrier, results) = submit_requests_grouped(&mut engine, &requests)
                     .map_err(|e| io::Error::new(e.kind(), format!("request group at {index}: {e}")))?;
                 let (append_us, apply_us) = engine.take_group_append_apply_us();
+                // Request-path probe/read time: the dispatch elapsed minus the
+                // engine's WAL append and memtable apply (the barrier is only
+                // SUBMITTED on this path, never taken). The remainder is the
+                // synchronous `cust`/stock/order probes - the cold-read stall
+                // this work package attributes and reduces.
+                let submit_elapsed_us = started.elapsed().as_micros() as u64;
+                let read_us = submit_elapsed_us.saturating_sub(append_us.saturating_add(apply_us));
+                window_read_us = window_read_us.saturating_add(read_us);
                 let mut ok_count = 0u64;
                 let mut err_count = 0u64;
                 let mut else_delta = 0u64;
@@ -1199,7 +1337,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                 }
-                let issue_us = started.duration_since(t0).as_secs_f64() * 1e6;
+                // Schedule-lag samples are dispatch-scoped: record them now, in
+                // the dispatch window, so the window-boundary drain can stay
+                // non-blocking without mis-attributing lag.
+                record_group_lag(
+                    due_us, index, end - index, issue_us, total, &args.rates, args.segment_requests,
+                    args.lag_ceiling_us,
+                    &mut early_dispatches_total, &mut early_dispatches_window, &mut late_total, &mut lags,
+                );
+                lag_recorded = true;
                 if barrier {
                     pending.push_back(PendingGroup {
                         seq: group_seq,
@@ -1329,10 +1475,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             if needs_maintenance_drain {
                 drain_all_pending_groups(
                     &mut engine, &mut pending, total, &args.rates, args.segment_requests,
-                    args.lag_ceiling_us, window_index,
+                    window_index,
                     &mut completed, &mut errors, &mut else_used, &mut first_error,
-                    &mut early_dispatches_total, &mut early_dispatches_window, &mut late_total,
-                    &mut lags, &mut latencies, &mut group_elapseds,
+                    &mut latencies, &mut group_elapseds,
                     &mut window_fsync_sum, &mut stall_group)?;
             }
             let maintain_t0 = Instant::now();
@@ -1352,7 +1497,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             // covering barrier's completion), so the inline path is skipped.
             if !deferred_group {
                 let group_us = started.elapsed().as_micros() as u64;
-                let issue_us = started.duration_since(t0).as_secs_f64() * 1e6;
                 let completion_us = issue_us + group_us as f64;
                 let first_due_us = due_us;
                 // Per-group phase attribution (slice 55): drain the engine's
@@ -1373,18 +1517,20 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 if report.completion_us > stall_group.completion_us {
                     stall_group = report;
                 }
-                let mut member_due_us = due_us;
-                for i in index..end {
-                    let raw_lag = issue_us - member_due_us;
-                    if raw_lag < -EARLY_TOLERANCE_US { early_dispatches_total += 1; early_dispatches_window += 1; }
-                    let lag = raw_lag.max(0.0) as u64;
-                    let latency = (completion_us - member_due_us).max(0.0) as u64;
-                    lags.push(lag);
-                    latencies.push(latency);
-                    if lag > args.lag_ceiling_us { late_total += 1; }
-                    member_due_us += interval_us(i + 1, total, &args.rates, args.segment_requests);
+                // The grouped path already recorded schedule-lag at dispatch;
+                // the synchronous/dry-run/batch paths record it here (their
+                // completion is immediate, so dispatch and completion coincide).
+                if !lag_recorded {
+                    record_group_lag(
+                        due_us, index, end - index, issue_us, total, &args.rates, args.segment_requests,
+                        args.lag_ceiling_us,
+                        &mut early_dispatches_total, &mut early_dispatches_window, &mut late_total, &mut lags,
+                    );
                 }
-                group_elapseds.push((completion_us - first_due_us).max(0.0) as u64);
+                record_group_service(
+                    due_us, index, end - index, completion_us, total, &args.rates, args.segment_requests,
+                    &mut latencies, &mut group_elapseds,
+                );
             }
             // Advance the open-loop schedule to the due time of the next unissued request.
             due_us = end_due_us;
@@ -1422,18 +1568,20 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             || window_start.elapsed() >= Duration::from_millis(args.window_ms)
             || (next_rate != window_rate && groups_window > 0)
         {
-            // Drain every in-flight overlapped barrier first: the window's stats
-            // must include each group's completion, and the compaction/apply
-            // paths below refuse to run while a barrier is in flight. This also
-            // preserves the arrival model: every group dispatched in this window
-            // is attributed to the rung it was offered under.
-            drain_all_pending_groups(
+            // Drain only ALREADY-COMPLETED overlapped barriers (non-blocking):
+            // schedule-lag samples were recorded at dispatch, so the window's lag
+            // statistics are complete without waiting, and a still-in-flight
+            // barrier contributes only its service samples to the window where it
+            // actually completes. This removes the boundary-drain stall that the
+            // WP-E residual attributed to a fraction of the rung-50 breaches.
+            let boundary_drain_t0 = Instant::now();
+            drain_completed_groups(
                 &mut engine, &mut pending, total, &args.rates, args.segment_requests,
-                args.lag_ceiling_us, window_index,
+                window_index,
                 &mut completed, &mut errors, &mut else_used, &mut first_error,
-                &mut early_dispatches_total, &mut early_dispatches_window, &mut late_total,
-                &mut lags, &mut latencies, &mut group_elapseds,
+                &mut latencies, &mut group_elapseds,
                 &mut window_fsync_sum, &mut stall_group)?;
+            window_boundary_drain_us = boundary_drain_t0.elapsed().as_micros() as u64;
             // Compaction actuation (Slice 37/53), BEFORE the policy reload and
             // the snapshot: the merge threshold that governed this window is the
             // one that governs its compaction, and the merged bytes are attributed
@@ -1443,23 +1591,28 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             // the worker thread.
             let mut compact_bytes_window: u64 = 0;
             if let Some(budget) = args.compact_bytes {
-                if let Some(worker) = compaction_worker.as_mut() {
-                    let mut select_us: u64 = 0;
-                    if !worker.busy() {
-                        let select_t0 = Instant::now();
-                        if let Some(job) = engine.compaction_job(budget, COMPACT_MIN_TILES, CompactShape::CheapestPair)? {
-                            select_us = select_t0.elapsed().as_micros() as u64;
-                            worker.submit(job)?;
+                // Skip selection+apply while a barrier is still in flight: the
+                // engine's compaction paths refuse to run then, and deferring by
+                // one window changes only WHEN a merge runs, never WHETHER.
+                if engine.pending_barriers() == 0 {
+                    if let Some(worker) = compaction_worker.as_mut() {
+                        let mut select_us: u64 = 0;
+                        if !worker.busy() {
+                            let select_t0 = Instant::now();
+                            if let Some(job) = engine.compaction_job(budget, COMPACT_MIN_TILES, CompactShape::CheapestPair)? {
+                                select_us = select_t0.elapsed().as_micros() as u64;
+                                worker.submit(job)?;
+                            }
                         }
-                    }
-                    if let Some(outcome) = worker.try_take_done()? {
-                        let apply_t0 = Instant::now();
-                        let merged = engine.apply_compaction_job(&outcome)?;
-                        let apply_us = apply_t0.elapsed().as_micros() as u64;
-                        compact_bytes_window = merged;
-                        compact_bytes_total += merged;
-                        compact_merges += 1;
-                        compact_actuation_print(window_index, select_us, apply_us, &outcome);
+                        if let Some(outcome) = worker.try_take_done()? {
+                            let apply_t0 = Instant::now();
+                            let merged = engine.apply_compaction_job(&outcome)?;
+                            let apply_us = apply_t0.elapsed().as_micros() as u64;
+                            compact_bytes_window = merged;
+                            compact_bytes_total += merged;
+                            compact_merges += 1;
+                            compact_actuation_print(window_index, select_us, apply_us, &outcome);
+                        }
                     }
                 }
             }
@@ -1482,13 +1635,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             // The group elapsed is a diagnostic (the largest group completion minus its first
             // member's due time); it bounds the per-request service latencies and is never one.
             let group_elapsed_us = group_elapseds.iter().copied().max().unwrap_or(0);
-            // Group statistics: the window's request count (`latencies.len()`) is the sum of its
-            // group sizes, so `mean_group_size == requests / groups`. `groups_over_service_ceiling`
-            // counts groups whose elapsed exceeded the service ceiling, so a reader can tell
-            // whether the p99 tail is one group's serial work or many independent stalls.
+            // Group statistics: the window's request count (`lags.len()`) is the
+            // sum of its dispatched group sizes (schedule-lag is recorded at
+            // dispatch), so `mean_group_size == requests / groups`.
+            // `groups_over_service_ceiling` counts groups whose elapsed exceeded
+            // the service ceiling, so a reader can tell whether the p99 tail is
+            // one group's serial work or many independent stalls.
             let groups = groups_window;
+            let requests_this_window = lags.len() as u64;
             let mean_group_size = if groups > 0 {
-                latencies.len() as f64 / groups as f64
+                requests_this_window as f64 / groups as f64
             } else {
                 0.0
             };
@@ -1506,6 +1662,18 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .count() as u64;
             let behind = lag_p99 > args.lag_ceiling_us;
             let window_late = late_total - window_late_start;
+            // Boundary-vs-read breach attribution: a boundary drain can only
+            // cause a lag breach if it alone blocked the pacer past the ceiling,
+            // and then it delays exactly the next window's FIRST group. After the
+            // non-blocking fix `boundary_drain_prev_us` is ~0, so this bucket is
+            // ~0 and the residual breaches are the synchronous cold reads.
+            let boundary_lag_breaches = if boundary_drain_prev_us > args.lag_ceiling_us {
+                lags.iter().take(first_group_count as usize)
+                    .filter(|&&lag| lag > args.lag_ceiling_us).count() as u64
+            } else {
+                0
+            };
+            let read_lag_breaches = window_late.saturating_sub(boundary_lag_breaches);
             let service_ceiling_breached = args.ceiling_us.is_some_and(|c| p99 > c);
             let lag_ceiling_breached = lag_p99 > args.lag_ceiling_us;
             if behind || window_late > 0 { late_growth_windows += 1 } else { late_growth_windows = 0 }
@@ -1540,7 +1708,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 writeln!(out, "{}", metrics_json_line(WindowLine {
                     window: window_index,
                     rate: window_rate,
-                    requests: latencies.len() as u64,
+                    requests: lags.len() as u64,
                     completed,
                     errors,
                     compact_bytes: compact_bytes_window,
@@ -1580,7 +1748,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     behind={behind} late_total={late_total} errors_window={window_error_count} \
                     invalid={invalid} reject_reason={} service_ceiling_us={} lag_ceiling_us={} \
                     compact_bytes={compact_bytes_window}",
-                    window_rate, latencies.len(),
+                    window_rate, lags.len(),
                     reason.clone().unwrap_or_else(|| "none".into()),
                     args.ceiling_us.map(|c| c.to_string()).unwrap_or_else(|| "none".into()),
                     args.lag_ceiling_us)?;
@@ -1610,6 +1778,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             window_stall_print(window_index, proc_now.since(proc_prev), trim_us, window_fsync_sum,
                                window_maintain_us, stall_group, max_sleep_us, max_sleep_request_us,
                                max_latency_us, max_lag_us, group_elapsed_us);
+            eprintln!(
+                "lag_breach_attribution window={window_index} total={window_late} \
+                 boundary={boundary_lag_breaches} reads={read_lag_breaches} \
+                 boundary_drain_us={boundary_drain_prev_us} read_us={window_read_us}");
             proc_prev = proc_now;
             // Reset the per-window stall attribution for the next window.
             stall_group = GroupPhaseReport::default();
@@ -1617,6 +1789,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             window_maintain_us = 0;
             max_sleep_us = 0;
             max_sleep_request_us = 0;
+            boundary_drain_prev_us = window_boundary_drain_us;
+            first_group_count = 0;
+            window_read_us = 0;
             window_index += 1;
             window_start = Instant::now();
             window_late_start = late_total;
@@ -1625,6 +1800,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             // the offered schedule, so its wall time is not charged to the next rung.
         }
     }
+
+    // Defensive: every dispatched group must be finalized before the summary,
+    // and before any compaction apply (which refuses a barrier in flight). The
+    // trailing-window flush is non-blocking, so a slow cross-boundary barrier
+    // may still be in flight here; drain it now.
+    drain_all_pending_groups(
+        &mut engine, &mut pending, total, &args.rates, args.segment_requests,
+        window_index,
+        &mut completed, &mut errors, &mut else_used, &mut first_error,
+        &mut latencies, &mut group_elapseds,
+        &mut window_fsync_sum, &mut stall_group)?;
 
     // Drain the last in-flight compaction build so the final state and the
     // `compact_*` totals reflect it; the worker's channel closes when the driver
@@ -1638,16 +1824,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
-
-    // Defensive: every dispatched group must be finalized before the summary. The
-    // trailing-window flush normally drains all in-flight barriers already.
-    drain_all_pending_groups(
-        &mut engine, &mut pending, total, &args.rates, args.segment_requests,
-        args.lag_ceiling_us, window_index,
-        &mut completed, &mut errors, &mut else_used, &mut first_error,
-        &mut early_dispatches_total, &mut early_dispatches_window, &mut late_total,
-        &mut lags, &mut latencies, &mut group_elapseds,
-        &mut window_fsync_sum, &mut stall_group)?;
 
     let elapsed = t0.elapsed();
     let device_end = probe_device(&probe_dir(&args.target), 50);
@@ -1819,6 +1995,19 @@ mod tests {
         assert!(parse_args(vec!["b".into(), "dir".into(), "t.jsonl".into(), "--rate-rps".into(), "10".into(),
                                 "--region-mode".into(), "nonsense".into()]).is_err(),
             "an unknown region mode is rejected");
+    }
+
+    #[test]
+    fn key_encoding_flag_selects_and_rejects() {
+        let family = parse_args(vec!["b".into(), "dir".into(), "t.jsonl".into(), "--rate-rps".into(), "10".into()])
+            .expect("valid args");
+        assert_eq!(family.key_encoding, KeyEncoding::FamilyFirst, "family-first is the default");
+        let entity = parse_args(vec!["b".into(), "dir".into(), "t.jsonl".into(), "--rate-rps".into(), "10".into(),
+                                     "--key-encoding".into(), "entity_first".into()]).expect("valid encoding");
+        assert_eq!(entity.key_encoding, KeyEncoding::EntityFirst);
+        assert!(parse_args(vec!["b".into(), "dir".into(), "t.jsonl".into(), "--rate-rps".into(), "10".into(),
+                                "--key-encoding".into(), "nonsense".into()]).is_err(),
+            "an unknown key encoding is rejected");
     }
 
     #[test]
@@ -2043,5 +2232,35 @@ mod tests {
         assert!(parse_args(vec!["b".into(), "wal".into(), "t.jsonl".into(), "--rate-rps".into(), "10".into(),
                                 "--lag-ceiling-us".into(), "0".into()]).is_err(),
             "a zero lag ceiling is rejected");
+    }
+
+    /// Schedule-lag samples are dispatch-scoped and service-latency samples are
+    /// completion-scoped: the split recorders must produce the same per-request
+    /// lag (issue minus due) and service latency (completion minus due) the
+    /// single combined recorder used to, without cross-contaminating the two
+    /// vectors. This is what lets the window-boundary drain stay non-blocking
+    /// while a cross-boundary group still lands its lag in the dispatch window.
+    #[test]
+    fn record_group_lag_and_service_split_dispatch_and_completion_scopes() {
+        let rates = [10.0]; // 100,000 us per request interval
+        let mut early_total = 0u64;
+        let mut early_window = 0u64;
+        let mut late_total = 0u64;
+        let mut lags: Vec<u64> = Vec::new();
+        let mut latencies: Vec<u64> = Vec::new();
+        let mut group_elapseds: Vec<u64> = Vec::new();
+        // Two requests due at 100,000 and 200,000 us, dispatched at 250,000 us
+        // (both late), completed at 400,000 us.
+        record_group_lag(100_000.0, 0, 2, 250_000.0, 100, &rates, None, 10_000,
+                         &mut early_total, &mut early_window, &mut late_total, &mut lags);
+        assert_eq!(lags, vec![150_000, 50_000], "lag = issue - each member's own due time");
+        assert_eq!(late_total, 2, "both requests are over the 10 ms ceiling");
+        assert_eq!(early_total, 0);
+        record_group_service(100_000.0, 0, 2, 400_000.0, 100, &rates, None,
+                             &mut latencies, &mut group_elapseds);
+        assert_eq!(latencies, vec![300_000, 200_000], "latency = completion - each member's own due time");
+        assert_eq!(group_elapseds, vec![300_000], "group elapsed = completion - first member's due time");
+        assert_eq!(lags, vec![150_000, 50_000], "the service recorder must not touch lags");
+        assert!(latencies.iter().all(|&l| l > 10_000), "service latency is not bounded by the lag ceiling");
     }
 }

@@ -388,11 +388,12 @@ def build_binaries(release: bool) -> dict:
 # ---------------------------------------------------------------------------
 def build_inventory(name: str, mode: str, region_layout: str | None, bins: dict,
                     traces: dict, args: argparse.Namespace, workroot: Path,
-                    env: dict, cap: int) -> "ScopeResult":
+                    env: dict, cap: int, key_encoding: str = "family_first") -> "ScopeResult":
     """Seed dimensions, apply the flow writes (grouped), checkpoint: inside one capped scope."""
     d = workroot / name
     seed_env = {
         "FLASHDB_REGION_MODE": mode,
+        "FLASHDB_KEY_ENCODING": key_encoding,
         "FLASHDB_SEED_CHECKPOINT_BYTES": str(args.checkpoint_bytes),
         "FLASHDB_SEED_ROTATE_BYTES": str(args.rotate_bytes),
     }
@@ -404,7 +405,7 @@ def build_inventory(name: str, mode: str, region_layout: str | None, bins: dict,
         (f"/usr/bin/time -v {bins['load']} {d} {traces['write']} --rate-rps {args.write_rate} "
          f"--window-ms 1000 --group-requests {args.group_requests} "
          f"--checkpoint-bytes {args.checkpoint_bytes} --rotate-bytes {args.rotate_bytes} "
-         f"--region-mode {mode}"),
+         f"--region-mode {mode} --key-encoding {key_encoding}"),
         f"/usr/bin/time -v {bins['scale']} checkpoint {d}",
     ])
     return scope(cap, script, env2, f"build-{name}")
