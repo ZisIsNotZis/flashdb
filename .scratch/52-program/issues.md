@@ -171,3 +171,21 @@ Combined gates (run at merged master `112f96a`):
   durability, so no latency fix was applied: the ticket states the smallest honest blocker and
   proposes (not implements) how the pre-registration can treat the 10 ms service ceiling.
   279 Rust tests and 132 Python tests green; 0 build warnings; `git diff --check` silent.
+
+## wave4 WP-D dispatch record
+
+- Timestamp: 2026-10-13T21:45:00+08:00.
+- Action: dispatched work package D "attribute and remove the primary-metric (lag-ceiling)
+  stalls" to the single-writer `wave4/lag` worktree. Contract, diagnosis, decision, tests,
+  gates, before/after table and verdict are in `.scratch/55-lag-stall-attribution/issues.md`.
+- Result: commit `ed51975` (per-group phase + OS-view instrumentation + `--dry-run` host-stall
+  control; no latency fix). Diagnosis with per-group numbers: the ~hundreds-of-ms single-request
+  stall is a cascade — one write group's WAL `fdatasync` tails to 71-498 ms on the shared device
+  (present with compaction AND WAL maintenance fully off, e.g. c51-writes-only 9/40 lag-rej at
+  rung 50), and the synchronous single-writer pacer blocks behind it, so the NEXT group is issued
+  that late and breaches the lag ceiling. The compaction worker's concurrent tile I/O is a
+  secondary, run-dependent slow-read source (cold44 9/40 -> 1/40 with it off) that does not
+  reproduce on the 12.25x confirmation. No honest engine/driver change removes the device fsync
+  tail without weakening durability, so no latency fix was applied: the ticket states the bounded
+  honest blocker and proposals. 280 Rust tests and 132 Python tests green; 0 build warnings;
+  `git diff --check` silent.
