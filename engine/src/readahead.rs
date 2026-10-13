@@ -180,7 +180,6 @@ fn worker(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::engine::{Engine, Op};
     use std::path::PathBuf;
 
