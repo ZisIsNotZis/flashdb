@@ -386,3 +386,19 @@ warning: `VIRTUAL_ENV=/home/z/.venv` does not match the project environment path
 | `docs/objective.md` | latency statement now marks the lag-only primary as the adopted §7.1 decision and flags the open reconciliation with `pre-registration.md`'s either-ceiling validity rule | 54, 55, 56, 57 (residual proposals + open item) |
 
 - Not changed: `.scratch/15-objective-v0/pre-registration.md` (author-owned) and tickets 53-57 (verification records).
+
+## wave7 WP-G dispatch record
+
+- Timestamp: 2026-10-14T00:53:00+08:00.
+- Action: dispatched work package G "take the request-path reads off the pacer" to the
+  single-writer `wave7/readsoverlap` worktree. Contract, diagnosis, rejected alternatives, design,
+  tests, gates, before/after table and verdict are in `.scratch/58-overlapped-reads/issues.md`.
+- Result: commits `94c3027` (checkpoint) + `67c541f` (read-ahead tile warming) + `009ce3d`
+  (pace the warm to avoid a startup read burst). A background
+  read-ahead worker pre-reads the tile blocks for the next 64 requests (paced 4 ms/request), so the
+  pacer's authoritative reads are page-cache hits and the cold page-in happens off the pacer;
+  durability/ordering/read correctness are untouched (warming only). 291 Rust tests and 132 Python
+  tests green; 0 build warnings; `git diff --check` silent. Rung 50 is sustained by the lag ceiling
+  on c51 (0/40) and cold44 run B (0/40); cold44 run A is 1/40 with the single breach attributed to
+  the write-path WAL append under a device fsync stall (not a read). The primary-vs-service ceiling
+  reconciliation remains the OPEN AUTHOR ITEM.

@@ -7,5 +7,6 @@ pub mod metrics;
 pub mod request;
 pub mod replay;
 mod bloom;
+pub mod readahead;
 mod tile;
 pub mod wal;
