@@ -62,9 +62,9 @@ increase (3 windows: max_group 360/23/299 ms vs read_bytes 0.9/1.6/1.8 MB — no
 
 ### Config 4 neither — full trace, compaction off + WAL maintenance off, 192 MiB (ticket-49 residual)
 
-Median svc p95 11,150/12,371/17,659/34,128 us (reproduces ticket-49 `neither` 11,839/16,963/
+Median svc p95 11,588/10,578/19,817/26,522 us (reproduces ticket-49 `neither` 11,839/16,963/
 39,511/41,102 within session drift), `group_fsync` med 124,994/253,281/516,005/653,117 us,
-`trim_us` max 116–265 us, `majflt=0`, `read_bytes` 1.1–7.8 MB/window.
+`trim_us` max 104–265 us, `majflt=0`, `read_bytes` 1.1–7.8 MB/window.
 
 ### cold51 confirmation (12.25x, baseline, compaction + WAL on)
 
@@ -82,8 +82,8 @@ thread.**
 
 - `group_fsync_us` is 119–654 ms PER WINDOW (baseline) / 113–739 ms (warm), and it grows with the
   write rate exactly as the tail does. At rung 50 there are ~20 write-groups/window, so the barrier
-  is ~5–7 ms per group — the same-device fsync probe measures `device_fsync_p50_us=5176`,
-  `device_fsync_p99_us=10528` (baseline). The whole window's fdatasync sum is 1–2 orders of
+  is ~5–7 ms per group — the same-device fsync probe measures `device_fsync_p50_us=6669`,
+  `device_fsync_p99_us=13396` (baseline; c51 `9107`/`26391`). The whole window's fdatasync sum is 1–2 orders of
   magnitude larger than every other candidate.
 - **Cold read page-ins are NOT dominant.** `readonly` (fully cold, `read_bytes` up to 3.4 MB/window)
   gives median svc p95 2.7–4.3 ms. `warm` (read_bytes=0, the whole instance cached) STILL gives
@@ -98,7 +98,7 @@ thread.**
   I/O, but it is not the median tail.
 
 What remains unseparated: the fdatasync's OWN tail (why a few barriers reach 10–15 ms) is the
-shared device (`device_fsync_p99_us=10528`), not separable from the engine; and the rare
+shared device (`device_fsync_p99_us=13396` baseline / `26391` c51), not separable from the engine; and the rare
 multi-hundred-ms scheduler spikes (no I/O correlate) are un-attributed to any engine code.
 
 ## Decision + rejected alternatives
@@ -128,20 +128,29 @@ below, and propose (not implement) the pre-registration treatment.
 
 ## Smallest honest statement
 
-The two lowest rungs fail the **service** ceiling (10 ms), not the pre-registration's own lag
-ceiling: rung 50 lag p99 median is 2,193–2,691 us and rung 100 lag p99 median 3,836–9,337 us, while
-service p99 median is 16.9/21.5 ms (baseline) — because a write request waits for its group's single
-WAL `fdatasync`, measured at 5,176 us p50 / 10,528 us p99 on this device, and at low offered load
-group commit cannot batch writes (one write per group). That barrier is the equal-durability cost,
-not an engine/driver defect, so no honest code change removes it without weakening durability.
+At rung 50 NEITHER the 10 ms service ceiling NOR the pre-registration's PRIMARY per-window lag
+ceiling (`lag p99 <= 10 ms`, no window rejected) is met: the per-window lag ceiling is breached in
+9/40 windows (baseline) and 7/40 (c51), while the service ceiling is breached in 39/40 and 38/40.
+The median per-window lag p99 is small (2,193–2,691 us), but the per-window tail decides the
+metric: each breaching window carries a single-request stall (`max_group_us` == `max_latency_us`,
+up to ~724 ms) with no matching `read_bytes` increase — the rare un-attributed scheduler/disk spikes
+listed in the residual. The service ceiling fails because a write request waits for its group's
+single WAL `fdatasync`, measured at 6,669 us p50 / 13,396 us p99 on this device (c51
+9,107/26,391), and at low offered load group commit cannot batch writes (one write per group).
+That barrier is the equal-durability cost, not an engine/driver defect, so no honest code change
+removes it without weakening durability.
 
 ## Proposal for the pre-registration (not implemented)
 
-1. Judge the primary sustained-load metric on the **lag ceiling alone** (`lag p99 <= 10 ms`, the
-   pre-registration's own number), and report the service-latency distribution as the efficiency
-   measure the pre-registration already calls it — decoupling the service ceiling from window
-   rejection. A fixed 10 ms service ceiling is below the device's own fdatasync p99 (10.5 ms), so
-   it is unsatisfiable by any engine that must `fdatasync` per write group on this box.
+1. Decouple the SERVICE ceiling from window rejection and judge the primary metric on the
+   pre-registration's per-window lag ceiling alone (`lag p99 <= 10 ms`, no window rejected), while
+   reporting the service-latency distribution as the efficiency measure the pre-registration
+   already calls it. This is a proposal only, and it does NOT pass rung 50 on today's data: the
+   per-window lag ceiling is itself breached (9/40 baseline, 7/40 c51) by the un-attributed
+   scheduler/disk spikes, so it would first require those spikes to be attributed/fixed (or the
+   ceiling made robust to them). Separately, a fixed 10 ms service ceiling is below the device's
+   own fdatasync p99 (13.4 ms baseline / 26.4 ms c51), so it is unsatisfiable by any engine that
+   must `fdatasync` per write group on this box.
 2. If the service ceiling must reject windows, make it **relative to the measured device fdatasync**
    (e.g. `N × device_fsync_p99`), so it scales with the device instead of an absolute number.
 3. Alternatively, state the durability floor explicitly: under group commit with per-group
@@ -165,12 +174,17 @@ sustained-rung claim.
 
 ## Acceptance verdict
 
-**Irreducibly blocked (honest), not a fake pass.** No rung sustains the 10 ms SERVICE ceiling
-because a write group's WAL `fdatasync` (5.2 ms p50 / 10.5 ms p99 on this device) cannot be
-amortized at low offered load. The pre-registration's PRIMARY lag ceiling is met at rung 50
-(lag p99 median 2.2–2.7 ms) and borderline at rung 100 (lag p99 median 3.8–9.3 ms). The blocker is
-the durability barrier, not an engine/driver defect, not allocator/scheduler jitter, not cold reads.
-Throughput and write amp are unchanged (no code change).
+**Irreducibly blocked (honest), not a fake pass.** At rung 50 NEITHER the 10 ms service ceiling
+NOR the pre-registration's PRIMARY per-window lag ceiling (`lag p99 <= 10 ms`, no window rejected)
+is met: the per-window lag ceiling is breached in 9/40 windows (baseline) and 7/40 (c51), and every
+rung 100+ window also breaches at least the service ceiling (rung 100 lag breaches 10/20 baseline,
+3/20 c51). The lag breaches trace to the rare un-attributed scheduler/disk spikes listed in the
+residual — the median per-window lag p99 is small (2.2–2.7 ms at rung 50) but the per-window tail
+decides the metric. The service ceiling fails because a write group's WAL `fdatasync` (6,669 us
+p50 / 13,396 us p99 on this device; c51 9,107/26,391) cannot be amortized at low offered load. The
+blockers are the durability barrier (service ceiling) and the un-attributed spikes (lag ceiling),
+neither an engine/driver defect; allocator and cold reads are not dominant. Throughput and write
+amp are unchanged (no code change).
 
 ## Residual / unseparated items
 

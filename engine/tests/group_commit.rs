@@ -362,7 +362,11 @@ fn grouped_api_fails_closed_outside_and_around_a_group() {
 /// empty group takes no sync, and the accumulator resets exactly after it is read.
 /// The barrier's absolute elapsed time is not asserted (it depends on the file
 /// system and this machine), only the accounting contract the load driver's
-/// per-window attribution relies on.
+/// per-window attribution relies on. A non-zero-accumulation assertion on the
+/// non-empty group is deliberately omitted: the counter is
+/// `Instant::elapsed().as_micros()`, which truncates a sub-microsecond
+/// `fdatasync` to 0, and on a fast `fdatasync` (e.g. a tmpfs-backed temp dir)
+/// that makes `> 0` flaky rather than a property of the accounting.
 #[test]
 fn group_fsync_accounting_attributes_the_barrier_and_resets() {
     let files = Files::new();
@@ -379,7 +383,7 @@ fn group_fsync_accounting_attributes_the_barrier_and_resets() {
     let (id, ops) = block(1);
     assert_eq!(e.commit_block_grouped(&id, &ops).unwrap(), Outcome::Committed { csn: 1 });
     e.end_group().unwrap();
-    let _barrier_us = e.take_group_fsync_us();
+    let _barrier_us = e.take_group_fsync_us(); // not asserted > 0: as_micros() truncates sub-us fsync on fast filesystems
     assert_eq!(e.take_group_fsync_us(), 0, "the accumulator resets after it is read");
     assert_eq!(wal_records(&files), 1);
 }

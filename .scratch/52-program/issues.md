@@ -127,7 +127,7 @@ Integrated HEAD: `183a0be140757a5784e196fbff22ca7b7d005044` (`git rev-parse HEAD
   before/after table and verdict are in `.scratch/54-residual-tail/issues.md`.
 - Result: commits `c36b9c3` (per-window proc/io + trim_heap instrumentation) and `6ec1ea3`
   (group-barrier fdatasync timing + tests). Diagnosis: the ticket-49 residual is dominated by the
-  per-group WAL `fdatasync` (5.2 ms p50 / 10.5 ms p99 on this device, 119–654 ms/window), NOT cold
+  per-group WAL `fdatasync` (6.7 ms p50 / 13.4 ms p99 on this device, 119–654 ms/window), NOT cold
   page-ins (read-only 2.7–4.3 ms; warm read_bytes=0 still 9.3–21.7 ms), NOT allocator (≤ 5 ms) and
   NOT scheduler jitter. It is the equal-durability barrier, irreducible without weakening
   durability, so no latency fix was applied: the ticket states the smallest honest blocker and
