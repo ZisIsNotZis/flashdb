@@ -83,7 +83,7 @@ Mechanism:
 6. Tests: `request_read_lookups_extracts_the_probes_each_shape_pays` and
    `tile_read_view_resolves_published_unique_handles_without_the_memtable`.
 
-## Gates (verbatim, run at final HEAD)
+## Gates (verbatim, run at final HEAD `19fd0db`)
 
 1. `source $HOME/.cargo/env; cargo build --workspace --offline` — 0 warnings:
 ```
