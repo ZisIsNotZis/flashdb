@@ -50,7 +50,8 @@ lag ceiling 63, union 64); `early_dispatches = 0` with zero tolerance; `error_wi
 
 ## 3. First valid evaluation of the primary metric
 
-`adversarial` workload, `declared` arm, cold instance 1,643,933,528 B under a 192 MiB cap = **8.17x**
+Commit `9bae6fe`, verified. `adversarial` workload, `declared` arm, cold instance 1,643,933,528 B
+under a 192 MiB cap = **8.17x**
 (below the 10x floor; see §7), one seed. Per-request, microseconds; both ceilings 10,000 us.
 
 | offered | achieved | % | svc p50 | svc p95 | svc p99 | lag p50 | lag p95 | lag p99 | sustained | svc-rejected | lag-rejected |
@@ -123,7 +124,7 @@ implementation disagreed. All are fixed or recorded.
     lag — **fixed** in `965adf4` (two named ceilings, per-request samples).
 12. a per-region publish emits one tile per region, so the runner's shipped 16 KiB checkpoint/rotate
     cadence exhausts `MAX_TILES = 1024` and aborts a scored run mid-way — **pinned** by a regression
-    test in `bab567c`; the fix is adopted (§7).
+    test in `bab567c`; the fix is adopted (§7; ticket `.scratch/46-partitioned-publish-tile-cap`).
 
 ## 7. Decisions adopted
 
@@ -144,11 +145,14 @@ philosophy rather than asked, and that work must not stop). Reviewable and rever
    (frozen disclosed config, no tuning race), one request-level harness driving every arm, every arm
    in the same memory-constrained regime.
 3. **The 10x floor is a requirement, not a qualification.** Verdicts from an 8.17x instance are
-   provisional; final verdicts are re-derived on a >=10x instance. An 8.17x instance is warmer than a
-   10x one, so a failure there cannot be explained away by the lower ratio.
-4. **The tile-cap defect is fixed on both sides**: raise and make configurable the tile cap, make the
-   run harness's default cadence compatible with per-region publishing, and make a scored run refuse
-   an incompatible cadence loudly instead of aborting mid-run.
+   provisional; final verdicts are re-derived on a >=10x instance (`.scratch/51-instance-10x`). An
+   8.17x instance is warmer than a 10x one, so a failure there cannot be explained away by the lower
+   ratio.
+4. **The tile-cap defect is fixed on both sides** (`.scratch/46-partitioned-publish-tile-cap`): raise
+   and make configurable the tile cap, make the run harness's default cadence compatible with
+   per-region publishing, and make a scored run refuse an incompatible cadence loudly instead of
+   aborting mid-run. The shipped default must be able to run the shipped engine in the documented
+   regime.
 5. **Endurance is a constraint, not a price** (`docs/objective.md`): the reorganisation write term is
    0.083-0.669% of the service-time term, so no weight can move an argmin; the objective is maximise
    sustained load subject to the latency ceiling and a write-amplitude budget.

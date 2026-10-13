@@ -4,6 +4,8 @@ Status: drafted 2026-10-01 under the author's decisions in `objective-v1.md` (le
 access patterns; score sustained throughput / efficiency under high load) and their instruction to
 proceed autonomously. It states what would **falsify** the thesis, with numbers, before 0b is run.
 The author may change any number; changing one after seeing results invalidates the run.
+Decisions marked *resolved* or *adopted* **2026-10-09** were taken by the orchestrator under the
+author's standing autonomy grant (`.scratch/STATUS.md` §7) and are reviewable by the author.
 
 ## Hypothesis
 
@@ -54,8 +56,10 @@ reference-load p99) becomes concrete only once a reference-load p99 has been mea
 
 ## Instance size, seeds, aggregation
 
-- Data >= **10x** the memory budget. At today's engineering scale: a cgroup cap of 512 MiB with
-  >= 5 GiB of data (>= 10x); the full 128 GiB / 8 GiB regime stays a later run.
+- Data >= **10x** the memory budget — a **requirement, not a qualification**: a verdict from an
+  instance below 10x is provisional and is re-derived on the 10x instance (`.scratch/51-instance-10x`).
+  At today's engineering scale: a cgroup cap of 512 MiB with >= 5 GiB of data (>= 10x); the full
+  128 GiB / 8 GiB regime stays a later run.
 - **10** independent access-distribution seeds per arm; report **median and IQR**, and a win is
   accepted only if the median shows it and the IQR does not contradict it.
 - Drift is injected deterministically (not sampled), so it is identical across arms.
