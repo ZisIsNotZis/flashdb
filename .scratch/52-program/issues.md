@@ -601,3 +601,48 @@ No failures.
   seed44 churns `P|Customer` to 8.37x declared during rung 50 (T3 FAIL). The harness's both-ceilings
   `T2 PASS` is a 0/0 artifact and must not be quoted. Gates: 293 Rust + 134 Python tests green,
   cargo build 0 warnings, `git diff --check` silent.
+
+## Integration record: wave9 lanes + wave10 re-eval
+
+- Timestamp: 2026-10-14T03:49:59+08:00
+- Actor: integrator worker (single writer on master)
+- Base at integration start: master `e625e00a112c17e6bb63598886c67d92cc212fec` (already contains
+  the wave8/eval docs plus both wave9 lane merges)
+- Merge: `git merge --no-ff wave10/eval` (WP-K T1/T2 re-run; ticket `.scratch/62-eval-rerun` +
+  run artifacts)
+  - Merge commit: `bbab411d0481c836f10ab179d318f34eb8d41232`
+  - Parents: `e625e00a112c17e6bb63598886c67d92cc212fec` + `9ad38cf63b335097d4b81bb4092c52399c95f040`
+  - Conflict resolution: `.scratch/52-program/issues.md` had a content conflict (master's
+    "Integration record: wave9/scanwarm + wave9/churn" section and the branch's "wave10 WP-K
+    dispatch record" both appended after the same anchor, the wave9 WP-J dispatch record). Resolved
+    by keeping both sections in chronological order (wave9 integration record first, then the WP-K
+    dispatch record); no content dropped.
+- Final HEAD after integration: `bbab411d0481c836f10ab179d318f34eb8d41232`
+- SSOT worktree created from integrated master:
+  - `git worktree add -b wave11/ssot /home/z/vibe/worktrees/flashdb/wave11-ssot master`
+    - Path: `/home/z/vibe/worktrees/flashdb/wave11-ssot`, branch `wave11/ssot`, HEAD
+      `bbab411d0481c836f10ab179d318f34eb8d41232`
+
+Combined gates (run at merge `bbab411d0481c836f10ab179d318f34eb8d41232`; 0 warnings throughout):
+
+1. `cargo build --workspace --offline` — 0 warnings:
+```
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.09s
+```
+
+2. `cargo test --workspace --offline` — totals: **293 passed; 0 failed; 0 ignored**
+   (126 lib + 22 flashdb-load + 9 batch_commit + 5 compaction_job + 4 constraints +
+   3 family_colocation + 11 group_commit + 6 manifest_engine + 7 merge_threshold +
+   14 metrics + 33 multi_tile + 7 order_flow + 1 partitioned_publish_cap + 5 read_requests +
+   3 region_compaction + 6 region_partition + 3 replay_trace + 8 request_commit + 2 scale_bin +
+   3 tile_format + 3 tile_layout + 12 tile_read + 0 flashdb-replay + 0 flashdb-scale + 0 main + 0 doc-tests)
+
+3. `cd harness && uv run --with pytest pytest -q`:
+```
+warning: `VIRTUAL_ENV=/home/z/.venv` does not match the project environment path `.venv` and will be ignored; use `--active` to target the active environment instead
+134 passed in 4.72s
+```
+
+4. `git diff --check` — silent (exit 0).
+
+No failures.
