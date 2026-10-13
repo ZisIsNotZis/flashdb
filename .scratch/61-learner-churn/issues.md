@@ -68,7 +68,7 @@ decision thresholds above the noise floor (general statistical discipline, no wo
 2. **Median scoring.** Each arm is scored by the **median** of its per-request samples, not the
    mean, so a one-window latency/compaction spike cannot move an argmin. This is the heavy-tail-safe
    form of the bandit and is what lets a no-locality workload settle.
-3. **Switch margin 5% → 50%** (the same as the drift threshold). The measured per-window cost noise
+3. **Switch margin 5% → 50%.** The measured per-window cost noise
    is ~30% CV on this shared box, so 5% let noise fabricate a switch; 50% is above the noise floor
    while a genuine gradient (the win workload's 50-500% per-region spread, or a large shape change)
    still switches.

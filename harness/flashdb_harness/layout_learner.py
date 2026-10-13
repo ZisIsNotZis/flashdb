@@ -114,12 +114,12 @@ Three guards sit on top of the bandit:
   each candidate is sampled ``min_samples`` windows, then the gate opens.
 * **hysteresis** -- once the gate is open, the incumbent is replaced only when a
   challenger's median cost beats it by more than ``margin`` (default ``0.5`` =
-  50% relative, the same threshold as ``drift_margin``) for ``stability_window``
-  consecutive steps. A one-window noise spike therefore cannot move the policy,
-  and neither can the ~30% per-window cost noise of a shared device: the minimum
-  improvement a challenger must show sits above the noise floor, so a
-  no-locality workload settles while a genuine gradient (the win workload's
-  per-region spread, or the drift workload's shape change) still switches.
+  50% relative) for ``stability_window`` consecutive steps. A one-window noise
+  spike therefore cannot move the policy, and neither can the ~30% per-window
+  cost noise of a shared device: the minimum improvement a challenger must show
+  sits above the noise floor, so a no-locality workload settles while a genuine
+  gradient (the win workload's per-region spread, or the drift workload's shape
+  change) still switches.
 * **p99 hard constraint** -- a window whose region ``p99_ns`` exceeds the
   region's declared ceiling is an *invalid* window (objective v1's validity
   rule): it is not counted as reward evidence, and the candidate that produced
