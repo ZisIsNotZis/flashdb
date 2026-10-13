@@ -125,8 +125,8 @@ the durability/end-to-end check).
 |---:|---:|---:|---:|---:|
 | cold44 WP-E before (blocking boundary, old get) | 5/40 | 38/40 | 3,260 / 135,165 | 15,569 |
 | c51 WP-E before | 2/40 | 38/40 | 1,720 / 174,192 | 14,443 |
-| cold44 wave6 run1 | 4/40 | 38/40 | 2,393 / 113,984 | 18,931 |
-| cold44 wave6 run2 | 6/40 | 39/40 | 1,669 / 235,475 | 21,054 |
+| cold44 wave6 (pre-inline-drain, ec47e25) | 4/40 | 38/40 | 2,393 / 113,984 | 18,931 |
+| cold44 wave6 (final, 76231d2) | 6/40 | 39/40 | 1,669 / 235,475 | 21,054 |
 | c51 wave6 (12.25x) | 4/40 | 38/40 | 2,410 / 82,565 | 16,626 |
 | ef wave6 (8.14x) | 15/40 | 38/40 | 4,542 / 153,009 | 20,836 |
 
@@ -136,13 +136,15 @@ the durability/end-to-end check).
 |---:|---:|---:|---:|---:|---:|---:|
 | cold44 WP-E before | 299 | 22 | 74 | 106 | 56,758,538 | 38 |
 | c51 WP-E before | 616 | 19 | 74 | 106 | 56,758,273 | 38 |
-| cold44 wave6 run1 | 221 | 14 | 74 | 106 | 20,904,807 | 26 |
-| cold44 wave6 run2 | 597 | 21 | 75 | 106 | 22,704,958 | 27 |
+| cold44 wave6 (pre-inline-drain, ec47e25) | 221 | 14 | 73 | 106 | 22,704,958 | 26 |
+| cold44 wave6 (final, 76231d2) | 597 | 21 | 74 | 106 | 20,904,807 | 26 |
 | c51 wave6 (12.25x) | 483 | 15 | 74 | 107 | 23,310,824 | 27 |
 | ef wave6 (8.14x) | 887 | 40 | 73 | 106 | 265,216,151 | 26 |
 
-Boundary-vs-read attribution (`lag_breach_attribution`): **boundary=0 on every wave6 run** (WP-E
-attributed ~4 of 11 lag-rejected windows to the boundary). All remaining lag breaches are
+Boundary-vs-read attribution (`lag_breach_attribution`): **boundary=0 on the final binary
+(`76231d2`) on every run** (cold44, c51, ef). The pre-inline-drain intermediate (`ec47e25`) had
+`boundary=1` on cold44, which is exactly the residual the inline drain removes; WP-E attributed
+~4 of 11 lag-rejected windows to the boundary. All remaining lag breaches on the final binary are
 read-attributed.
 
 Per-request dependent-read volume (request-path `bytes_read`):
