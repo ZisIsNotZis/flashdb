@@ -78,9 +78,10 @@ Per movement scan the index replaces the full scan with:
 | docs JSON-parsed / scan | 30,000 | 1 | **29,999** |
 | CPU parse / scan | ~38-43 ms | ~0.3-0.5 ms | **~99%** |
 
-Write + space cost: one index tile of 30,000 `order_no -> handle` entries ≈ **~1 MB on disk**
-(one-time, built OFF-path). Amortized against 2,471 scans, the build is ~0.4 KB of derived write per
-~4.78 MB of scan read it removes.
+Write + space cost: one index tile of 30,000 `order_no -> handle` entries is **~2.14 MB on disk**
+(measured, one-time, built OFF-path; 4 KiB pages). The Stage-1 estimate of ~1 MB under-counted the
+per-entry overhead (key + handle + CRC + length prefixes ≈ 71 B/entry). Amortized against 2,471
+scans, the build is ~0.87 KB of derived write per ~4.78 MB of scan read it removes.
 
 ### GO / NO-GO
 
@@ -105,8 +106,10 @@ always falls back to the existing authoritative scan.
 - **Build (off-path).** A new `engine/src/index.rs`: `TileReadView::scan_primary(entity, |handle,
   doc|)` streams the whole `P|StockMovement` prefix tile-only (the exact prefix `scan_primary`
   walks), JSON-parses each doc once, extracts `(order_no, handle)`, and writes ONE `Tile` via
-  `TileWriter` (64 KiB pages, no bloom). `TileWriter::finish` syncs the file; the caller syncs the
-  parent dir before adoption, matching the compaction apply ordering.
+  `TileWriter` (4 KiB pages, no bloom). The tile is written to a scratch name and atomically renamed
+  over the final name, so a retire + rebuild replaces the stale sidecar (`TileWriter` refuses to
+  overwrite an existing file). `TileWriter::finish` syncs the file; the caller syncs the parent dir
+  before adoption, matching the compaction apply ordering.
 - **Adopt (off-path, lazy).** The driver builds the index on a background thread after open
   (reusing the `TileReadView` already shared with the read-ahead worker) and calls
   `Engine::adopt_order_no_index(Arc<Tile>)` once the tile + its dirent are durable. Until then, and
@@ -125,8 +128,12 @@ always falls back to the existing authoritative scan.
   `index_order_no` only for `StockMovement`; the driver builds/retires the index off-path as the
   learner toggles it. The reward is the existing unit-anchored, reorg-priced cost: the scan speedup
   lands in the movement region's service term (`count * mean_ns`), and the index build's output
-  bytes are attributed to the region's `compaction_bytes` (derived-output write amplification), so
-  lambda prices it exactly like a merge.
+  bytes are attributed to a NEW per-region `index_output_bytes` counter (not `compaction_bytes`),
+  so lambda prices it for endurance but the slice-39 churn budget (which keys off
+  `compaction_bytes`) does NOT treat a one-time ~2.14 MB build as recurring merge reorganisation.
+  Adding it to `compaction_bytes` was tried first and dead-locked the learner: with the declared
+  arm's ~88-96 KB/window budget, the first build's ~2.14 MB `mean_compaction_bytes` (n=1) made every
+  indexed candidate permanently inadmissible, so the axis was unlearnable.
 
 ### Rejected alternatives (recorded)
 
@@ -170,8 +177,77 @@ always falls back to the existing authoritative scan.
 ## Status
 
 - [x] Stage 1 deterministic headroom measured and recorded (GO).
-- [ ] Stage 2 engine: derived index tile build + read-path fallback + tests.
-- [ ] Stage 2 driver: off-path build/adopt + policy knob + metrics attribution.
-- [ ] Stage 2 harness: learner action (indexed candidates for `P|StockMovement`).
-- [ ] Before/after on win (declared + learned, static-derived if cheap).
-- [ ] Gates (verbatim) + acceptance verdict + residuals.
+- [x] Stage 2 engine: derived index tile build + read-path fallback + tests.
+- [x] Stage 2 driver: off-path build/adopt + policy knob + metrics attribution.
+- [x] Stage 2 harness: learner action (indexed candidates for `P|StockMovement`).
+- [x] Before/after on win (declared + learned + static-derived, seed 42 ×2).
+- [x] Gates (verbatim) + acceptance verdict + residuals.
+
+## Stage 2 — measured before/after (win, seed 42, lambda 1.0, cap 128 MiB)
+
+Release binary built once; each arm on a fresh `cp -a` of `/tmp/cold51/per_region-mixed` under
+`systemd-run --user --scope -p MemoryMax=128MiB -p MemorySwapMax=0`, one process at a time, shared
+box. Load at run start ≈ 4.1/12 cores (seed42) and ≈ 3.0-3.3/12 (repeat). Two full seed-42 runs
+(repeat = noise band).
+
+### Achieved throughput and service latency (the objective axis)
+
+| arm | achieved rps (agg) | rung 50 | rung 100 | rung 200 | rung 400 | svc p99 @100+ |
+|---|---:|---:|---:|---:|---:|---:|
+| `declared` (index off) | 72.0 / 73.0 | 50.0 (100%) | 85.2 / 85 (85%) | 86.8 (43%) | 82.7 (21%) | ~4-36 ms |
+| `learned@1.0` (index on) | **107.0 / 107.0** | 50.0 (100%) | **100.0 (100%)** | **199.9 (100%)** | **399.8 (100%)** | ~10-125 µs |
+| `static-derived` (index on) | **107.0 / 107.0** | 50.0 (100%) | **100.0 (100%)** | **199.9 (100%)** | **400.2 (100%)** | ~9-197 µs |
+
+(Per-rung achieved is `achieved_rps` and `achieved_fraction` from the committed JSON; the two runs
+agree on learned/static-derived to <0.05 rps — the index benefit is far outside the ±1 rps declared
+noise band.)
+
+The learner **commits** `P|StockMovement = {page_size 4096, merge_min_tiles 200, index_order_no:
+true}` in both runs; `static-derived` freezes the same index choice. The `order_no` index removes
+the full-entity scan: service p99 at 100-400 rps collapses from ~4-36 ms (declared, scan-bound) to
+~10-197 µs (indexed), and achieved throughput at the top rung rises from ~83 rps to ~400 rps.
+
+### Reorganisation cost (endurance term)
+
+| arm | reorg bytes | index builds |
+|---|---:|---:|
+| `declared` | 8.0-8.9 MB | 0 |
+| `learned@1.0` | 31.6-35.1 MB | 3 (≈6.4 MB) + burn-in merge churn |
+| `static-derived` | 19.8-28.0 MB | 1-2 + merge |
+
+The index build is 2,143,439 B each (measured, deterministic); the learner's 3 rebuilds are the
+False→True toggles of the 12-candidate movement-region burn-in. This is the priced cost of learning
+the axis, and it is exactly why the build output is `index_output_bytes` (reward-priced) and not
+`compaction_bytes` (churn-budget).
+
+### Sustained-throughput verdict (BOTH judging views, never overstated)
+
+- **§7.1 lag-only (primary):** sustained rps = **0 for every arm in both runs**. The index does NOT
+  raise the strict lag-only sustained score: `declared` breaches the lag ceiling at every rung
+  (scan saturation → queueing), and the indexed arms still breach it in 1-4 windows per rung at
+  100/200/400 rps (the per-group `fdatasync` durability floor + shared-box scheduling spikes, e.g.
+  one window's lag p99 of ~97 ms at rung 200), plus 13-26 windows at rung 50 from the learner's own
+  burn-in churn.
+- **Both ceilings (pre-registration):** sustained rps = 0 everywhere, as pre-registered (the service
+  ceiling is device-bound; the indexed arms still reject 5-39 windows per rung on the service
+  ceiling).
+
+**What WP-M actually moved:** the *achieved throughput* and *service latency* the objective scores
+are the metric that moved (declared 72→learned/static 107 rps aggregate, and 100% achieved at
+100/200/400 rps vs declared's 85%/43%/21%). The remaining binding constraint on a strictly positive
+*sustained* score is now the per-group `fdatasync` durability floor (the lag ceiling), which is a
+DIFFERENT axis (device-bound write durability), not the scan axis this package was scoped to fix.
+The index is therefore **necessary but not sufficient**: it eliminates the scan bottleneck the thesis
+named, but the lag ceiling is independently breached, so the strict score stays 0.
+
+## Residuals / limits
+
+- Two seed-42 runs (noise band), not the 3-seed matrix: the box is shared and one process at a time
+  is enforced; deterministic counts (scan share, index build bytes, per-doc parse) are the primary
+  evidence, timings are stated with load.
+- The learner's rung-50 burn-in is 12 movement-region candidates × min_samples(3) = 36 windows ≈
+  the whole 40-window rung, so rung 50 is churn-dominated for the learned arm; the committed index
+  only acts from rung 100 onward. This is a stated cost of the doubled movement-region candidate
+  set, priced in the reorg term.
+- `static-derived` sweep cost now also prices `compaction_bytes` (aligning it with the learner's
+  reward); this changes the pre-WP-M static-derived control's behaviour for the merge axis too.
