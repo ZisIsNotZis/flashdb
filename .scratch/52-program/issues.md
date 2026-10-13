@@ -338,3 +338,37 @@ warning: `VIRTUAL_ENV=/home/z/.venv` does not match the project environment path
   -16.6% reads (4.03→3.36 blocks/req) but regresses compaction write amp ~12x (22→265 MB), so its
   rung-50 tail is worse (15/40). Honest FAIL on the primary criterion; pre-registration ceiling
   reconciliation left as the flagged OPEN AUTHOR ITEM.
+
+## Integration record: wave6/reads
+
+- Timestamp: 2026-10-13T23:54:50+08:00
+- Actor: integrator worker (single writer on master)
+- Base at integration start: master `adba22785cc621ba65d562574b7a1068ab027655`
+- Merge: `git merge --no-ff wave6/reads` (non-blocking boundary drain, newest-first read, key-encoding selector + entity-first co-location arm; independently verified PASS at `17de3a3`)
+  - Merge commit: `e3a4804c928e229d4b90b5a4207595a4dbc5fa60`
+  - Parents: `adba22785cc621ba65d562574b7a1068ab027655` + `17de3a3db6e4f7af9778dfeaa12bba4400aea76a`
+  - Conflict resolution: one content conflict in `.scratch/52-program/issues.md` (both branches appended a section after `## wave5 WP-E dispatch record`). Resolved by keeping both `Integration record: wave5/overlap` (master) and `wave6 WP-F dispatch record` (wave6/reads) in chronological order; no content dropped.
+- Final HEAD after merge (integrated revision under gate): `e3a4804c928e229d4b90b5a4207595a4dbc5fa60`
+
+Combined gates (run at merged master `e3a4804`):
+
+1. `source $HOME/.cargo/env; cargo build --workspace --offline` — 0 warnings:
+```
+   Compiling flashdb-engine v0.1.0 (/home/z/vibe/flashdb/engine)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.90s
+```
+
+2. `cargo test --workspace --offline` — totals: 289 passed; 0 failed; 0 ignored.
+(122 lib + 22 flashdb-load + 9 batch_commit + 5 compaction_job + 4 constraints +
+3 family_colocation + 11 group_commit + 6 manifest_engine + 7 merge_threshold +
+14 metrics + 33 multi_tile + 7 order_flow + 1 partitioned_publish_cap + 5 read_requests +
+3 region_compaction + 6 region_partition + 3 replay_trace + 8 request_commit + 2 scale_bin +
+3 tile_format + 3 tile_layout + 12 tile_read + 0 flashdb-replay + 0 flashdb-scale + 0 main + 0 doc-tests)
+
+3. `cd harness && uv run --with pytest pytest -q`:
+```
+warning: `VIRTUAL_ENV=/home/z/.venv` does not match the project environment path `.venv` and will be ignored; use `--active` to target the active environment instead
+132 passed in 6.19s
+```
+
+4. `git diff --check` — silent (exit 0).
