@@ -670,3 +670,46 @@ No failures.
   `fdatasync` durability floor, a different (device-bound) axis. Gates: 299 Rust + 138 Python tests
   green, cargo build 0 warnings, `git diff --check` silent. Residuals and the exact cause of the
   remaining 0 are recorded in the ticket.
+
+## Integration record: wave12/accesspath
+
+- Timestamp: 2026-10-14T07:37:21+08:00
+- Actor: integrator worker (single writer on master)
+- Base at integration start: master `65d8d3baba98fa2312ac760a3163c376b18c39cd`
+- Merge: `git merge --no-ff wave12/accesspath` (WP-M learned secondary access path; engine index
+  tile + driver off-path build/adopt/retire + harness indexed axis + ticket
+  `.scratch/64-learned-access-path` + run artifacts)
+  - Merge commit: `2c1c719de9db378b3bfb01a20a95c757325ad30a`
+  - Parents: `65d8d3baba98fa2312ac760a3163c376b18c39cd` + `5fdcb2209d1d713dd924e3fd071e10daf0f265c6`
+  - Conflict resolution: none (clean `ort` merge; no conflicting files).
+- Final HEAD after integration: `2c1c719de9db378b3bfb01a20a95c757325ad30a`
+- Evaluation worktree created from integrated master:
+  - `git worktree add -b wave13/eval /home/z/vibe/worktrees/flashdb/wave13-eval master`
+    - Path: `/home/z/vibe/worktrees/flashdb/wave13-eval`, branch `wave13/eval`, HEAD
+      `2c1c719de9db378b3bfb01a20a95c757325ad30a`
+
+Combined gates (run at merge `2c1c719de9db378b3bfb01a20a95c757325ad30a`; 0 warnings throughout):
+
+1. `cargo build --workspace --offline` — 0 warnings:
+```
+   Compiling flashdb-engine v0.1.0 (/home/z/vibe/flashdb/engine)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 3.02s
+```
+
+2. `cargo test --workspace --offline` — totals: **299 passed; 0 failed; 0 ignored**
+   (126 lib + 22 flashdb-load + 9 batch_commit + 5 compaction_job + 4 constraints +
+   3 family_colocation + 11 group_commit + 6 manifest_engine + 7 merge_threshold +
+   15 metrics + 33 multi_tile + 7 order_flow + 5 order_no_index + 1 partitioned_publish_cap +
+   5 read_requests + 3 region_compaction + 6 region_partition + 3 replay_trace + 8 request_commit +
+   2 scale_bin + 3 tile_format + 3 tile_layout + 12 tile_read + 0 flashdb-replay + 0 flashdb-scale +
+   0 main + 0 doc-tests)
+
+3. `cd harness && uv run --with pytest pytest -q`:
+```
+warning: `VIRTUAL_ENV=/home/z/.venv` does not match the project environment path `.venv` and will be ignored; use `--active` to target the active environment instead
+138 passed in 4.15s
+```
+
+4. `git diff --check` — silent (exit 0).
+
+No failures.
