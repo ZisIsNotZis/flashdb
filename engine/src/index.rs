@@ -80,7 +80,9 @@ pub fn build_order_no_index(
     entries.sort_by(|a, b| a.0.cmp(&b.0));
     let path = dir.join(name);
     let digest = [0u8; 32];
-    let mut writer = crate::tile::TileWriter::new(&path, coverage_csn, &digest, 65_536)?;
+    // 4 KiB pages: a point probe reads one 4 KiB block, and the one-time write
+    // amplification stays at the data's own size (no 64 KiB block padding).
+    let mut writer = crate::tile::TileWriter::new(&path, coverage_csn, &digest, 4_096)?;
     for (key, value) in &entries {
         writer.push(key, value)?;
     }
