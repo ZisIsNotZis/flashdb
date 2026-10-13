@@ -833,6 +833,19 @@ struct BarrierResult {
     result: io::Result<()>,
     /// The `fdatasync` elapsed time (us) measured on the worker thread.
     fsync_us: u64,
+    /// The wall-clock instant the `fdatasync` returned on the worker thread.
+    completed_at: Instant,
+}
+
+/// Observed completion of one overlapped WAL barrier (slice 56): the
+/// worker-measured `fdatasync` elapsed time and the instant the sync returned.
+/// The load driver uses `completed_at` (not its own drain time) as the group's
+/// completion, so service latency includes the barrier but not the later
+/// window-boundary drain.
+#[derive(Clone, Copy, Debug)]
+pub struct BarrierCompletion {
+    pub fsync_us: u64,
+    pub completed_at: Instant,
 }
 
 /// A single background thread that runs overlapped WAL barriers in FIFO order.
@@ -853,7 +866,8 @@ impl BarrierWorker {
                 let t0 = Instant::now();
                 let result = job.sync();
                 let fsync_us = t0.elapsed().as_micros() as u64;
-                if result_tx.send(BarrierResult { result, fsync_us }).is_err() {
+                let completed_at = Instant::now();
+                if result_tx.send(BarrierResult { result, fsync_us, completed_at }).is_err() {
                     break;
                 }
             }
@@ -2607,6 +2621,14 @@ impl Engine {
         self.csn
     }
 
+    /// The live WAL's valid byte length (excluding any torn tail). Observation
+    /// only: the overlapped load driver uses it to decide when a bounded-WAL
+    /// maintenance call will actually publish/rotate, so it can drain in-flight
+    /// barriers first instead of refusing below the threshold.
+    pub fn wal_valid_len(&self) -> u64 {
+        self.wal.valid_len()
+    }
+
     /// Next globally unused handle. The caller reserves further handles locally within
     /// one block; only successfully published handles advance the persisted high-water mark.
     pub fn next_handle(&self) -> io::Result<u64> {
@@ -3007,11 +3029,11 @@ impl Engine {
     }
 
     /// Block until the OLDEST in-flight overlapped barrier completes, drain it,
-    /// and return its `fdatasync` elapsed time (us). A failed `fdatasync`
+    /// and return its [`BarrierCompletion`]. A failed `fdatasync`
     /// poisons the WAL writer exactly like the synchronous path and is returned
     /// as `Err`; nothing is acknowledged, and every later append fails until
     /// reopen. Fails closed when no barrier is in flight.
-    pub fn wait_group_barrier(&mut self) -> io::Result<u64> {
+    pub fn wait_group_barrier(&mut self) -> io::Result<BarrierCompletion> {
         let received = match self.barrier_worker.as_mut() {
             Some(worker) => worker.result_rx.recv(),
             None => return Err(io::Error::new(io::ErrorKind::Other, "no WAL barrier in flight")),
@@ -3030,10 +3052,10 @@ impl Engine {
     }
 
     /// Non-blocking variant of [`Engine::wait_group_barrier`]: drain the oldest
-    /// completed barrier (if one is ready) and return its `fdatasync` elapsed
-    /// time, or `Ok(None)` when no barrier has completed yet. A disconnected
-    /// worker or a failed `fdatasync` fails closed exactly as the blocking form.
-    pub fn try_take_group_barrier(&mut self) -> io::Result<Option<u64>> {
+    /// completed barrier (if one is ready) and return its completion, or
+    /// `Ok(None)` when no barrier has completed yet. A disconnected worker or a
+    /// failed `fdatasync` fails closed exactly as the blocking form.
+    pub fn try_take_group_barrier(&mut self) -> io::Result<Option<BarrierCompletion>> {
         let Some(worker) = self.barrier_worker.as_mut() else {
             return Ok(None);
         };
@@ -3052,12 +3074,12 @@ impl Engine {
     }
 
     /// Fold one drained barrier completion into the engine: return the observed
-    /// `fdatasync` elapsed time, and on failure poison the WAL writer so every
-    /// later append fails closed (recovery required), exactly like a failed
-    /// synchronous [`Engine::end_group`].
-    fn observe_barrier_result(&mut self, result: BarrierResult) -> io::Result<u64> {
+    /// completion, and on failure poison the WAL writer so every later append
+    /// fails closed (recovery required), exactly like a failed synchronous
+    /// [`Engine::end_group`].
+    fn observe_barrier_result(&mut self, result: BarrierResult) -> io::Result<BarrierCompletion> {
         match result.result {
-            Ok(()) => Ok(result.fsync_us),
+            Ok(()) => Ok(BarrierCompletion { fsync_us: result.fsync_us, completed_at: result.completed_at }),
             Err(e) => {
                 self.wal.poison();
                 Err(e)
