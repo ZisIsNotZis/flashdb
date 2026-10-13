@@ -248,6 +248,29 @@ a 14x run-to-run spread; (d) the run-to-run throughput noise is 38-71% on win an
 The thesis is not dead and not alive: it is blocked on the win-workload scan path (readiness gap 1)
 and on a quiet-box 10-seed run.
 
+## Verbatim project verification (run at final HEAD `dc0a6cb`)
+
+1. `cargo build --workspace --offline` — 0 warnings:
+```
+   Compiling digest v0.10.7
+   Compiling sha2 v0.10.9
+   Compiling serde_derive v1.0.229
+   Compiling flashdb-engine v0.1.0 (/home/z/vibe/worktrees/flashdb/wave8-eval-pilot/engine)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 9.36s
+```
+2. `cargo test --workspace --offline` — totals: **291 passed; 0 failed; 0 ignored**
+(124 lib + 22 flashdb-load + 9 batch_commit + 5 compaction_job + 4 constraints + 3 family_colocation
++ 11 group_commit + 6 manifest_engine + 7 merge_threshold + 14 metrics + 33 multi_tile + 7 order_flow
++ 1 partitioned_publish_cap + 5 read_requests + 3 region_compaction + 6 region_partition +
+3 replay_trace + 8 request_commit + 2 scale_bin + 3 tile_format + 3 tile_layout + 12 tile_read +
+0 flashdb-replay + 0 flashdb-scale + 0 main + 0 doc-tests).
+3. `cd harness && uv run --with pytest pytest -q`:
+```
+warning: `VIRTUAL_ENV=/home/z/.venv` does not match the project environment path `.venv` and will be ignored; use `--active` to target the active environment instead
+132 passed in 5.73s
+```
+4. `git diff --check` — silent (exit 0).
+
 ## Dispatch
 
 - Timestamp: 2026-10-14T01:00:00+08:00 (plan commit; runs follow)
