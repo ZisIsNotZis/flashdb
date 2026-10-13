@@ -402,3 +402,44 @@ warning: `VIRTUAL_ENV=/home/z/.venv` does not match the project environment path
   on c51 (0/40) and cold44 run B (0/40); cold44 run A is 1/40 with the single breach attributed to
   the write-path WAL append under a device fsync stall (not a read). The primary-vs-service ceiling
   reconciliation remains the OPEN AUTHOR ITEM.
+
+## Integration record: wave7/readsoverlap
+
+- Timestamp: 2026-10-14T00:56:33+08:00
+- Actor: integrator worker (single writer on master)
+- Base at integration start: master `5b4b78d85de0ee74b66c7cc467af7a40b91d22e4`
+- Merge: `git merge --no-ff wave7/readsoverlap` (read-ahead tile warming takes cold point reads off the pacer; WP-G independently verified PASS at `22eef3e`)
+  - Merge commit: `908c1eb597d42b7a9db6d7113990280d1d8a310e`
+  - Parents: `5b4b78d85de0ee74b66c7cc467af7a40b91d22e4` + `22eef3e37923807f8f584c469d2c78bb2d4278a0`
+  - Conflict resolution: none. The branch's file set is disjoint from master's current tree and merged cleanly with the ort strategy.
+- Integration cleanup (minimal, behavior-preserving): the merged branch's test module carried an unused `use super::*;` import (`engine/src/readahead.rs:183`) that `cargo test` flagged on a fresh lib-test compile. Removed that one line in commit `49285d3a043376ed3cbfebd92d98a882217c042b` ("52: drop unused readahead test import (0-warning cargo test)") so `cargo test` recompiles with 0 warnings. No behavior change; does not disturb WP-G's PASS.
+- Final HEAD after integration (this record commit): `git rev-parse HEAD` on master (reported to the orchestrator).
+- Next lane worktree: `git worktree add -b wave8/eval /home/z/vibe/worktrees/flashdb/wave8-eval-pilot master`
+  - Worktree path: `/home/z/vibe/worktrees/flashdb/wave8-eval-pilot`
+  - Branch: `wave8/eval`
+  - HEAD at creation: `908c1eb597d42b7a9db6d7113990280d1d8a310e` (the merge commit, before the cleanup/record commits)
+  - After this record commit, `wave8/eval` was fast-forwarded to integrated master so the pilot is based on the final integrated HEAD (see note below).
+
+Combined gates (run at HEAD `49285d3a043376ed3cbfebd92d98a882217c042b`, i.e. merge + cleanup; 0 warnings throughout):
+
+1. `cargo build --workspace --offline` — 0 warnings:
+```
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.07s
+```
+
+2. `cargo test --workspace --offline` — totals: **291 passed; 0 failed; 0 ignored**
+   (124 lib + 22 flashdb-load + 9 batch_commit + 5 compaction_job + 4 constraints +
+   3 family_colocation + 11 group_commit + 6 manifest_engine + 7 merge_threshold +
+   14 metrics + 33 multi_tile + 7 order_flow + 1 partitioned_publish_cap + 5 read_requests +
+   3 region_compaction + 6 region_partition + 3 replay_trace + 8 request_commit + 2 scale_bin +
+   3 tile_format + 3 tile_layout + 12 tile_read + 0 flashdb-replay + 0 flashdb-scale + 0 main + 0 doc-tests)
+
+3. `cd harness && uv run --with pytest pytest -q`:
+```
+warning: `VIRTUAL_ENV=/home/z/.venv` does not match the project environment path `.venv` and will be ignored; use `--active` to target the active environment instead
+132 passed in 4.09s
+```
+
+4. `git diff --check` — silent (exit 0).
+
+No failures, no conflicts.
