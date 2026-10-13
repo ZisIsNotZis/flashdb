@@ -2152,7 +2152,7 @@ mod tests {
                 region: "P|Stock".to_string(),
                 probes: 0, probe_misses: 0, bytes_read: 0, bytes_written: 40,
                 commit_blocks: 1, commit_ops: 1,
-                compaction_bytes: 4288, compaction_merges: 1,
+                compaction_bytes: 4288, compaction_merges: 1, index_output_bytes: 0,
                 count: 0, p50_ns: 0.0, p99_ns: 0.0, mean_ns: 0.0,
             }],
         };
