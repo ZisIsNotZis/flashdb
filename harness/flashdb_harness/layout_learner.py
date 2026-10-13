@@ -239,10 +239,14 @@ DEFAULT_LAMBDA_NS_PER_BYTE = DEVICE_WRITE_NS_PER_BYTE
 
 @dataclass(frozen=True, order=True)
 class LayoutCandidate:
-    """One published per-region policy: a tile page size and a merge threshold."""
+    """One published per-region policy: a tile page size, a merge threshold, and
+    (WP-M) whether to build the derived `order_no -> StockMovement` secondary
+    access path. The index axis is a no-op for regions other than
+    ``P|StockMovement``; the engine ignores it there."""
 
     page_size: int
     merge_min_tiles: int
+    index_order_no: bool = False
 
     def __post_init__(self) -> None:
         if self.page_size not in (4096, 65536):
@@ -252,7 +256,10 @@ class LayoutCandidate:
 
     def entry(self) -> dict:
         """The engine's per-region policy entry (bloom bits fall back to the default)."""
-        return {"page_size": self.page_size, "merge_min_tiles": self.merge_min_tiles}
+        entry = {"page_size": self.page_size, "merge_min_tiles": self.merge_min_tiles}
+        if self.index_order_no:
+            entry["index_order_no"] = True
+        return entry
 
 
 # The 2 x 3 published set: 6 candidates. Both axes have a measured cold gradient.
@@ -262,6 +269,16 @@ DEFAULT_CANDIDATES: tuple[LayoutCandidate, ...] = tuple(
 # The engine's shipped default (LayoutPolicy::declared_default): 4 KiB pages, 10
 # bloom bits, merge_min_tiles = 2. It is the region's initial active candidate.
 DECLARED_DEFAULT = LayoutCandidate(4096, 2)
+# WP-M: the movement primary region additionally offers the same 6 layouts with
+# the `order_no` secondary access path switched on (12 candidates there; every
+# other region keeps the published 6 so the global burn-in cost is unchanged).
+INDEXED_CANDIDATES: tuple[LayoutCandidate, ...] = DEFAULT_CANDIDATES + tuple(
+    LayoutCandidate(p, m, index_order_no=True)
+    for p in DEFAULT_PAGE_SIZES for m in DEFAULT_MERGE_MIN_TILES
+)
+# The region the secondary access path is built for (must match the engine's
+# `P|StockMovement` region spelling under family-first key encoding).
+INDEXED_REGION = "P|StockMovement"
 
 
 def is_policy_region(name: str) -> bool:
@@ -526,22 +543,46 @@ class LayoutLearner:
             raise ValueError("reorg_budget_bytes_per_window must be >= 0 or None")
         self.ceilings_ns = dict(self.ceilings_ns)
         self._tie = _seeded_order(self.candidates, self.seed)
+        self._tie_maps: dict[tuple[LayoutCandidate, ...], dict[LayoutCandidate, int]] = {}
         self._regions: dict[str, _RegionState] = {}
         self._step_index = 0
         self._window_added_reorg = 0.0
 
     # -- state helpers ------------------------------------------------------
+    def _candidates_for(self, name: str) -> tuple[LayoutCandidate, ...]:
+        """The candidate set a region explores. The movement primary region
+        additionally carries the `order_no` secondary-access-path variants
+        (WP-M); every other region keeps the published base set, so the global
+        burn-in cost is unchanged."""
+        if name == INDEXED_REGION:
+            base = tuple(self.candidates)
+            indexed = tuple(
+                LayoutCandidate(c.page_size, c.merge_min_tiles, True) for c in base
+            )
+            return tuple(dict.fromkeys(base + indexed))
+        return tuple(self.candidates)
+
+    def _tie_for(self, st: _RegionState) -> dict[LayoutCandidate, int]:
+        """The seeded tie-break permutation for a region's candidate set (cached)."""
+        cands = tuple(st.arms.keys())
+        m = self._tie_maps.get(cands)
+        if m is None:
+            m = _seeded_order(cands, self.seed)
+            self._tie_maps[cands] = m
+        return m
+
     def _region(self, name: str) -> _RegionState:
         st = self._regions.get(name)
         if st is None:
-            st = _RegionState(arms={c: _Arm() for c in self.candidates})
-            start = DECLARED_DEFAULT if DECLARED_DEFAULT in st.arms else self.candidates[0]
+            cands = self._candidates_for(name)
+            st = _RegionState(arms={c: _Arm() for c in cands})
+            start = DECLARED_DEFAULT if DECLARED_DEFAULT in st.arms else cands[0]
             st.active = start
             self._regions[name] = st
         return st
 
     def _available(self, st: _RegionState) -> list[LayoutCandidate]:
-        return [c for c in self.candidates if not st.arms[c].violating]
+        return [c for c in st.arms if not st.arms[c].violating]
 
     def _admissible(self, st: _RegionState) -> list[LayoutCandidate]:
         """Available candidates the reorganisation budget can admit (Slice 39).
@@ -755,10 +796,11 @@ class LayoutLearner:
             self._reset_gate(st)
 
     def _initial_pick(self, st: _RegionState, available: list[LayoutCandidate]) -> LayoutCandidate:
+        tie = self._tie_for(st)
         gated = [c for c in available if st.arms[c].n >= self.min_samples]
         if gated:
-            return min(gated, key=lambda c: (st.arms[c].median_cost, self._tie[c]))
-        return min(available, key=lambda c: (st.arms[c].n, self._tie[c]))
+            return min(gated, key=lambda c: (st.arms[c].median_cost, tie[c]))
+        return min(available, key=lambda c: (st.arms[c].n, tie[c]))
 
     def _ucb_pick(self, st: _RegionState, eligible: list[LayoutCandidate]) -> LayoutCandidate:
         """UCB1 in minimisation form: ``argmin`` of a lower confidence bound on cost.
@@ -773,6 +815,7 @@ class LayoutLearner:
         log_total = math.log(max(total, 2))
         scale = max((st.arms[c].median_cost for c in eligible if st.arms[c].n > 0), default=1.0)
         scale = max(scale, 1.0)
+        tie = self._tie_for(st)
 
         def lcb(c: LayoutCandidate) -> float:
             arm = st.arms[c]
@@ -780,7 +823,7 @@ class LayoutLearner:
                 return -math.inf
             return arm.median_cost - self.exploration_c * scale * math.sqrt(log_total / arm.n)
 
-        return min(eligible, key=lambda c: (lcb(c), self._tie[c]))
+        return min(eligible, key=lambda c: (lcb(c), tie[c]))
 
     # -- drift --------------------------------------------------------------
     def _note_deviation(self, st: _RegionState, cost: float) -> None:
@@ -823,12 +866,13 @@ class LayoutLearner:
         k = self.drift_reexplore_candidates
         if k is None or k >= len(admissible):
             return admissible
+        tie = self._tie_for(st)
         ordered: list[LayoutCandidate] = []
         if st.active is not None and st.active in admissible:
             ordered.append(st.active)
         ordered.extend(sorted(
             (c for c in admissible if c != st.active),
-            key=lambda c: (st.arms[c].median_cost, self._tie[c]),
+            key=lambda c: (st.arms[c].median_cost, tie[c]),
         ))
         return set(ordered[:k])
 

@@ -207,7 +207,11 @@ def policy_active_map(policy: dict) -> dict[str, LayoutCandidate]:
     out: dict[str, LayoutCandidate] = {}
     for region, entry in policy.get("regions", {}).items():
         merged = {**default, **entry}
-        out[region] = LayoutCandidate(int(merged["page_size"]), int(merged["merge_min_tiles"]))
+        out[region] = LayoutCandidate(
+            int(merged["page_size"]),
+            int(merged["merge_min_tiles"]),
+            bool(merged.get("index_order_no", False)),
+        )
     return out
 
 
@@ -610,7 +614,8 @@ def build_sweep(windows: list[dict], max_rate: float | None = None) -> dict:
             key = str(active[region])
             acc = sweep.setdefault(region, {}).setdefault(
                 key, {"n": 0, "sum_cost": 0.0, "page_size": active[region].page_size,
-                      "merge_min_tiles": active[region].merge_min_tiles})
+                      "merge_min_tiles": active[region].merge_min_tiles,
+                      "index_order_no": active[region].index_order_no})
             acc["n"] += 1
             acc["sum_cost"] += region_cost_ns_from_window(r, 1.0)
     return sweep
@@ -629,7 +634,8 @@ def argmin_from_sweep(sweep: dict, seed: int = 0) -> dict[str, LayoutCandidate]:
             key=lambda k: (by_candidate[k]["sum_cost"] / by_candidate[k]["n"], k),
         )
         acc = by_candidate[best_key]
-        out[region] = LayoutCandidate(int(acc["page_size"]), int(acc["merge_min_tiles"]))
+        out[region] = LayoutCandidate(
+            int(acc["page_size"]), int(acc["merge_min_tiles"]), bool(acc.get("index_order_no", False)))
     return out
 
 

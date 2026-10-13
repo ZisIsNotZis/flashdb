@@ -74,7 +74,9 @@ def selection_from_document(document: dict, regions) -> dict:
     out = {}
     for region in regions:
         entry = document["regions"].get(region, document["default"])
-        out[region] = ll.LayoutCandidate(entry["page_size"], entry["merge_min_tiles"])
+        out[region] = ll.LayoutCandidate(
+            entry["page_size"], entry["merge_min_tiles"],
+            bool(entry.get("index_order_no", False)))
     return out
 
 
@@ -86,6 +88,30 @@ def test_candidate_set_is_the_published_2x3_grid():
     assert {c.page_size for c in ll.DEFAULT_CANDIDATES} == {4096, 65536}
     assert {c.merge_min_tiles for c in ll.DEFAULT_CANDIDATES} == {2, 8, 200}
     assert ll.DECLARED_DEFAULT in ll.DEFAULT_CANDIDATES
+
+
+def test_order_no_index_axis_is_offered_only_for_the_movement_region():
+    learner = ll.LayoutLearner(seed=0)
+    # The base candidate set stays 6 everywhere.
+    assert learner._candidates_for("P|Stock") == ll.DEFAULT_CANDIDATES
+    # The movement primary region doubles to 12: the same 6 layouts, with and
+    # without the order_no secondary access path.
+    movement = learner._candidates_for(ll.INDEXED_REGION)
+    assert len(movement) == 12
+    assert {c.index_order_no for c in movement} == {False, True}
+    assert movement[:6] == ll.DEFAULT_CANDIDATES
+    # Every indexed candidate is the same page/merge grid with the flag set.
+    assert all(c.page_size in (4096, 65536) and c.merge_min_tiles in (2, 8, 200)
+               for c in movement)
+
+
+def test_policy_document_emits_the_order_no_index_flag():
+    indexed = ll.LayoutCandidate(65536, 2, index_order_no=True)
+    doc = ll.policy_document({"P|StockMovement": indexed})
+    assert doc["regions"]["P|StockMovement"]["index_order_no"] is True
+    assert "index_order_no" not in ll.policy_document({"P|Stock": ll.DECLARED_DEFAULT})["regions"]["P|Stock"]
+    # An entry() never emits the flag unless it is selected.
+    assert ll.DECLARED_DEFAULT.entry() == {"page_size": 4096, "merge_min_tiles": 2}
 
 
 def test_reward_proxy_is_service_time_plus_lambda_times_bytes():
