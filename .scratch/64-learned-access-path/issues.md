@@ -87,7 +87,7 @@ scans, the build is ~0.87 KB of derived write per ~4.78 MB of scan read it remov
 
 **GO.** The deterministic headroom is material on all three axes the objective scores: the scan's
 inline CPU (29,999 doc parses/scan) and read volume (~4.78 MB/scan) both collapse to a point probe,
-and the one-time write cost (~1 MB) is priced in the existing reorg term. This is not intuition: it
+and the one-time write cost (~2.1 MB measured) is priced in the existing reorg term. This is not intuition: it
 is 30,000 -> 1 docs and 4.78 MB -> ~70 KB, per scan, with the scan measured as the rung-50 lag
 blocker in WP-K.
 
