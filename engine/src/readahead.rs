@@ -24,8 +24,14 @@ use crate::tile::Tile;
 
 /// How many requests ahead of the pacer's dispatched position the worker keeps
 /// warm. Bounded so the warmed blocks are still resident when the request is
-/// served, and large enough to absorb an isolated slow worker read.
-const READ_AHEAD_LEAD: u64 = 400;
+/// served, and large enough to absorb an isolated slow worker read without
+/// bursting a large read set at startup (which contends with the early WAL
+/// fsync/append).
+const READ_AHEAD_LEAD: u64 = 64;
+
+/// Per-request pause after warming one request, so the warm reads are spread
+/// over time instead of bursting the whole lead at startup.
+const WARM_PACE_MS: u64 = 4;
 
 /// A read-only, thread-safe snapshot of the engine's published tiles. Tiles are
 /// immutable after publish (compaction/publish replace them with new files and
@@ -149,7 +155,7 @@ fn worker(
             }
         }
         let target = position.load(Ordering::Relaxed).saturating_add(READ_AHEAD_LEAD).min(total);
-        while warm_index < target {
+        if warm_index < target {
             if let Ok(req) = serde_json::from_str::<Value>(&lines[warm_index as usize]) {
                 for lookup in request_read_lookups(&req) {
                     // Warm and discard. A failure (e.g. a tile concurrently
@@ -159,6 +165,10 @@ fn worker(
                 }
             }
             warm_index += 1;
+            // Pace the warm: spread the block reads over time instead of
+            // bursting the whole lead at startup.
+            std::thread::sleep(Duration::from_millis(WARM_PACE_MS));
+            continue;
         }
         match rx.recv_timeout(Duration::from_millis(2)) {
             Ok(Msg::Refresh(v)) => view = v,
