@@ -156,3 +156,18 @@ Combined gates (run at merged master `112f96a`):
 (uv emitted a non-failing warning: `VIRTUAL_ENV=/home/z/.venv` does not match the project environment path `.venv`; tests still passed.)
 
 4. `git diff --check` — silent (exit 0).
+
+## wave3 WP-C dispatch record
+
+- Timestamp: 2026-10-13T20:51:50+08:00.
+- Action: dispatched work package C "separate and remove the residual latency tail" to the
+  single-writer `wave3/residual` worktree. Contract, diagnosis, decision, tests, gates,
+  before/after table and verdict are in `.scratch/54-residual-tail/issues.md`.
+- Result: commits `c36b9c3` (per-window proc/io + trim_heap instrumentation) and `6ec1ea3`
+  (group-barrier fdatasync timing + tests). Diagnosis: the ticket-49 residual is dominated by the
+  per-group WAL `fdatasync` (6.7 ms p50 / 13.4 ms p99 on this device, 119–654 ms/window), NOT cold
+  page-ins (read-only 2.7–4.3 ms; warm read_bytes=0 still 9.3–21.7 ms), NOT allocator (≤ 5 ms) and
+  NOT scheduler jitter. It is the equal-durability barrier, irreducible without weakening
+  durability, so no latency fix was applied: the ticket states the smallest honest blocker and
+  proposes (not implements) how the pre-registration can treat the 10 ms service ceiling.
+  279 Rust tests and 132 Python tests green; 0 build warnings; `git diff --check` silent.
