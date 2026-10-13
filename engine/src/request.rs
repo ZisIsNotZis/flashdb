@@ -486,3 +486,101 @@ pub fn execute_order_flow(engine: &mut Engine, req: &Value) -> io::Result<Reques
     }
     Ok(results)
 }
+
+/// The unique-index lookups a supported request's read path probes, in order.
+/// Used by the read-ahead worker (slice 58) to warm the exact tile blocks the
+/// authoritative read will touch. Purely observational: the worker warms and
+/// discards; it never feeds a decision from these keys.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadLookup {
+    pub entity: &'static str,
+    pub field: &'static str,
+    pub value: Vec<u8>,
+}
+
+/// Return the unique lookups (and nothing else) a supported request will probe
+/// on the read path. Order-flow requests probe customer, then order/backorder
+/// uniqueness, then stock; point reads probe their one entity. A movement scan
+/// is a full-entity scan with no unique prefix, so it returns no lookups.
+pub fn request_read_lookups(req: &Value) -> Vec<ReadLookup> {
+    let Some(blocks) = req.get("blocks").and_then(Value::as_object) else { return Vec::new() };
+    if blocks.contains_key("cust") && blocks.contains_key("take") {
+        let params = req.get("params");
+        let mut out = Vec::with_capacity(4);
+        if let Some(email) = params.and_then(|p| p.get("email")).and_then(Value::as_str) {
+            out.push(ReadLookup { entity: CUSTOMER.entity, field: CUSTOMER.unique, value: email.as_bytes().to_vec() });
+        }
+        if let Some(order_no) = params.and_then(|p| p.get("order_no")).and_then(Value::as_str) {
+            out.push(ReadLookup { entity: ORDER.entity, field: ORDER.unique, value: order_no.as_bytes().to_vec() });
+            out.push(ReadLookup { entity: BACKORDER.entity, field: BACKORDER.unique, value: order_no.as_bytes().to_vec() });
+        }
+        if let (Some(sku), Some(loc)) = (
+            params.and_then(|p| p.get("sku")).and_then(Value::as_str),
+            params.and_then(|p| p.get("loc")).and_then(Value::as_str),
+        ) {
+            out.push(ReadLookup { entity: STOCK.entity, field: STOCK.unique, value: stock_key(sku, loc) });
+        }
+        return out;
+    }
+    let Some(q) = blocks.get("q").and_then(Value::as_object) else { return Vec::new() };
+    if let Some(get) = q.get("get")
+        .and_then(Value::as_object)
+        .and_then(|g| g.get("Stock"))
+        .and_then(Value::as_object)
+    {
+        if let Some(where_) = get.get("where").and_then(Value::as_object) {
+            if let (Some(sku), Some(loc)) = (where_.get("sku").and_then(Value::as_str), where_.get("loc").and_then(Value::as_str)) {
+                return vec![ReadLookup { entity: STOCK.entity, field: STOCK.unique, value: stock_key(sku, loc) }];
+            }
+        }
+        return Vec::new();
+    }
+    if let Some(find) = q.get("find")
+        .and_then(Value::as_object)
+        .and_then(|f| f.get("Customer"))
+        .and_then(Value::as_object)
+    {
+        if let Some(email) = find.get("email").and_then(Value::as_str) {
+            return vec![ReadLookup { entity: CUSTOMER.entity, field: CUSTOMER.unique, value: email.as_bytes().to_vec() }];
+        }
+    }
+    Vec::new()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn request_read_lookups_extracts_the_probes_each_shape_pays() {
+        let order_flow = json!({
+            "blocks": {"cust": {"find": {"Customer": {"email": "$email"}}}, "take": {"needs": ["cust"]}},
+            "params": {"email": "a@x", "order_no": "O1", "sku": "S1", "loc": "L1", "qty": 1}
+        });
+        assert_eq!(request_read_lookups(&order_flow), vec![
+            ReadLookup { entity: "Customer", field: "email", value: b"a@x".to_vec() },
+            ReadLookup { entity: "Order", field: "order_no", value: b"O1".to_vec() },
+            ReadLookup { entity: "Backorder", field: "order_no", value: b"O1".to_vec() },
+            ReadLookup { entity: "Stock", field: "sku_loc", value: serde_json::to_vec(&["S1", "L1"]).unwrap() },
+        ]);
+
+        let stock_get = json!({
+            "blocks": {"q": {"get": {"Stock": {"where": {"sku": "S2", "loc": "L2"}}}}}
+        });
+        assert_eq!(request_read_lookups(&stock_get), vec![
+            ReadLookup { entity: "Stock", field: "sku_loc", value: serde_json::to_vec(&["S2", "L2"]).unwrap() },
+        ]);
+
+        let customer_find = json!({
+            "blocks": {"q": {"find": {"Customer": {"email": "b@y"}}}}
+        });
+        assert_eq!(request_read_lookups(&customer_find), vec![
+            ReadLookup { entity: "Customer", field: "email", value: b"b@y".to_vec() },
+        ]);
+
+        let movements = json!({
+            "blocks": {"q": {"find": {"StockMovement": {"where": {"order_no": "O9"}}, "order": ["movement_no"], "limit": 100}}}
+        });
+        assert!(request_read_lookups(&movements).is_empty(), "a movement scan has no unique prefix to warm");
+    }
+}

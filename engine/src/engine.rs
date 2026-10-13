@@ -19,6 +19,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
+use std::sync::Arc;
 use std::time::Instant;
 
 use serde::Deserialize;
@@ -755,7 +756,7 @@ pub struct Engine {
 /// An open tile plus the plain filename under which the manifest references it
 /// (explicit path, discovery, or an engine-chosen checkpoint name).
 struct TileHandle {
-    tile: Tile,
+    tile: Arc<Tile>,
     name: String,
 }
 
@@ -936,7 +937,7 @@ impl Engine {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "tile path must be a plain filename inside the engine directory"));
         }
         let tile = Tile::open(tile_path)?;
-        Self::open_impl(wal_path.as_ref(), vec![TileHandle { tile, name }], None, keys::KeyEncoding::FamilyFirst)
+        Self::open_impl(wal_path.as_ref(), vec![TileHandle { tile: Arc::new(tile), name }], None, keys::KeyEncoding::FamilyFirst)
     }
 
     /// Durable-root recovery: select the highest valid manifest page in `dir`, open
@@ -981,7 +982,7 @@ impl Engine {
                 if opened.cutoff() != t.cutoff || opened.digest() != &t.digest {
                     return Err(io::Error::new(io::ErrorKind::InvalidData, "manifest tile reference disagrees with tile header"));
                 }
-                tiles.push(TileHandle { tile: opened, name: t.name.clone() });
+                tiles.push(TileHandle { tile: Arc::new(opened), name: t.name.clone() });
             }
         }
         let mut e = Self::open_impl(&dir.join(wal_name), tiles, segment.as_ref().map(|s| s.start_csn), encoding)?;
@@ -1222,7 +1223,7 @@ impl Engine {
         let emitted = self.write_verified_tiles(tile_path, cutoff)?;
         self.mt.evict_through(cutoff);
         for EmittedTile { name, tile } in emitted {
-            self.tiles.push(TileHandle { tile, name });
+            self.tiles.push(TileHandle { tile: Arc::new(tile), name });
         }
         Ok(())
     }
@@ -1432,7 +1433,7 @@ impl Engine {
         // 4. In-memory flip only after the durable flip.
         self.mt.evict_through(cutoff);
         for EmittedTile { name, tile } in emitted {
-            self.tiles.push(TileHandle { tile, name });
+            self.tiles.push(TileHandle { tile: Arc::new(tile), name });
         }
         Ok(())
     }
@@ -1830,11 +1831,11 @@ impl Engine {
             for (i, t) in self.tiles.drain(..).enumerate() {
                 if retired.contains(&i) { continue; }
                 if kept.len() == pos {
-                    kept.push(TileHandle { tile: new_tile.take().expect("replacement inserted once"), name: outcome.name.clone() });
+                    kept.push(TileHandle { tile: Arc::new(new_tile.take().expect("replacement inserted once")), name: outcome.name.clone() });
                 }
                 kept.push(t);
             }
-            if let Some(t) = new_tile { kept.push(TileHandle { tile: t, name: outcome.name.clone() }); }
+            if let Some(t) = new_tile { kept.push(TileHandle { tile: Arc::new(t), name: outcome.name.clone() }); }
             self.tiles = kept;
             if let Some(region) = &region {
                 let id = self.metrics.borrow_mut().resolve_region(region);
@@ -1847,7 +1848,7 @@ impl Engine {
             let retire: Vec<&str> = outcome.input_names.iter().map(String::as_str).collect();
             self.manifest.as_mut().unwrap().publish_replacing_lazy(&retire, replacement, checkpoint, segment)?;
             let retired: Vec<TileHandle> = self.tiles.drain(start..start + len).collect();
-            self.tiles.insert(start, TileHandle { tile: replacement_tile, name: outcome.name.clone() });
+            self.tiles.insert(start, TileHandle { tile: Arc::new(replacement_tile), name: outcome.name.clone() });
             debug_assert!(retired.len() == len);
         }
         self.last_compaction = Some(outcome.stats);
@@ -2067,7 +2068,7 @@ impl Engine {
         //    list; the memtable is untouched (it holds only versions above the
         //    global newest cutoff).
         let retired: Vec<TileHandle> = self.tiles.drain(start..end).collect();
-        self.tiles.insert(start, TileHandle { tile, name });
+        self.tiles.insert(start, TileHandle { tile: Arc::new(tile), name });
         let manifest_us = manifest_t0.elapsed().as_micros() as u64;
         // 5. Only now drop the retired input files. Unlink after the durable flip
         //    is safe: open fds keep working (POSIX) and the new root no longer
@@ -2161,11 +2162,11 @@ impl Engine {
         for (i, t) in self.tiles.drain(..).enumerate() {
             if retired.contains(&i) { continue; }
             if kept.len() == pos {
-                kept.push(TileHandle { tile: new_tile.take().expect("replacement inserted once"), name: name.clone() });
+                kept.push(TileHandle { tile: Arc::new(new_tile.take().expect("replacement inserted once")), name: name.clone() });
             }
             kept.push(t);
         }
-        if let Some(t) = new_tile { kept.push(TileHandle { tile: t, name }); }
+        if let Some(t) = new_tile { kept.push(TileHandle { tile: Arc::new(t), name }); }
         self.tiles = kept;
         let manifest_us = manifest_t0.elapsed().as_micros() as u64;
         // Observability only (slice 34): attribute this region merge's output tile
@@ -2539,6 +2540,16 @@ impl Engine {
     /// Prototype inspection hook: proves tile-covered versions are no longer served
     /// from the memtable (not a bound on WAL recovery or total RAM).
     pub fn serving_memtable_entries(&self) -> usize { self.mt.len() }
+
+    /// A read-only, thread-safe snapshot of the engine's published tiles for the
+    /// read-ahead worker (slice 58). Tiles are immutable after publish, so the
+    /// snapshot only needs to be refreshed when publish/compaction replaces one.
+    pub fn tile_read_view(&self) -> crate::readahead::TileReadView {
+        crate::readahead::TileReadView::new(
+            Arc::new(self.tiles.iter().map(|t| t.tile.clone()).collect()),
+            self.key_encoding,
+        )
+    }
 
     /// Install the provisional layout policy the two tile write paths (publish and
     /// compaction) consult, including the per-region merge threshold the
@@ -3591,7 +3602,7 @@ pub fn build_compaction_job(dir: &Path, job: &CompactionJob) -> io::Result<Compa
     let mut tiles: Vec<TileHandle> = Vec::with_capacity(job.input_names.len());
     for name in &job.input_names {
         let tile = Tile::open(&dir.join(name))?;
-        tiles.push(TileHandle { tile, name: name.clone() });
+        tiles.push(TileHandle { tile: Arc::new(tile), name: name.clone() });
     }
     let refs: Vec<&TileHandle> = tiles.iter().collect();
     let expected: u64 = refs.iter().fold(wal_entries.len() as u64, |acc, t| acc.saturating_add(t.tile.count()));

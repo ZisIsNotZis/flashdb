@@ -1097,7 +1097,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let argv: Vec<String> = std::env::args().collect();
     let args = parse_args(argv).map_err(io::Error::other)?;
 
-    let lines: Vec<String> = {
+    let lines: std::sync::Arc<Vec<String>> = {
         let f = BufReader::new(File::open(&args.trace)?);
         let mut v = Vec::new();
         for line in f.lines() {
@@ -1105,7 +1105,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             if line.len() as u64 > MAX_LINE { return Err(io::Error::other("trace line too long").into()); }
             if !line.trim().is_empty() { v.push(line); }
         }
-        v
+        std::sync::Arc::new(v)
     };
     let total = lines.len() as u64;
     if total == 0 { return Err(io::Error::other("empty trace").into()); }
@@ -1153,6 +1153,21 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // `--compact-bytes` actuator is on; its channel closes (and the worker exits)
     // when the driver drops it at the end of `run`.
     let mut compaction_worker = args.compact_bytes.map(|_| CompactionWorker::spawn(probe_dir(&args.target)));
+
+    // Read-ahead tile warming (slice 58): a background worker pre-reads the tile
+    // blocks of the next few requests so a slow cold page-in happens off the
+    // pacer and lands in the worker's headroom, not the next dispatch's lag.
+    // Purely a cache warm; the authoritative read still runs inline with
+    // newest-first memtable-over-tile precedence. Off in --dry-run (no engine
+    // reads to warm).
+    let mut read_ahead = if args.dry_run {
+        None
+    } else {
+        Some(flashdb_engine::readahead::ReadAhead::spawn(
+            std::sync::Arc::clone(&lines),
+            engine.tile_read_view(),
+        ))
+    };
 
     let t0 = Instant::now();
     // `due_us` is ALWAYS the due time of the next request to issue, so an unissued request never
@@ -1535,6 +1550,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             // Advance the open-loop schedule to the due time of the next unissued request.
             due_us = end_due_us;
             index = end;
+            if let Some(ra) = read_ahead.as_mut() {
+                ra.set_position(index);
+            }
         } else {
             // burst pacing: bounded chunks, never a per-request sleep whose granularity would
             // masquerade as engine saturation (measured: 41 us service time vs a ~1 ms timer).
@@ -1615,6 +1633,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                 }
+            }
+            // Publish/compaction may have replaced tiles this window: give the
+            // read-ahead worker the fresh snapshot before it warms the next
+            // window's requests.
+            if let Some(ra) = read_ahead.as_mut() {
+                ra.refresh(engine.tile_read_view());
             }
             // Actual wall time the window covered, emitted so a consumer can compare it with the
             // window's offered schedule span. The pacer dispatches a group as soon as its first
