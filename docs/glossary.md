@@ -47,6 +47,12 @@ Terms used in this repository's docs, explained for a reader who is not a databa
 - **Off-policy evaluation** — estimating what a *different* layout would have cost, when only the chosen layout was ever observed.
 - **Angriness** — the engine's **internal pricing / soft-penalty form**: a bounded S-curve penalty for exceeding the latency SLO under the current load, plus credit terms (served fraction, deadline met) and penalty terms for unserved, wasted work, space and reorg/compile cost. One primitive covers every term — σ for penalty, 1 − σ for credit. It is **not** the governing objective of the pre-registered comparison, which maximises sustained offered load under hard feasibility conditions (the latency ceiling and the write-amplitude budget), and angriness is **not yet well-posed**. See `objective.md` for the full term list, the scalarisation, and its still-unresolved defects.
 - **SLO** — service level objective: the latency target a request is expected to meet.
+- **Schedule lag** — the delay between a request's due time under the paced offered load and its actual dispatch; the primary metric is bounded on this, not on completion.
+- **Lag ceiling** — the bound on per-request schedule-lag p99 that decides whether a window is valid; default 10 ms (`--lag-ceiling-us`), the number the pre-registration's primary metric is written with.
+- **Service-latency ceiling** — the separate bound on per-request service latency (dispatch to completion) p99; reported as the latency/efficiency measure, not the primary metric.
+- **Sustained level** — an offered-load level at which achieved throughput stays within 5% of offered and no window is rejected; the primary metric is the highest sustained level.
+- **10x floor** — the pre-registration's requirement that data be at least 10x the memory budget; a verdict from a lower ratio is provisional.
+- **External baseline** — a competing engine (sqlite, postgres) run as an arm through the same request-level harness at matched durability; the T5–T7 thresholds score against it.
 - **p99** — the 99th percentile. Used instead of the mean because latency distributions are heavy-tailed and the mean hides the failures.
 - **Error budget / burn rate** — the accumulated tolerable violation, and the speed at which it is being consumed. Angriness is the budget; its derivative is the burn rate.
 - **Canary / gray release** — rolling a change out to a fraction of the data, monitoring for regression, and rolling back if it loses.
