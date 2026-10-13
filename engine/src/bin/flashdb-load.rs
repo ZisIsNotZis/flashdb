@@ -82,7 +82,7 @@ use std::path::Path;
 use std::io::{self, BufRead, BufReader, Write};
 use std::time::{Duration, Instant};
 
-use flashdb_engine::engine::{CompactShape, Engine, LayoutPolicy, Op, Outcome, RegionMode, RequestOutcome};
+use flashdb_engine::engine::{build_compaction_job, CompactShape, CompactionJob, CompactionOutcome, Engine, LayoutPolicy, Op, Outcome, RegionMode, RequestOutcome};
 use flashdb_engine::metrics::WindowSnapshot;
 use flashdb_engine::replay::execute_requests_grouped;
 use flashdb_engine::request::execute_request;
@@ -552,13 +552,76 @@ fn maintain_wal(engine: &mut Engine, checkpoint_bytes: Option<u64>, rotate_bytes
     Ok(())
 }
 
-/// One window's compaction actuation: the engine's existing `maybe_compact_shape`
-/// with the shipped shape and the driver's tile gate at its floor, so the ACTIVE
-/// per-region policy's `merge_min_tiles` chooses which regions merge. Returns the
-/// merged output tile's bytes (`None` when no region was eligible), exactly what
-/// `maybe_compact` returns - no format, manifest, WAL or tile change.
-fn compact_window(engine: &mut Engine, budget_bytes: u64) -> io::Result<Option<u64>> {
-    engine.maybe_compact_shape(budget_bytes, COMPACT_MIN_TILES, CompactShape::CheapestPair)
+/// An off-request-path compaction worker. The driver sends it a
+/// [`CompactionJob`] and it builds the replacement tile with
+/// [`build_compaction_job`] while the main loop keeps dispatching and
+/// committing; the main loop later applies the finished outcome with
+/// [`Engine::apply_compaction_job`]. One job in flight at a time keeps the
+/// worker's reads from racing the engine's own tile unlinks.
+struct CompactionWorker {
+    tx: std::sync::mpsc::Sender<CompactionJob>,
+    rx: std::sync::mpsc::Receiver<io::Result<CompactionOutcome>>,
+    in_flight: bool,
+}
+
+impl CompactionWorker {
+    fn spawn(dir: std::path::PathBuf) -> Self {
+        let (tx, job_rx) = std::sync::mpsc::channel::<CompactionJob>();
+        let (out_tx, rx) = std::sync::mpsc::channel::<io::Result<CompactionOutcome>>();
+        std::thread::spawn(move || {
+            for job in job_rx {
+                let result = build_compaction_job(&dir, &job);
+                if out_tx.send(result).is_err() { break; }
+            }
+        });
+        CompactionWorker { tx, rx, in_flight: false }
+    }
+
+    fn busy(&self) -> bool { self.in_flight }
+
+    fn submit(&mut self, job: CompactionJob) -> io::Result<()> {
+        self.tx.send(job).map_err(io::Error::other)?;
+        self.in_flight = true;
+        Ok(())
+    }
+
+    /// A finished outcome, when one is ready. A failed build is returned as the
+    /// engine error (fail closed) and the in-flight slot is cleared.
+    fn try_take_done(&mut self) -> io::Result<Option<CompactionOutcome>> {
+        match self.rx.try_recv() {
+            Ok(Ok(outcome)) => { self.in_flight = false; Ok(Some(outcome)) }
+            Ok(Err(e)) => { self.in_flight = false; Err(e) }
+            Err(std::sync::mpsc::TryRecvError::Empty) => Ok(None),
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.in_flight = false;
+                Err(io::Error::other("compaction worker disconnected"))
+            }
+        }
+    }
+
+    /// Blocking variant used only at the end of the run, to apply the last
+    /// in-flight build before the summary.
+    fn take_done(&mut self) -> io::Result<Option<CompactionOutcome>> {
+        match self.rx.recv() {
+            Ok(Ok(outcome)) => { self.in_flight = false; Ok(Some(outcome)) }
+            Ok(Err(e)) => { self.in_flight = false; Err(e) }
+            Err(_) => { self.in_flight = false; Ok(None) }
+        }
+    }
+}
+
+/// Per-applied-actuation observability (slice 53): one `compact_actuation` line
+/// per merge, carrying the off-request-path build phase split plus the
+/// request-path run-selection and lazy-apply times, so the remaining stall can
+/// be attributed without a separate probe.
+fn compact_actuation_print(window_index: u64, select_us: u64, apply_us: u64, outcome: &CompactionOutcome) {
+    let s = &outcome.stats;
+    eprintln!(
+        "compact_actuation window={window_index} input_bytes={} output_bytes={} \
+         select_us={select_us} apply_us={apply_us} build_elapsed_us={} \
+         stream_us={} finish_us={} verify_us={}",
+        outcome.input_bytes, outcome.output_bytes, s.elapsed_us,
+        s.build.stream_us, s.build.finish_us, s.build.verify_us);
 }
 
 /// Return already-freed heap pages to the OS. The load path streams large transient buffers (each
@@ -636,6 +699,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             peak_rss_kb().map(|v| v.to_string()).unwrap_or_else(|| "none".into()))?;
         reset_peak_rss();
     }
+
+    // Off-request-path compaction worker (slice 53): builds one replacement tile
+    // at a time while the request path keeps committing. Only spawned when the
+    // `--compact-bytes` actuator is on; its channel closes (and the worker exits)
+    // when the driver drops it at the end of `run`.
+    let mut compaction_worker = args.compact_bytes.map(|_| CompactionWorker::spawn(probe_dir(&args.target)));
 
     let t0 = Instant::now();
     // `due_us` is ALWAYS the due time of the next request to issue, so an unissued request never
@@ -882,16 +951,33 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             || window_start.elapsed() >= Duration::from_millis(args.window_ms)
             || (next_rate != window_rate && !latencies.is_empty())
         {
-            // Compaction actuation (Slice 37), BEFORE the policy reload and the
-            // snapshot: the merge threshold that governed this window is the one
-            // that governs its compaction, and the merged bytes are attributed to
-            // this window's per-region `compaction_bytes`. Off when unset.
+            // Compaction actuation (Slice 37/53), BEFORE the policy reload and
+            // the snapshot: the merge threshold that governed this window is the
+            // one that governs its compaction, and the merged bytes are attributed
+            // to this window's per-region `compaction_bytes`. Off when unset.
+            // Slice 53 makes the build off-path: run selection + the lazy apply
+            // stay on the request path (both are cheap), the tile build runs on
+            // the worker thread.
             let mut compact_bytes_window: u64 = 0;
             if let Some(budget) = args.compact_bytes {
-                if let Some(merged) = compact_window(&mut engine, budget)? {
-                    compact_bytes_window = merged;
-                    compact_bytes_total += merged;
-                    compact_merges += 1;
+                if let Some(worker) = compaction_worker.as_mut() {
+                    let mut select_us: u64 = 0;
+                    if !worker.busy() {
+                        let select_t0 = Instant::now();
+                        if let Some(job) = engine.compaction_job(budget, COMPACT_MIN_TILES, CompactShape::CheapestPair)? {
+                            select_us = select_t0.elapsed().as_micros() as u64;
+                            worker.submit(job)?;
+                        }
+                    }
+                    if let Some(outcome) = worker.try_take_done()? {
+                        let apply_t0 = Instant::now();
+                        let merged = engine.apply_compaction_job(&outcome)?;
+                        let apply_us = apply_t0.elapsed().as_micros() as u64;
+                        compact_bytes_window = merged;
+                        compact_bytes_total += merged;
+                        compact_merges += 1;
+                        compact_actuation_print(window_index, select_us, apply_us, &outcome);
+                    }
                 }
             }
             // Actual wall time the window covered, emitted so a consumer can compare it with the
@@ -1031,6 +1117,19 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             // Deliberately do NOT relabel the window with the upcoming rung: an idle window while
             // the next rung's first group is still pending belongs to the rung that is still on
             // the offered schedule, so its wall time is not charged to the next rung.
+        }
+    }
+
+    // Drain the last in-flight compaction build so the final state and the
+    // `compact_*` totals reflect it; the worker's channel closes when the driver
+    // drops it, and any build that finished is applied before the summary.
+    if let Some(worker) = compaction_worker.as_mut() {
+        while worker.busy() {
+            if let Some(outcome) = worker.take_done()? {
+                let merged = engine.apply_compaction_job(&outcome)?;
+                compact_bytes_total += merged;
+                compact_merges += 1;
+            }
         }
     }
 

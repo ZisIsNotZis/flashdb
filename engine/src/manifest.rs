@@ -638,12 +638,26 @@ impl Manifest {
         if self.poisoned {
             return Err(io::Error::new(io::ErrorKind::Other, "manifest writer poisoned; reopen to recover"));
         }
-        let result = self.publish_inner(tiles, checkpoint, segment);
+        let result = self.publish_inner(tiles, checkpoint, segment, true);
         if result.is_err() { self.poisoned = true; }
         result
     }
 
-    fn publish_inner(&mut self, tiles: Vec<TileRef>, checkpoint: Checkpoint, segment: Option<SegmentRef>) -> io::Result<()> {
+    /// [`Manifest::publish`] without the file and parent-directory syncs. The
+    /// in-memory root still flips, so a later durable publish carries this page
+    /// with it; until then a crash can revert to the previous durable root (whose
+    /// tiles are all still present), which is the documented lazy-compaction
+    /// trade: reorganisation may be lost, never data.
+    pub(crate) fn publish_lazy(&mut self, tiles: Vec<TileRef>, checkpoint: Checkpoint, segment: Option<SegmentRef>) -> io::Result<()> {
+        if self.poisoned {
+            return Err(io::Error::new(io::ErrorKind::Other, "manifest writer poisoned; reopen to recover"));
+        }
+        let result = self.publish_inner(tiles, checkpoint, segment, false);
+        if result.is_err() { self.poisoned = true; }
+        result
+    }
+
+    fn publish_inner(&mut self, tiles: Vec<TileRef>, checkpoint: Checkpoint, segment: Option<SegmentRef>, durable: bool) -> io::Result<()> {
         let seq = self.root.seq.checked_add(1).ok_or_else(|| invalid("manifest seq exhausted"))?;
         if tiles.is_empty() || tiles.len() > MAX_TILES {
             return Err(invalid("publish requires one to MAX_TILES active tiles"));
@@ -673,8 +687,10 @@ impl Manifest {
             self.inject_sync_error = false;
             return Err(io::Error::new(io::ErrorKind::Other, "injected manifest sync failure"));
         }
-        self.file.sync_data()?;
-        File::open(Self::parent(&self.path))?.sync_all()?;
+        if durable {
+            self.file.sync_data()?;
+            File::open(Self::parent(&self.path))?.sync_all()?;
+        }
         self.root = root;
         self.slot = slot;
         Ok(())
@@ -703,7 +719,24 @@ impl Manifest {
         if self.poisoned {
             return Err(io::Error::new(io::ErrorKind::Other, "manifest writer poisoned; reopen to recover"));
         }
-        let result = self.publish_replacing_inner(retire, replacement, checkpoint, segment);
+        let result = self.publish_replacing_inner(retire, replacement, checkpoint, segment, true);
+        if result.is_err() { self.poisoned = true; }
+        result
+    }
+
+    /// [`Manifest::publish_replacing`] without the file and parent-directory
+    /// syncs; see [`Manifest::publish_lazy`].
+    pub(crate) fn publish_replacing_lazy(
+        &mut self,
+        retire: &[&str],
+        replacement: TileRef,
+        checkpoint: Checkpoint,
+        segment: Option<SegmentRef>,
+    ) -> io::Result<()> {
+        if self.poisoned {
+            return Err(io::Error::new(io::ErrorKind::Other, "manifest writer poisoned; reopen to recover"));
+        }
+        let result = self.publish_replacing_inner(retire, replacement, checkpoint, segment, false);
         if result.is_err() { self.poisoned = true; }
         result
     }
@@ -714,6 +747,7 @@ impl Manifest {
         replacement: TileRef,
         checkpoint: Checkpoint,
         segment: Option<SegmentRef>,
+        durable: bool,
     ) -> io::Result<()> {
         if retire.is_empty() {
             return Err(invalid("range replacement requires a non-empty retired run"));
@@ -754,7 +788,7 @@ impl Manifest {
         if tiles.iter().filter(|t| t.name == replacement_name).count() > 1 {
             return Err(invalid("replacement name collides with a surviving active tile"));
         }
-        self.publish_inner(tiles, checkpoint, segment)
+        self.publish_inner(tiles, checkpoint, segment, durable)
     }
 }
 

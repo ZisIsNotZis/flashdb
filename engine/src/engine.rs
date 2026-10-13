@@ -475,6 +475,93 @@ impl CompactShape {
     }
 }
 
+/// Wall-clock phase split of ONE compaction actuation's tile build (the
+/// [`Engine::write_compacted_tile`] half), in microseconds. Observability for
+/// the latency-tail diagnosis (slice 53): never persisted, never consulted by
+/// any read/write/durability decision, and recorded only on a successful merge.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CompactionBuildStats {
+    /// Replay the WAL suffix, reduce it into the run's `(lower, cutoff]` window,
+    /// and stream the merged reduction into the tile writer (data blocks only;
+    /// no fsync). This is the merge CPU + tile data write.
+    pub stream_us: u64,
+    /// `TileWriter::finish`: directory + superblock, the tile file `sync_data`,
+    /// and the reopen/verification of the written superblock.
+    pub finish_us: u64,
+    /// The two fail-closed verification passes over the written tile.
+    pub verify_us: u64,
+}
+
+/// Wall-clock phase split of ONE successful compaction actuation, in
+/// microseconds. `input_bytes`/`output_bytes` are the merged run's on-disk
+/// input sizes and the replacement tile's on-disk size; `elapsed_us` is the
+/// whole [`Engine::merge_run`]/[`Engine::merge_region_run`] wall time.
+/// Observability for the latency-tail diagnosis (slice 53): never persisted and
+/// never consulted by any decision.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CompactionStats {
+    pub input_bytes: u64,
+    pub output_bytes: u64,
+    pub elapsed_us: u64,
+    pub build: CompactionBuildStats,
+    /// The standalone parent-directory `sync_all` that makes the replacement
+    /// tile's directory entry durable before the manifest references it.
+    pub dir_sync_us: u64,
+    /// Manifest inactive-page write + file `sync_data` + parent-directory
+    /// `sync_all` (the durable flip).
+    pub manifest_us: u64,
+    /// Best-effort unlink of the retired input tiles.
+    pub unlink_us: u64,
+}
+
+/// A self-contained compaction build: every input a worker needs to produce ONE
+/// replacement tile without touching the live engine. The worker opens the
+/// named input tiles read-only and reads the WAL suffix through `wal_file`
+/// bounded by `wal_valid_len` (the length captured when the job was created), so
+/// it can run off the request path while the engine keeps committing.
+#[derive(Debug)]
+pub struct CompactionJob {
+    /// Retired input tile filenames, in cutoff order.
+    pub input_names: Vec<String>,
+    pub lower: u64,
+    pub cutoff: u64,
+    /// `None` for a whole-keyspace run; `Some(prefix)` for a per-region run.
+    pub region: Option<Vec<u8>>,
+    pub output_name: String,
+    pub page_size: u32,
+    pub bloom_bits_per_key: u8,
+    pub key_encoding: keys::KeyEncoding,
+    /// An already-open handle to the WAL segment the job reads from. Bounded by
+    /// `wal_valid_len` so concurrent appends are never observed.
+    pub wal_file: std::fs::File,
+    pub wal_valid_len: u64,
+    /// The engine's expected WAL max CSN at job creation (the republish guard).
+    pub wal_max_expected: u64,
+    /// The engine's CSN at job creation; the republish guard is skipped only when
+    /// it is 0 (an engine that has never committed).
+    pub wal_csn: u64,
+    /// The retained-WAL floor below which records are not re-derivable.
+    pub wal_floor: u64,
+}
+
+/// A finished off-request-path compaction build: the replacement tile's
+/// identity plus its sizes and phase split, ready for
+/// [`Engine::apply_compaction_job`].
+#[derive(Debug)]
+pub struct CompactionOutcome {
+    pub name: String,
+    pub cutoff: u64,
+    pub digest: [u8; 32],
+    /// The retired input tile filenames (the job's run), needed to apply the
+    /// flip against the live tile list.
+    pub input_names: Vec<String>,
+    /// The region for a per-region run; `None` for a whole-keyspace run.
+    pub region: Option<Vec<u8>>,
+    pub input_bytes: u64,
+    pub output_bytes: u64,
+    pub stats: CompactionStats,
+}
+
 /// 一个块内的键空间变更。键的 CSN 部分由引擎在发布时填充。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Op {
@@ -626,6 +713,10 @@ pub struct Engine {
     /// because read paths take `&self`; it is the only interior mutability here.
     /// Disabled via [`Engine::set_metrics_enabled`].
     metrics: RefCell<Metrics>,
+    /// Phase split of the most recent successful compaction actuation (slice
+    /// 53). Observational only: never persisted and never read on any
+    /// correctness path.
+    last_compaction: Option<CompactionStats>,
 }
 
 /// An open tile plus the plain filename under which the manifest references it
@@ -688,6 +779,7 @@ impl Engine {
             region_mode: RegionMode::Global,
             key_encoding: keys::KeyEncoding::FamilyFirst,
             metrics: RefCell::new(Metrics::new()),
+            last_compaction: None,
         })
     }
 
@@ -887,7 +979,7 @@ impl Engine {
         drop(records);
         drop(covered);
         Self::trim_retained_heap();
-        Ok(Engine { wal, mt, tiles, wal_path: wal_path.to_path_buf(), dir: parent_dir(wal_path), manifest: None, segment: None, segment_suffix_csn: csn, wal_detached: false, csn, dedup, max_handle, group_open: false, group_pending: false, layout: LayoutPolicy::declared_default(), region_mode: RegionMode::Global, key_encoding: encoding, metrics: RefCell::new(Metrics::new()) })
+        Ok(Engine { wal, mt, tiles, wal_path: wal_path.to_path_buf(), dir: parent_dir(wal_path), manifest: None, segment: None, segment_suffix_csn: csn, wal_detached: false, csn, dedup, max_handle, group_open: false, group_pending: false, layout: LayoutPolicy::declared_default(), region_mode: RegionMode::Global, key_encoding: encoding, metrics: RefCell::new(Metrics::new()), last_compaction: None })
     }
 
     /// The CSN floor below which the active WAL file holds no records: the
@@ -1240,6 +1332,34 @@ impl Engine {
         Ok(())
     }
 
+    /// [`Engine::manifest_publish`] without the manifest file and parent-
+    /// directory syncs, for a lazy compaction flip (see
+    /// [`Engine::apply_compaction_job`]). The in-memory root still flips and the
+    /// next durable publish carries it; a crash before then can revert to the
+    /// previous durable root whose tiles are all still present.
+    fn manifest_publish_lazy(&mut self, refs: Vec<TileRef>, checkpoint: Checkpoint, segment: Option<SegmentRef>) -> io::Result<()> {
+        match &mut self.manifest {
+            Some(m) => m.publish_lazy(refs, checkpoint, segment)?,
+            None => {
+                let path = self.dir.join(manifest::MANIFEST_NAME);
+                let mut m = match Manifest::create(&path) {
+                    Ok(m) => m,
+                    Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                        match Manifest::open(&path)? {
+                            Some(m) if m.root().tiles.is_empty() => m,
+                            _ => return Err(io::Error::new(io::ErrorKind::InvalidData,
+                                "manifest already exists with active tiles; use open_discover to adopt them before publishing")),
+                        }
+                    }
+                    Err(e) => return Err(e),
+                };
+                m.publish_lazy(refs, checkpoint, segment)?;
+                self.manifest = Some(m);
+            }
+        }
+        Ok(())
+    }
+
     /// Rotate the WAL onto a fresh, empty segment once the live segment exceeds
     /// `max_wal_bytes`. Preconditions: every committed block must already be
     /// published as a tile (`newest cutoff == csn`) and at least one tile must
@@ -1432,6 +1552,147 @@ impl Engine {
         self.merge_run(start, len).map(Some)
     }
 
+    /// Select the same run [`Engine::maybe_compact_shape`] would merge and
+    /// return it as a self-contained [`CompactionJob`] WITHOUT doing any merge.
+    /// `Ok(None)` when no region/run is eligible (the same gate as
+    /// [`Engine::maybe_compact_shape`]). The job carries a duplicate handle to
+    /// the live WAL file bounded by the current valid length, so a worker can
+    /// build the replacement off the request path while the engine keeps
+    /// committing.
+    pub fn compaction_job(&self, max_merge_bytes: u64, max_tiles: usize, shape: CompactShape) -> io::Result<Option<CompactionJob>> {
+        if self.tiles.len() < max_tiles || self.tiles.len() < 2 {
+            return Ok(None);
+        }
+        self.ensure_no_group("compaction_job")?;
+        if self.manifest.as_ref().is_some_and(|m| m.poisoned()) {
+            return Err(io::Error::new(io::ErrorKind::Other, "manifest writer poisoned; reopen to recover"));
+        }
+        self.ensure_attached()?;
+        let (indices, region) = if self.region_mode == RegionMode::PerRegion {
+            let Some(indices) = self.select_region_run(max_merge_bytes, max_tiles, shape)? else {
+                return Ok(None);
+            };
+            let region = tile_first_region(&self.tiles[indices[0]]).map(<[u8]>::to_vec);
+            (indices, region)
+        } else {
+            let (start, len) = self.select_run(max_merge_bytes, max_tiles, shape)?;
+            ((start..start + len).collect::<Vec<usize>>(), None)
+        };
+        let newest = *indices.last().unwrap();
+        let cutoff = self.tiles[newest].cutoff();
+        let lower = if region.is_some() {
+            (0..indices[0])
+                .rev()
+                .find(|&i| tile_first_region(&self.tiles[i]).map(<[u8]>::to_vec) == region)
+                .map(|i| self.tiles[i].cutoff())
+                .unwrap_or(0)
+        } else if indices[0] == 0 {
+            0
+        } else {
+            self.tiles[indices[0] - 1].cutoff()
+        };
+        // The replacement name follows the synchronous merge's collision rule.
+        let base = format!("compact-{cutoff}.tile");
+        let output_name = if self.tiles[newest].name == base || self.dir.join(&base).try_exists()? {
+            self.unique_compaction_name(cutoff)?
+        } else {
+            base
+        };
+        let layout_region = match (self.region_mode, &region, self.tiles[indices[0]].tile.first_key().and_then(keys::region_prefix)) {
+            (RegionMode::PerRegion, Some(_), Some(prefix)) => keys::region_name(prefix),
+            _ => TILE_LAYOUT_REGION.to_string(),
+        };
+        let (page_size, bloom_bits_per_key) = self.layout.for_region(&layout_region);
+        Ok(Some(CompactionJob {
+            input_names: indices.iter().map(|&i| self.tiles[i].name.clone()).collect(),
+            lower,
+            cutoff,
+            region,
+            output_name,
+            page_size,
+            bloom_bits_per_key,
+            key_encoding: self.key_encoding,
+            wal_file: self.wal.file_clone()?,
+            wal_valid_len: self.wal.valid_len(),
+            wal_max_expected: if self.segment.is_some() { self.segment_suffix_csn } else { self.csn },
+            wal_csn: self.csn,
+            wal_floor: self.wal_floor(),
+        }))
+    }
+
+    /// Apply a worker-built [`CompactionOutcome`] produced from this engine's
+    /// [`CompactionJob`]: flip the manifest root and the in-memory tile list to
+    /// install the replacement, and record the per-merge observability. The flip
+    /// is LAZY (no manifest file/dir sync) and the retired inputs are NOT
+    /// unlinked: compaction reorganisation is only an optimisation, the WAL
+    /// stays the durability authority, and a crash before the next durable
+    /// manifest publish (checkpoint/rotation) simply reverts to the previous
+    /// durable root whose tiles are still on disk. Returns the replacement's
+    /// output size.
+    pub fn apply_compaction_job(&mut self, outcome: &CompactionOutcome) -> io::Result<u64> {
+        self.ensure_no_group("apply_compaction_job")?;
+        if self.manifest.as_ref().is_some_and(|m| m.poisoned()) {
+            return Err(io::Error::new(io::ErrorKind::Other, "manifest writer poisoned; reopen to recover"));
+        }
+        self.ensure_attached()?;
+        // Resolve the retired run against the CURRENT list. Tiles are only ever
+        // appended between job creation and apply, so the named run is still
+        // present; an absent name is a caller error and fails closed.
+        let mut indices: Vec<usize> = Vec::with_capacity(outcome.input_names.len());
+        for name in &outcome.input_names {
+            let i = self.tiles.iter().position(|t| &t.name == name)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "compaction job retired a tile no longer active"))?;
+            indices.push(i);
+        }
+        let replacement_tile = Tile::open(&self.dir.join(&outcome.name))?;
+        let replacement = TileRef { name: outcome.name.clone(), cutoff: outcome.cutoff, digest: outcome.digest };
+        let checkpoint = Checkpoint { csn: self.tiles.last().unwrap().cutoff(), handle_watermark: self.max_handle };
+        let segment = self.segment.clone();
+        if outcome.region.is_some() {
+            // Per-region: rebuild the full `(cutoff, region)`-ordered list with
+            // the replacement inserted at its sort position (same as
+            // `merge_region_run`).
+            let region = outcome.region.clone();
+            let retired: HashSet<usize> = indices.iter().copied().collect();
+            let pos = self.tiles.iter().enumerate()
+                .filter(|(i, t)| !retired.contains(i)
+                    && (t.cutoff(), tile_first_region(t).map(<[u8]>::to_vec)) < (outcome.cutoff, region.clone()))
+                .count();
+            let mut refs: Vec<TileRef> = Vec::with_capacity(self.tiles.len() - indices.len() + 1);
+            for (i, t) in self.tiles.iter().enumerate() {
+                if !retired.contains(&i) { refs.push(t.tile_ref()); }
+            }
+            refs.insert(pos, replacement.clone());
+            self.manifest_publish_lazy(refs, checkpoint, segment)?;
+            let mut new_tile = Some(replacement_tile);
+            let mut kept: Vec<TileHandle> = Vec::with_capacity(self.tiles.len() - indices.len() + 1);
+            for (i, t) in self.tiles.drain(..).enumerate() {
+                if retired.contains(&i) { continue; }
+                if kept.len() == pos {
+                    kept.push(TileHandle { tile: new_tile.take().expect("replacement inserted once"), name: outcome.name.clone() });
+                }
+                kept.push(t);
+            }
+            if let Some(t) = new_tile { kept.push(TileHandle { tile: t, name: outcome.name.clone() }); }
+            self.tiles = kept;
+            if let Some(region) = &region {
+                let id = self.metrics.borrow_mut().resolve_region(region);
+                self.metrics.borrow_mut().region_compaction(id, outcome.output_bytes);
+            }
+        } else {
+            // Whole-list: the retired names are one contiguous window; replace it.
+            let start = indices[0];
+            let len = indices.len();
+            let retire: Vec<&str> = outcome.input_names.iter().map(String::as_str).collect();
+            self.manifest.as_mut().unwrap().publish_replacing_lazy(&retire, replacement, checkpoint, segment)?;
+            let retired: Vec<TileHandle> = self.tiles.drain(start..start + len).collect();
+            self.tiles.insert(start, TileHandle { tile: replacement_tile, name: outcome.name.clone() });
+            debug_assert!(retired.len() == len);
+        }
+        self.last_compaction = Some(outcome.stats);
+        Ok(outcome.output_bytes)
+    }
+
     /// Start and length of the contiguous run to merge under `shape`. The
     /// cheapest-pair policy is the run of length >= 2 with the smallest combined
     /// on-disk size within `max_merge_bytes`, ties in favour of the oldest
@@ -1574,6 +1835,7 @@ impl Engine {
     /// publish at the run's newest cutoff would carry.
     fn merge_run(&mut self, start: usize, len: usize) -> io::Result<u64> {
         debug_assert!(len >= 2 && start + len <= self.tiles.len());
+        let t0 = Instant::now();
         let end = start + len;
         let cutoff = self.tiles[end - 1].cutoff();
         let lower = if start == 0 { 0 } else { self.tiles[start - 1].cutoff() };
@@ -1599,7 +1861,11 @@ impl Engine {
         // 1. Build + verify the merged tile for the run's union range against the
         //    retained WAL projection, exactly as publish verifies one tile.
         let inputs: Vec<&TileHandle> = self.tiles[start..end].iter().collect();
-        let tile = match self.write_compacted_tile(&path, &inputs, lower, cutoff, None) {
+        let mut input_bytes: u64 = 0;
+        for t in &inputs {
+            input_bytes = input_bytes.saturating_add(fs::metadata(self.dir.join(&t.name)).map(|m| m.len())?);
+        }
+        let (tile, build) = match self.write_compacted_tile(&path, &inputs, lower, cutoff, None) {
             Ok(t) => t,
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
                 return Err(io::Error::new(io::ErrorKind::AlreadyExists, format!(
@@ -1610,12 +1876,15 @@ impl Engine {
         let out_size = fs::metadata(&path)?.len();
         // 2. The tile's own directory entry must be durable before the manifest
         //    can reference it (checkpoint publication ordering).
+        let dir_sync_t0 = Instant::now();
         File::open(&self.dir)?.sync_all()?;
+        let dir_sync_us = dir_sync_t0.elapsed().as_micros() as u64;
         // 3. Manifest protocol: the retired run is replaced by the one new tile.
         //    The global newest cutoff (and therefore the checkpoint) is unchanged:
         //    tiles after the run keep the frontier, or the replacement itself
         //    carries it when the run reached the end. `publish_replacing` accepts
         //    any contiguous window, not just a prefix.
+        let manifest_t0 = Instant::now();
         let replacement = TileRef { name: name.clone(), cutoff, digest: *tile.digest() };
         let checkpoint = Checkpoint { csn: self.tiles.last().unwrap().cutoff(), handle_watermark: self.max_handle };
         let segment = self.segment.clone();
@@ -1638,14 +1907,26 @@ impl Engine {
         //    global newest cutoff).
         let retired: Vec<TileHandle> = self.tiles.drain(start..end).collect();
         self.tiles.insert(start, TileHandle { tile, name });
+        let manifest_us = manifest_t0.elapsed().as_micros() as u64;
         // 5. Only now drop the retired input files. Unlink after the durable flip
         //    is safe: open fds keep working (POSIX) and the new root no longer
         //    references them. Failures are best-effort ignored — the compaction
         //    is already durable and a leftover file is a harmless orphan that
         //    discovery ignores and never adopts.
+        let unlink_t0 = Instant::now();
         for old in &retired {
             let _ = fs::remove_file(self.dir.join(&old.name));
         }
+        let unlink_us = unlink_t0.elapsed().as_micros() as u64;
+        self.last_compaction = Some(CompactionStats {
+            input_bytes,
+            output_bytes: out_size,
+            elapsed_us: t0.elapsed().as_micros() as u64,
+            build,
+            dir_sync_us,
+            manifest_us,
+            unlink_us,
+        });
         Ok(out_size)
     }
 
@@ -1667,6 +1948,7 @@ impl Engine {
     /// active set plus that unreferenced file).
     fn merge_region_run(&mut self, indices: &[usize]) -> io::Result<u64> {
         debug_assert!(indices.len() >= 2 && indices.windows(2).all(|w| w[0] < w[1]));
+        let t0 = Instant::now();
         let newest = *indices.last().unwrap();
         let cutoff = self.tiles[newest].cutoff();
         let region: Option<Vec<u8>> = tile_first_region(&self.tiles[indices[0]]).map(<[u8]>::to_vec);
@@ -1678,7 +1960,11 @@ impl Engine {
         let name = self.unique_compaction_name(cutoff)?;
         let path = self.dir.join(&name);
         let inputs: Vec<&TileHandle> = indices.iter().map(|&i| &self.tiles[i]).collect();
-        let tile = match self.write_compacted_tile(&path, &inputs, lower, cutoff, region.as_deref()) {
+        let mut input_bytes: u64 = 0;
+        for t in &inputs {
+            input_bytes = input_bytes.saturating_add(fs::metadata(self.dir.join(&t.name)).map(|m| m.len())?);
+        }
+        let (tile, build) = match self.write_compacted_tile(&path, &inputs, lower, cutoff, region.as_deref()) {
             Ok(t) => t,
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
                 return Err(io::Error::new(io::ErrorKind::AlreadyExists, format!(
@@ -1687,7 +1973,10 @@ impl Engine {
             Err(e) => return Err(e),
         };
         let out_size = fs::metadata(&path)?.len();
+        let dir_sync_t0 = Instant::now();
         File::open(&self.dir)?.sync_all()?;
+        let dir_sync_us = dir_sync_t0.elapsed().as_micros() as u64;
+        let manifest_t0 = Instant::now();
         let retired: HashSet<usize> = indices.iter().copied().collect();
         let retired_names: Vec<String> = indices.iter().map(|&i| self.tiles[i].name.clone()).collect();
         let replacement = TileRef { name: name.clone(), cutoff, digest: *tile.digest() };
@@ -1717,6 +2006,7 @@ impl Engine {
         }
         if let Some(t) = new_tile { kept.push(TileHandle { tile: t, name }); }
         self.tiles = kept;
+        let manifest_us = manifest_t0.elapsed().as_micros() as u64;
         // Observability only (slice 34): attribute this region merge's output tile
         // bytes and the merge itself to the region that was merged, so the learner
         // can derive the per-region rewrite factor (`metrics.rs` module docs).
@@ -1731,6 +2021,7 @@ impl Engine {
         // Report a failure rather than swallow it - `merge_run`'s silent best-effort
         // is fine for a whole-dataset merge, but a per-region compaction should say
         // when it leaves an orphan and what the directory then is.
+        let unlink_t0 = Instant::now();
         for old in &retired_names {
             if let Err(e) = fs::remove_file(self.dir.join(old)) {
                 if e.kind() != io::ErrorKind::NotFound {
@@ -1738,6 +2029,16 @@ impl Engine {
                 }
             }
         }
+        let unlink_us = unlink_t0.elapsed().as_micros() as u64;
+        self.last_compaction = Some(CompactionStats {
+            input_bytes,
+            output_bytes: out_size,
+            elapsed_us: t0.elapsed().as_micros() as u64,
+            build,
+            dir_sync_us,
+            manifest_us,
+            unlink_us,
+        });
         Ok(out_size)
     }
 
@@ -1764,6 +2065,13 @@ impl Engine {
     /// regions disjoint.
     pub fn active_tile_cutoffs(&self) -> Vec<u64> {
         self.tiles.iter().map(|t| t.cutoff()).collect()
+    }
+
+    /// Phase split of the most recent successful compaction actuation, if any
+    /// (observability hook for the slice-53 latency-tail diagnosis). `None`
+    /// until the first successful [`Engine::maybe_compact_shape`] merge.
+    pub fn last_compaction_stats(&self) -> Option<CompactionStats> {
+        self.last_compaction
     }
 
     /// Each active tile's region name in list order (inspection/benchmark hook),
@@ -1821,7 +2129,8 @@ impl Engine {
     /// key-ordered map. [`Engine::stream_merged_reduction`] merges both sources
     /// and pushes the reduced stream straight into the streaming writer, so peak
     /// compaction RAM tracks the WAL window, not the total tile bytes.
-    fn write_compacted_tile(&self, tile_path: &Path, tiles: &[&TileHandle], lower: u64, cutoff: u64, region: Option<&[u8]>) -> io::Result<Tile> {
+    fn write_compacted_tile(&self, tile_path: &Path, tiles: &[&TileHandle], lower: u64, cutoff: u64, region: Option<&[u8]>) -> io::Result<(Tile, CompactionBuildStats)> {
+        let stream_t0 = Instant::now();
         let (records, _) = wal::replay(&self.wal_path)?;
         self.verify_wal_matches_state(&records)?;
         let digest = wal_digest(&records, cutoff, self.wal_floor())?;
@@ -1863,7 +2172,7 @@ impl Engine {
         let mut bloom = (bloom_bits_per_key > 0)
             .then(|| BloomBuilder::new(expected, bloom_bits_per_key as u32));
         let mut writer = TileWriter::new(tile_path, cutoff, &digest, page_size)?;
-        self.stream_merged_reduction(tiles, lower, cutoff, &wal_entries, |key, value| {
+        Self::stream_merged_reduction(tiles, lower, cutoff, &wal_entries, |key, value| {
             writer.push(key, value)?;
             if let Some(bloom) = bloom.as_mut() {
                 if let Some(prefix) = unique_prefix_of(key) { bloom.insert(prefix); }
@@ -1871,12 +2180,16 @@ impl Engine {
             Ok(())
         })?;
         if let Some(bloom) = bloom { writer.set_bloom(bloom.finish())?; }
+        let stream_us = stream_t0.elapsed().as_micros() as u64;
+        let finish_t0 = Instant::now();
         let tile = writer.finish()?;
+        let finish_us = finish_t0.elapsed().as_micros() as u64;
         // Fail closed: re-run the identical merge and compare it 1:1, streaming,
         // against the written tile. That catches encoder/streaming defects but is
         // self-referential (same reduction, same inputs), so it is paired with an
         // INDEPENDENT check against the WAL-derived expectation below.
-        self.verify_compacted_tile(&tile, tiles, lower, &wal_entries, cutoff)?;
+        let verify_t0 = Instant::now();
+        Self::verify_compacted_tile(&tile, tiles, lower, &wal_entries, cutoff)?;
         // Independent verification of everything above the rotation floor: the
         // retained WAL suffix is the authority for versions in (floor, cutoff], so
         // compare the written tile against it. This restores the check that the
@@ -1888,8 +2201,9 @@ impl Engine {
         // never be re-derived - so the comparison starts at the floor. That is the
         // documented trust boundary (see FDBTILE2.md/FDBTILE3.md), stated here so
         // the gap is visible at the call site rather than implied.
-        self.verify_compacted_against_wal(&tile, &wal_entries, lower.max(self.wal_floor()), cutoff)?;
-        Ok(tile)
+        Self::verify_compacted_against_wal(&tile, &wal_entries, lower.max(self.wal_floor()), cutoff)?;
+        let verify_us = verify_t0.elapsed().as_micros() as u64;
+        Ok((tile, CompactionBuildStats { stream_us, finish_us, verify_us }))
     }
 
     /// K-way merge of the given active tile run (one [`TileCursor`] each) and the
@@ -1903,7 +2217,6 @@ impl Engine {
     /// its lower bound). Only one logical key is retained as state, so nothing
     /// here is proportional to the tile bytes.
     fn stream_merged_reduction(
-        &self,
         tiles: &[&TileHandle],
         lower: u64,
         cutoff: u64,
@@ -1955,7 +2268,6 @@ impl Engine {
     /// 1:1 match: every reduced entry must appear in key order with the same
     /// value, and any extra tile entry is an error.
     fn verify_compacted_tile(
-        &self,
         tile: &Tile,
         tiles: &[&TileHandle],
         lower: u64,
@@ -1978,7 +2290,7 @@ impl Engine {
             pending = actual.next();
             Ok(())
         };
-        self.stream_merged_reduction(tiles, lower, cutoff, wal_entries, &mut compare)?;
+        Self::stream_merged_reduction(tiles, lower, cutoff, wal_entries, &mut compare)?;
         if let Some(entry) = pending {
             entry?;
             return Err(io::Error::new(io::ErrorKind::InvalidData, "compacted tile contains an extra entry"));
@@ -1996,7 +2308,6 @@ impl Engine {
     /// and was verified when the floor-spanning tile was first published; see the
     /// trust boundary in FDBTILE2.md/FDBTILE3.md).
     fn verify_compacted_against_wal(
-        &self,
         tile: &Tile,
         wal_entries: &BTreeMap<Vec<u8>, Vec<u8>>,
         lower: u64,
@@ -2853,6 +3164,96 @@ fn wal_digest_record(hash: &mut Sha256, last: &mut u64, payload: &[u8], csn: u64
 fn wal_digest_finish(hash: Sha256, last: u64, cutoff: u64, floor: u64) -> io::Result<[u8; 32]> {
     if cutoff > last.max(floor) { return Err(io::Error::new(io::ErrorKind::InvalidData, "tile cutoff exceeds WAL")); }
     Ok(hash.finalize().into())
+}
+
+/// Build ONE compaction replacement tile from a self-contained [`CompactionJob`],
+/// entirely off the live engine: open the named input tiles read-only, replay the
+/// WAL suffix bounded by the job's captured valid length, stream the same
+/// reduction [`Engine::write_compacted_tile`] performs, sync the output tile, and
+/// run both fail-closed verification passes. Returns the replacement's identity
+/// and phase split. Nothing here touches the manifest or the engine's in-memory
+/// tile list; the caller applies the result with [`Engine::apply_compaction_job`].
+///
+/// The output tile's directory entry is deliberately NOT parent-directory-synced
+/// here: the apply side installs the flip lazily and the next durable manifest
+/// publish (checkpoint/rotation) makes both the entry and the flip durable, at
+/// which point the tile becomes referenced. A crash before then reverts to the
+/// previous durable root, whose tiles are all still present (the lazy apply never
+/// unlinks), so compaction is only ever lost, never corrupted.
+pub fn build_compaction_job(dir: &Path, job: &CompactionJob) -> io::Result<CompactionOutcome> {
+    let t0 = Instant::now();
+    let (records, _) = wal::replay_file(&job.wal_file, job.wal_valid_len)?;
+    // The republish guard, identical to the synchronous path: the WAL suffix the
+    // worker reads must end at the CSN the engine had served when the job was
+    // created. `wal_csn == 0` (never committed) skips the comparison.
+    let wal_max = records.last().map(|r| decode_payload(r).map(|v| v.0)).transpose()?.unwrap_or(0);
+    if wal_max != job.wal_max_expected && job.wal_csn != 0 {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "WAL differs from serving state"));
+    }
+    let digest = wal_digest(&records, job.cutoff, job.wal_floor)?;
+    // Source (b): the retained WAL suffix inside `(lower, cutoff]`, key-ordered.
+    let mut wal_entries: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+    for payload in &records {
+        let (csn, _, ops) = decode_payload(payload)?;
+        if csn > job.lower && csn <= job.cutoff {
+            for op in &ops {
+                let (key, value) = op_kv(op, csn, job.key_encoding);
+                if job.region.as_deref().is_some_and(|r| keys::region_prefix(&key) != Some(r)) { continue; }
+                wal_entries.insert(key, value);
+            }
+        }
+    }
+    // Source (a): the run's input tiles, opened read-only by name.
+    let mut tiles: Vec<TileHandle> = Vec::with_capacity(job.input_names.len());
+    for name in &job.input_names {
+        let tile = Tile::open(&dir.join(name))?;
+        tiles.push(TileHandle { tile, name: name.clone() });
+    }
+    let refs: Vec<&TileHandle> = tiles.iter().collect();
+    let expected: u64 = refs.iter().fold(wal_entries.len() as u64, |acc, t| acc.saturating_add(t.tile.count()));
+    let mut bloom = (job.bloom_bits_per_key > 0)
+        .then(|| BloomBuilder::new(expected, job.bloom_bits_per_key as u32));
+    let path = dir.join(&job.output_name);
+    let mut writer = TileWriter::new(&path, job.cutoff, &digest, job.page_size)?;
+    Engine::stream_merged_reduction(&refs, job.lower, job.cutoff, &wal_entries, |key, value| {
+        writer.push(key, value)?;
+        if let Some(bloom) = bloom.as_mut() {
+            if let Some(prefix) = unique_prefix_of(key) { bloom.insert(prefix); }
+        }
+        Ok(())
+    })?;
+    if let Some(bloom) = bloom { writer.set_bloom(bloom.finish())?; }
+    let stream_us = t0.elapsed().as_micros() as u64;
+    let finish_t0 = Instant::now();
+    let tile = writer.finish()?;
+    let finish_us = finish_t0.elapsed().as_micros() as u64;
+    let verify_t0 = Instant::now();
+    Engine::verify_compacted_tile(&tile, &refs, job.lower, &wal_entries, job.cutoff)?;
+    Engine::verify_compacted_against_wal(&tile, &wal_entries, job.lower.max(job.wal_floor), job.cutoff)?;
+    let verify_us = verify_t0.elapsed().as_micros() as u64;
+    let output_bytes = fs::metadata(&path)?.len();
+    let input_bytes = refs.iter().fold(0u64, |acc, t| {
+        acc.saturating_add(fs::metadata(dir.join(&t.name)).map(|m| m.len()).unwrap_or(0))
+    });
+    let elapsed_us = t0.elapsed().as_micros() as u64;
+    Ok(CompactionOutcome {
+        name: job.output_name.clone(),
+        cutoff: job.cutoff,
+        digest: *tile.digest(),
+        input_names: job.input_names.clone(),
+        region: job.region.clone(),
+        input_bytes,
+        output_bytes,
+        stats: CompactionStats {
+            input_bytes,
+            output_bytes,
+            elapsed_us,
+            build: CompactionBuildStats { stream_us, finish_us, verify_us },
+            dir_sync_us: 0,
+            manifest_us: 0,
+            unlink_us: 0,
+        },
+    })
 }
 
 // Directory a manifest or tile name resolves against; empty parents mean ".".
