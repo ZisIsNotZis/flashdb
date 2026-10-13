@@ -88,7 +88,7 @@ run-level ``compaction_bytes / tile_bytes_before``.
 The bandit
 ----------
 :class:`LayoutLearner` is **UCB1**, in its minimisation form (a lower confidence
-bound on the region's cost: ``mean_cost - c * sqrt(ln(N) / n)``, pulled arm =
+bound on the region's cost: ``median_cost - c * sqrt(ln(N) / n)``, pulled arm =
 ``argmin``). UCB1 is chosen over epsilon-greedy because it needs **no RNG in the
 decision path**: for a fixed sequence of observed rewards the arm sequence is
 fixed, which the project's determinism/replay discipline requires, and its
@@ -97,6 +97,15 @@ regret is logarithmic rather than linear. The one place a seed is used is exact
 the candidate set); this never changes a gated decision, only which of two
 equally-scored candidates is picked.
 
+The cost evidence is **per-request** cost (total window cost divided by the
+region's request count; the absolute write cost for a request-free region), so
+a rate-ladder step -- which scales the request count and the service term
+together -- does not look like a cost change. Each arm is scored by the
+**median** of its per-request samples rather than the mean, so a one-window
+latency or compaction spike on a shared device cannot move an argmin; this is
+the robust (heavy-tail-safe) form of the bandit, and it is what lets a
+no-locality workload settle instead of churn.
+
 Three guards sit on top of the bandit:
 
 * **minimum-sample gate** -- a candidate cannot be adopted as the incumbent
@@ -104,9 +113,13 @@ Three guards sit on top of the bandit:
   candidate has too). Until then the learner is in a bounded, named *burn-in*:
   each candidate is sampled ``min_samples`` windows, then the gate opens.
 * **hysteresis** -- once the gate is open, the incumbent is replaced only when a
-  challenger's mean cost beats it by more than ``margin`` (relative) for
-  ``stability_window`` consecutive steps. A one-window noise spike therefore
-  cannot move the policy.
+  challenger's median cost beats it by more than ``margin`` (default ``0.5`` =
+  50% relative) for ``stability_window`` consecutive steps. A one-window noise
+  spike therefore cannot move the policy, and neither can the ~30% per-window
+  cost noise of a shared device: the minimum improvement a challenger must show
+  sits above the noise floor, so a no-locality workload settles while a genuine
+  gradient (the win workload's per-region spread, or the drift workload's shape
+  change) still switches.
 * **p99 hard constraint** -- a window whose region ``p99_ns`` exceeds the
   region's declared ceiling is an *invalid* window (objective v1's validity
   rule): it is not counted as reward evidence, and the candidate that produced
@@ -115,11 +128,14 @@ Three guards sit on top of the bandit:
 
 Non-stationarity (drift) is what makes the learner adapt and the
 ``flashdb-static-derived`` control not. **Drift trigger (per region):** the
-active candidate's window cost deviates from the region's reference cost (set
-when the gate first opened) by more than ``drift_margin`` (default ``0.5`` =
-50% relative) for ``drift_windows`` (default 2) consecutive windows (the
-pre-registration's drift workload changes the access shape, so the active
-region's cost moves).
+active candidate's per-request window cost deviates from the region's reference
+cost (the active arm's median per-request cost, set when the gate first opened)
+by more than ``drift_margin`` (default ``2.0`` = 200% relative) for
+``drift_windows`` (default 2) consecutive windows (the pre-registration's drift
+workload changes the access shape, so the active region's cost moves). The
+200% floor is set above the device-saturation latency rise the rate ladder
+produces at high offered rungs (2-9x per-request cost on a shared box): that is
+a *load* artifact, not an access-shape change, and must not re-open exploration.
 
 The response is **targeted**. First, it is scoped to the region that triggered:
 only that region re-explores, and every other region keeps its committed
@@ -408,7 +424,12 @@ def _seeded_order(candidates: tuple[LayoutCandidate, ...], seed: int) -> dict[La
 @dataclass
 class _Arm:
     n: int = 0
-    sum_cost: float = 0.0
+    # Cost evidence is per-request cost where the region served requests (load-invariant: a rate
+    # step scales count and total cost together, so their ratio is unchanged) and the absolute
+    # write cost where it did not (a request-free region's only cost is its reorganisation). The
+    # bandit compares MEDIANS of these samples -- not means -- so a one-window latency/compaction
+    # spike on a shared device cannot move an argmin and make the learner churn on noise.
+    cost_samples: list[float] = field(default_factory=list)
     # Reorganisation evidence is a STABLE property of a candidate (how many bytes its merges
     # write per window), unlike the non-stationary cost evidence, so it is NOT reset by a drift
     # restart -- otherwise a restart would forget that a candidate is expensive and re-admit it.
@@ -417,8 +438,15 @@ class _Arm:
     violating: bool = False       # proved to break this region's p99 ceiling
 
     @property
-    def mean_cost(self) -> float:
-        return self.sum_cost / self.n if self.n else math.inf
+    def median_cost(self) -> float:
+        """Median per-request cost across the sampled windows (``inf`` if unsampled)."""
+        if not self.cost_samples:
+            return math.inf
+        samples = sorted(self.cost_samples)
+        mid = len(samples) // 2
+        if len(samples) % 2:
+            return samples[mid]
+        return (samples[mid - 1] + samples[mid]) / 2.0
 
     @property
     def mean_compaction_bytes(self) -> float:
@@ -463,11 +491,11 @@ class LayoutLearner:
     candidates: tuple[LayoutCandidate, ...] = DEFAULT_CANDIDATES
     lambda_ns_per_byte: float = DEFAULT_LAMBDA_NS_PER_BYTE
     min_samples: int = 3
-    margin: float = 0.05
+    margin: float = 0.5
     stability_window: int = 2
     exploration_c: float = math.sqrt(2)
     ceilings_ns: Mapping[str, float] = field(default_factory=dict)
-    drift_margin: float = 0.5
+    drift_margin: float = 2.0
     drift_windows: int = 2
     # Targeted drift response: re-explore the incumbent plus the best K-1
     # challengers (None = the full candidate set, the correctness fallback).
@@ -580,11 +608,14 @@ class LayoutLearner:
             st.arms[candidate].violating = True
             return
         cost = region_cost_ns(stats, self.lambda_ns_per_byte)
+        # Drift is detected on PER-REQUEST cost (load-invariant): a rate-ladder step scales
+        # `count` and `cost` together, so only a genuine access-shape change moves this signal.
         if candidate == st.active and self._in_exploitation(st) and st.reference_cost is not None:
-            self._note_deviation(st, cost)
+            if stats.count > 0:
+                self._note_deviation(st, cost / stats.count)
         arm = st.arms[candidate]
         arm.n += 1
-        arm.sum_cost += cost
+        arm.cost_samples.append(cost / stats.count if stats.count > 0 else cost)
         arm.compaction_n += 1
         arm.sum_compaction_bytes += stats.compaction_bytes
 
@@ -691,17 +722,18 @@ class LayoutLearner:
         if not self._in_exploitation(st):
             return  # min-sample gate: a challenger (or the incumbent) is short of evidence
         if st.reference_cost is None:
-            st.reference_cost = st.arms[st.active].mean_cost
+            st.reference_cost = st.arms[st.active].median_cost
         incumbent = st.active
-        incumbent_cost = st.arms[incumbent].mean_cost
+        incumbent_cost = st.arms[incumbent].median_cost
         others = [c for c in available if c != incumbent]
         if not others:
             self._reset_gate(st)
             return
-        # UCB1 names the challenger; the margin below compares MEANS, so the
-        # exploration bonus can never on its own move the policy.
+        # UCB1 names the challenger; the margin below compares MEDIANS (robust,
+        # load-invariant), so the exploration bonus can never on its own move the
+        # policy and a rate step or one-window spike cannot fabricate an improvement.
         challenger = self._ucb_pick(st, others)
-        improvement = (incumbent_cost - st.arms[challenger].mean_cost) / max(abs(incumbent_cost), 1.0)
+        improvement = (incumbent_cost - st.arms[challenger].median_cost) / max(abs(incumbent_cost), 1.0)
         if improvement > self.margin:
             if st.pending == challenger:
                 st.pending_streak += 1
@@ -725,7 +757,7 @@ class LayoutLearner:
     def _initial_pick(self, st: _RegionState, available: list[LayoutCandidate]) -> LayoutCandidate:
         gated = [c for c in available if st.arms[c].n >= self.min_samples]
         if gated:
-            return min(gated, key=lambda c: (st.arms[c].mean_cost, self._tie[c]))
+            return min(gated, key=lambda c: (st.arms[c].median_cost, self._tie[c]))
         return min(available, key=lambda c: (st.arms[c].n, self._tie[c]))
 
     def _ucb_pick(self, st: _RegionState, eligible: list[LayoutCandidate]) -> LayoutCandidate:
@@ -739,14 +771,14 @@ class LayoutLearner:
         """
         total = sum(st.arms[c].n for c in eligible)
         log_total = math.log(max(total, 2))
-        scale = max((st.arms[c].mean_cost for c in eligible if st.arms[c].n > 0), default=1.0)
+        scale = max((st.arms[c].median_cost for c in eligible if st.arms[c].n > 0), default=1.0)
         scale = max(scale, 1.0)
 
         def lcb(c: LayoutCandidate) -> float:
             arm = st.arms[c]
             if arm.n < self.min_samples:
                 return -math.inf
-            return arm.mean_cost - self.exploration_c * scale * math.sqrt(log_total / arm.n)
+            return arm.median_cost - self.exploration_c * scale * math.sqrt(log_total / arm.n)
 
         return min(eligible, key=lambda c: (lcb(c), self._tie[c]))
 
@@ -773,7 +805,7 @@ class LayoutLearner:
         """
         for candidate in self._reexplore_targets(st):
             st.arms[candidate].n = 0
-            st.arms[candidate].sum_cost = 0.0
+            st.arms[candidate].cost_samples.clear()
         self._reset_gate(st)
         st.reference_cost = None
         st.deviation_streak = 0
@@ -796,7 +828,7 @@ class LayoutLearner:
             ordered.append(st.active)
         ordered.extend(sorted(
             (c for c in admissible if c != st.active),
-            key=lambda c: (st.arms[c].mean_cost, self._tie[c]),
+            key=lambda c: (st.arms[c].median_cost, self._tie[c]),
         ))
         return set(ordered[:k])
 

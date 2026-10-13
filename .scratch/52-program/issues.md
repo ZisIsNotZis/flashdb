@@ -522,3 +522,21 @@ No failures, no conflicts.
   package. No point-lookup regression mechanism (scan warm is inert for adversarial shapes) and no
   read/write amplification blowup (+2.3% device reads). 293 Rust / 132 Python tests green; 0 build
   warnings; `git diff --check` silent.
+
+## wave9 WP-J dispatch record (learner churn fix)
+
+- Timestamp: 2026-10-14T02:41:00+08:00.
+- Action: dispatched work package J "stop the learner churning on the adversarial-uniform workload
+  (T2)" to the single-writer `wave9/churn` worktree. Contract, quantified diagnosis, design +
+  rejected alternatives, change, tests, verbatim gates, before/after tables, both judging views,
+  acceptance verdict and residual items are in `.scratch/61-learner-churn/issues.md` (checkpoint
+  committed before implementing; the fix and the six final-config run artifacts committed after).
+- Change (harness only, no engine code): the learner's cost evidence is now per-request and
+  median-scored (load-invariant and spike-robust), and the switch/drift thresholds are raised to
+  50% / 200% above the measured noise floor. Result (pilot-grade, 2 seeds + 1 repeat, 12.25x c51,
+  shared box load avg 4-5): the pre-registration's disqualifying rung-50 lag churn is gone
+  (learned 0-1/40 vs the pre-fix 8-9/40, matching declared), learned's adversarial reorg fell from
+  3.6-4.4x to 0.19-0.84x declared on 2 of 3 runs (one 2.40x outlier from a late-rung
+  device-saturation drift episode — the exact remaining cause, labelled not-resolved); on win the
+  learner still adapts (12/12 regions non-default both seeds, decision count > 0). Gates: 291 Rust
+  + 134 Python tests green, cargo build 0 warnings, `git diff --check` silent.
