@@ -614,6 +614,13 @@ pub struct Engine {
     /// whole-keyspace tile ([`RegionMode::Global`], the default). Not persisted:
     /// recovery derives each tile's region from the tile's first key.
     region_mode: RegionMode,
+    /// The key spelling new keys are written with. [`keys::KeyEncoding::FamilyFirst`]
+    /// (the default) reproduces today's keyspace exactly; [`keys::KeyEncoding::EntityFirst`]
+    /// writes one entity's `P`/`U`/`R` keys adjacently so a region-partitioned
+    /// publish can co-locate them in one tile. Not persisted (like `region_mode`
+    /// and `LayoutPolicy`): recovery must be told the encoding used to write
+    /// (slice 50), and reads accept both spellings regardless.
+    key_encoding: keys::KeyEncoding,
     /// Per-pattern latency telemetry (slice 16). Observational only: never
     /// persisted, never read on the correctness path. `RefCell` is required
     /// because read paths take `&self`; it is the only interior mutability here.
@@ -679,13 +686,22 @@ impl Engine {
             group_pending: false,
             layout: LayoutPolicy::declared_default(),
             region_mode: RegionMode::Global,
+            key_encoding: keys::KeyEncoding::FamilyFirst,
             metrics: RefCell::new(Metrics::new()),
         })
     }
 
-    /// Recover wholly from WAL; does not automatically discover tile candidates.
+    /// Recover wholly from WAL under the default [`keys::KeyEncoding::FamilyFirst`];
+    /// does not automatically discover tile candidates.
     pub fn open(wal_path: impl AsRef<Path>) -> io::Result<Engine> {
-        Self::open_impl(wal_path.as_ref(), Vec::new(), None)
+        Self::open_impl(wal_path.as_ref(), Vec::new(), None, keys::KeyEncoding::FamilyFirst)
+    }
+
+    /// [`Engine::open`] with an explicit key encoding. The WAL holds ops, not
+    /// keys, so replay re-encodes them and must use the same spelling the data
+    /// was written with; the encoding is not persisted.
+    pub fn open_with_encoding(wal_path: impl AsRef<Path>, encoding: keys::KeyEncoding) -> io::Result<Engine> {
+        Self::open_impl(wal_path.as_ref(), Vec::new(), None, encoding)
     }
 
     /// Explicit prototype recovery: a missing, corrupt or WAL-mismatched tile fails
@@ -704,7 +720,7 @@ impl Engine {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "tile path must be a plain filename inside the engine directory"));
         }
         let tile = Tile::open(tile_path)?;
-        Self::open_impl(wal_path.as_ref(), vec![TileHandle { tile, name }], None)
+        Self::open_impl(wal_path.as_ref(), vec![TileHandle { tile, name }], None, keys::KeyEncoding::FamilyFirst)
     }
 
     /// Durable-root recovery: select the highest valid manifest page in `dir`, open
@@ -723,6 +739,14 @@ impl Engine {
     /// dedup is built from suffix records only (pre-rotation block ids are
     /// forgotten by design — a published tile covers their state).
     pub fn open_discover(dir: impl AsRef<Path>) -> io::Result<Engine> {
+        Self::open_discover_with_encoding(dir, keys::KeyEncoding::FamilyFirst)
+    }
+
+    /// [`Engine::open_discover`] with an explicit key encoding. Required to
+    /// reopen a database whose WAL records were written under
+    /// [`keys::KeyEncoding::EntityFirst`]: replay re-encodes the ops, so the
+    /// encoding is a recovery input, not a persisted fact (slice 50).
+    pub fn open_discover_with_encoding(dir: impl AsRef<Path>, encoding: keys::KeyEncoding) -> io::Result<Engine> {
         let dir = dir.as_ref();
         let manifest = Manifest::open(&dir.join(manifest::MANIFEST_NAME))?;
         // The root names the live WAL segment once rotation has happened; before
@@ -744,7 +768,7 @@ impl Engine {
                 tiles.push(TileHandle { tile: opened, name: t.name.clone() });
             }
         }
-        let mut e = Self::open_impl(&dir.join(wal_name), tiles, segment.as_ref().map(|s| s.start_csn))?;
+        let mut e = Self::open_impl(&dir.join(wal_name), tiles, segment.as_ref().map(|s| s.start_csn), encoding)?;
         if let Some(m) = &manifest {
             let cp = m.root().checkpoint;
             match &segment {
@@ -779,7 +803,7 @@ impl Engine {
     /// (their state is durable in the tiles) and cannot be re-verified against
     /// the suffix; tiles above the floor are verified against the above-floor
     /// suffix range exactly as in full replay.
-    fn open_impl(wal_path: &Path, tiles: Vec<TileHandle>, floor: Option<u64>) -> io::Result<Engine> {
+    fn open_impl(wal_path: &Path, tiles: Vec<TileHandle>, floor: Option<u64>, encoding: keys::KeyEncoding) -> io::Result<Engine> {
         // The active list is ordered by `(cutoff, region)` strictly increasing.
         // A whole-keyspace tile spans every region, so for a legacy list the
         // region is constant per tile and this reduces to strictly increasing
@@ -822,7 +846,7 @@ impl Engine {
             }
             max_handle = max_handle.max(ops.iter().map(op_handle).max().unwrap_or(0));
             let destination = if rec_csn <= covered_through { &mut covered } else { &mut mt };
-            for op in &ops { apply_op(destination, op, rec_csn); }
+            for op in &ops { apply_op(destination, op, rec_csn, encoding); }
             csn = csn.max(rec_csn);
             dedup.insert(block_id, rec_csn);
         }
@@ -863,7 +887,7 @@ impl Engine {
         drop(records);
         drop(covered);
         Self::trim_retained_heap();
-        Ok(Engine { wal, mt, tiles, wal_path: wal_path.to_path_buf(), dir: parent_dir(wal_path), manifest: None, segment: None, segment_suffix_csn: csn, wal_detached: false, csn, dedup, max_handle, group_open: false, group_pending: false, layout: LayoutPolicy::declared_default(), region_mode: RegionMode::Global, metrics: RefCell::new(Metrics::new()) })
+        Ok(Engine { wal, mt, tiles, wal_path: wal_path.to_path_buf(), dir: parent_dir(wal_path), manifest: None, segment: None, segment_suffix_csn: csn, wal_detached: false, csn, dedup, max_handle, group_open: false, group_pending: false, layout: LayoutPolicy::declared_default(), region_mode: RegionMode::Global, key_encoding: encoding, metrics: RefCell::new(Metrics::new()) })
     }
 
     /// The CSN floor below which the active WAL file holds no records: the
@@ -1019,7 +1043,7 @@ impl Engine {
             wal_digest_record(&mut hash, &mut last_csn, payload, csn, cutoff)?;
             if csn <= cutoff && csn > lower {
                 for op in &ops {
-                    let (key, value) = op_kv(op, csn);
+                    let (key, value) = op_kv(op, csn, self.key_encoding);
                     wal_entries.insert(key, value);
                 }
             }
@@ -1749,6 +1773,14 @@ impl Engine {
         self.tiles.iter().map(|t| tile_first_region(t).map(keys::region_name)).collect()
     }
 
+    /// Each active tile's stored-key fence range `(first_key, last_key)` in list
+    /// order (inspection/measurement hook). `None` for an empty tile or an
+    /// untrusted final block. Lets a caller place a key in the tile that owns it
+    /// without reading the tile body.
+    pub fn active_tile_key_ranges(&self) -> Vec<(Option<Vec<u8>>, Option<Vec<u8>>)> {
+        self.tiles.iter().map(|t| (t.tile.first_key().map(<[u8]>::to_vec), t.tile.last_key().map(<[u8]>::to_vec))).collect()
+    }
+
     /// Sum of the active tiles' on-disk file lengths (inspection/benchmark hook).
     /// Unlike a directory glob this counts only manifest-referenced tiles, so it
     /// is not inflated by orphaned files a crash or failed compaction left behind.
@@ -1806,7 +1838,7 @@ impl Engine {
             let (csn, _, ops) = decode_payload(payload)?;
             if csn > lower && csn <= cutoff {
                 for op in &ops {
-                    let (key, value) = op_kv(op, csn);
+                    let (key, value) = op_kv(op, csn, self.key_encoding);
                     if region.is_some_and(|r| keys::region_prefix(&key) != Some(r)) { continue; }
                     wal_entries.insert(key, value);
                 }
@@ -2060,6 +2092,18 @@ impl Engine {
     /// The engine's current tile write mode (inspection/measurement hook).
     pub fn region_mode(&self) -> RegionMode { self.region_mode }
 
+    /// Select the key spelling new keys are written with (slice 50). The default
+    /// [`keys::KeyEncoding::FamilyFirst`] reproduces today's keyspace byte for
+    /// byte. [`keys::KeyEncoding::EntityFirst`] writes one entity's `P`/`U`/`R`
+    /// keys adjacently, so under [`RegionMode::PerRegion`] the three land in one
+    /// tile. Not persisted: reads accept both spellings, but WAL replay
+    /// re-encodes ops, so a later reopen must pass the same encoding to
+    /// [`Engine::open_with_encoding`]/[`Engine::open_discover_with_encoding`].
+    pub fn set_key_encoding(&mut self, encoding: keys::KeyEncoding) { self.key_encoding = encoding; }
+
+    /// The engine's current key encoding (inspection/measurement hook).
+    pub fn key_encoding(&self) -> keys::KeyEncoding { self.key_encoding }
+
     // K-way merge of the serving memtable and every published tile, all
     // traversed in global key order. Keys encode CSN descending, so each logical
     // key's versions arrive newest-first and the caller's first visible entry
@@ -2171,7 +2215,7 @@ impl Engine {
         }
         let mut touched: Vec<usize> = Vec::with_capacity(ops.len());
         for op in ops {
-            let (marker, entity) = op_region(op);
+            let (marker, entity) = op_region(op, self.key_encoding);
             let id = self.metrics.borrow_mut().resolve_region_parts(marker, entity);
             let bytes = op_encoded_len(op);
             self.metrics.borrow_mut().region_bytes_written(id, bytes);
@@ -2198,7 +2242,7 @@ impl Engine {
         let mut sample = MetricsSample { metrics: &self.metrics, id, region: metrics::DISABLED, started: t0 };
         check_name(entity)?;
         check_name(field)?;
-        let pfx = keys::reverse_prefix(entity, field, target)?;
+        let pfx = keys::reverse_prefix_with(self.key_encoding, entity, field, target)?;
         let region = self.region_of_prefix(&pfx);
         sample.region = region;
         let mut newest: HashMap<u64, bool> = HashMap::new();
@@ -2220,7 +2264,7 @@ impl Engine {
         let t0 = self.timing();
         let id = self.metrics.borrow_mut().resolve_unique(entity, field);
         let mut sample = MetricsSample { metrics: &self.metrics, id, region: metrics::DISABLED, started: t0 };
-        let pfx = keys::unique_prefix(entity, field, value)?;
+        let pfx = keys::unique_prefix_with(self.key_encoding, entity, field, value)?;
         let region = self.region_of_prefix(&pfx);
         sample.region = region;
         let mut seen = std::collections::HashSet::new();
@@ -2253,7 +2297,7 @@ impl Engine {
         let id = self.metrics.borrow_mut().resolve_primary(entity);
         let mut sample = MetricsSample { metrics: &self.metrics, id, region: metrics::DISABLED, started: t0 };
         check_name(entity)?;
-        let pfx = keys::primary_prefix(entity, handle)?;
+        let pfx = keys::primary_prefix_with(self.key_encoding, entity, handle)?;
         let region = self.region_of_prefix(&pfx);
         sample.region = region;
         let mut result = None;
@@ -2280,7 +2324,7 @@ impl Engine {
         let id = self.metrics.borrow_mut().resolve_scan(entity);
         let mut sample = MetricsSample { metrics: &self.metrics, id, region: metrics::DISABLED, started: t0 };
         check_name(entity)?;
-        let mut prefix = keys::primary_prefix(entity, 0)?;
+        let mut prefix = keys::primary_prefix_with(self.key_encoding, entity, 0)?;
         prefix.truncate(prefix.len() - 8);
         let region = self.region_of_prefix(&prefix);
         sample.region = region;
@@ -2434,7 +2478,7 @@ impl Engine {
                 }
                 Op::PutUnique { entity, field, value, handle }
                 | Op::DelUnique { entity, field, value, handle } => {
-                    let pfx = keys::unique_prefix(entity, field, value)?;
+                    let pfx = keys::unique_prefix_with(self.key_encoding, entity, field, value)?;
                     let entry = touched.entry(pfx).or_insert_with(||
                         (entity.clone(), field.clone(), value.clone(), HashMap::new()));
                     entry.3.insert(*handle, matches!(op, Op::PutUnique { .. }));
@@ -2470,7 +2514,7 @@ impl Engine {
         }
 
         for op in ops {
-            apply_op(&mut self.mt, op, csn);
+            apply_op(&mut self.mt, op, csn, self.key_encoding);
         }
         self.csn = csn;
         // The synced record is now the newest content of the active WAL file
@@ -2592,7 +2636,7 @@ impl Engine {
                         }
                         Op::PutUnique { entity, field, value, handle }
                         | Op::DelUnique { entity, field, value, handle } => {
-                            let pfx = keys::unique_prefix(entity, field, value)?;
+                            let pfx = keys::unique_prefix_with(self.key_encoding, entity, field, value)?;
                             let entry = overlay.entry(pfx).or_insert_with(|| PrefixEffect {
                                 entity: entity.clone(),
                                 field: field.clone(),
@@ -2698,7 +2742,7 @@ impl Engine {
         self.wal.sync()?;
         for &(csn, _block_id, ops) in &pending {
             for op in ops {
-                apply_op(&mut self.mt, op, csn);
+                apply_op(&mut self.mt, op, csn, self.key_encoding);
             }
             self.max_handle = self.max_handle.max(ops.iter().map(op_handle).max().unwrap_or(0));
         }
@@ -2862,26 +2906,42 @@ fn tile_single_region(t: &TileHandle) -> Option<&[u8]> {
 /// is safe to probe for a full unique prefix: a `false` can never hide a stored
 /// key that a probe for that prefix would match.
 fn unique_prefix_of(key: &[u8]) -> Option<&[u8]> {
-    if key.first() != Some(&keys::U) || key.len() < 17 { return None; }
+    if key.len() < 17 || keys::family_of(key) != Some(keys::U) { return None; }
     Some(&key[..key.len() - 16])
 }
 
 /// Whether `prefix` is exactly a full unique-index prefix as
-/// [`keys::unique_prefix`] spells it (`U | entity | 0 | field | 0 | len(4 BE) |
-/// value`, nonempty entity/field, `len` matching the value bytes). The
-/// probe-path bloom reject is gated on this: a primary/reverse prefix or a
-/// partial unique prefix was never inserted into a tile's bloom, so testing it
-/// there could answer `false` for a tile that holds a matching key - a false
-/// negative.
+/// [`keys::unique_prefix`] spells it under either encoding (`U | entity | 0 |
+/// field | 0 | len(4 BE) | value` family-first, or `ENTITY_FIRST | entity | 0 |
+/// U | field | 0 | len(4 BE) | value` entity-first; nonempty entity/field, `len`
+/// matching the value bytes). The probe-path bloom reject is gated on this: a
+/// primary/reverse prefix or a partial unique prefix was never inserted into a
+/// tile's bloom, so testing it there could answer `false` for a tile that holds
+/// a matching key - a false negative.
 fn is_unique_prefix(prefix: &[u8]) -> bool {
-    if prefix.first() != Some(&keys::U) { return false; }
-    let rest = &prefix[1..];
-    let Some(entity_end) = rest.iter().position(|&b| b == 0) else { return false };
-    if entity_end == 0 { return false; }
-    let after_entity = &rest[entity_end + 1..];
-    let Some(field_end) = after_entity.iter().position(|&b| b == 0) else { return false };
-    if field_end == 0 { return false; }
-    let value = &after_entity[field_end + 1..];
+    // `rest` starts at the first still-unconsumed 0-terminated name and `names`
+    // is how many name/0 pairs precede the length-prefixed value: two under
+    // family-first (entity, field), one under entity-first (the entity is
+    // already behind the marker + family byte).
+    let (rest, names) = match prefix.first() {
+        Some(&keys::U) => (&prefix[1..], 2usize),
+        Some(&keys::ENTITY_FIRST) => {
+            let after = &prefix[1..];
+            let Some(z) = after.iter().position(|&b| b == 0) else { return false };
+            if z == 0 { return false; }
+            match after.get(z + 1) {
+                Some(&keys::U) => (&after[z + 2..], 1),
+                _ => return false,
+            }
+        }
+        _ => return false,
+    };
+    let mut value = rest;
+    for _ in 0..names {
+        let Some(name_end) = value.iter().position(|&b| b == 0) else { return false };
+        if name_end == 0 { return false; }
+        value = &value[name_end + 1..];
+    }
     if value.len() < 4 { return false; }
     let value_len = u32::from_be_bytes(value[..4].try_into().unwrap()) as usize;
     value.len() == 4 + value_len
@@ -2897,15 +2957,27 @@ fn op_handle(op: &Op) -> u64 {
     }
 }
 
-/// The `(family marker, entity)` region an op writes to. The marker is the
-/// first byte of the op's encoded key, so the metrics region this resolves to
-/// is exactly the region a probe on that key family/entity serves.
-fn op_region(op: &Op) -> (u8, &[u8]) {
-    match op {
-        Op::PutDoc { entity, .. } | Op::DelDoc { entity, .. } => (keys::P, entity),
-        Op::PutUnique { entity, .. } | Op::DelUnique { entity, .. } => (keys::U, entity),
-        Op::PutReverse { entity, .. } | Op::DelReverse { entity, .. } => (keys::R, entity),
-    }
+/// The `(region marker, entity)` region an op writes to under encoding `enc`. The
+/// marker is the region prefix's first byte (the key's family under
+/// [`keys::KeyEncoding::FamilyFirst`], [`keys::ENTITY_FIRST`] under
+/// [`keys::KeyEncoding::EntityFirst`]), so the metrics region this resolves to is
+/// exactly the region a probe on the same key serves.
+fn op_region(op: &Op, enc: keys::KeyEncoding) -> (u8, &[u8]) {
+    let family = match op {
+        Op::PutDoc { .. } | Op::DelDoc { .. } => keys::P,
+        Op::PutUnique { .. } | Op::DelUnique { .. } => keys::U,
+        Op::PutReverse { .. } | Op::DelReverse { .. } => keys::R,
+    };
+    let marker = match enc {
+        keys::KeyEncoding::FamilyFirst => family,
+        keys::KeyEncoding::EntityFirst => keys::ENTITY_FIRST,
+    };
+    let entity = match op {
+        Op::PutDoc { entity, .. } | Op::DelDoc { entity, .. }
+        | Op::PutUnique { entity, .. } | Op::DelUnique { entity, .. }
+        | Op::PutReverse { entity, .. } | Op::DelReverse { entity, .. } => entity,
+    };
+    (marker, entity)
 }
 
 /// The exact number of bytes one op contributes to `encode_payload`: its type tag
@@ -2923,28 +2995,28 @@ fn op_encoded_len(op: &Op) -> u64 {
     }
 }
 
-fn apply_op(mt: &mut Memtable, op: &Op, csn: u64) {
-    let (key, value) = op_kv(op, csn);
+fn apply_op(mt: &mut Memtable, op: &Op, csn: u64, enc: keys::KeyEncoding) {
+    let (key, value) = op_kv(op, csn, enc);
     mt.apply(key, value);
 }
 
-/// The encoded key/value an op applies at `csn` - the single spelling shared by
-/// [`apply_op`] and compaction's WAL-suffix map.
-fn op_kv(op: &Op, csn: u64) -> (Vec<u8>, Vec<u8>) {
+/// The encoded key/value an op applies at `csn` under encoding `enc` - the
+/// single spelling shared by [`apply_op`] and compaction's WAL-suffix map.
+fn op_kv(op: &Op, csn: u64, enc: keys::KeyEncoding) -> (Vec<u8>, Vec<u8>) {
     match op {
-        Op::PutDoc { entity, handle, doc } => (keys::primary_key(entity, *handle, csn).unwrap(), doc.clone()),
-        Op::DelDoc { entity, handle } => (keys::primary_key(entity, *handle, csn).unwrap(), Vec::new()),
+        Op::PutDoc { entity, handle, doc } => (keys::primary_key_with(enc, entity, *handle, csn).unwrap(), doc.clone()),
+        Op::DelDoc { entity, handle } => (keys::primary_key_with(enc, entity, *handle, csn).unwrap(), Vec::new()),
         Op::PutUnique { entity, field, value, handle } => {
-            (keys::unique_key(entity, field, value, *handle, csn).unwrap(), handle.to_be_bytes().to_vec())
+            (keys::unique_key_with(enc, entity, field, value, *handle, csn).unwrap(), handle.to_be_bytes().to_vec())
         }
         Op::DelUnique { entity, field, value, handle } => {
-            (keys::unique_key(entity, field, value, *handle, csn).unwrap(), Vec::new())
+            (keys::unique_key_with(enc, entity, field, value, *handle, csn).unwrap(), Vec::new())
         }
         Op::PutReverse { entity, field, target, source } => {
-            (keys::reverse_key(entity, field, *target, *source, csn).unwrap(), vec![1])
+            (keys::reverse_key_with(enc, entity, field, *target, *source, csn).unwrap(), vec![1])
         }
         Op::DelReverse { entity, field, target, source } => {
-            (keys::reverse_key(entity, field, *target, *source, csn).unwrap(), Vec::new())
+            (keys::reverse_key_with(enc, entity, field, *target, *source, csn).unwrap(), Vec::new())
         }
     }
 }
