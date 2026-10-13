@@ -2920,6 +2920,11 @@ impl Engine {
         if !self.group_open {
             return Err(io::Error::new(io::ErrorKind::Other, "no commit group is open; begin_group first"));
         }
+        // The synchronous barrier path must not race an overlapped barrier still
+        // in flight: a synchronous `wal.sync()` would cover another group's
+        // appended-but-unacknowledged bytes out of order (and the overlapped path
+        // is the only one allowed to run with barriers in flight).
+        self.ensure_no_pending_barrier("end_group")?;
         let result = if self.group_pending {
             let t0 = Instant::now();
             let r = self.wal.sync();
@@ -2987,38 +2992,52 @@ impl Engine {
             return Err(io::Error::new(io::ErrorKind::Other, "no commit group is open; begin_group first"));
         }
         let owed = self.group_pending;
-        let mut result = Ok(());
         if owed {
             if self.barrier_in_flight >= MAX_PENDING_BARRIERS {
-                // Leave the group open: the caller must drain and retry.
-                result = Err(io::Error::new(io::ErrorKind::Other,
+                // Leave the group OPEN: the caller must drain barriers and retry.
+                // The group's commits are already appended to the WAL and applied
+                // to the memtable, so closing it here would strand them with no
+                // covering barrier owed and no way to retry. This is the one
+                // failure that does NOT close the group.
+                return Err(io::Error::new(io::ErrorKind::Other,
                     "WAL barrier in-flight cap reached; drain barriers before submitting more"));
-            } else if let Err(e) = self.ensure_attached() {
-                result = Err(e);
-            } else if let Err(e) = self.wal.sync_handle().and_then(|handle| {
-                let worker = self.barrier_worker.get_or_insert_with(BarrierWorker::spawn);
-                let job = WalSyncJob {
-                    handle,
-                    #[cfg(test)]
-                    fail: self.wal.take_barrier_error(),
-                };
-                match worker.job_tx.send(job) {
-                    Ok(()) => {
-                        self.barrier_in_flight += 1;
-                        Ok(())
-                    }
-                    Err(_) => {
-                        self.wal.poison();
-                        Err(io::Error::new(io::ErrorKind::Other, "WAL barrier worker disconnected"))
-                    }
-                }
-            }) {
-                result = Err(e);
+            }
+            let submitted = self.submit_overlapped_barrier();
+            self.group_open = false;
+            self.group_pending = false;
+            submitted?;
+            Ok(true)
+        } else {
+            self.group_open = false;
+            self.group_pending = false;
+            Ok(false)
+        }
+    }
+
+    /// Enqueue the open group's WAL barrier on the FIFO worker and increment
+    /// `barrier_in_flight`. Any failure poisons the WAL (or leaves it detached)
+    /// so the caller fails closed exactly like a failed synchronous barrier; the
+    /// caller still closes the group, because the poisoned writer refuses every
+    /// further commit until reopen.
+    fn submit_overlapped_barrier(&mut self) -> io::Result<()> {
+        self.ensure_attached()?;
+        let handle = self.wal.sync_handle()?;
+        let worker = self.barrier_worker.get_or_insert_with(BarrierWorker::spawn);
+        let job = WalSyncJob {
+            handle,
+            #[cfg(test)]
+            fail: self.wal.take_barrier_error(),
+        };
+        match worker.job_tx.send(job) {
+            Ok(()) => {
+                self.barrier_in_flight += 1;
+                Ok(())
+            }
+            Err(_) => {
+                self.wal.poison();
+                Err(io::Error::new(io::ErrorKind::Other, "WAL barrier worker disconnected"))
             }
         }
-        self.group_open = false;
-        self.group_pending = false;
-        result.map(|()| owed)
     }
 
     /// Number of submitted overlapped barriers whose completion has not yet been
@@ -4116,6 +4135,58 @@ mod tests {
         e.begin_group().unwrap();
         assert!(e.commit_block_grouped(b"b3", &[Op::PutDoc { entity: b"E".to_vec(), handle: 4, doc: b"doc4".to_vec() }]).is_err(),
             "the writer is poisoned after the failing barrier");
+        remove(&p);
+    }
+
+    /// `submit_group` at the in-flight cap must fail closed WITHOUT closing the
+    /// group, so the caller can drain barriers and retry the SAME group: the
+    /// group's commits are already appended to the WAL and applied, and closing
+    /// it would strand them with no covering barrier owed and no way to retry.
+    #[test]
+    fn submit_group_at_the_in_flight_cap_leaves_the_group_open_for_retry() {
+        let p = tmp("overlapped_cap.wal");
+        let mut e = Engine::create(&p).unwrap();
+        for i in 0..MAX_PENDING_BARRIERS {
+            e.begin_group().unwrap();
+            e.commit_block_grouped(format!("cap{i}").as_bytes(),
+                &[Op::PutDoc { entity: b"E".to_vec(), handle: (i as u64) + 1, doc: b"d".to_vec() }]).unwrap();
+            assert!(e.submit_group().unwrap(), "barrier {i} submits below the cap");
+        }
+        assert_eq!(e.pending_barriers(), MAX_PENDING_BARRIERS);
+
+        e.begin_group().unwrap();
+        e.commit_block_grouped(b"blocked",
+            &[Op::PutDoc { entity: b"E".to_vec(), handle: 65, doc: b"d".to_vec() }]).unwrap();
+        assert!(e.submit_group().is_err(), "the cap reached is a fail-closed error");
+        assert!(e.group_open(), "the group stays open so the caller can drain and retry");
+
+        for _ in 0..MAX_PENDING_BARRIERS {
+            assert!(e.wait_group_barrier().is_ok(), "each earlier barrier completes in order");
+        }
+        assert_eq!(e.pending_barriers(), 0);
+        assert!(e.submit_group().unwrap(), "the retained group submits after the drain");
+        assert!(e.wait_group_barrier().is_ok());
+        assert_eq!(e.pending_barriers(), 0);
+        remove(&p);
+    }
+
+    /// The synchronous `end_group` barrier must refuse while an overlapped
+    /// barrier is still in flight: a synchronous `wal.sync()` would cover
+    /// another group's appended-but-unacknowledged bytes out of order.
+    #[test]
+    fn end_group_refuses_while_an_overlapped_barrier_is_in_flight() {
+        let p = tmp("end_group_guard.wal");
+        let mut e = Engine::create(&p).unwrap();
+        e.begin_group().unwrap();
+        e.commit_block_grouped(b"o", &[Op::PutDoc { entity: b"E".to_vec(), handle: 1, doc: b"d".to_vec() }]).unwrap();
+        assert!(e.submit_group().unwrap());
+        assert_eq!(e.pending_barriers(), 1);
+
+        e.begin_group().unwrap();
+        e.commit_block_grouped(b"s", &[Op::PutDoc { entity: b"E".to_vec(), handle: 2, doc: b"d".to_vec() }]).unwrap();
+        assert!(e.end_group().is_err(), "end_group refuses a barrier in flight");
+
+        assert!(e.wait_group_barrier().is_ok(), "the overlapped barrier still completes");
         remove(&p);
     }
 
