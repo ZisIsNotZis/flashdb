@@ -10,6 +10,7 @@
 //! authoritative read still runs on the request path with newest-first
 //! memtable-over-tile precedence.
 
+use std::collections::HashSet;
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
@@ -19,7 +20,7 @@ use std::time::Duration;
 use serde_json::Value;
 
 use crate::keys;
-use crate::request::request_read_lookups;
+use crate::request::{request_read_lookups, request_scan_entities};
 use crate::tile::Tile;
 
 /// How many requests ahead of the pacer's dispatched position the worker keeps
@@ -95,6 +96,41 @@ impl TileReadView {
         }
         Ok(())
     }
+
+    /// Warm every data block the authoritative
+    /// [`crate::engine::Engine::scan_primary`] of `entity` would read (the whole
+    /// primary prefix). Memoized per snapshot so a full-entity scan is warmed
+    /// once per published tile set, not once per scan request — without the memo
+    /// the worker would re-scan the entity on every movement scan and turn
+    /// read-ahead into a second full-scan stream. `state` survives worker ticks
+    /// and refreshes; a new snapshot resets the memo.
+    fn warm_scan_prefix(&self, entity: &[u8], state: &mut ScanWarmState) -> io::Result<bool> {
+        if !Arc::ptr_eq(&self.tiles, &state.tiles) {
+            state.tiles = Arc::clone(&self.tiles);
+            state.warmed.clear();
+        }
+        if !state.warmed.insert(entity.to_vec()) {
+            return Ok(false);
+        }
+        // The exact prefix the authoritative scan walks: the entity's whole
+        // primary range (marker | entity | 0), not any single handle.
+        let mut prefix = keys::primary_prefix_with(self.key_encoding, entity, 0)?;
+        prefix.truncate(prefix.len() - 8);
+        for t in self.tiles.iter() {
+            if !t.could_contain_prefix(&prefix) { continue; }
+            let mut cursor = t.prefix_cursor(&prefix)?;
+            while cursor.next()?.is_some() {}
+        }
+        Ok(true)
+    }
+}
+
+/// Memoizes which entity prefixes have already been warmed for the current tile
+/// snapshot. The worker owns one across ticks; a snapshot change (publish or
+/// compaction replaced tiles) resets it on the next scan warm.
+struct ScanWarmState {
+    tiles: Arc<Vec<Arc<Tile>>>,
+    warmed: HashSet<Vec<u8>>,
 }
 
 /// The driver's handle to the read-ahead worker. Dropping it disconnects the
@@ -145,6 +181,7 @@ fn worker(
 ) {
     let total = lines.len() as u64;
     let mut warm_index: u64 = 0;
+    let mut scan_warm = ScanWarmState { tiles: Arc::new(Vec::new()), warmed: HashSet::new() };
     loop {
         // Adopt any pending tile snapshot before warming against it.
         loop {
@@ -163,6 +200,11 @@ fn worker(
                     // still reports the real error when it runs.
                     let _ = view.warm_lookup(lookup.entity.as_bytes(), lookup.field.as_bytes(), &lookup.value);
                 }
+                for entity in request_scan_entities(&req) {
+                    // Warm and discard; memoized per snapshot so a full-entity
+                    // scan is warmed once per tile set, not once per scan request.
+                    let _ = view.warm_scan_prefix(entity.as_bytes(), &mut scan_warm);
+                }
             }
             warm_index += 1;
             // Pace the warm: spread the block reads over time instead of
@@ -180,8 +222,11 @@ fn worker(
 
 #[cfg(test)]
 mod tests {
+    use super::ScanWarmState;
     use crate::engine::{Engine, Op};
+    use std::collections::HashSet;
     use std::path::PathBuf;
+    use std::sync::Arc;
 
     fn tmp_dir(name: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!(
@@ -233,6 +278,29 @@ mod tests {
         );
         view.warm_lookup(b"E", b"u", b"a1").unwrap();
         view.warm_primary(b"E", 1).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn scan_prefix_warm_is_memoized_per_snapshot_and_reads_the_whole_entity() {
+        let dir = tmp_dir("scanwarm");
+        let mut e = Engine::create(dir.join("data.wal")).unwrap();
+        e.commit_block(b"t1", &[
+            Op::PutDoc { entity: b"StockMovement".to_vec(), handle: 1, doc: b"{\"order_no\":\"O1\",\"movement_no\":\"M1\"}".to_vec() },
+            Op::PutDoc { entity: b"StockMovement".to_vec(), handle: 2, doc: b"{\"order_no\":\"O2\",\"movement_no\":\"M2\"}".to_vec() },
+        ]).unwrap();
+        e.publish_tile(dir.join("m1.tile"), 1).unwrap();
+
+        let mut state = ScanWarmState { tiles: Arc::new(Vec::new()), warmed: HashSet::new() };
+        let view = e.tile_read_view();
+        assert!(view.warm_scan_prefix(b"StockMovement", &mut state).unwrap(), "first warm does work");
+        assert!(!view.warm_scan_prefix(b"StockMovement", &mut state).unwrap(), "same snapshot is memoized");
+
+        // A refreshed snapshot is a new Arc identity, so the memo resets and the
+        // (now slightly newer) entity is warmed again exactly once.
+        let view2 = e.tile_read_view();
+        assert!(view2.warm_scan_prefix(b"StockMovement", &mut state).unwrap(), "a new snapshot re-warms");
+        assert!(!view2.warm_scan_prefix(b"StockMovement", &mut state).unwrap());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
