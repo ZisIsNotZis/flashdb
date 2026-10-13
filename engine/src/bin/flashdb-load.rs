@@ -123,6 +123,12 @@ struct Args {
     rotate_bytes: Option<u64>,
     region_mode: Option<RegionMode>,
     compact_bytes: Option<u64>,
+    /// Host-stall control (slice 55): `--dry-run` replaces a request's engine
+    /// execution with a bounded busy-wait (`--dry-run-busy-us`) after parsing
+    /// the trace line, so the pacer/window bookkeeping is exercised with no
+    /// engine I/O (no reads, writes, or fdatasync).
+    dry_run: bool,
+    dry_run_busy_us: u64,
 }
 
 fn parse_args(argv: Vec<String>) -> Result<Args, String> {
@@ -149,6 +155,8 @@ fn parse_args(argv: Vec<String>) -> Result<Args, String> {
         rotate_bytes: None,
         region_mode: None,
         compact_bytes: None,
+        dry_run: false,
+        dry_run_busy_us: 0,
     };
     let mut i = 3;
     while i < argv.len() {
@@ -223,6 +231,13 @@ fn parse_args(argv: Vec<String>) -> Result<Args, String> {
                     .parse().map_err(|_| "--compact-bytes must be a positive integer")?;
                 if n == 0 { return Err("--compact-bytes must be a positive integer".into()); }
                 args.compact_bytes = Some(n);
+                i += 2;
+            }
+            "--dry-run" => { args.dry_run = true; i += 1; }
+            "--dry-run-busy-us" => {
+                let n: u64 = argv.get(i + 1).ok_or("--dry-run-busy-us needs a value")?
+                    .parse().map_err(|_| "--dry-run-busy-us must be a non-negative integer")?;
+                args.dry_run_busy_us = n;
                 i += 2;
             }
             "--region-mode" => {
@@ -551,6 +566,16 @@ struct ProcCounters {
     read_bytes: u64,
     wchar: u64,
     write_bytes: u64,
+    /// Voluntary context switches (`/proc/self/status`), differenced per window.
+    vol_csw: u64,
+    /// Non-voluntary context switches (`/proc/self/status`), differenced per
+    /// window: a jump here coincides with the process being descheduled.
+    invol_csw: u64,
+    /// User + system CPU time in clock ticks (`/proc/self/stat` fields 14/15),
+    /// differenced per window so an off-CPU stall (wall time with no CPU
+    /// advance) is separable from a busy (on-CPU) stall.
+    utime_ticks: u64,
+    stime_ticks: u64,
 }
 
 impl ProcCounters {
@@ -562,6 +587,10 @@ impl ProcCounters {
             read_bytes: self.read_bytes.saturating_sub(prev.read_bytes),
             wchar: self.wchar.saturating_sub(prev.wchar),
             write_bytes: self.write_bytes.saturating_sub(prev.write_bytes),
+            vol_csw: self.vol_csw.saturating_sub(prev.vol_csw),
+            invol_csw: self.invol_csw.saturating_sub(prev.invol_csw),
+            utime_ticks: self.utime_ticks.saturating_sub(prev.utime_ticks),
+            stime_ticks: self.stime_ticks.saturating_sub(prev.stime_ticks),
         }
     }
 }
@@ -576,6 +605,18 @@ fn read_proc_counters() -> ProcCounters {
             let rest: Vec<&str> = stat[rp + 1..].split_whitespace().collect();
             c.minflt = rest.get(7).and_then(|v| v.parse().ok()).unwrap_or(0);
             c.majflt = rest.get(9).and_then(|v| v.parse().ok()).unwrap_or(0);
+            c.utime_ticks = rest.get(11).and_then(|v| v.parse().ok()).unwrap_or(0);
+            c.stime_ticks = rest.get(12).and_then(|v| v.parse().ok()).unwrap_or(0);
+        }
+    }
+    if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
+        for line in status.lines() {
+            let Some((k, v)) = line.split_once(':') else { continue };
+            match k {
+                "voluntary_ctxt_switches" => c.vol_csw = v.trim().parse().unwrap_or(0),
+                "nonvoluntary_ctxt_switches" => c.invol_csw = v.trim().parse().unwrap_or(0),
+                _ => {}
+            }
         }
     }
     if let Ok(io) = std::fs::read_to_string("/proc/self/io") {
@@ -594,18 +635,69 @@ fn read_proc_counters() -> ProcCounters {
     c
 }
 
-/// Per-window residual-attribution line (slice 54): the kernel/allocator counters differenced over
-/// the window plus the window's ABSOLUTE stall maxima, so a stall can be attributed to a cold
-/// page-in (`read_bytes`), a page-fault burst (`minflt`/`majflt`), or the request-path `trim_heap`
-/// call independently of the latency percentiles on stdout. Emitted to stderr so the frozen
-/// metrics-JSON schema on stdout is unchanged.
+/// Per-group attribution (slice 55): the driver's view of one dispatched group,
+/// so a single-request stall can be attributed to the wait before dispatch, the
+/// engine's WAL append/apply/barrier, the request-path WAL maintenance, or time
+/// off-CPU (completion minus the named phases).
+#[derive(Clone, Copy, Default)]
+struct GroupPhaseReport {
+    /// Schedule lag of the group's first member (issue minus its due time): the
+    /// pacer was this late observing the request as ready.
+    due_dispatch_us: u64,
+    /// Sum of the engine's per-block WAL `append` time inside this group.
+    append_us: u64,
+    /// Sum of the engine's memtable `apply` time inside this group.
+    apply_us: u64,
+    /// The group's single WAL `fdatasync` (0 for a read-only group).
+    fsync_us: u64,
+    /// Request-path WAL maintenance (publish/rotate) charged to this group.
+    maintain_us: u64,
+    /// Group completion minus its first member's due time (the `group_us`
+    /// diagnostic, which bounds every member's service latency).
+    completion_us: u64,
+}
+
+/// One `group_phase` line per dispatched group, so the phase breakdown is
+/// available per group (not only as the window's maximum) for attribution.
+/// Emitted to stderr so the frozen metrics-JSON schema on stdout is unchanged.
+fn group_phase_print(window_index: u64, seq: u64, requests: u64, p: GroupPhaseReport) {
+    eprintln!(
+        "group_phase window={window_index} seq={seq} requests={requests} \
+         due_dispatch_us={} append_us={} apply_us={} fsync_us={} maintain_us={} completion_us={}",
+        p.due_dispatch_us, p.append_us, p.apply_us, p.fsync_us, p.maintain_us, p.completion_us);
+}
+
+/// Burn `us` microseconds of wall clock without I/O (the host-stall control's
+/// stand-in for a request's on-CPU cost). A spin loop keeps the thread runnable
+/// so the pacer keeps its normal scheduling profile; `us == 0` is a no-op.
+fn busy_wait_us(us: u64) {
+    let target = Instant::now() + Duration::from_micros(us);
+    while Instant::now() < target {
+        std::hint::spin_loop();
+    }
+}
+
+/// Per-window residual-attribution line (slice 54, extended slice 55): the
+/// kernel/allocator counters differenced over the window (including the OS
+/// context-switch and CPU-tick view) plus the window's ABSOLUTE stall maxima and
+/// the stall group's phase breakdown, so a stall can be attributed without a
+/// rerun. Emitted to stderr so the frozen metrics-JSON schema on stdout is
+/// unchanged.
 fn window_stall_print(window_index: u64, c: ProcCounters, trim_us: u64, group_fsync_us: u64,
+                      stall: GroupPhaseReport, max_sleep_us: u64, max_sleep_request_us: u64,
                       max_latency_us: u64, max_lag_us: u64, max_group_us: u64) {
     eprintln!(
         "window_stall window={window_index} minflt={} majflt={} rchar={} read_bytes={} \
-         wchar={} write_bytes={} trim_us={trim_us} group_fsync_us={group_fsync_us} \
+         wchar={} write_bytes={} vol_csw={} invol_csw={} utime_ticks={} stime_ticks={} \
+         trim_us={trim_us} group_fsync_us={group_fsync_us} \
+         stall_due_dispatch_us={} stall_append_us={} stall_apply_us={} stall_fsync_us={} \
+         stall_maintain_us={} stall_completion_us={} \
+         max_sleep_us={max_sleep_us} max_sleep_request_us={max_sleep_request_us} \
          max_latency_us={max_latency_us} max_lag_us={max_lag_us} max_group_us={max_group_us}",
-        c.minflt, c.majflt, c.rchar, c.read_bytes, c.wchar, c.write_bytes);
+        c.minflt, c.majflt, c.rchar, c.read_bytes, c.wchar, c.write_bytes,
+        c.vol_csw, c.invol_csw, c.utime_ticks, c.stime_ticks,
+        stall.due_dispatch_us, stall.append_us, stall.apply_us, stall.fsync_us,
+        stall.maintain_us, stall.completion_us);
 }
 
 /// Bounded-WAL maintenance for a sustained write load: publish the serving memtable once the
@@ -803,6 +895,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Kernel/allocator counters sampled at the same instant as the window clock, so the first
     // window's delta covers only the load that follows (not open/replay).
     let mut proc_prev = read_proc_counters();
+    // Per-window stall attribution (slice 55): the dispatched group with the
+    // largest completion bounds the window's single-request stall; its phase
+    // breakdown plus the pacer's worst sleep overshoot make the stall
+    // attributable without a rerun.
+    let mut stall_group: GroupPhaseReport = GroupPhaseReport::default();
+    let mut window_fsync_sum: u64 = 0;
+    let mut max_sleep_us: u64 = 0;
+    let mut max_sleep_request_us: u64 = 0;
     let mut window_late_start: u64 = 0;
     let mut window_rate: f64 = rate_for(0, total, &args.rates, args.segment_requests);
     let mut late_growth_windows: u32 = 0;
@@ -846,8 +946,18 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             debug_assert!(end > index);
             groups_window += 1;
             max_group_size_window = max_group_size_window.max(end - index);
+            let group_seq = groups_window;
             let started = Instant::now();
-            if args.group_requests.is_some() {
+            if args.dry_run {
+                // Host-stall control (slice 55): pace and parse the trace but do
+                // no engine I/O. A bounded busy-wait stands in for the request's
+                // on-CPU cost so the pacer sees a comparable runnable load
+                // without any reads, writes, or fdatasync.
+                for i in index..end {
+                    serde_json::from_str::<Value>(&lines[i as usize])?;
+                    busy_wait_us(args.dry_run_busy_us);
+                }
+            } else if args.group_requests.is_some() {
                 // Grouped request mode: the real adapter flow (`cust -> take` with its stock
                 // guard, plus the read shapes) executed in order inside ONE deferred-barrier
                 // group, so guards see earlier requests' effects and the group shares one fsync.
@@ -974,10 +1084,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
             // Bounded-WAL maintenance (opt-in): publish then rotate once the write load has grown
             // the suffix past the configured thresholds, exactly as `seed-inventory` does. With
-            // neither flag set this is not called, so read runs pay nothing.
-            if args.checkpoint_bytes.is_some() || args.rotate_bytes.is_some() {
+            // neither flag set this is not called, so read runs pay nothing. It runs on the
+            // request path and is timed separately: a publish/rotate charged to this group's
+            // completion would otherwise look like an off-CPU stall, and it delays the NEXT
+            // group's dispatch.
+            let maintain_t0 = Instant::now();
+            if !args.dry_run && (args.checkpoint_bytes.is_some() || args.rotate_bytes.is_some()) {
                 maintain_wal(&mut engine, args.checkpoint_bytes, args.rotate_bytes)?;
             }
+            let maintain_us = maintain_t0.elapsed().as_micros() as u64;
             // Per-request measurement. A request's latency runs from ITS OWN due time (arrival)
             // to the group's completion, so each member of the group gets its own sample rather
             // than the group's elapsed time. The group elapsed (completion minus the FIRST
@@ -988,6 +1103,24 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let issue_us = started.duration_since(t0).as_secs_f64() * 1e6;
             let completion_us = issue_us + group_us as f64;
             let first_due_us = due_us;
+            // Per-group phase attribution (slice 55): drain the engine's
+            // append/apply/barrier accumulators once per dispatched group, so a
+            // single-request stall is attributable to the wait before dispatch,
+            // the WAL append/apply/barrier, the WAL maintenance, or off-CPU time.
+            let phase = engine.take_group_phase_us();
+            window_fsync_sum = window_fsync_sum.saturating_add(phase.fsync_us);
+            let report = GroupPhaseReport {
+                due_dispatch_us: (issue_us - first_due_us).max(0.0) as u64,
+                append_us: phase.append_us,
+                apply_us: phase.apply_us,
+                fsync_us: phase.fsync_us,
+                maintain_us,
+                completion_us: group_us,
+            };
+            group_phase_print(window_index, group_seq, end - index, report);
+            if report.completion_us > stall_group.completion_us {
+                stall_group = report;
+            }
             let mut member_due_us = due_us;
             for i in index..end {
                 let raw_lag = issue_us - member_due_us;
@@ -1005,9 +1138,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             index = end;
         } else {
             // burst pacing: bounded chunks, never a per-request sleep whose granularity would
-            // masquerade as engine saturation (measured: 41 us service time vs a ~1 ms timer)
+            // masquerade as engine saturation (measured: 41 us service time vs a ~1 ms timer).
+            // Time each chunk so a host-level wakeup delay (a <=1 ms sleep actually taking
+            // hundreds of ms) is attributable instead of looking like an engine stall.
             let chunk = (due_us - now_us).min(1000.0);
+            let sleep_t0 = Instant::now();
             std::thread::sleep(Duration::from_secs_f64(chunk / 1e6));
+            let sleep_us = sleep_t0.elapsed().as_micros() as u64;
+            if sleep_us > max_sleep_us {
+                max_sleep_us = sleep_us;
+                max_sleep_request_us = chunk as u64;
+            }
         }
 
         // A window must not span two offered rates: with `--segment-requests` the ladder steps at
@@ -1200,11 +1341,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let trim_t0 = Instant::now();
             trim_heap();
             let trim_us = trim_t0.elapsed().as_micros() as u64;
-            let group_fsync_us = engine.take_group_fsync_us();
             let proc_now = read_proc_counters();
-            window_stall_print(window_index, proc_now.since(proc_prev), trim_us, group_fsync_us,
+            window_stall_print(window_index, proc_now.since(proc_prev), trim_us, window_fsync_sum,
+                               stall_group, max_sleep_us, max_sleep_request_us,
                                max_latency_us, max_lag_us, group_elapsed_us);
             proc_prev = proc_now;
+            // Reset the per-window stall attribution for the next window.
+            stall_group = GroupPhaseReport::default();
+            window_fsync_sum = 0;
+            max_sleep_us = 0;
+            max_sleep_request_us = 0;
             window_index += 1;
             window_start = Instant::now();
             window_late_start = late_total;
@@ -1286,8 +1432,10 @@ mod tests {
 
     #[test]
     fn proc_counters_since_differences_and_never_underflows() {
-        let prev = ProcCounters { minflt: 1, majflt: 2, rchar: 3, read_bytes: 4, wchar: 5, write_bytes: 6 };
-        let cur = ProcCounters { minflt: 11, majflt: 2, rchar: 103, read_bytes: 4, wchar: 5, write_bytes: 106 };
+        let prev = ProcCounters { minflt: 1, majflt: 2, rchar: 3, read_bytes: 4, wchar: 5, write_bytes: 6,
+            vol_csw: 7, invol_csw: 8, utime_ticks: 9, stime_ticks: 10 };
+        let cur = ProcCounters { minflt: 11, majflt: 2, rchar: 103, read_bytes: 4, wchar: 5, write_bytes: 106,
+            vol_csw: 17, invol_csw: 8, utime_ticks: 109, stime_ticks: 10 };
         let d = cur.since(prev);
         assert_eq!(d.minflt, 10);
         assert_eq!(d.majflt, 0, "equal counters differ to zero");
@@ -1295,11 +1443,17 @@ mod tests {
         assert_eq!(d.read_bytes, 0);
         assert_eq!(d.wchar, 0);
         assert_eq!(d.write_bytes, 100);
+        assert_eq!(d.vol_csw, 10);
+        assert_eq!(d.invol_csw, 0);
+        assert_eq!(d.utime_ticks, 100);
+        assert_eq!(d.stime_ticks, 0);
         // A counter that went backwards (e.g. a fresh /proc/self/io in a new
         // pid namespace) must saturate to 0, never panic.
         let back = prev.since(cur);
         assert_eq!(back.minflt, 0);
         assert_eq!(back.write_bytes, 0);
+        assert_eq!(back.invol_csw, 0);
+        assert_eq!(back.stime_ticks, 0);
     }
 
     #[test]
@@ -1359,6 +1513,23 @@ mod tests {
                                  "--rate-rps".into(), "10".into(),
                                  "--compact-bytes".into()]).is_err(),
             "--compact-bytes needs a value");
+    }
+
+    #[test]
+    fn dry_run_flag_enables_the_host_stall_control() {
+        let plain = parse_args(vec!["b".into(), "dir".into(), "t.jsonl".into(),
+                                     "--rate-rps".into(), "10".into()]).expect("valid args");
+        assert!(!plain.dry_run, "dry-run is off unless requested");
+        assert_eq!(plain.dry_run_busy_us, 0);
+        let on = parse_args(vec!["b".into(), "dir".into(), "t.jsonl".into(),
+                                  "--rate-rps".into(), "10".into(),
+                                  "--dry-run".into(), "--dry-run-busy-us".into(), "2000".into()])
+            .expect("valid dry-run args");
+        assert!(on.dry_run);
+        assert_eq!(on.dry_run_busy_us, 2000);
+        assert!(parse_args(vec!["b".into(), "dir".into(), "t.jsonl".into(),
+                                 "--rate-rps".into(), "10".into(), "--dry-run-busy-us".into()]).is_err(),
+            "--dry-run-busy-us needs a value");
     }
 
     #[test]

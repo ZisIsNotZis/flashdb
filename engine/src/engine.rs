@@ -693,8 +693,18 @@ pub struct Engine {
     /// [`Engine::end_group`] knows a barrier is owed. An empty group takes no
     /// `sync` (nothing was appended). Reset by `begin_group`/`end_group`.
     group_pending: bool,
+    /// Sum of the per-group WAL `append` elapsed time (us) since the last
+    /// [`Engine::take_group_phase_us`]. Observational only (slice 55): never
+    /// persisted and never read on any correctness path; it attributes the
+    /// request-path WAL append separately from the memtable apply and the
+    /// durability barrier.
+    group_append_us: u64,
+    /// Sum of the per-group memtable `apply` elapsed time (us) since the last
+    /// [`Engine::take_group_phase_us`]. Observational only (slice 55): never
+    /// persisted and never read on any correctness path.
+    group_apply_us: u64,
     /// Sum of the per-group WAL `fdatasync` elapsed time (us) since the last
-    /// [`Engine::take_group_fsync_us`]. Observational only (slice 54): never
+    /// [`Engine::take_group_phase_us`]. Observational only (slice 54/55): never
     /// persisted and never read on any correctness path; it attributes the
     /// request-path durability barrier separately from the read/allocator stalls.
     group_fsync_us: u64,
@@ -762,6 +772,19 @@ impl Drop for MetricsSample<'_> {
     }
 }
 
+/// Per-group WAL `append` / memtable `apply` / WAL `fdatasync` elapsed time
+/// (us), drained by [`Engine::take_group_phase_us`] once per dispatched group.
+/// Observational only (slice 55): never persisted and never read on any
+/// correctness path; it attributes a single-request stall to the append, the
+/// apply, or the durability barrier (or, when all three are small, to time spent
+/// off-CPU before dispatch).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GroupPhase {
+    pub append_us: u64,
+    pub apply_us: u64,
+    pub fsync_us: u64,
+}
+
 impl Engine {
     /// 新建（空库）。
     pub fn create(wal_path: impl AsRef<Path>) -> io::Result<Engine> {
@@ -780,6 +803,8 @@ impl Engine {
             max_handle: 0,
             group_open: false,
             group_pending: false,
+            group_append_us: 0,
+            group_apply_us: 0,
             group_fsync_us: 0,
             layout: LayoutPolicy::declared_default(),
             region_mode: RegionMode::Global,
@@ -985,7 +1010,7 @@ impl Engine {
         drop(records);
         drop(covered);
         Self::trim_retained_heap();
-        Ok(Engine { wal, mt, tiles, wal_path: wal_path.to_path_buf(), dir: parent_dir(wal_path), manifest: None, segment: None, segment_suffix_csn: csn, wal_detached: false, csn, dedup, max_handle, group_open: false, group_pending: false, group_fsync_us: 0, layout: LayoutPolicy::declared_default(), region_mode: RegionMode::Global, key_encoding: encoding, metrics: RefCell::new(Metrics::new()), last_compaction: None })
+        Ok(Engine { wal, mt, tiles, wal_path: wal_path.to_path_buf(), dir: parent_dir(wal_path), manifest: None, segment: None, segment_suffix_csn: csn, wal_detached: false, csn, dedup, max_handle, group_open: false, group_pending: false, group_append_us: 0, group_apply_us: 0, group_fsync_us: 0, layout: LayoutPolicy::declared_default(), region_mode: RegionMode::Global, key_encoding: encoding, metrics: RefCell::new(Metrics::new()), last_compaction: None })
     }
 
     /// The CSN floor below which the active WAL file holds no records: the
@@ -2778,14 +2803,22 @@ impl Engine {
         result
     }
 
-    /// Sum of the per-group WAL `fdatasync` elapsed time (us) accumulated since
-    /// the previous call, then reset to 0. Observational only (slice 54): the
-    /// load driver samples this once per window so a window's durability-barrier
-    /// stall is attributed separately from its read/allocator stalls.
-    pub fn take_group_fsync_us(&mut self) -> u64 {
-        let v = self.group_fsync_us;
+    /// Per-group WAL `append` / memtable `apply` / WAL `fdatasync` elapsed time
+    /// (us) accumulated since the previous call, then reset. Observational only
+    /// (slice 55): the load driver drains this once per dispatched group so a
+    /// single-request stall can be attributed to the WAL append, the memtable
+    /// apply, or the durability barrier — or, when all three are small, to time
+    /// spent off-CPU before the group was dispatched.
+    pub fn take_group_phase_us(&mut self) -> GroupPhase {
+        let phase = GroupPhase {
+            append_us: self.group_append_us,
+            apply_us: self.group_apply_us,
+            fsync_us: self.group_fsync_us,
+        };
+        self.group_append_us = 0;
+        self.group_apply_us = 0;
         self.group_fsync_us = 0;
-        v
+        phase
     }
 
     /// Shared single-block commit core. `barrier` selects whether the WAL
@@ -2850,15 +2883,21 @@ impl Engine {
         }
 
         let payload = encode_payload(csn, block_id, ops);
+        let append_t0 = Instant::now();
         self.wal.append(&payload)?;
+        self.group_append_us = self.group_append_us.saturating_add(append_t0.elapsed().as_micros() as u64);
         self.record_commit_regions(ops);
         if barrier {
+            let sync_t0 = Instant::now();
             self.wal.sync()?;
+            self.group_fsync_us = self.group_fsync_us.saturating_add(sync_t0.elapsed().as_micros() as u64);
         }
 
+        let apply_t0 = Instant::now();
         for op in ops {
             apply_op(&mut self.mt, op, csn, self.key_encoding);
         }
+        self.group_apply_us = self.group_apply_us.saturating_add(apply_t0.elapsed().as_micros() as u64);
         self.csn = csn;
         // The synced record is now the newest content of the active WAL file
         // (in segment mode too), keeping the republish guard's comparison
