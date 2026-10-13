@@ -89,6 +89,9 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--write-requests", type=int, default=30_000)
     ap.add_argument("--write-rate", type=int, default=100_000)
     ap.add_argument("--group-requests", type=int, default=64)
+    ap.add_argument("--key-encoding", choices=("family_first", "entity_first"),
+                    default="family_first",
+                    help="key spelling for the built instance (entity_first co-locates P/U/R)")
     a = ap.parse_args(argv)
 
     build_cap = a.build_cap_mib << 20
@@ -107,7 +110,7 @@ def main(argv: list[str]) -> int:
     traces = {"seed": seed_trace, "write": write_trace}
     name = "per_region-mixed"
     res = c.build_inventory(name, "per_region", c.MIXED_REGION_LAYOUT, bins, traces,
-                            a, workroot, env, build_cap)
+                            a, workroot, env, build_cap, key_encoding=a.key_encoding)
     docs = None
     for line in res.stdout.splitlines():
         if line.startswith("phase=seed-inventory ok=true"):

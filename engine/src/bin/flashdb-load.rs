@@ -84,6 +84,7 @@ use std::io::{self, BufRead, BufReader, Write};
 use std::time::{Duration, Instant};
 
 use flashdb_engine::engine::{build_compaction_job, BarrierCompletion, CompactShape, CompactionJob, CompactionOutcome, Engine, LayoutPolicy, Op, Outcome, RegionMode, RequestOutcome, MAX_PENDING_BARRIERS};
+use flashdb_engine::keys::KeyEncoding;
 use flashdb_engine::metrics::WindowSnapshot;
 use flashdb_engine::replay::submit_requests_grouped;
 use flashdb_engine::request::execute_request;
@@ -123,6 +124,7 @@ struct Args {
     checkpoint_bytes: Option<u64>,
     rotate_bytes: Option<u64>,
     region_mode: Option<RegionMode>,
+    key_encoding: KeyEncoding,
     compact_bytes: Option<u64>,
     /// Host-stall control (slice 55): `--dry-run` replaces a request's engine
     /// execution with a bounded busy-wait (`--dry-run-busy-us`) after parsing
@@ -155,6 +157,7 @@ fn parse_args(argv: Vec<String>) -> Result<Args, String> {
         checkpoint_bytes: None,
         rotate_bytes: None,
         region_mode: None,
+        key_encoding: KeyEncoding::FamilyFirst,
         compact_bytes: None,
         dry_run: false,
         dry_run_busy_us: 0,
@@ -247,6 +250,15 @@ fn parse_args(argv: Vec<String>) -> Result<Args, String> {
                     .ok_or_else(|| format!("unknown region mode {name:?} (global|per_region)"))?);
                 i += 2;
             }
+            "--key-encoding" => {
+                let name = argv.get(i + 1).ok_or("--key-encoding needs a value")?;
+                args.key_encoding = match name.as_str() {
+                    "family_first" | "family-first" => KeyEncoding::FamilyFirst,
+                    "entity_first" | "entity-first" => KeyEncoding::EntityFirst,
+                    _ => return Err(format!("unknown key encoding {name:?} (family_first|entity_first)")),
+                };
+                i += 2;
+            }
             "--no-tiles" => { args.discover = false; i += 1; }
             other => return Err(format!("unknown argument {other:?}")),
         }
@@ -283,12 +295,16 @@ fn rate_for(index: u64, total: u64, rates: &[f64], segment_requests: Option<u64>
 /// Resolve the CLI target. A directory opens tile-aware with `Engine::open_discover` unless
 /// `discover` is false, in which case (and for a WAL file path) the engine is opened by WAL
 /// path with tiles ignored: `--no-tiles` is the memtable-only control for the same data.
-fn open_target(target: &str, discover: bool) -> io::Result<Engine> {
+fn open_target(target: &str, discover: bool, encoding: KeyEncoding) -> io::Result<Engine> {
     let path = Path::new(target);
     if path.is_dir() {
-        if discover { Engine::open_discover(path) } else { Engine::open(path.join("data.wal")) }
+        if discover {
+            Engine::open_discover_with_encoding(path, encoding)
+        } else {
+            Engine::open_with_encoding(path.join("data.wal"), encoding)
+        }
     } else {
-        Engine::open(path)
+        Engine::open_with_encoding(path, encoding)
     }
 }
 
@@ -1098,7 +1114,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // depending on what else is running, so a load run without a device baseline cannot be
     // interpreted: "saturation" may be the device, not the engine. Same session, same directory.
     let device = probe_device(&probe_dir(&args.target), 100);
-    let mut engine = open_target(&args.target, args.discover)?;
+    let mut engine = open_target(&args.target, args.discover, args.key_encoding)?;
     // External policy control: apply the JSON policy file (CLI wins over the
     // `FLASHDB_POLICY_FILE` env var) before any work. A malformed file is a hard
     // error at start: the controller asked for a policy it did not get.
@@ -1968,6 +1984,19 @@ mod tests {
         assert!(parse_args(vec!["b".into(), "dir".into(), "t.jsonl".into(), "--rate-rps".into(), "10".into(),
                                 "--region-mode".into(), "nonsense".into()]).is_err(),
             "an unknown region mode is rejected");
+    }
+
+    #[test]
+    fn key_encoding_flag_selects_and_rejects() {
+        let family = parse_args(vec!["b".into(), "dir".into(), "t.jsonl".into(), "--rate-rps".into(), "10".into()])
+            .expect("valid args");
+        assert_eq!(family.key_encoding, KeyEncoding::FamilyFirst, "family-first is the default");
+        let entity = parse_args(vec!["b".into(), "dir".into(), "t.jsonl".into(), "--rate-rps".into(), "10".into(),
+                                     "--key-encoding".into(), "entity_first".into()]).expect("valid encoding");
+        assert_eq!(entity.key_encoding, KeyEncoding::EntityFirst);
+        assert!(parse_args(vec!["b".into(), "dir".into(), "t.jsonl".into(), "--rate-rps".into(), "10".into(),
+                                "--key-encoding".into(), "nonsense".into()]).is_err(),
+            "an unknown key encoding is rejected");
     }
 
     #[test]
