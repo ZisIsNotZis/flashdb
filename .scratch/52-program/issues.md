@@ -118,3 +118,41 @@ Integrated HEAD: `183a0be140757a5784e196fbff22ca7b7d005044` (`git rev-parse HEAD
   (11.0x below the ticket-49 baseline); the "no window rejected" rung is NOT met because
   the ticket-49 un-attributed residual (cold read page-ins / allocator / OS jitter) still
   rejects windows with compaction off the path — reported, not overstated.
+
+## Integration record: wave2/tailfix
+
+- Timestamp: 2026-10-13T20:26:16+08:00
+- Actor: integrator worker (single writer on master)
+- Base at integration start: master `e11bf6ceb2d5a4b92e2fb9be5701f05093d76500`
+- Merge: `git merge --no-ff wave2/tailfix` (off-request-path compaction fix; independently verified PASS at `e9e2ae5`)
+  - Merge commit: `112f96a90418298e176a28bfe60e21075ce737eb`
+  - Parents: `e11bf6ceb2d5a4b92e2fb9be5701f05093d76500` + `e9e2ae59d8e631f10deab991eca25ba3233c495f`
+  - Conflict resolution: none (clean ort merge; no conflicts).
+- Final HEAD after merge: `112f96a90418298e176a28bfe60e21075ce737eb`
+- Next lane worktree: `git worktree add -b wave3/residual /home/z/vibe/worktrees/flashdb/wave3-residual master`
+  - Worktree path: `/home/z/vibe/worktrees/flashdb/wave3-residual`
+  - Branch: `wave3/residual`
+  - HEAD: `112f96a90418298e176a28bfe60e21075ce737eb`
+
+Combined gates (run at merged master `112f96a`):
+
+1. `source $HOME/.cargo/env; cargo build --workspace --offline` — 0 warnings:
+```
+   Compiling flashdb-engine v0.1.0 (/home/z/vibe/flashdb/engine)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 3.56s
+```
+
+2. `cargo test --workspace --offline` — totals: 277 passed; 0 failed; 0 ignored.
+(117 lib + 18 flashdb-load + 9 batch_commit + 5 compaction_job + 4 constraints +
+3 family_colocation + 8 group_commit + 6 manifest_engine + 7 merge_threshold +
+14 metrics + 33 multi_tile + 7 order_flow + 1 partitioned_publish_cap + 5 read_requests +
+3 region_compaction + 6 region_partition + 3 replay_trace + 8 request_commit + 2 scale_bin +
+3 tile_format + 3 tile_layout + 12 tile_read + 0 flashdb-replay + 0 flashdb-scale + 0 main + 0 doc-tests)
+
+3. `cd harness && uv run --with pytest pytest -q`:
+```
+132 passed in 4.77s
+```
+(uv emitted a non-failing warning: `VIRTUAL_ENV=/home/z/.venv` does not match the project environment path `.venv`; tests still passed.)
+
+4. `git diff --check` — silent (exit 0).
