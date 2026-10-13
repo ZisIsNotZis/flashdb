@@ -1,0 +1,88 @@
+== before seed42 2026-10-14T02:56:06+08:00 ==
+loadavg: 4.59 5.36 5.51 25/2310 1184177
+%CPU   RSS COMMAND
+ 100  4688 ps
+95.4 8006524 llama-server
+82.8 269784 mpv
+42.6 253104 wdavdaemon
+30.6 1499696 ghostty
+15.1 315424 MainThread
+ 9.4 24228 Xvfb
+
+== after seed42 2026-10-14T03:06:07+08:00 ==
+loadavg: 8.82 7.04 6.21 26/2333 1198194
+%CPU   RSS COMMAND
+ 200  4712 ps
+ 169 12413264 llama-server
+83.2 271352 mpv
+42.2 241192 wdavdaemon
+30.6 1499696 ghostty
+14.9 215864 python
+14.0 819724 python
+
+== before seed43 2026-10-14T03:06:29+08:00 ==
+loadavg: 7.20 6.82 6.16 3/2337 1198514
+%CPU   RSS COMMAND
+ 163 12413340 llama-server
+83.2 271352 mpv
+42.2 249052 wdavdaemon
+30.6 1499696 ghostty
+16.2 180492 python
+13.6 789616 python
+ 9.5 24228 Xvfb
+
+== after seed43 2026-10-14T03:16:06+08:00 ==
+loadavg: 5.49 6.14 6.11 5/2331 1207344
+%CPU   RSS COMMAND
+ 172 13616908 llama-server
+83.5 269804 mpv
+41.7 238388 wdavdaemon
+30.6 1499696 ghostty
+17.5 151448 python
+10.0 158812 npm exec wechat
+ 9.5 24228 Xvfb
+
+== before seed44 2026-10-14T03:16:08+08:00 ==
+loadavg: 5.49 6.14 6.11 6/2334 1207376
+%CPU   RSS COMMAND
+ 172 13616908 llama-server
+83.5 269804 mpv
+41.7 240272 wdavdaemon
+30.6 1499696 ghostty
+17.5 151448 python
+ 9.5 24228 Xvfb
+ 8.3 158812 npm exec wechat
+
+== after seed44 2026-10-14T03:26:19+08:00 ==
+loadavg: 7.17 7.34 6.77 7/2426 1220345
+%CPU   RSS COMMAND
+ 237 16391868 llama-server
+83.3 271376 mpv
+57.6 297004 chrome-headless
+41.5 239916 wdavdaemon
+30.9 892192 chrome-headless
+30.6 1499260 ghostty
+14.9 529224 chrome-headless
+
+== before seed42-repeat 2026-10-14T03:26:21+08:00 ==
+loadavg: 7.17 7.34 6.77 19/2430 1220372
+%CPU   RSS COMMAND
+ 237 16391932 llama-server
+ 100  4736 ps
+83.3 271376 mpv
+58.3 169692 chrome-headless
+41.4 239996 wdavdaemon
+31.1 659228 chrome-headless
+30.6 1499260 ghostty
+
+== after seed42-repeat 2026-10-14T03:36:38+08:00 ==
+loadavg: 6.77 7.26 7.09 8/2329 1230715
+%CPU   RSS COMMAND
+ 371 2601068 llama-server
+ 100  4692 ps
+83.0 269824 mpv
+41.1 245280 wdavdaemon
+30.6 1499316 ghostty
+ 9.4 24228 Xvfb
+ 9.4 161560 npm exec wechat
+
