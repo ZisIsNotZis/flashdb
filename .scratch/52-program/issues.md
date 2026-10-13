@@ -105,3 +105,16 @@ Integrated HEAD: `183a0be140757a5784e196fbff22ca7b7d005044` (`git rev-parse HEAD
 | `.scratch/52-program/issues.md` | integration record: reworded the stale "Final HEAD hash … `bef4f14`" line to distinguish the integrated revision (code under gate) `bef4f14` from the then-current HEAD at review recording `38e9242` | `git rev-parse HEAD` = `38e924253a709a67aa1d41b098b946e0d1d1ccf0` |
 | `.scratch/49-latency-tail-attribution/issues.md` | (a) `--compact-bytes 0 -> omit` source citation: `cold_0b.py:846` → `cold_0b.py:883-886`; (b) overstated bound `(4.2x-28x)`/`>= 4.2x` → `(4.17x-28x)`/`>= 4.17x` (no measured number changed) | (a) `harness/flashdb_harness/cold_0b.py` lines 883-886; (b) ticket's rung-400 example 590,578/141,402 = 4.18x |
 | `.scratch/52-program/wave1-verify-fix.js` | added (untracked control script) via `git add` | task instruction |
+
+## wave2 WP-B dispatch record
+
+- Timestamp: 2026-10-13 (resumed after the 30-minute wall; commits ae1df85).
+- Action: dispatched work package B "make load-path compaction latency-safe" to the
+  single-writer `wave2/tailfix` worktree. Contract, diagnosis, decision, change, tests,
+  gates, before/after table and verdict are in `.scratch/53-compaction-tail-latency/issues.md`.
+- Result: commits `a59f703` (off-path compaction build + lazy apply) and `ae1df85`
+  (read+write WAL handle). 274 Rust tests and 132 Python tests green; 0 build warnings;
+  `git diff --check` silent. Acceptance: the 3x rung-200 svc-p99 threshold is met
+  (11.0x below the ticket-49 baseline); the "no window rejected" rung is NOT met because
+  the ticket-49 un-attributed residual (cold read page-ins / allocator / OS jitter) still
+  rejects windows with compaction off the path — reported, not overstated.
