@@ -536,6 +536,78 @@ fn reset_peak_rss() {
     let _ = std::fs::write("/proc/self/clear_refs", "5\n");
 }
 
+/// Cumulative kernel/allocator counters sampled once per window and differenced at each
+/// boundary, so a window's stall can be attributed to the work that window actually did.
+/// `/proc/self/stat` fields 10/12 are the minor/major page-fault counts; `/proc/self/io`'s
+/// `read_bytes` is the bytes the block layer actually fetched from storage (a page-cache miss)
+/// while `rchar` is every byte handed to `read`/`pread` regardless of cache, so the ratio
+/// `read_bytes`/`rchar` separates a cold page-in from a cache-hit read without touching the
+/// read path. A missing file (non-Linux) yields zeros and the per-window line is still emitted.
+#[derive(Clone, Copy, Default)]
+struct ProcCounters {
+    minflt: u64,
+    majflt: u64,
+    rchar: u64,
+    read_bytes: u64,
+    wchar: u64,
+    write_bytes: u64,
+}
+
+impl ProcCounters {
+    fn since(self, prev: ProcCounters) -> ProcCounters {
+        ProcCounters {
+            minflt: self.minflt.saturating_sub(prev.minflt),
+            majflt: self.majflt.saturating_sub(prev.majflt),
+            rchar: self.rchar.saturating_sub(prev.rchar),
+            read_bytes: self.read_bytes.saturating_sub(prev.read_bytes),
+            wchar: self.wchar.saturating_sub(prev.wchar),
+            write_bytes: self.write_bytes.saturating_sub(prev.write_bytes),
+        }
+    }
+}
+
+fn read_proc_counters() -> ProcCounters {
+    let mut c = ProcCounters::default();
+    if let Ok(stat) = std::fs::read_to_string("/proc/self/stat") {
+        // `pid (comm) state ...`: the comm field may itself contain spaces or parens, so parse
+        // from the LAST ')' (the comm close). Tokens after it: state(0), ppid(1), pgrp(2),
+        // session(3), tty_nr(4), tpgid(5), flags(6), minflt(7), cminflt(8), majflt(9), ...
+        if let Some(rp) = stat.rfind(')') {
+            let rest: Vec<&str> = stat[rp + 1..].split_whitespace().collect();
+            c.minflt = rest.get(7).and_then(|v| v.parse().ok()).unwrap_or(0);
+            c.majflt = rest.get(9).and_then(|v| v.parse().ok()).unwrap_or(0);
+        }
+    }
+    if let Ok(io) = std::fs::read_to_string("/proc/self/io") {
+        for line in io.lines() {
+            let Some((k, v)) = line.split_once(':') else { continue };
+            let v = v.trim().parse::<u64>().unwrap_or(0);
+            match k.trim() {
+                "rchar" => c.rchar = v,
+                "read_bytes" => c.read_bytes = v,
+                "wchar" => c.wchar = v,
+                "write_bytes" => c.write_bytes = v,
+                _ => {}
+            }
+        }
+    }
+    c
+}
+
+/// Per-window residual-attribution line (slice 54): the kernel/allocator counters differenced over
+/// the window plus the window's ABSOLUTE stall maxima, so a stall can be attributed to a cold
+/// page-in (`read_bytes`), a page-fault burst (`minflt`/`majflt`), or the request-path `trim_heap`
+/// call independently of the latency percentiles on stdout. Emitted to stderr so the frozen
+/// metrics-JSON schema on stdout is unchanged.
+fn window_stall_print(window_index: u64, c: ProcCounters, trim_us: u64,
+                      max_latency_us: u64, max_lag_us: u64, max_group_us: u64) {
+    eprintln!(
+        "window_stall window={window_index} minflt={} majflt={} rchar={} read_bytes={} \
+         wchar={} write_bytes={} trim_us={trim_us} max_latency_us={max_latency_us} \
+         max_lag_us={max_lag_us} max_group_us={max_group_us}",
+        c.minflt, c.majflt, c.rchar, c.read_bytes, c.wchar, c.write_bytes);
+}
+
 /// Bounded-WAL maintenance for a sustained write load: publish the serving memtable once the
 /// retained WAL exceeds `checkpoint_bytes`, then retire the published segment onto a fresh one
 /// once it exceeds `rotate_bytes`. Both mirror `cmd_seed_inventory`'s cadence; the effect is that a
@@ -728,6 +800,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut group_elapseds: Vec<u64> = Vec::new();
     let mut window_index: u64 = 0;
     let mut window_start = Instant::now();
+    // Kernel/allocator counters sampled at the same instant as the window clock, so the first
+    // window's delta covers only the load that follows (not open/replay).
+    let mut proc_prev = read_proc_counters();
     let mut window_late_start: u64 = 0;
     let mut window_rate: f64 = rate_for(0, total, &args.rates, args.segment_requests);
     let mut late_growth_windows: u32 = 0;
@@ -1014,6 +1089,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let max_group_size = max_group_size_window;
             // The absolute minimum per-request lag, kept separately from the clamped percentiles.
             let min_lag_us = lags.iter().copied().min().unwrap_or(0);
+            // The absolute maximum per-request service latency and schedule lag (the window's
+            // single-request stall), kept so the residual can be attributed to one request vs
+            // many. `latencies` and `sorted_lags` are already sorted ascending, so the last
+            // element is the maximum.
+            let max_latency_us = latencies.last().copied().unwrap_or(0);
+            let max_lag_us = sorted_lags.last().copied().unwrap_or(0);
             let groups_over_service_ceiling = group_elapseds.iter()
                 .filter(|&&g| args.ceiling_us.is_some_and(|c| g > c))
                 .count() as u64;
@@ -1111,8 +1192,18 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             groups_window = 0;
             max_group_size_window = 0;
             early_dispatches_window = 0;
-            // keep the process footprint flat across windows (scan results churn hundred-KB Vecs)
+            // keep the process footprint flat across windows (scan results churn hundred-KB Vecs).
+            // Timed and attributed here: `malloc_trim(0)` runs ON the request thread once per
+            // window, so its stall lands in this window's boundary, not the next window's service
+            // latencies; the elapsed time plus the differenced kernel counters are printed before
+            // the index advances so `window_stall` and the window line share one index.
+            let trim_t0 = Instant::now();
             trim_heap();
+            let trim_us = trim_t0.elapsed().as_micros() as u64;
+            let proc_now = read_proc_counters();
+            window_stall_print(window_index, proc_now.since(proc_prev), trim_us,
+                               max_latency_us, max_lag_us, group_elapsed_us);
+            proc_prev = proc_now;
             window_index += 1;
             window_start = Instant::now();
             window_late_start = late_total;
