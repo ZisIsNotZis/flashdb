@@ -48,7 +48,7 @@ The emitted driver payload is (frozen binary; run-47's exact scored args):
 |---|---|---|
 | 1 | `baseline` | none (group 64, 8 MiB checkpoint/rotate, `--compact-bytes 67108864`) |
 | 2 | `group1` | `--group-requests 1` (one request per group) |
-| 3 | `nocompact` | compaction off. There is NO `--no-compact` flag and the driver REJECTS `--compact-bytes 0` ("--compact-bytes must be a positive integer", `flashdb-load.rs:222-224`); disabling is documented as omitting the flag ("Off by default", `flashdb-load.rs:69`). The `cold_0b` runner maps `--compact-bytes 0` to omitting the driver flag (`cold_0b.py:846`), used here. |
+| 3 | `nocompact` | compaction off. There is NO `--no-compact` flag and the driver REJECTS `--compact-bytes 0` ("--compact-bytes must be a positive integer", `flashdb-load.rs:222-224`); disabling is documented as omitting the flag ("Off by default", `flashdb-load.rs:69`). The `cold_0b` runner maps `--compact-bytes 0` to omitting the driver flag (`cold_0b.py:883-886`), used here. |
 | 4 | `bigcadence` | `--checkpoint-bytes 1073741824 --rotate-bytes 1073741824` (1 GiB). Large enough: the instance opens with a retained WAL of 4,922,007 B and the recorded run WAL ingest is 979,080 B (5,901,087 B total, ~182x below 1 GiB), so `maybe_checkpoint`/`rotate_wal` (both gate on `wal.valid_len() > N`, `engine.rs:2022,1230`) cannot fire. Confirmed: WAL segment unchanged (`data-31376.wal` 4,922,007 -> 8,422,738 B, no rename). |
 | 5 | `bigcap` | `--cap-mib 384` (MemoryMax 384 MiB; data:cap 8.17x -> 4.08x) |
 | 6 | `neither` | separation experiment, not one of the five requested: `--compact-bytes 0` AND 1 GiB cadence (both suspected stall sources off) |
@@ -186,9 +186,9 @@ p95 (43,420 at rung 200) is still 9.3x below the baseline's best pass (404,711).
 **Dominant mechanism: compaction actuation (the driver's per-window `--compact-bytes` merge).**
 - Removing it (`nocompact`) collapses the tail at every rung: median per-window svc p99
   163,919/447,608/684,019/624,328 -> 17,728/20,695/30,505/178,902 (3.5x-22x) and svc p95 median
-  116,586/387,608/624,019/590,578 -> 14,061/13,660/24,432/141,402 (4.2x-28x); lag p99 max drops
+  116,586/387,608/624,019/590,578 -> 14,061/13,660/24,432/141,402 (4.17x-28x); lag p99 max drops
   862,658/751,335/816,329/765,218 -> 259,957/210,883/29,921/246,179. This survives the repeat: at
-  every rung the worst `nocompact` median svc p95 is still >= 4.2x below the best baseline median
+  every rung the worst `nocompact` median svc p95 is still >= 4.17x below the best baseline median
   svc p95 (e.g. 141,402 vs 590,578 at rung 400; 43,420 vs 404,711 at rung 200). It is the only
   configuration that moves the tail outside the baseline range.
 - Removing WAL maintenance/rotation instead (`bigcadence`) leaves the tail in the baseline range or

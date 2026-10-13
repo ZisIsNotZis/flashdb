@@ -52,7 +52,7 @@ Terms used in this repository's docs, explained for a reader who is not a databa
 - **Service-latency ceiling** — the separate bound on per-request service latency (dispatch to completion) p99; reported as the latency/efficiency measure, not the primary metric.
 - **Sustained level** — an offered-load level at which achieved throughput stays within 5% of offered and no window is rejected; the primary metric is the highest sustained level.
 - **10x floor** — the pre-registration's requirement that data be at least 10x the memory budget; a verdict from a lower ratio is provisional.
-- **External baseline** — a competing engine (sqlite, postgres) run as an arm through the same request-level harness at matched durability; the T5–T7 thresholds score against it.
+- **External baseline** — a competing engine (sqlite, postgres, lmdb, rocksdb) run as an arm through the same request-level harness at matched durability; the T5–T7 thresholds score against it.
 - **p99** — the 99th percentile. Used instead of the mean because latency distributions are heavy-tailed and the mean hides the failures.
 - **Error budget / burn rate** — the accumulated tolerable violation, and the speed at which it is being consumed. Angriness is the budget; its derivative is the burn rate.
 - **Canary / gray release** — rolling a change out to a fraction of the data, monitoring for regression, and rolling back if it loses.

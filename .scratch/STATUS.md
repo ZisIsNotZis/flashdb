@@ -62,7 +62,7 @@ under a 192 MiB cap = **8.17x**
 | 400 | 400.00 | 100.00 | 19,638 | 412,788 | 445,288 | 7,992 | 374,784 | 407,284 | no | 4 | 4 |
 
 Whole run: 8000/8000 completed, 0 errors, 106.0 rps against an offered mean of 106.67, reorganisation
-299,390,660 B over 63 merges.
+317,915,511 B over 64 merges.
 
 **Verdict: no rung is sustained.** The failure is a **latency tail**, not throughput: the per-request
 median is ~6 ms at rest (the same order as the session's device fsync p50 of 5-6.7 ms — a hypothesis,

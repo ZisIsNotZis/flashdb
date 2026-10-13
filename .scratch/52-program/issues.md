@@ -34,8 +34,8 @@ Control scripts commit:
 
 Conflict resolution: none. The five branch file sets are disjoint and merged cleanly with the ort strategy.
 
-Final HEAD hash (after merges + control-scripts commit): `bef4f14847e2735d08c1c875a262e0e6c6ff1188`
-Integrated revision hash (code under gate): `bef4f14847e2735d08c1c875a262e0e6c6ff1188`
+Integrated revision hash (code under gate): `bef4f14847e2735d08c1c875a262e0e6c6ff1188` (HEAD after merges + control-scripts commit at integration)
+Final HEAD hash at review recording: `38e924253a709a67aa1d41b098b946e0d1d1ccf0` (later than the integrated revision)
 
 Combined gates (run at integrated revision):
 
@@ -95,3 +95,13 @@ Integrated HEAD: `183a0be140757a5784e196fbff22ca7b7d005044` (`git rev-parse HEAD
 - **rev-decisions** — `VERDICT: PASS` — blocking findings: none (finding 1 is a P1 stale reorganisation figure in STATUS.md §3, explicitly labelled non-blocking).
 - **rev-tails** — `VERDICT: PASS` — blocking findings: none.
 - **rev-integration** — `VERDICT: CANNOT-VERIFY` — blocking findings: 1 (full workspace build + Rust test + Python suite at `183a0be` unexecuted — no shell tool, so the decisive build/test/reproducibility gate is unrun). Non-blocking P2: `52-program/issues.md` "Final HEAD hash" labels `bef4f14` as final while the true final HEAD is `183a0be`.
+
+## wave1b review corrections applied (2026-10-13T19:06:10+08:00)
+
+| file | change | source |
+|---|---|---|
+| `.scratch/STATUS.md` | §3 "Whole run" reorganisation line: `299,390,660 B over 63 merges` → `317,915,511 B over 64 merges` | `.scratch/47-latency-trusted-curve/curve.json` (commit `9bae6fe`) summary `compact_bytes_total: 317915511`, `compact_merges: 64` |
+| `docs/glossary.md` | "External baseline" parenthetical: `(sqlite, postgres)` → `(sqlite, postgres, lmdb, rocksdb)` | `.scratch/15-objective-v0/pre-registration.md` B1 (adopted 2026-10-09) |
+| `.scratch/52-program/issues.md` | integration record: reworded the stale "Final HEAD hash … `bef4f14`" line to distinguish the integrated revision (code under gate) `bef4f14` from the then-current HEAD at review recording `38e9242` | `git rev-parse HEAD` = `38e924253a709a67aa1d41b098b946e0d1d1ccf0` |
+| `.scratch/49-latency-tail-attribution/issues.md` | (a) `--compact-bytes 0 -> omit` source citation: `cold_0b.py:846` → `cold_0b.py:883-886`; (b) overstated bound `(4.2x-28x)`/`>= 4.2x` → `(4.17x-28x)`/`>= 4.17x` (no measured number changed) | (a) `harness/flashdb_harness/cold_0b.py` lines 883-886; (b) ticket's rung-400 example 590,578/141,402 = 4.18x |
+| `.scratch/52-program/wave1-verify-fix.js` | added (untracked control script) via `git add` | task instruction |
