@@ -2781,13 +2781,36 @@ impl Engine {
         let region = self.region_of_prefix(&pfx);
         sample.region = region;
         let mut result = None;
-        self.scan_merged(&pfx, region, |key, value| {
-            if keys::key_csn(key).is_some() {
-                result = if value.is_empty() { None } else { Some(value.to_vec()) };
-                return Ok(false);
+        let mut bytes_read: u64 = 0;
+        // Newest-first point probe: the memtable holds every version above the
+        // newest tile cutoff, and the tiles are ordered by increasing cutoff with
+        // DISJOINT CSN ranges, so `handle`'s newest version is either in the
+        // memtable or in the NEWEST tile whose key range contains it. Probing
+        // newest-first stops at the first hit instead of opening a cursor on
+        // every tile that holds an older version (an updated Stock row spans
+        // several cutoffs), which is the dominant cold-read cost of the request
+        // path. Correctness is unchanged: the first hit is by construction the
+        // highest-CSN version, and a tombstone is a hit that returns `None`.
+        if let Some((_, value)) = self.mt.scan_iter(&pfx).next() {
+            result = if value.is_empty() { None } else { Some(value.to_vec()) };
+        } else {
+            for t in self.tiles.iter().rev() {
+                if !t.tile.could_contain_prefix(&pfx) { continue; }
+                let mut cursor = t.tile.prefix_cursor(&pfx)?;
+                let found = match cursor.next()? {
+                    Some((key, value)) if keys::key_csn(key).is_some() => {
+                        result = if value.is_empty() { None } else { Some(value.to_vec()) };
+                        true
+                    }
+                    _ => false,
+                };
+                bytes_read = bytes_read.saturating_add(cursor.bytes_read());
+                if found { break; }
             }
-            Ok(true)
-        })?;
+        }
+        if region != metrics::DISABLED {
+            self.metrics.borrow_mut().region_bytes_read(region, bytes_read);
+        }
         self.metrics.borrow_mut().region_probe(region, result.is_some());
         Ok(result)
     }
@@ -4502,6 +4525,32 @@ mod tests {
         }]).unwrap();
         assert_eq!(e.reverse_lookup(b"ServiceTicket", b"order", 101).unwrap(), vec![202]);
         remove(&p);
+    }
+
+    /// The primary point read probes newest-first: the newest version lives in
+    /// the memtable or the NEWEST tile that contains the handle, so `get` must
+    /// return it without reading every older version, and a tombstone in a newer
+    /// tile must shadow a live version in an older one.
+    #[test]
+    fn get_probes_newest_first_across_tiles_and_memtable() {
+        let dir = tmp_dir("get-newest-first");
+        let put = |h: u64, v: &[u8]| Op::PutDoc { entity: b"E".to_vec(), handle: h, doc: v.to_vec() };
+        let mut e = Engine::create(&dir.join("data.wal")).unwrap();
+        e.commit_block(b"v1", &[put(1, b"v1")]).unwrap();       // csn 1
+        e.publish_tile(&dir.join("t1.tile"), 1).unwrap();       // tile covers (0,1]
+        e.commit_block(b"v2", &[put(1, b"v2")]).unwrap();       // csn 2
+        e.publish_tile(&dir.join("t2.tile"), 2).unwrap();       // tile covers (1,2]
+        e.commit_block(b"v3", &[put(1, b"v3")]).unwrap();       // csn 3, memtable
+        assert_eq!(e.get(b"E", 1).unwrap(), Some(b"v3".to_vec()), "memtable wins over every tile");
+        drop(e);
+
+        let mut e = Engine::open_discover(&dir).unwrap();
+        assert_eq!(e.get(b"E", 1).unwrap(), Some(b"v3".to_vec()));
+        e.commit_block(b"del", &[Op::DelDoc { entity: b"E".to_vec(), handle: 1 }]).unwrap(); // csn 4
+        e.publish_tile(&dir.join("t3.tile"), 4).unwrap();       // tombstone above v3
+        assert_eq!(e.get(b"E", 1).unwrap(), None, "a newer tombstone shadows the live version");
+        drop(e);
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
