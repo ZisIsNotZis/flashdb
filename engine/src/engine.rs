@@ -14,7 +14,7 @@
 
 use std::cell::RefCell;
 use std::collections::hash_map::Entry;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::io::Write;
@@ -453,10 +453,11 @@ fn is_region_spelling(name: &str) -> bool {
         if matches!(family, "P" | "U" | "R") && !entity.is_empty())
 }
 
-/// The largest active-tile list the engine will hold, re-exported from
-/// [`crate::manifest::MAX_TILES`]. It is a **policy constant**, not a page
+/// The largest active-tile list the engine will hold by default, re-exported from
+/// [`crate::manifest::MAX_TILES`]. It is a **policy ceiling**, not a page
 /// artefact: the manifest chains continuation pages, so this is the caller's
-/// compaction-trigger knob rather than the size of one 4 KiB root.
+/// compaction-trigger knob rather than the size of one 4 KiB root. Per-engine
+/// the cap is configurable via [`Engine::set_max_tiles`].
 pub const MAX_ACTIVE_TILES: usize = manifest::MAX_TILES;
 
 /// Which contiguous run [`Engine::maybe_compact_shape`] merges. All three
@@ -693,6 +694,11 @@ pub struct Engine {
     /// alone are NON-decreasing: a region-partitioned publish emits one tile per
     /// region at the same cutoff. The pair ordering is what keeps regions disjoint.
     tiles: Vec<TileHandle>,
+    /// Active-tile policy cap this engine refuses to exceed on publish. It is a
+    /// runtime knob, not a page artefact: the manifest chains continuation pages
+    /// up to [`crate::manifest::MAX_TILES`], so this may be raised/lowered per
+    /// engine within that ceiling via [`Engine::set_max_tiles`]. Not persisted.
+    max_tiles: usize,
     wal_path: PathBuf,
     dir: PathBuf,
     manifest: Option<Manifest>,
@@ -977,6 +983,7 @@ impl Engine {
             wal: Wal::create(&wal_path)?,
             mt: Memtable::new(),
             tiles: Vec::new(),
+            max_tiles: manifest::MAX_TILES,
             wal_path: wal_path.as_ref().to_path_buf(),
             dir: parent_dir(wal_path.as_ref()),
             manifest: None,
@@ -1201,7 +1208,7 @@ impl Engine {
         drop(records);
         drop(covered);
         Self::trim_retained_heap();
-        Ok(Engine { wal, mt, tiles, wal_path: wal_path.to_path_buf(), dir: parent_dir(wal_path), manifest: None, segment: None, segment_suffix_csn: csn, wal_detached: false, csn, dedup, max_handle, group_open: false, group_pending: false, group_frames: Vec::new(), group_defer_append: false, group_append_us: 0, group_apply_us: 0, group_fsync_us: 0, barrier_worker: None, barrier_in_flight: 0, layout: LayoutPolicy::declared_default(), region_mode: RegionMode::Global, key_encoding: encoding, order_no_index: None, metrics: RefCell::new(Metrics::new()), last_compaction: None, merge_floor: RefCell::new(HashMap::new()) })
+        Ok(Engine { wal, mt, tiles, max_tiles: manifest::MAX_TILES, wal_path: wal_path.to_path_buf(), dir: parent_dir(wal_path), manifest: None, segment: None, segment_suffix_csn: csn, wal_detached: false, csn, dedup, max_handle, group_open: false, group_pending: false, group_frames: Vec::new(), group_defer_append: false, group_append_us: 0, group_apply_us: 0, group_fsync_us: 0, barrier_worker: None, barrier_in_flight: 0, layout: LayoutPolicy::declared_default(), region_mode: RegionMode::Global, key_encoding: encoding, order_no_index: None, metrics: RefCell::new(Metrics::new()), last_compaction: None, merge_floor: RefCell::new(HashMap::new()) })
     }
 
     /// The CSN floor below which the active WAL file holds no records: the
@@ -1351,10 +1358,11 @@ impl Engine {
     fn write_verified_tiles(&self, tile_path: &Path, cutoff: u64) -> io::Result<Vec<EmittedTile>> {
         let lower = self.tiles.last().map(|t| t.cutoff()).unwrap_or(0);
         // Remaining manifest capacity. A partitioned publish emits one tile per region, so the
-        // cap must be checked BEFORE each region's file is created: otherwise a publish near the
-        // cap wrote its files, failed inside the manifest, and POISONED the writer (requiring a
-        // reopen) for a condition that is simply "not enough room". Global mode still costs one.
-        let capacity = manifest::MAX_TILES.saturating_sub(self.tiles.len());
+        // whole emit is refused BEFORE any region file is created (see the pre-count below):
+        // otherwise a publish near the cap wrote its files, failed inside the manifest, and
+        // POISONED the writer (requiring a reopen) for a condition that is simply "not enough
+        // room". Global mode still costs one.
+        let capacity = self.max_tiles.saturating_sub(self.tiles.len());
         if capacity == 0 {
             return Err(io::Error::new(io::ErrorKind::InvalidInput,
                 "active tile list is full; compact or rotate before publishing"));
@@ -1389,6 +1397,20 @@ impl Engine {
             verify_tile_against_wal(&tile, &wal_entries, lower, cutoff, None)?;
             return Ok(vec![EmittedTile { name: tile_name(tile_path), tile }]);
         }
+        // Partitioned: count the distinct regions this publish would emit BEFORE
+        // writing any region file. A publish of exactly `capacity` regions fits;
+        // one more is refused up front with the same pinned error, so an over-cap
+        // publish leaves no partial/orphan region files behind.
+        let mut distinct_regions: BTreeSet<Option<Vec<u8>>> = BTreeSet::new();
+        for (key, _) in self.mt.entries() {
+            let Some(csn) = keys::key_csn(key) else { continue };
+            if csn <= lower || csn > cutoff { continue; }
+            distinct_regions.insert(keys::region_prefix(key).map(<[u8]>::to_vec));
+        }
+        if distinct_regions.len() > capacity {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput,
+                "active tile list is full for this publish: a partitioned publish emits one tile per region and the remaining capacity is smaller"));
+        }
         // Partitioned: the memtable stream is key-ordered, so a region's keys
         // are contiguous. Buffer nothing; keep exactly one writer open and
         // finish it when the region prefix changes.
@@ -1412,10 +1434,7 @@ impl Engine {
                     verify_tile_against_wal(&tile, &wal_entries, lower, cutoff, region.as_deref())?;
                     emitted.push(EmittedTile { name: tile_name(&region_tile_path(tile_path, emitted.len())), tile });
                 }
-                if emitted.len() >= capacity {
-                    return Err(io::Error::new(io::ErrorKind::InvalidInput,
-                        "active tile list is full for this publish: a partitioned publish emits one tile per region and the remaining capacity is smaller"));
-                }
+                debug_assert!(emitted.len() < capacity, "pre-counted regions must fit the capacity");
                 current = region;
                 let path = region_tile_path(tile_path, emitted.len());
                 let (page_size, bits) = self.layout.for_region(&current.as_deref().map(keys::region_name).unwrap_or_default());
@@ -1474,8 +1493,9 @@ impl Engine {
     /// full active tile list plus the new tile, sync the manifest file, sync
     /// the parent directory, flip the in-memory root — and only then evict
     /// tile-covered memtable versions. Rules: tile cutoffs must be strictly
-    /// increasing (no CSN overlap with the newest active tile), at most
-    /// [`manifest::MAX_TILES`] active tiles, the tile path must be a plain
+    /// increasing (no CSN overlap with the newest active tile), at most the
+    /// engine's configured [`Engine::max_tiles`] active tiles, the tile path
+    /// must be a plain
     /// not-yet-existing filename inside the engine directory (the manifest
     /// stores the name, never a path), and any manifest I/O error poisons the
     /// writer until reopen selects the highest valid page. A failed publish
@@ -1495,7 +1515,7 @@ impl Engine {
         if self.tiles.last().is_some_and(|t| t.cutoff() >= cutoff) {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "tile cutoff must be strictly above the newest active tile cutoff"));
         }
-        if self.tiles.len() >= manifest::MAX_TILES {
+        if self.tiles.len() >= self.max_tiles {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "active tile list is full; no compaction exists in this slice"));
         }
         let tile_path = tile_path.as_ref();
@@ -2703,6 +2723,18 @@ impl Engine {
 
     /// The engine's current tile write mode (inspection/measurement hook).
     pub fn region_mode(&self) -> RegionMode { self.region_mode }
+
+    /// Set the active-tile policy cap this engine refuses to exceed on publish,
+    /// clamped to `1..=crate::manifest::MAX_TILES`. Lowering the cap below the
+    /// current active-tile count is legal: subsequent publishes/compactions
+    /// respect the new cap, and a full list fails closed as usual. Not persisted
+    /// (the on-disk manifest bound is the fixed structural ceiling).
+    pub fn set_max_tiles(&mut self, max_tiles: usize) {
+        self.max_tiles = max_tiles.clamp(1, manifest::MAX_TILES);
+    }
+
+    /// The engine's current active-tile policy cap (inspection hook).
+    pub fn max_tiles(&self) -> usize { self.max_tiles }
 
     /// Select the key spelling new keys are written with (slice 50). The default
     /// [`keys::KeyEncoding::FamilyFirst`] reproduces today's keyspace byte for

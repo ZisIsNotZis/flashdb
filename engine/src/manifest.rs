@@ -115,12 +115,12 @@ const CHAIN_MARKER: u32 = u32::MAX;
 /// assertion below so a change to any page/frame field size is a build failure,
 /// not a silently torn chain. A publish beyond it is refused as `InvalidInput`;
 /// a CRC-valid page claiming more is corruption.
-pub(crate) const MAX_TILES: usize = 1024;
+pub(crate) const MAX_TILES: usize = 4096;
 
 /// Hard cap on continuation pages per root slot. This is the chain's termination
 /// bound: neither `chain_pages` nor `chain_start + chain_pages` may exceed it,
 /// and the file may not be longer than `2 + 2*MAX_CHAIN_PAGES` pages.
-const MAX_CHAIN_PAGES: usize = 96;
+const MAX_CHAIN_PAGES: usize = 316;
 const MANIFEST_MAX_BYTES: u64 = (2 + 2 * MAX_CHAIN_PAGES) as u64 * PAGE as u64;
 
 // The chained root descriptor (marker/total/chain_pages/chain_start + checkpoint

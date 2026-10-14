@@ -3,7 +3,7 @@
 //! [`Engine::maybe_checkpoint`] trigger. The WAL stays the sole recovery
 //! authority and is never rotated or truncated here.
 
-use flashdb_engine::engine::{CompactShape, Engine, Op, Outcome, MAX_ACTIVE_TILES};
+use flashdb_engine::engine::{CompactShape, Engine, Op, Outcome};
 use std::fs;
 use std::io::ErrorKind;
 use std::path::PathBuf;
@@ -210,14 +210,15 @@ fn compaction_name_owned_by_live_tile_fails_closed_without_hint_to_delete() {
 fn manifest_refuses_more_than_max_tiles() {
     let files = Files::new();
     let mut e = Engine::create(&files.wal).unwrap();
-    // manifest::MAX_TILES is now a policy constant (1024) backed by a chained
-    // multi-page root, not the capacity of one 4 KiB page: publish one-doc tiles
-    // until the bound is reached.
-    for i in 1..=MAX_ACTIVE_TILES as u64 {
+    // The active-tile cap is a configurable policy bound (default 4096) backed by a chained
+    // multi-page root. Use a small configured cap so the fill/reopen round-trip stays fast.
+    const CAP: usize = 16;
+    e.set_max_tiles(CAP);
+    for i in 1..=CAP as u64 {
         e.commit_block(&format!("b{i}").into_bytes(), &[doc(i, b"d")]).unwrap();
         e.publish_tile(&files.dir.join(format!("tile-{i}.tile")), i).unwrap();
     }
-    let over = MAX_ACTIVE_TILES as u64 + 1;
+    let over = CAP as u64 + 1;
     e.commit_block(b"over", &[doc(over, b"d")]).unwrap();
     let err = e.publish_tile(&files.dir.join("tile-over.tile"), over).unwrap_err();
     assert_eq!(err.kind(), ErrorKind::InvalidInput, "the tile list is bounded, and a full list is InvalidInput on publish, not corruption");
@@ -225,9 +226,9 @@ fn manifest_refuses_more_than_max_tiles() {
     drop(e);
     let e = Engine::open_discover(&files.dir).unwrap();
     assert_eq!(e.csn(), over);
-    assert_eq!(e.serving_memtable_entries(), 1, "all MAX_ACTIVE_TILES tiles re-verified against the WAL at open");
+    assert_eq!(e.serving_memtable_entries(), 1, "all CAP tiles re-verified against the WAL at open");
     assert_eq!(e.get(b"E", 1).unwrap(), Some(b"d".to_vec()));
-    assert_eq!(e.get(b"E", MAX_ACTIVE_TILES as u64).unwrap(), Some(b"d".to_vec()));
+    assert_eq!(e.get(b"E", CAP as u64).unwrap(), Some(b"d".to_vec()));
 }
 
 #[test]
@@ -375,19 +376,21 @@ fn compact_refuses_under_two_tiles_and_leftover_candidates() {
 fn compact_releases_the_max_tiles_bound() {
     let files = Files::new();
     let mut e = Engine::create(&files.wal).unwrap();
-    // Fill the manifest to its policy bound (MAX_ACTIVE_TILES).
-    for i in 1..=MAX_ACTIVE_TILES as u64 {
+    // Fill the manifest to its configured policy bound (small, so the test stays fast).
+    const CAP: usize = 16;
+    e.set_max_tiles(CAP);
+    for i in 1..=CAP as u64 {
         e.commit_block(&format!("b{i}").into_bytes(), &[doc(i, b"d")]).unwrap();
         e.publish_tile(&files.dir.join(format!("tile-{i}.tile")), i).unwrap();
     }
-    let over = MAX_ACTIVE_TILES as u64 + 1;
+    let over = CAP as u64 + 1;
     e.commit_block(b"over", &[doc(over, b"d")]).unwrap();
     assert_eq!(e.publish_tile(&files.dir.join("tile-over.tile"), over).unwrap_err().kind(), ErrorKind::InvalidInput);
     assert_eq!(e.serving_memtable_entries(), 1, "refused publish left the memtable serving");
     e.compact().unwrap();
-    assert!(files.dir.join(format!("compact-{MAX_ACTIVE_TILES}.tile")).exists());
+    assert!(files.dir.join(format!("compact-{CAP}.tile")).exists());
     assert!(!files.dir.join("tile-1.tile").exists());
-    assert!(!files.dir.join(format!("tile-{MAX_ACTIVE_TILES}.tile")).exists());
+    assert!(!files.dir.join(format!("tile-{CAP}.tile")).exists());
     assert_eq!(e.serving_memtable_entries(), 1, "compaction still never touches the memtable");
     // The freed slots accept new tiles again.
     e.publish_tile(&files.dir.join("tile-over.tile"), over).unwrap();
@@ -395,7 +398,7 @@ fn compact_releases_the_max_tiles_bound() {
     drop(e);
     let e = Engine::open_discover(&files.dir).unwrap();
     assert_eq!(e.get(b"E", 1).unwrap(), Some(b"d".to_vec()));
-    assert_eq!(e.get(b"E", MAX_ACTIVE_TILES as u64).unwrap(), Some(b"d".to_vec()));
+    assert_eq!(e.get(b"E", CAP as u64).unwrap(), Some(b"d".to_vec()));
     assert_eq!(e.get(b"E", over).unwrap(), Some(b"d".to_vec()));
     assert_eq!(e.serving_memtable_entries(), 0);
 }
