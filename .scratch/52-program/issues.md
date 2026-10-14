@@ -1016,3 +1016,27 @@ No failures.
   - `cargo test --workspace --offline` — 304 Rust tests passed, 0 failed.
   - `cd harness && uv run --with pytest pytest -q` — 140 passed.
   - `git diff --check` — silent.
+
+## wave21 WP-W2 dispatch record (close the rung-50 compaction re-warm residual)
+
+- Timestamp: 2026-10-14T14:48:48+08:00 (diagnosis/design checkpoint committed `52d5a5e`) ->
+  2026-10-14T15:16:08+08:00 (measurement complete; final record committed at the hash named in
+  the ticket).
+- Action: dispatched work package W2 "warm newly published compaction output off the pacer so a
+  post-compaction read is not a cold page-in" to the single-writer `wave21/rewarm` worktree
+  (branch `wave21/rewarm`, based on master `8a4ea20`). Contract, diagnosis, design + rejected
+  alternatives, change, tests, before/after tables, both judging views, acceptance verdict and
+  residual are in `.scratch/76-compaction-rewarm/issues.md`; raw artifacts are the committed
+  `seed42/43/44/42-repeat` `.json`/`.md` in the same directory. Diagnosis: the read-ahead worker's
+  64-request lookahead is warmed once against the OLD snapshot, and a compaction publish replaces
+  tiles without rewinding the worker's warm cursor, so the next ~64 requests' POINT reads hit the
+  replacement tile cold on the pacer (the movement scan prefix self-heals via the per-refresh memo;
+  the `order_no` index tile is a sidecar and never compacted). Fix: on `Refresh`, detect a real tile
+  set change by `Arc<Tile>` pointer identity and rewind the warm cursor to the pacer's position, so
+  the lead is re-warmed against the new tiles; a same-set refresh adds no redundant work. Result:
+  post-publish windows clean in all 4 win runs (lag_p99 0.1-6.2 ms), static-derived rung-50 lag-rej
+  3/1/1/2 -> 1/2/1/1 (median 2 -> 1); 0/40 NOT reached because the remaining 1-2/40 are the
+  compaction BUILD window's device fdatasync tail (63-313 ms) + 91 ms append + 30-60 MB build I/O
+  under the 128 MiB cap (a proven device/working-set floor), not the post-publish read. Throughput
+  unchanged (static-derived 107/107/106/107 before and after). Gates: 305 Rust + 140 Python tests
+  green, cargo build 0 warnings, `git diff --check` silent.
