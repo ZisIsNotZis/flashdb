@@ -242,9 +242,11 @@ DEFAULT_LAMBDA_NS_PER_BYTE = DEVICE_WRITE_NS_PER_BYTE
 @dataclass(frozen=True, order=True)
 class LayoutCandidate:
     """One published per-region policy: a tile page size, a merge threshold, and
-    (WP-M) whether to build the derived `order_no -> StockMovement` secondary
-    access path. The index axis is a no-op for regions other than
-    ``P|StockMovement``; the engine ignores it there."""
+    whether to build the derived `order_no -> StockMovement` secondary access
+    path (WP-M). The index axis is a no-op for regions other than
+    ``P|StockMovement``; the engine ignores it there. The learner offers it only
+    to ``P|StockMovement`` and only once that region has actually served a scan
+    request (WP-O: the axis is demand-gated, not explored as a cross product)."""
 
     page_size: int
     merge_min_tiles: int
@@ -271,13 +273,13 @@ DEFAULT_CANDIDATES: tuple[LayoutCandidate, ...] = tuple(
 # The engine's shipped default (LayoutPolicy::declared_default): 4 KiB pages, 10
 # bloom bits, merge_min_tiles = 2. It is the region's initial active candidate.
 DECLARED_DEFAULT = LayoutCandidate(4096, 2)
-# WP-M: the movement primary region additionally offers the same 6 layouts with
-# the `order_no` secondary access path switched on (12 candidates there; every
-# other region keeps the published 6 so the global burn-in cost is unchanged).
-INDEXED_CANDIDATES: tuple[LayoutCandidate, ...] = DEFAULT_CANDIDATES + tuple(
-    LayoutCandidate(p, m, index_order_no=True)
-    for p in DEFAULT_PAGE_SIZES for m in DEFAULT_MERGE_MIN_TILES
-)
+# WP-O: the `order_no` secondary access path is a DEMAND-GATED, one-shot axis,
+# not a 12-candidate cross product. `P|StockMovement` starts on the base 6-grid
+# (index off); the first window in which it actually serves a scan (`count > 0`)
+# flips its candidate set to the same 6 layouts with `index_order_no=True`, and
+# the index stays on for the rest of the run. A region that never serves a scan
+# (the adversarial workload's 0-scan `P|StockMovement`) never offers the index,
+# so the learner cannot build a ~2.14 MB sidecar for zero read benefit.
 # The region the secondary access path is built for (must match the engine's
 # `P|StockMovement` region spelling under family-first key encoding).
 INDEXED_REGION = "P|StockMovement"
@@ -502,6 +504,8 @@ class _RegionState:
     last_change_step: int | None = None
     budget_blocks: int = 0        # switches refused because projected added reorg exceeded budget
     cooldown_holds: int = 0       # steps a change was held back by the per-region cooldown
+    # WP-O: the movement region has swapped its candidate set to the index-on grid.
+    index_flipped: bool = False
 
 
 @dataclass
@@ -558,17 +562,57 @@ class LayoutLearner:
 
     # -- state helpers ------------------------------------------------------
     def _candidates_for(self, name: str) -> tuple[LayoutCandidate, ...]:
-        """The candidate set a region explores. The movement primary region
-        additionally carries the `order_no` secondary-access-path variants
-        (WP-M); every other region keeps the published base set, so the global
-        burn-in cost is unchanged."""
-        if name == INDEXED_REGION:
-            base = tuple(self.candidates)
-            indexed = tuple(
-                LayoutCandidate(c.page_size, c.merge_min_tiles, True) for c in base
-            )
-            return tuple(dict.fromkeys(base + indexed))
+        """The base candidate set a region explores (the published 2 x 3 grid).
+
+        The `order_no` secondary-access-path axis (WP-M/WP-O) is NOT part of this
+        grid: it is offered to ``P|StockMovement`` only as a demand-gated,
+        one-shot flip (see :meth:`_flip_index_axis`), so the movement region's
+        burn-in stays the same 6 candidates as every other region.
+        """
         return tuple(self.candidates)
+
+    def _index_on_candidates(self) -> tuple[LayoutCandidate, ...]:
+        """The same published grid with the `order_no` index switched on."""
+        return tuple(
+            LayoutCandidate(c.page_size, c.merge_min_tiles, index_order_no=True)
+            for c in self.candidates
+        )
+
+    def _flip_index_axis(self, name: str, stats: RegionStats) -> None:
+        """One-shot, demand-gated adoption of the `order_no` index axis (WP-O).
+
+        Called once per window AFTER the window's evidence is recorded against
+        the candidate that was active for it. The movement region starts on the
+        base grid (index off); the first window in which it actually serves a
+        scan request (``count > 0``) justifies the index, so the region's
+        candidate set is replaced with the index-on grid and the burn-in restarts
+        on that grid. The index is then STICKY for the rest of the run (the
+        index-off candidates are gone), so the learner toggles it at most once
+        per region per run instead of once per candidate change. A region that
+        never serves a scan never flips: the axis is gated on measured demand,
+        not on exploration.
+        """
+        if name != INDEXED_REGION or stats.count <= 0:
+            return
+        st = self._region(name)
+        if st.index_flipped:
+            return
+        st.index_flipped = True
+        indexed = self._index_on_candidates()
+        st.arms = {c: _Arm() for c in indexed}
+        # A fresh candidate set is a fresh burn-in: leave no stale incumbent,
+        # pending gate or reference evidence from the index-off grid (its cost
+        # profile is not comparable to the index-on grid's). The next `step`
+        # re-adopts the seeded-first index-on candidate and starts the cooldown.
+        st.active = None
+        st.pending = None
+        st.pending_streak = 0
+        st.reference_cost = None
+        st.deviation_streak = 0
+        st.reexploring = False
+        st.reexplore_start = None
+        st.recovery_windows = None
+        st.last_change_step = None
 
     def _tie_for(self, st: _RegionState) -> dict[LayoutCandidate, int]:
         """The seeded tie-break permutation for a region's candidate set (cached)."""
@@ -626,6 +670,11 @@ class LayoutLearner:
             st = self._region(name)
             if st.active is not None:
                 self.record(name, st.active, window.regions[name])
+            # WP-O: adopt the order_no index axis on the first window with real
+            # scan traffic, AFTER recording that window against the index-off
+            # candidate it actually ran under. The flip replaces the candidate
+            # set, so the policy written below is index-on for the NEXT window.
+            self._flip_index_axis(name, window.regions[name])
             # A drift detected by `record` above starts the epoch in THIS window
             # (the reset already happened and one arm may be re-sampled), so the
             # response is counted from here, not from the next window.
