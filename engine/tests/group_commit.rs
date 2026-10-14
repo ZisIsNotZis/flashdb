@@ -401,18 +401,18 @@ fn overlapped_barriers_drain_in_order_and_recover() {
     let mut e = Engine::create(&files.wal).unwrap();
     e.commit_block(b"base", &[put_doc(1, "doc1")]).unwrap();
 
-    e.begin_group().unwrap();
+    e.begin_group_deferred().unwrap();
     let (id2, ops2) = block(2);
     e.commit_block_grouped(&id2, &ops2).unwrap();
     assert!(e.submit_group().unwrap(), "a write group owes a barrier");
 
-    e.begin_group().unwrap();
+    e.begin_group_deferred().unwrap();
     let (id3, ops3) = block(3);
     e.commit_block_grouped(&id3, &ops3).unwrap();
     assert!(e.submit_group().unwrap());
 
     // An empty group submits no barrier and closes cleanly.
-    e.begin_group().unwrap();
+    e.begin_group_deferred().unwrap();
     assert!(!e.submit_group().unwrap(), "an empty group owes no barrier");
     assert_eq!(e.pending_barriers(), 2, "only the two write groups have barriers in flight");
 
@@ -449,4 +449,29 @@ fn submit_requests_grouped_reports_barrier_and_per_request_results() {
     e.wait_group_barrier().unwrap();
     assert_eq!(e.pending_barriers(), 0);
     assert_eq!(on_hand(&e), 93, "in-order guard semantics are unchanged (100 - 3 - 4)");
+}
+
+/// WP-P (slice 67): the grouped WAL append is deferred off the request path.
+/// `commit_block_grouped` buffers the frame (no device write), so the WAL length
+/// and record count do not advance until the barrier worker appends; the
+/// memtable/CSN advance immediately (in-order guard semantics unchanged), and
+/// after the barrier the deferred frame is durable and recoverable. This fails
+/// against the pre-change behaviour, where the append ran inline before
+/// `submit_group` returned.
+#[test]
+fn deferred_append_buffers_on_the_pacer_and_lands_on_the_worker() {
+    let files = Files::new();
+    let mut e = Engine::create(&files.wal).unwrap();
+    e.begin_group_deferred().unwrap();
+    e.commit_block_grouped(b"b1", &[put_doc(1, "doc1")]).unwrap();
+    assert_eq!(e.wal_valid_len(), 0, "the WAL append is deferred off the request path");
+    assert_eq!(wal_records(&files), 0, "no frame is on disk before the worker runs");
+    assert_eq!(e.csn(), 1, "the memtable/CSN advance on the pacer immediately");
+    assert!(e.submit_group().unwrap(), "a write group owes an append+barrier job");
+    e.wait_group_barrier().unwrap();
+    assert!(e.wal_valid_len() > 0, "the worker appended the frame before its barrier");
+    assert_eq!(wal_records(&files), 1, "the deferred frame is on disk after the barrier");
+    drop(e);
+    let e = Engine::open(&files.wal).unwrap();
+    assert_eq!(e.get(b"E", 1).unwrap(), Some(b"doc1".to_vec()), "the deferred append is durable");
 }

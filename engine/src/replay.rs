@@ -163,14 +163,17 @@ pub fn execute_requests_grouped(
     Ok(results)
 }
 
-/// Execute a batch of requests as ONE overlapped-barrier group (slice 56).
+/// Execute a batch of requests as ONE overlapped append+barrier group
+/// (slice 56/67).
 ///
-/// Identical to [`execute_requests_grouped`] except the group's WAL barrier is
-/// SUBMITTED to the engine's background barrier worker instead of taken
-/// synchronously: the requests are validated, WAL-appended and applied in order
-/// immediately (so a later request's probe/guard sees every earlier effect
-/// exactly as sequential commits would), then the caller observes the barrier's
-/// completion by draining [`Engine::wait_group_barrier`] /
+/// Identical to [`execute_requests_grouped`] except each write block's WAL
+/// frame is BUFFERED on the pacer (not written) and the whole group's barrier
+/// is SUBMITTED to the engine's background worker instead of taken
+/// synchronously: the requests are validated and applied in order immediately
+/// (so a later request's probe/guard sees every earlier effect exactly as
+/// sequential commits would), the worker appends the group's frames and
+/// `fdatasync`s them off the request path, and the caller observes the
+/// barrier's completion by draining [`Engine::wait_group_barrier`] /
 /// [`Engine::try_take_group_barrier`] in submission order. A request is NEVER
 /// acknowledged before an `fdatasync` covering its appends has completed.
 ///
@@ -184,7 +187,7 @@ pub fn submit_requests_grouped(
     engine: &mut Engine,
     requests: &[Value],
 ) -> io::Result<(bool, Vec<io::Result<RequestResult>>)> {
-    engine.begin_group()?;
+    engine.begin_group_deferred()?;
     let mut results = Vec::with_capacity(requests.len());
     for request in requests {
         results.push(execute_request(engine, request));

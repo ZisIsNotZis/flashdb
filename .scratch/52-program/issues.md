@@ -734,3 +734,31 @@ No failures.
   aggregate win throughput declared 68-74 -> learned/static 107 rps (+44.6% to +57.4%); adversarial
   learned builds 0 index (pre-change 3) and rung-50 lag-rej 0/40 = declared; adversarial reorg ratio
   median 1.36x (pre-change 2.51x). Gates: 299 Rust + 140 Python, build 0 warnings, diff --check silent.
+
+## wave14 WP-P dispatch record (request-path write stall)
+
+- Timestamp: 2026-10-14T09:00:00+08:00 (measurement window 08:29-08:59).
+- Action: dispatched work package P "remove the request-path device durability stall" to the
+  single-writer `wave14/writestall` worktree. Contract, diagnosis, design, rejected alternatives,
+  invariants argument, change, tests, gates, before/after tables, both judging views, acceptance
+  verdict and residuals are in `.scratch/67-requestpath-write-stall/issues.md` (checkpoint
+  `618b760`; implementation `98ba12e` + `16303ef`).
+- Result: the grouped WAL append is now deferred onto the existing FIFO barrier worker (append +
+  `fdatasync` in one job, `Wal::encode_frame` + `group_frames` + `begin_group_deferred`); the
+  pacer never blocks on the device `write_all`, and an ack still requires the covering `fdatasync`
+  (tests: `deferred_append_buffers_on_the_pacer_and_lands_on_the_worker`,
+  `end_group_refuses_a_deferred_append_group`, strengthened
+  `overlapped_barrier_sync_error_fails_closed_and_poisons_the_wal`). Per-group proof: a 129.6 ms
+  `fdatasync` now dispatches the NEXT group with 70 us of lag (was a ~54-74 ms cascade); across the
+  three win after-runs static-derived sees 12 fsyncs >100 ms and 23 >50 ms with ZERO fsync-attributed
+  lag breaches. A supervisor-approved scope extension (same commit set) also warms the WP-M
+  `order_no` index tile in the read-ahead view (`tile_read_view` + `request_read_lookups` +
+  `OrderNoIndex::tile`), removing the mid-rung cold-index page-ins the write fix exposed.
+  Measurement (win, 12.25x c51, seeds 42/43 + 42 repeat, shared box with the concurrent churn2
+  lane): static-derived rung-50 lag-rej 2-4/40 -> **2/40** in all three after-runs, and the two
+  remaining windows are the read-ahead worker's STARTUP WARM-UP (windows 0-1, `reads=N boundary=0`),
+  not the write path and not the durability floor; declared ~39-40/40 (full scan) and learned
+  ~25-26/40 (the WP-O churn) are unchanged. Throughput and write amp unchanged. Honest verdict:
+  write-path acceptance MET; rung-50 lag-rej=0 NOT reached (residual 2/40 warm-up transient), both
+  judging views reported, pre-registration untouched. Gates: 302 Rust + 138 Python tests green,
+  cargo build 0 warnings, `git diff --check` silent.

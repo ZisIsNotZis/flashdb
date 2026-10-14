@@ -519,7 +519,9 @@ pub struct ReadLookup {
 /// Return the unique lookups (and nothing else) a supported request will probe
 /// on the read path. Order-flow requests probe customer, then order/backorder
 /// uniqueness, then stock; point reads probe their one entity. A movement scan
-/// is a full-entity scan with no unique prefix, so it returns no lookups.
+/// probes the WP-M `order_no` index (when adopted) in addition to the full
+/// primary prefix `request_scan_entities` warms, so it returns that one index
+/// probe here.
 pub fn request_read_lookups(req: &Value) -> Vec<ReadLookup> {
     let Some(blocks) = req.get("blocks").and_then(Value::as_object) else { return Vec::new() };
     if blocks.contains_key("cust") && blocks.contains_key("take") {
@@ -560,6 +562,21 @@ pub fn request_read_lookups(req: &Value) -> Vec<ReadLookup> {
     {
         if let Some(email) = find.get("email").and_then(Value::as_str) {
             return vec![ReadLookup { entity: CUSTOMER.entity, field: CUSTOMER.unique, value: email.as_bytes().to_vec() }];
+        }
+    }
+    if let Some(find) = q.get("find")
+        .and_then(Value::as_object)
+        .and_then(|f| f.get("StockMovement"))
+        .and_then(Value::as_object)
+    {
+        // A movement scan reads the whole primary prefix AND (when the WP-M
+        // derived `order_no` index is adopted) probes the index tile first. The
+        // primary prefix is warmed by `request_scan_entities`; warm the index
+        // point probe here so the read-ahead worker covers it too.
+        if let Some(order_no) = find.get("where").and_then(Value::as_object)
+            .and_then(|w| w.get("order_no")).and_then(Value::as_str)
+        {
+            return vec![ReadLookup { entity: MOVEMENT.entity, field: "order_no", value: order_no.as_bytes().to_vec() }];
         }
     }
     Vec::new()
@@ -617,7 +634,9 @@ mod tests {
         let movements = json!({
             "blocks": {"q": {"find": {"StockMovement": {"where": {"order_no": "O9"}}, "order": ["movement_no"], "limit": 100}}}
         });
-        assert!(request_read_lookups(&movements).is_empty(), "a movement scan has no unique prefix to warm");
+        assert_eq!(request_read_lookups(&movements), vec![
+            ReadLookup { entity: "StockMovement", field: "order_no", value: b"O9".to_vec() },
+        ], "a movement scan probes the WP-M order_no index (when adopted) so the read-ahead worker warms it");
     }
 
     #[test]

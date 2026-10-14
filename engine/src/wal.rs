@@ -72,14 +72,7 @@ impl Wal {
 
     /// 追加一条记录（未持久化；调用方随后 `sync`）。拒绝空载荷和恢复器无法读取的超长载荷。
     pub fn append(&mut self, payload: &[u8]) -> io::Result<()> {
-        self.ensure_writable()?;
-        if payload.is_empty() || payload.len() > MAX_RECORD {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "WAL payload length out of bounds"));
-        }
-        let mut frame = Vec::with_capacity(HEADER + payload.len());
-        frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-        frame.extend_from_slice(&crc32c(payload).to_le_bytes());
-        frame.extend_from_slice(payload);
+        let frame = self.encode_frame(payload)?;
         #[cfg(test)]
         if self.inject_partial_append {
             self.inject_partial_append = false;
@@ -98,6 +91,35 @@ impl Wal {
         }
         self.valid_len += frame.len() as u64;
         Ok(())
+    }
+
+    /// Build the framed bytes for one record WITHOUT writing them
+    /// (`[len u32 LE][crc32c(payload) u32 LE][payload]`). Used by the grouped
+    /// commit path (slice 67) to defer the device-bound `write_all` off the
+    /// request thread onto the WAL append/barrier worker: the frame is built
+    /// cheaply on the pacer, and the worker later writes these exact bytes and
+    /// `fdatasync`s them. The bounds and poison checks are identical to
+    /// [`Wal::append`], so a buffered frame that would fail closed on the pacer
+    /// also refuses to buffer.
+    pub(crate) fn encode_frame(&self, payload: &[u8]) -> io::Result<Vec<u8>> {
+        self.ensure_writable()?;
+        if payload.is_empty() || payload.len() > MAX_RECORD {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "WAL payload length out of bounds"));
+        }
+        let mut frame = Vec::with_capacity(HEADER + payload.len());
+        frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        frame.extend_from_slice(&crc32c(payload).to_le_bytes());
+        frame.extend_from_slice(payload);
+        Ok(frame)
+    }
+
+    /// Advance the valid-length watermark after a worker has appended `len`
+    /// bytes (slice 67). The grouped path appends off the request thread, so
+    /// the writer only learns an append succeeded when the barrier completes;
+    /// every `valid_len` consumer already runs with no barrier in flight, so
+    /// the watermark never needs to see an in-flight group's bytes.
+    pub(crate) fn record_appended(&mut self, len: u64) {
+        self.valid_len += len;
     }
 
     /// `fdatasync`：失败后写者中毒，必须重新打开并重放 WAL 才能继续。
@@ -134,11 +156,12 @@ impl Wal {
         self.file.try_clone()
     }
 
-    /// A duplicated handle to the live WAL file for an overlapped-barrier worker
-    /// (slice 56). The clone shares the open file description, so `sync_data` on
-    /// it flushes the same inode the main writer appends to; the main writer is
-    /// NOT borrowed while the worker runs. A failed sync is observed on the
-    /// clone, so the caller must propagate it by [`Wal::poison`]ing the writer.
+    /// A duplicated handle to the live WAL file for an overlapped append+barrier
+    /// worker (slice 56/67). The clone shares the open file description, so the
+    /// worker's `write_all` appends at the same offset the main writer owns and
+    /// `sync_data` flushes the same inode; the main writer is NOT borrowed while
+    /// the worker runs. A failed append or sync is observed on the clone, so the
+    /// caller must propagate it by [`Wal::poison`]ing the writer.
     /// Refuses (and therefore fails closed) once the writer is poisoned, exactly
     /// as [`Wal::sync`] does.
     pub(crate) fn sync_handle(&mut self) -> io::Result<File> {

@@ -341,4 +341,38 @@ mod tests {
         assert!(!view2.warm_scan_prefix(b"StockMovement", &mut state).unwrap());
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// WP-P follow-on: `Engine::tile_read_view` must include the adopted WP-M
+    /// `order_no` index tile, so the read-ahead worker warms the index point
+    /// probe the authoritative movement scan performs. Without it the probe is a
+    /// cold page-in on the pacer (the residual WP-P found at rung 50). This
+    /// fails against the pre-change behaviour, where the view held only
+    /// `self.tiles` and the index tile was absent.
+    #[test]
+    fn tile_read_view_includes_the_adopted_order_no_index() {
+        let dir = tmp_dir("indexwarm");
+        let mut e = Engine::create(dir.join("data.wal")).unwrap();
+        e.commit_block(b"m", &[
+            Op::PutDoc { entity: b"StockMovement".to_vec(), handle: 1, doc: br#"{"order_no":"O1","movement_no":"M1"}"#.to_vec() },
+            Op::PutDoc { entity: b"StockMovement".to_vec(), handle: 2, doc: br#"{"order_no":"O2","movement_no":"M2"}"#.to_vec() },
+        ]).unwrap();
+        e.publish_tile(dir.join("p.tile"), 1).unwrap();
+
+        // Before adoption the warm view has no `order_no` index probe.
+        let view_without = e.tile_read_view();
+        assert_eq!(view_without.unique_handle_tiles(b"StockMovement", b"order_no", b"O1").unwrap(), None,
+            "no index is adopted, so the warm view has no order_no index probe");
+
+        // Build and adopt the derived index (off-path in production; inline here).
+        let build = crate::index::build_order_no_index(&dir, &e.tile_read_view(), "order_no.idx").unwrap();
+        std::fs::File::open(&dir).unwrap().sync_all().unwrap();
+        e.adopt_order_no_index(build.index);
+
+        // After adoption the warm view resolves the index probe from the index
+        // tile, so the read-ahead worker warms the exact block the scan probes.
+        let view_with = e.tile_read_view();
+        assert_eq!(view_with.unique_handle_tiles(b"StockMovement", b"order_no", b"O1").unwrap(), Some(1),
+            "the adopted index tile is part of the warm view");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
