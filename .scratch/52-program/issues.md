@@ -1325,3 +1325,16 @@ No failures.
   - `cargo test --workspace --offline` — 308 passed; 0 failed; 0 ignored.
   - `cd harness && uv run --with pytest pytest -q` — 146 passed in 4.34s.
   - `git diff --check` — silent.
+
+## SSOT refresh (WP-79)
+
+- Timestamp: 2026-10-14T18:47:20+08:00.
+- Action: refreshed `.scratch/STATUS.md` in place to the current single source of truth — bound
+  revision `482e3a1bd2a0c12dff4e0f3f758cd8a29556fed2`, pilot-grade T1-T4 verdicts (3 seeds + one
+  repeat), current physical-layout mechanisms, device-bound honest limit, accounting convention,
+  and the three open author items. Recorded the current harness floor behaviour (ratio correctly
+  computed; the JSON `not_concluded` floor string remains a stale cosmetic caveat, not yet fixed).
+  `.scratch/15-objective-v0/pre-registration.md` not edited.
+- Gates: `cargo build --workspace --offline` 0 warnings; `cargo test --workspace --offline`
+  308 passed / 0 failed / 0 ignored; `cd harness && uv run --with pytest pytest -q` 146 passed;
+  `git diff --check` silent.
