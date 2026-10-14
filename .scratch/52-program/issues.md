@@ -1294,3 +1294,34 @@ No failures.
   `git diff --check` silent.
 - Full tables, accounting convention (`summary.compact_bytes_total`), box-load log, and residual
   gaps: `.scratch/79-final-eval/issues.md`.
+
+## Integration record: WP-79 final eval
+
+- Timestamp: 2026-10-14T18:42:42+08:00 (integration committed).
+- Action: single-writer integrator merged `wave23/final-eval` (WP-79 final combined post-integration
+  evaluation) into `master` (`git merge --no-ff`, merge commit
+  `0faba9cb7fca7bb618391d3db38c62f572472014`). The independent verifier verdict was **PASS** — all
+  measured tables, ratios, verdict directions, conventions, disclaimers and gates check out against
+  the committed raw JSON; one material (but correctly disclosed) direction-change finding and four
+  non-blocking prose inaccuracies, no blocking findings.
+- Change carried (ticket `.scratch/79-final-eval/issues.md` + per-seed
+  `42/42r/43/44{,-drift}.{json,md}` + `boxload.md` + `analyze.py`): the final-revision proof of the
+  thesis metrics on the fully integrated tree (tilecap + driftshape + rewarm repair). Headline
+  verdicts (pilot-grade, 3 independent seeds + 1 repeat, NOT a 10-seed verdict): T1 learned vs
+  declared aggregate achieved **+41.3% to +50.7% (median +47.6%)**, outside the ~4.0% noise band;
+  T2 **PASS** (adversarial reorg median 0.933x, max 0.995x <= 1.5x; 0 index builds on the 0-scan
+  region); T3 **PASS** (win reorg median 0.767x, max 0.941x <= 3x; no single-region blowup); T4
+  **EVALUABLE and measured NOT SUPPORTED** (both arms drop ~8-9% at the write-spike drift, neither
+  recovers, learned ≈ static +2%). Primary §7.1 lag-only: rung 50 NOT sustained (static 2-3/40,
+  learned 3-6/40); rung 100 lag-sustained — static-derived 4/4, learned 3/4; rung 200 lag-sustained
+  — static-derived 4/4, learned 2/4. Both ceilings (harness): 0/96 win/adversarial rows sustained
+  (service ceiling device-bound).
+- Conflict: one, in `.scratch/52-program/issues.md` (both `wave23/final-eval` and `master` appended
+  sections at the same spot after the WP-X integration record). Resolved by keeping both sides in
+  order: WP-X record repair, Integration record: WP-X record repair (merged), WP-79 setup dispatch,
+  WP-79 results record. No other conflicts; `.scratch/79-final-eval/*` artifacts added cleanly.
+- Combined gates (verbatim, run at integrated HEAD `0faba9cb7fca7bb618391d3db38c62f572472014`):
+  - `cargo build --workspace --offline` — Finished `dev` profile, 0 warnings.
+  - `cargo test --workspace --offline` — 308 passed; 0 failed; 0 ignored.
+  - `cd harness && uv run --with pytest pytest -q` — 146 passed in 4.34s.
+  - `git diff --check` — silent.
