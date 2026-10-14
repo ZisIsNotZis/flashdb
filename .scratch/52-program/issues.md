@@ -1256,3 +1256,41 @@ No failures.
   - `cargo test --workspace --offline` — 308 passed; 0 failed; 0 ignored.
   - `cd harness && uv run --with pytest pytest -q` — 146 passed in 4.37s.
   - `git diff --check` — silent.
+
+## WP-79 final combined evaluation: setup dispatch record
+
+- Timestamp: 2026-10-14T17:23:27+08:00.
+- Action: dispatched the final combined post-integration evaluation (ticket 79) to the
+  single-writer `wave23/final-eval` worktree, based on fully integrated master
+  `48b0488af5d9db1c2252c727e9389bfb06ecdc09` (tilecap + driftshape + rewarm repair).
+- Worktree: `/home/z/vibe/worktrees/flashdb/wave23-final-eval` (branch `wave23/final-eval`).
+- Release build: `cargo build --workspace --release --offline` — Finished in 15.67s, 0 warnings;
+  measured binaries `target/release/flashdb-load`, `flashdb-scale`, `flashdb-replay`.
+- Instance: fresh cold copy `cp -a /tmp/cold51/per_region-mixed /tmp/wave23-eval/per_region-mixed`;
+  1,643,925,811 B (12.25x).
+- Contract: arms/seed/verdict deliverable and gates live in `.scratch/79-final-eval/issues.md`.
+
+## WP-79 final combined evaluation: results record
+
+- Timestamp: 2026-10-14 17:32-18:22 +08:00 (measurement); record committed on `wave23/final-eval`.
+- Action: ran the full superset, 8 lock-protected harness invocations (4 seeds x (win+adversarial 6
+  arm-runs + write-spike-drift 3 arm-runs) = 36 arm-runs), one flashdb process at a time under
+  `MemoryMax=128MiB` and `flock /tmp/wave21-measure.lock`, against the fresh cold instance
+  `/tmp/wave23-eval/per_region-mixed` (12.25x). Box loadavg 2.89-5.89 (quiet).
+- Headline (pilot-grade, 3 seeds + 1 repeat, NOT a 10-seed verdict):
+  - Primary (§7.1 lag-only): rung 50 NOT sustained (static 2-3/40, learned 3-6/40, declared
+    39-40/40); **rung 100 lag-sustained — static-derived 4/4 seeds, learned 3/4; rung 200
+    lag-sustained — static-derived 4/4, learned 2/4.**
+  - T1: learned vs declared aggregate achieved **+41.3% to +50.7% (median +47.6%)**, outside the
+    ~4.0% noise band.
+  - T2: PASS (rung-50 lag learned <= declared; 0 index builds on the 0-scan region; adversarial
+    reorg ratio median 0.933x, max 0.995x <= 1.5x).
+  - T3: PASS (win reorg ratio median 0.767x, max 0.941x <= 3x; no single-region blowup).
+  - T4 (write-spike): EVALUABLE, measured NOT SUPPORTED (both arms drop ~8-9% at the drift, neither
+    recovers, learned ≈ static +2%).
+  - Both ceilings (harness): 0/96 win/adversarial rows `sustained` (service ceiling device-bound).
+- Gates: `cargo build --workspace --offline` 0 warnings; `cargo test --workspace --offline`
+  308 passed / 0 failed / 0 ignored; `cd harness && uv run --with pytest pytest -q` 146 passed;
+  `git diff --check` silent.
+- Full tables, accounting convention (`summary.compact_bytes_total`), box-load log, and residual
+  gaps: `.scratch/79-final-eval/issues.md`.
