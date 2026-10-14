@@ -1230,3 +1230,29 @@ No failures.
   `cargo test --workspace --offline` 306 passed / 0 failed / 0 ignored;
   `cd harness && uv run --with pytest pytest -q` 146 passed in 4.40s; `git diff --check` silent
   (exit 0).
+
+## Integration record: WP-X record repair (merged)
+
+- Timestamp: 2026-10-14T17:38:09+08:00 (integration committed).
+- Action: single-writer integrator merged `wave22/eval` (WP-X record repair) into `master`
+  (`git merge --no-ff`, merge commit `59829b853ed2ef1318e04519594722249b0200f7`). The independent
+  repair verifier verdict was **PASS**: the WP-X evaluation record in `.scratch/78-eval-wave21/`
+  is corrected against the committed raw JSON (T3 reorg re-derived from
+  `summary.compact_bytes_total`, median 0.923x, plus two minor finding fixes), with no eval re-run
+  and the pre-registration doc untouched.
+- Change carried (ticket `.scratch/78-eval-wave21/issues.md` + per-seed `42/42r/43/44.md`): the
+  T3 win/learned reorg ratio is re-derived from `summary.compact_bytes_total` (median 0.923x, max
+  0.941x), superseding the prior 0.564x median; two minor corrections (seed43 rung-200 achieved
+  fraction 1.1315 / seed42-repeat rung-400 1.0040, and the T4 post-drift drop -9.4% to -10.9%).
+  T3 verdict unchanged (<=3x PASS); T4 verdict stays EVALUABLE, measured NOT SUPPORTED.
+- Conflict: one, in `.scratch/52-program/issues.md` (both `wave22/eval` and `master` appended
+  dispatch/integration sections at the same spot after the wave20 integration record). Resolved by
+  keeping all appended sections in chronological order: wave21 WP-W2 dispatch, Integration record:
+  wave21 lanes, wave22 WP-X dispatch, wave21 WP-W2 repair dispatch, Integration record:
+  wave21/rewarm repair, WP-X record repair. No other conflicts; `.scratch/78-eval-wave21/*`
+  artifacts added cleanly and the wave21/rewarm code/artifacts on master are untouched.
+- Combined gates (verbatim, run at integrated HEAD `59829b853ed2ef1318e04519594722249b0200f7`):
+  - `cargo build --workspace --offline` — Finished, 0 warnings.
+  - `cargo test --workspace --offline` — 308 passed; 0 failed; 0 ignored.
+  - `cd harness && uv run --with pytest pytest -q` — 146 passed in 4.37s.
+  - `git diff --check` — silent.
