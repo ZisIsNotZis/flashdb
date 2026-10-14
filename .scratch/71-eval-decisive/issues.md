@@ -275,6 +275,9 @@ lock. NOT a 10-seed pre-registered verdict.**
    builds on the 0-scan region; reorg ratio median 0.928x, max 0.944x (<= 1.5x).
 5. **T3:** win reorg ratio median 0.934x, max 0.941x (<= 3x); the single-region blowup does NOT
    recur (max single-window actuation 11.08-11.37 MB, one pair).
+6. **T4 (drift recovery within 2 windows): NOT measured in this run** — this package ran only the
+   win and adversarial workloads (per the task), not the drift workload, so T4 stays UNDERIVED at
+   this revision (STATUS §5: the default parameters need 6 windows, not the pre-registered 2).
 
 **What the evidence supports:** the layout axis (WP-M `order_no` index) is necessary and delivers a
 reproducible, large achieved-throughput + service-latency win (declared 70-75 -> learned/static
