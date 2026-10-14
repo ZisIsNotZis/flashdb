@@ -154,13 +154,57 @@ impl TileReadView {
         // primary range (marker | entity | 0), not any single handle.
         let mut prefix = keys::primary_prefix_with(self.key_encoding, entity, 0)?;
         prefix.truncate(prefix.len() - 8);
-        for t in self.tiles.iter() {
-            if !t.could_contain_prefix(&prefix) { continue; }
-            let mut cursor = t.prefix_cursor(&prefix)?;
-            while cursor.next()?.is_some() {}
-        }
+        let _ = self.warm_prefix_range(&prefix)?;
         Ok(true)
     }
+
+    /// Walk a whole key prefix across every tile that could contain it, reading
+    /// each block so it lands in the page cache. Returns how many entries the
+    /// walk yielded (the count is discarded by callers; it exists only so the
+    /// startup warm-up can be observed in tests).
+    fn warm_prefix_range(&self, prefix: &[u8]) -> io::Result<u64> {
+        let mut entries = 0u64;
+        for t in self.tiles.iter() {
+            if !t.could_contain_prefix(prefix) { continue; }
+            let mut cursor = t.prefix_cursor(prefix)?;
+            while cursor.next()?.is_some() { entries += 1; }
+        }
+        Ok(entries)
+    }
+
+    /// One bounded synchronous warm-up pass at run start (WP-R): page in the
+    /// movement scan prefix and, when the derived `order_no` index is adopted,
+    /// the index tile's blocks, so the first timed window's movement scans are
+    /// page-cache hits instead of cold page-ins on the pacer. Purely
+    /// observational: the walked rows are discarded and never feed a decision.
+    /// The caller runs this once before the timed windows begin (off the timed
+    /// clock), so it is a bounded startup read, never a second full scan on the
+    /// request path.
+    pub fn warm_startup(&self) -> io::Result<StartupWarm> {
+        // The authoritative movement scan's fallback reads the whole primary
+        // prefix; page it in so a miss/mismatch never cold-faults on the pacer.
+        let mut scan_prefix = keys::primary_prefix_with(self.key_encoding, crate::index::INDEX_ENTITY, 0)?;
+        scan_prefix.truncate(scan_prefix.len() - 8);
+        let scan_entries = self.warm_prefix_range(&scan_prefix)?;
+        // The derived index tile is keyed under `U|StockMovement|order_no`; walking
+        // that whole prefix pages in every index block the point probe could touch.
+        // `unique_prefix_with` appends a length-delimited value, so strip the empty
+        // value's 4-byte length to leave the shared field prefix
+        // (`U | entity | 0 | field | 0`) every index entry starts with.
+        let mut index_prefix = keys::unique_prefix_with(
+            self.key_encoding, crate::index::INDEX_ENTITY, crate::index::INDEX_FIELD, b"")?;
+        index_prefix.truncate(index_prefix.len() - 4);
+        let index_entries = self.warm_prefix_range(&index_prefix)?;
+        Ok(StartupWarm { scan_entries, index_entries })
+    }
+}
+
+/// What the startup warm-up pass read (page-cache priming only; the rows are
+/// discarded). Entry counts are the observable contract, not a correctness bound.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct StartupWarm {
+    pub scan_entries: u64,
+    pub index_entries: u64,
 }
 
 /// Memoizes which entity prefixes have already been warmed for the current tile
@@ -373,6 +417,38 @@ mod tests {
         let view_with = e.tile_read_view();
         assert_eq!(view_with.unique_handle_tiles(b"StockMovement", b"order_no", b"O1").unwrap(), Some(1),
             "the adopted index tile is part of the warm view");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// WP-R: the bounded synchronous startup warm-up must walk the movement scan
+    /// prefix AND, once the `order_no` index is adopted, the index tile, so the
+    /// first timed window's scans are page-cache hits. This pins the eager warm
+    /// the driver performs before the timed windows; before this package there
+    /// was no such pass (the index was adopted lazily at the first boundary and
+    /// the worker's view lacked it for another window).
+    #[test]
+    fn warm_startup_walks_the_scan_prefix_and_the_adopted_index() {
+        let dir = tmp_dir("startupwarm");
+        let mut e = Engine::create(dir.join("data.wal")).unwrap();
+        e.commit_block(b"m", &[
+            Op::PutDoc { entity: b"StockMovement".to_vec(), handle: 1, doc: br#"{"order_no":"O1","movement_no":"M1"}"#.to_vec() },
+            Op::PutDoc { entity: b"StockMovement".to_vec(), handle: 2, doc: br#"{"order_no":"O2","movement_no":"M2"}"#.to_vec() },
+        ]).unwrap();
+        e.publish_tile(dir.join("p.tile"), 1).unwrap();
+
+        // Without an adopted index the pass warms the scan prefix but no index rows.
+        let warm_before = e.tile_read_view().warm_startup().unwrap();
+        assert!(warm_before.scan_entries >= 2, "the movement scan prefix is walked: {}", warm_before.scan_entries);
+        assert_eq!(warm_before.index_entries, 0, "no index tile is present yet");
+
+        // Adopt the derived index; the pass must now also walk the index tile.
+        let build = crate::index::build_order_no_index(&dir, &e.tile_read_view(), "order_no.idx").unwrap();
+        std::fs::File::open(&dir).unwrap().sync_all().unwrap();
+        e.adopt_order_no_index(build.index);
+
+        let warm_after = e.tile_read_view().warm_startup().unwrap();
+        assert!(warm_after.scan_entries >= 2, "the movement scan prefix is still walked");
+        assert!(warm_after.index_entries >= 2, "the adopted index tile's entries are walked: {}", warm_after.index_entries);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
