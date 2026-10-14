@@ -242,7 +242,7 @@ after the window loop and attributes to no window or region). See the final-drai
 
 | run | `U|Stock` | `P|Customer` | `U|Customer` | total reorg | max single merge |
 |---|---:|---:|---:|---:|---:|
-| before seed42 | **75.2 MB / 8** | **30.8 MB / 3** | 0 | 109.3 MB | 10.16 MB |
+| before seed42 | **75.2 MB / 8** | **30.8 MB / 3** | 0 | 109.3 MB | 10.30 MB |
 | before seed42-repeat | 0 / 0 | 0 | 0 | 3.3 MB | ~0 |
 | after seed42 | 5.23 MB / 1 | 10.29 MB / 1 | 0 / 0 | 17.12 MB | 10.29 MB |
 | after seed43 | 5.23 MB / 1 | 0 / 0 | 0 / 0 | 18.26 MB | 11.37 MB |
@@ -264,9 +264,10 @@ merge is 11,372,547 B ≈ 11.37 MB — one pair, still not a burst. The ticket-6
 reproduced above are per-region sums and undercount their own final drained merge the same way
 (e.g. before seed42 learned: 109,308,744 B reported vs 119,471,031 B summary, a 10,162,287 B final
 merge), so before-vs-after is apples-to-apples in merge count (both sides drop one final merge) but
-both sides undercount by one merge. This ticket corrects the `after seed43` total/ratio/median
-below to the summary totals; the other after runs have no final-drain gap (summary == per-region
-sum).
+both sides undercount by one merge. The `before seed42` cell was the final drained merge value
+(10,162,287 B); it is corrected here to the true max single merge 10.30 MB (a 10,300,227 B
+`P|Customer` window merge). This ticket corrects the `after seed43` total/ratio/median below to the
+summary totals; the other after runs have no final-drain gap (summary == per-region sum).
 
 ### win T3 reorg ratio (learned/declared and static/declared)
 
