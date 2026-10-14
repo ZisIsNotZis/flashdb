@@ -55,6 +55,16 @@ impl TileReadView {
         self.key_encoding
     }
 
+    /// True when `other` names the same immutable tile set as `self` (same tile
+    /// count and every `Arc<Tile>` pointer-identical). Kept tiles keep their
+    /// `Arc<Tile>` across a publish/compaction, while replaced or newly adopted
+    /// tiles get a fresh one, so pointer identity detects a real snapshot change
+    /// without touching file contents.
+    fn same_tile_set(&self, other: &TileReadView) -> bool {
+        if self.tiles.len() != other.tiles.len() { return false; }
+        self.tiles.iter().zip(other.tiles.iter()).all(|(a, b)| Arc::ptr_eq(a, b))
+    }
+
     /// Tile-only walk of an entity's whole primary prefix (the exact prefix
     /// [`crate::engine::Engine::scan_primary`] walks, minus the serving
     /// memtable), yielding each live document's `(handle, csn, doc bytes)` once.
@@ -227,6 +237,24 @@ enum Msg {
     Refresh(TileReadView),
 }
 
+/// Adopt a fresh tile snapshot in the worker. When the tile set actually
+/// changed, every block the worker warmed ahead belongs to the old snapshot
+/// (replaced tiles keep their open fds but the authoritative read now probes
+/// the new files), so rewind the warm cursor to the pacer's current position to
+/// re-warm the lead against the new tiles. A refresh that carries the same tile
+/// set leaves the cursor alone (no redundant re-warm every window).
+fn adopt_snapshot(
+    view: &mut TileReadView,
+    position: &AtomicU64,
+    warm_index: &mut u64,
+    next: TileReadView,
+) {
+    if !view.same_tile_set(&next) {
+        *warm_index = position.load(Ordering::Relaxed);
+    }
+    *view = next;
+}
+
 impl ReadAhead {
     /// Spawn the worker with the trace lines it reads ahead of and the initial
     /// tile snapshot. The worker tracks `position` (the pacer's dispatched
@@ -265,10 +293,12 @@ fn worker(
     let mut warm_index: u64 = 0;
     let mut scan_warm = ScanWarmState { tiles: Arc::new(Vec::new()), warmed: HashSet::new() };
     loop {
-        // Adopt any pending tile snapshot before warming against it.
+        // Adopt any pending tile snapshot before warming against it. A snapshot
+        // whose tile set changed rewinds the cursor so the lead is re-warmed
+        // against the new tiles (the old lead warms stale, replaced blocks).
         loop {
             match rx.try_recv() {
-                Ok(Msg::Refresh(v)) => view = v,
+                Ok(Msg::Refresh(v)) => adopt_snapshot(&mut view, &position, &mut warm_index, v),
                 Err(mpsc::TryRecvError::Empty) => break,
                 Err(mpsc::TryRecvError::Disconnected) => return,
             }
@@ -295,7 +325,7 @@ fn worker(
             continue;
         }
         match rx.recv_timeout(Duration::from_millis(2)) {
-            Ok(Msg::Refresh(v)) => view = v,
+            Ok(Msg::Refresh(v)) => adopt_snapshot(&mut view, &position, &mut warm_index, v),
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => return,
         }
@@ -449,6 +479,56 @@ mod tests {
         let warm_after = e.tile_read_view().warm_startup().unwrap();
         assert!(warm_after.scan_entries >= 2, "the movement scan prefix is still walked");
         assert!(warm_after.index_entries >= 2, "the adopted index tile's entries are walked: {}", warm_after.index_entries);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// WP-W2: when a compaction/publish replaces tiles, the worker must re-warm
+    /// the lead it already warmed against the OLD snapshot, otherwise the first
+    /// reads of the replacement tiles are cold page-ins on the pacer (the rung-50
+    /// residual). This pins the snapshot-change detection and the cursor rewind;
+    /// before this package the worker advanced its warm cursor past the stale
+    /// lead and never re-warmed it.
+    #[test]
+    fn adopt_snapshot_rewinds_the_warm_cursor_only_when_the_tile_set_changes() {
+        use super::adopt_snapshot;
+        use std::sync::atomic::AtomicU64;
+
+        let dir = tmp_dir("rewind");
+        let mut e = Engine::create(dir.join("data.wal")).unwrap();
+        e.commit_block(b"m", &[
+            Op::PutDoc { entity: b"StockMovement".to_vec(), handle: 1, doc: br#"{"order_no":"O1","movement_no":"M1"}"#.to_vec() },
+            Op::PutDoc { entity: b"StockMovement".to_vec(), handle: 2, doc: br#"{"order_no":"O2","movement_no":"M2"}"#.to_vec() },
+        ]).unwrap();
+        e.publish_tile(dir.join("p.tile"), 1).unwrap();
+
+        // Two views of the same tile set are pointer-identical.
+        let no_index = e.tile_read_view();
+        assert!(no_index.same_tile_set(&e.tile_read_view()), "same tile set is detected");
+
+        // Adopting the index appends a NEW tile, so the tile set changes.
+        let build = crate::index::build_order_no_index(&dir, &e.tile_read_view(), "order_no.idx").unwrap();
+        std::fs::File::open(&dir).unwrap().sync_all().unwrap();
+        e.adopt_order_no_index(build.index);
+        let with_index = e.tile_read_view();
+        assert!(!no_index.same_tile_set(&with_index), "the adopted index tile changes the set");
+
+        let position = AtomicU64::new(100);
+        let mut warm_index = 164u64;
+        let mut view = no_index;
+
+        // A real snapshot change rewinds the cursor to the pacer's position so
+        // the already-warmed lead is re-warmed against the new tiles.
+        adopt_snapshot(&mut view, &position, &mut warm_index, with_index);
+        assert_eq!(warm_index, 100, "a changed tile set rewinds the warm cursor");
+
+        // A refresh that carries the SAME tile set leaves the cursor alone (no
+        // redundant re-warm every window boundary).
+        warm_index = 164;
+        let with_index_same = e.tile_read_view();
+        assert!(view.same_tile_set(&with_index_same));
+        adopt_snapshot(&mut view, &position, &mut warm_index, with_index_same);
+        assert_eq!(warm_index, 164, "an unchanged tile set keeps the warm cursor");
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
