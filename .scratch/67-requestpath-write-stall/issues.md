@@ -243,9 +243,15 @@ Per-rung achieved throughput (after, the only thing the objective's throughput a
 | learned@1.0 | 50 | 100 | 199-200 | 351-400 |
 | static-derived | 50 | 100 | 200 | 354-400 |
 
-Write amplification is unchanged by construction (the change only moves WAL frame writes between
-threads; frame bytes and compaction bytes are identical) — the three after-runs' static-derived
-`reorg_bytes` are 8.0-8.9 MB, matching the before runs and WP-N.
+Write amplification does NOT show a clean non-regression. Static-derived write amp (`reorg_bytes`
++ `index_output_bytes`, the summed per-region compaction plus index output) was seed42=21.9 /
+seed43=21.9 / seed42-repeat=30.2 MB before, but seed42new=26.4 / seed43new=94.9 /
+seed42repeatnew=98.0 MB after — 2 of 3 after-runs are 3.2-4.3x higher. The whole excess is a
+single ~69-72 MB merge (`U|Customer` 69.0 MB on seed43new, `P|Customer` 72.1 MB on
+seed42repeatnew) with zero index output, plausibly shared-box timing noise, and NOT causally tied
+to the read-path-only follow-on (a read-path change cannot cause a Customer-region compaction);
+the write-amplification non-regression criterion is therefore NOT substantiated by the current
+evidence and is left pending the WP-R re-measure.
 
 ### The write-stall is removed (per-group proof, before state seed 42)
 
@@ -273,9 +279,11 @@ service-vs-lag reconciliation, unchanged).
 
 ## Acceptance verdict
 
-**Write-path acceptance: MET.** The single pacer no longer blocks on device write latency; a
-covering `fdatasync` still gates every ack (tests); throughput and write amp are unchanged;
-ordering/newest-first/disjoint-tiles unchanged. The named blocker is removed with per-group proof.
+**Write-path acceptance: MET** (the write-stall fix itself), with the write-amplification
+non-regression criterion **NOT substantiated** (see the before/after note above). The single pacer
+no longer blocks on device write latency; a covering `fdatasync` still gates every ack (tests);
+throughput is unchanged; ordering/newest-first/disjoint-tiles unchanged. The named blocker is
+removed with per-group proof.
 
 **Rung-50 lag-rej = 0: NOT reached — honest residual 2/40 (static-derived), and it is proven NOT
 write-path and NOT device-durability-bound.** The two remaining windows are the read-ahead
