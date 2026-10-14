@@ -141,45 +141,140 @@ correctness is untouched (syncs never change bytes).
   (off-path build) set `set_sync_every(COMPACT_TILE_SYNC_EVERY_BYTES)` (2 MiB) right after the
   writer is constructed.
 
-## Measurement
+### Change (throttle)
 
-(Updated after the throttled build is measured; the protocol is the same as the original W2 run.)
-Instance `cp -a` copy of `/tmp/cold51/per_region-mixed` (12.25x), release binary built once and
-copied, one process at a time under `flock /tmp/wave21-measure.lock -c '<full command>'`.
-Harness `cold_0b.py --workloads win --arms declared learned static-derived --lambdas 1.0`, full
-ladder 50/100/200/400 rps, `--cap-mib 128 --checkpoint-bytes 8388608 --rotate-bytes 8388608
---compact-bytes 67108864 --ceiling-us 10000 --lag-ceiling-us 10000`. Seeds 42/43/44 + a 42 repeat.
-Report per-rung achieved_rps, lag-rej, lag p99, and the BUILD-window vs post-publish attribution.
+- `engine/src/tile.rs`: `TileWriter` gains `set_sync_every(bytes)` plus an `unsynced` byte
+  counter; `flush_block` calls `self.file.sync_data()?` once the accumulated unsynced data-block
+  bytes reach the threshold, then resets the counter. `TileWriter::new` defaults it OFF, so the
+  ordinary publish stream and its single final `sync_data` are byte-for-byte unchanged.
+- `engine/src/engine.rs`: `pub const COMPACT_TILE_SYNC_EVERY_BYTES: u64 = 2 * 1024 * 1024`;
+  `write_compacted_tile` (synchronous merge path) and `build_compaction_job` (off-path build)
+  call `writer.set_sync_every(COMPACT_TILE_SYNC_EVERY_BYTES)` right after the writer is built.
+
+### Tests (throttle)
+
+- `engine/src/tile.rs::streaming_writer_periodic_sync_is_byte_identical` — NEW: a writer with
+  `set_sync_every(1)` (one sync per block) produces a byte-identical tile to the un-synced
+  stream, and the tile reopens with the same entry count. Pins that the cadence changes only
+  durability timing, never the encoded bytes.
+
+## Measurement (throttled build; the repair run)
+
+Release binary built once from HEAD `f71899c` (`flashdb-load` sha256
+`7126819a3390cdde804c7a85cb0f134eabf486daae49759b80c274ce88ae000e`), copied to
+`/tmp/wave21-rewarm-bin/flashdb-load` and verified byte-identical to `target/release/flashdb-load`.
+Instance is the same pristine `cp -a` copy of `/tmp/cold51/per_region-mixed`
+(`/tmp/wave21-rewarm/cold51`, 1,643,925,811 B / 134,217,728 B = **12.25x**; byte-identical size to
+the source). Harness `cold_0b.py --workloads win --arms declared learned static-derived
+--lambdas 1.0`, full ladder 50/100/200/400 rps, `--cap-mib 128 --checkpoint-bytes 8388608
+--rotate-bytes 8388608 --compact-bytes 67108864 --ceiling-us 10000 --lag-ceiling-us 10000`.
+Seeds 42/43/44 + seed 42 repeat, one arm process at a time; every seed invocation wrapped in
+`flock /tmp/wave21-measure.lock -c '<full command>'`. Raw artifacts: `repair-{seed42,seed43,seed44,seed42-repeat}.{json,md}`.
+
+Box load at boundaries (shared 12-core box):
+
+| boundary | time | loadavg 1/5/15 |
+|---|---|---|---|
+| seed42 start | 16:19:28 | 4.50 / 5.11 / 5.71 |
+| seed42 end | 16:28:50 | 4.48 / 5.10 / 5.53 |
+| seed43 start | 16:28:56 | 4.44 / 5.08 / 5.52 |
+| seed43 end | 16:34:06 | 4.88 / 5.07 / 5.39 |
+| seed44 start | 16:34:11 | 4.81 / 5.05 / 5.39 |
+| seed44 end | 16:47:18 | 7.03 / 5.40 / 5.30 |
+| seed42-repeat start | 16:47:23 | 7.03 / 5.43 / 5.31 |
+| seed42-repeat end | 16:52:38 | 7.14 / 6.59 / 5.81 |
+
+The seed42-repeat run landed under rising external load (loadavg 1min 7.0-7.1 throughout) and is
+therefore a noise-contaminated outlier, not a like-for-like repeat (see the verdict).
 
 ## Before/after tables
 
-"Before" = WP-S integrated master (ticket 71); "after" = this package. Win workload, rung 50,
-40 windows, `--lambdas 1.0`.
+"Before" = WP-S integrated master (ticket 71); "after" = this package (throttled build). Win
+workload, rung 50, 40 windows, `--lambdas 1.0`.
 
 **static-derived rung-50 lag-rejected windows** (the acceptance rung):
 
 | run | before (windows) | after (windows) |
 |---|---:|---:|
-| seed42 | 3/40 | (measured after the throttle) |
-| seed43 | 1/40 | |
-| seed44 | 1/40 | |
-| seed42-repeat | 2/40 | |
-| **median** | **2/40** | |
+| seed42 | 3/40 | **0/40** |
+| seed43 | 1/40 | 2/40 (19, 22) |
+| seed44 | 1/40 | 1/40 (35) |
+| seed42-repeat | 2/40 | 8/40 (external load) |
+| **median** | **2/40** | **1.5/40** |
 
-**Achieved throughput (aggregate achieved rps) — must not regress:**
+**Achieved throughput (per-rung achieved rps) — must not regress** (seed42 as the clean
+representative; the other seeds agree):
 
-| arm | before (42/43/44/42-rpt) | after |
+| arm | before 50/100/200/400 | after 50/100/200/400 |
 |---|---|---|
-| declared | 72 / 72 / 70 / 72 | |
-| learned@1.0 | 107 / 107 / 106 / 107 | |
-| static-derived | 107 / 107 / 106 / 107 | |
+| declared | 50 / 85 / 85 / 80.5 | 50 / 86.6 / 84.4 / 83.2 |
+| learned@1.0 | 50 / 100 / 199.9 / 399.4 | 50 / 100 / 199.9 / 399.8 |
+| static-derived | 50 / 100 / 199.9 / 399.6 | 50 / 100 / 199.9 / 399.8 |
 
-## Acceptance verdict
+No throughput regression on either indexed arm; declared stays device-bound (~85% at 100+ rps),
+unchanged from before.
 
-**Corrected (repair):** the rung-50 residual is the compaction BUILD window's device tail, not a
-post-publish cold read. The earlier claim that the fix made every post-publish window clean is
-retracted (seed42 w19 is a post-publish lag breach caused by a 12.6 ms WAL-`fdatasync` device
-noise tail with no build concurrent). The re-warm change is a sound warm-path correctness fix,
-not the residual fix. Rung-50 lag-rej = 0/40 is NOT established by the pre-repair W2 runs
-(static-derived median 1/40); the build-throttle fix and its measurement are recorded below the
-tables when measured.
+## The throttle's effect and the fsync-during-build distribution
+
+The cadence bounds the build's single durable flush. Build `finish_us` (the tile `sync_data`)
+for the 10-11 MB merges: **before 56-320 ms → after 11-32 ms** (`stream_us` absorbs the extra
+syncs, so total build wall time is roughly unchanged). Build-window lag attribution after the
+throttle (static-derived, from per-arm stderr):
+
+| seed | build window | output | finish_us | pacer stall (stderr) | max_lag_us |
+|---|---|---:|---:|---:|---:|
+| 42 | 20 (10.17 MB) | clean | 32,000 | `stall_fsync_us=71,739` | 1,647 |
+| 42 | 22 (11.08 MB) | clean | 11,281 | `stall_fsync_us=26,803` | 197 |
+| 43 | 19 (10.17 MB) | **breach** | 23,998 | `stall_fsync_us=77,740` `read_bytes=93.2 MB` | 38,353 |
+| 43 | 22 (11.08 MB) | **breach** | 29,771 | pure read 40 ms `read_bytes=147 MB` | 20,462 |
+| 44 | 35 (no build) | **breach** | — | `stall_fsync_us=99,451` | 63,771 |
+
+So the device-bound residual is now explicit: the build's own durable flush is bounded to
+11-32 ms, but (a) the build's INPUT-tile stream reads 93-147 MB under the 12.25x working set and
+(b) the pacer's WAL `fdatasync` still tails to 77-99 ms while that read I/O is in flight — and to
+99 ms even with NO build running (seed44 w35). Those are the shared device's own read/write
+latency floor, >10 ms, not an engine mechanism.
+
+## Gates (verbatim, final HEAD after the repair commits)
+
+1. `cargo build --workspace --offline` — 0 warnings:
+```
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.03s
+```
+2. `cargo test --workspace --offline` — totals: **306 passed; 0 failed; 0 ignored**
+   (305 pre-repair + 1 new `streaming_writer_periodic_sync_is_byte_identical`).
+3. `cd harness && uv run --with pytest pytest -q`:
+```
+warning: `VIRTUAL_ENV=/home/z/.venv` does not match the project environment path `.venv` and will be ignored; use `--active` to target the active environment instead
+140 passed in 4.07s
+```
+4. `git diff --check` — silent (exit 0).
+
+## Acceptance verdict (honest, post-repair)
+
+**Diagnosis corrected:** the rung-50 residual is the compaction BUILD's device I/O + `fdatasync`
+tail, not a post-publish cold read. The falsified claim "POST-publish windows clean in all four
+runs" is retracted: seed42 w19 (pre-repair run) is a post-publish lag breach (12.58 ms) whose
+mechanism is a 12.6 ms WAL-`fdatasync` device-noise tail with no build concurrent, not a cold read.
+
+**Fix:** the re-warm change (`8aa7b29`) is kept as a sound warm-path correctness fix (stale-lead
+re-warm), not the residual fix. The new bounded `sync_data` cadence (`f71899c`) is a sound,
+bounded, off-path-only change that bounds the build's durable flush to 11-32 ms; durability is
+only strengthened, correctness untouched (byte-identical tile).
+
+**Rung-50 lag-rej = 0/40 across >=3 seeds: NOT reached** — static-derived 0/2/1/8 (median 1.5),
+where the 8 is the externally-loaded repeat (526 ms-1049 ms breaches at a 0.3 MB build and at
+non-build windows, loadavg 7.0+). The remaining breaches are proven device-bound by the
+fsync-during-build distribution above: the pacer's WAL `fdatasync` tails to 77-99 ms under the
+build's 93-147 MB stream reads (and to 99 ms with no build), i.e. the shared device's own
+latency floor above the 10 ms lag ceiling, irreducible without weakening durability. The build's
+INPUT-tile read set (93-147 MB under 12.25x) is the next-order device/working-set cost, out of
+scope for this package.
+
+**Judging views:** §7.1 lag-only primary — rung-50 NOT sustained (median 1.5/40), rung 100
+sustained in the clean seeds (lag_p99 ~0.6-1.2 ms). Both-ceilings — 0 rps everywhere, unchanged
+(the service ceiling remains device-bound; the open §7.1 reconciliation is untouched).
+
+**Honest label:** pilot-grade. 4 runs = 3 independent seeds + one repeat, all lock-protected,
+one process at a time; the repeat is externally-loaded. The diagnosis correction and the
+build-flush bound are solid; 0/40 is not claimed.
