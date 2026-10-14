@@ -59,6 +59,31 @@ def test_plan_workload_stepping_and_drift_scaling() -> None:
     assert drift.mixes[2]["scan"] == m.WIN_MIX["scan"] * 10, "drift multiplies the shape weight"
 
 
+def test_plan_workload_write_drift_multiplies_the_write_weight_only() -> None:
+    """WP-W: the write-spike drift is selectable and keeps every other WIN_MIX weight."""
+    drift = m.plan_workload("drift", 50, 1000, drift_shape="write", drift_factor=10, drift_rate=150)
+    assert drift.rates == [150] * 6
+    assert drift.mixes[0] == m.WIN_MIX and drift.mixes[1] == m.WIN_MIX
+    drifted = drift.mixes[2]
+    assert drifted["write"] == m.WIN_MIX["write"] * 10
+    for shape in ("stock", "customer", "scan"):
+        assert drifted[shape] == m.WIN_MIX[shape], "only the write weight is multiplied"
+    # The default remains the ticket-73 scan spike.
+    default = m.plan_workload("drift", 50, 1000, drift_rate=150)
+    assert default.mixes[2]["scan"] == m.WIN_MIX["scan"] * 10
+    assert default.mixes[2]["write"] == m.WIN_MIX["write"]
+
+
+def test_plan_workload_drift_pre_segments_extends_the_clean_pre_drift_baseline() -> None:
+    """WP-W: a longer pre-drift keeps the drift boundary after the learner's burn-in (ticket 73 c)."""
+    drift = m.plan_workload("drift", 50, 1000, drift_rate=150, drift_pre_segments=6)
+    assert drift.rates == [150] * 10, "6 pre-drift + 4 post-drift segments"
+    assert all(mix == m.WIN_MIX for mix in drift.mixes[:6]), "the first 6 segments are pre-drift win mix"
+    assert drift.mixes[6]["scan"] == m.WIN_MIX["scan"] * 10
+    # The default keeps the ticket-73 trace shape (2 pre-drift + 4 post-drift = 6 total).
+    assert m.plan_workload("drift", 50, 1000, drift_rate=150).rates == [150] * 6
+
+
 def test_build_trace_is_deterministic_and_has_the_expected_shapes(tmp_path) -> None:
     class A:
         seed, customers, skus, locs, on_hand, write_requests = 7, 500, 200, 2, 1000, 300

@@ -70,6 +70,16 @@ raising the write share raises the cold-read+fsync work per offered request — 
 direction from the scan drift. This is the capacity-reducing hypothesis to test, not an assumed
 result.
 
+Change 2 (discovered during evaluability probing, recorded before the T4 run): the drift plan
+hard-codes `pre=2` pre-drift segments (4,000 requests). Ticket 73 residual (c) already flags that
+this is shorter than the learned arm's demand-gated index burn-in at >= 800 rps, so learned's
+pre-drift baseline is polluted at exactly the rates where a capacity-reducing drift saturates.
+To re-test T4 honestly the pre-drift segment count must be configurable:
+- `--drift-pre-segments INT` default `2` (preserves the ticket-73 scan-drift trace exactly);
+  the post-drift stays at 4 segments, so the default total stays 6 segments as before.
+- Thread it into `plan_workload`. This is a harness trace-length knob, not a threshold; the
+  2-window target, the 10% band, and every ceiling are untouched.
+
 Key-popularity spike (stretch, only if cheap): the generator already has `set_key_spike` (a
 flash-sale hot-SKU knob) but `build_trace` never exposes it, and a hot-key drift is not obviously
 capacity-reducing on this schema (a hot key warms up, which removes cold reads). It is therefore

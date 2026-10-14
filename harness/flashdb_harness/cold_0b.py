@@ -668,7 +668,7 @@ class WorkloadPlan:
 
 def plan_workload(name: str, reference_rate: int, segment_requests: int,
                   drift_shape: str = "scan", drift_factor: int = 10,
-                  drift_rate: int | None = None) -> WorkloadPlan:
+                  drift_rate: int | None = None, drift_pre_segments: int = 2) -> WorkloadPlan:
     """Build the offered-load plan for one workload (``win`` / ``adversarial`` / ``drift``)."""
     if name == "win":
         return WorkloadPlan("win", [reference_rate * m for m in RATE_MULTIPLES],
@@ -681,13 +681,13 @@ def plan_workload(name: str, reference_rate: int, segment_requests: int,
         # the mix changes deterministically at the boundary after the pre-drift segments. The rate
         # is chosen to sit in the engine's sustainable band on this box (not the lowest step).
         rate = drift_rate or reference_rate
-        n = 6
-        pre = 2
+        pre = drift_pre_segments
+        post = 4
         mixes = [dict(WIN_MIX)] * pre
         drifted = dict(WIN_MIX)
         drifted[drift_shape] = drifted[drift_shape] * drift_factor
-        mixes += [drifted] * (n - pre)
-        return WorkloadPlan("drift", [rate] * n, segment_requests, mixes)
+        mixes += [drifted] * post
+        return WorkloadPlan("drift", [rate] * (pre + post), segment_requests, mixes)
     raise ValueError(f"unknown workload {name!r}")
 
 
@@ -1186,6 +1186,16 @@ def main(argv: list[str]) -> int:
                     help="fraction of the pre-drift highest sustained level used by --drift-rate auto")
     ap.add_argument("--drift-preflight-segment-requests", type=int, default=1000,
                     help="requests per level in the pre-flight ladder that --drift-rate auto runs")
+    ap.add_argument("--drift-shape", type=str, choices=["scan", "write"], default="scan",
+                    help="which WIN_MIX shape weight is multiplied across the drift boundary: "
+                         "'scan' (the ticket-73 shape, kept selectable) or 'write' (a "
+                         "write-spike drift; Slice WP-W)")
+    ap.add_argument("--drift-factor", type=int, default=10,
+                    help="multiplier applied to --drift-shape's weight in the post-drift segments")
+    ap.add_argument("--drift-pre-segments", type=int, default=2,
+                    help="pre-drift segments (win mix) before the drift boundary; ticket-73 default "
+                         "is 2. Raise it when the learned arm's demand-gated index burn-in would "
+                         "otherwise overlap the drift boundary (ticket 73 residual c).")
     ap.add_argument("--segment-requests", type=int, default=2000)
     ap.add_argument("--ceiling-us", type=int, required=True,
                     help="service-latency ceiling in microseconds; REQUIRED. The pre-registration "
@@ -1278,7 +1288,10 @@ def main(argv: list[str]) -> int:
     plans: dict[str, WorkloadPlan] = {}
     traces: dict[str, Path] = {}
     for wl in a.workloads:
-        plan = plan_workload(wl, a.reference_rate, a.segment_requests, drift_rate=resolved_drift_rate)
+        plan = plan_workload(wl, a.reference_rate, a.segment_requests,
+                             drift_shape=a.drift_shape, drift_factor=a.drift_factor,
+                             drift_rate=resolved_drift_rate,
+                             drift_pre_segments=a.drift_pre_segments)
         plans[wl] = plan
         trace = workroot / f"{wl}.jsonl"
         meta = build_trace(trace, plan, a)
@@ -1392,6 +1405,9 @@ def main(argv: list[str]) -> int:
         "rate_multiples": list(RATE_MULTIPLES),
         "drift_rate": resolved_drift_rate,
         "drift_rate_rule": drift_rate_info,
+        "drift_shape": a.drift_shape,
+        "drift_factor": a.drift_factor,
+        "drift_pre_segments": a.drift_pre_segments,
         "learner_cooldown_windows": a.learner_cooldown_windows,
         "learner_reorg_budget_factor": a.learner_reorg_budget_factor,
         "mix": {"win": dict(WIN_MIX), "adversarial": dict(UNIFORM_MIX)},
@@ -1590,6 +1606,12 @@ def render_report(result: dict) -> str:
     rule = result.get("drift_rate_rule")
     if rule is not None:
         w("")
+        shape = result.get("drift_shape")
+        factor = result.get("drift_factor")
+        pre = result.get("drift_pre_segments")
+        w(f"**Drift shape (WP-W):** the post-drift segments multiply the `{shape}` WIN_MIX weight "
+          f"x{factor}" + (" (the ticket-73 scan spike, kept selectable)" if shape == "scan"
+                          else " (a write-spike drift)") + f"; {pre} pre-drift segment(s).")
         w(f"**Drift rate (Slice 39):** resolved to **{result.get('drift_rate')} rps** by rule "
           f"`{rule.get('mode')}`. Rule: the fixed drift rate is `--drift-rate-fraction` = "
           f"{rule.get('fraction'):.0%} of the PRE-DRIFT (win) mix's highest sustained level, "
