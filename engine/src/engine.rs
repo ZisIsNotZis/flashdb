@@ -775,6 +775,18 @@ pub struct Engine {
     /// Provisional per-region layout the two tile write paths consult. Never
     /// persisted; the per-tile parameters live in each tile's superblock.
     layout: LayoutPolicy,
+    /// Per-region automatic-merge payback counter (wave16 R2): the number of
+    /// tiles PUBLISHED into each region since that region's last automatic
+    /// merge (or since open, for a region that has not merged).
+    /// [`Engine::select_region_run`] makes a region eligible only once this
+    /// count reaches its `merge_min_tiles` threshold, and resets it to zero when
+    /// the region is selected. This minimum-payback hysteresis stops a threshold
+    /// sitting at a region's current tile count from re-triggering a merge on
+    /// every publish, which is the single-region oscillation that made a hot
+    /// region emit several large merges back-to-back. Never persisted: a reopen
+    /// restarts every region at zero, which defers (never forbids) its next
+    /// merge. `RefCell` because [`Engine::select_region_run`] runs under `&self`.
+    merge_payback: RefCell<HashMap<Vec<u8>, usize>>,
     /// Whether a write path partitions its output one tile per `(entity, key
     /// family)` region ([`RegionMode::PerRegion`]) or the historical single
     /// whole-keyspace tile ([`RegionMode::Global`], the default). Not persisted:
@@ -987,6 +999,7 @@ impl Engine {
             order_no_index: None,
             metrics: RefCell::new(Metrics::new()),
             last_compaction: None,
+            merge_payback: RefCell::new(HashMap::new()),
         })
     }
 
@@ -1186,7 +1199,7 @@ impl Engine {
         drop(records);
         drop(covered);
         Self::trim_retained_heap();
-        Ok(Engine { wal, mt, tiles, wal_path: wal_path.to_path_buf(), dir: parent_dir(wal_path), manifest: None, segment: None, segment_suffix_csn: csn, wal_detached: false, csn, dedup, max_handle, group_open: false, group_pending: false, group_frames: Vec::new(), group_defer_append: false, group_append_us: 0, group_apply_us: 0, group_fsync_us: 0, barrier_worker: None, barrier_in_flight: 0, layout: LayoutPolicy::declared_default(), region_mode: RegionMode::Global, key_encoding: encoding, order_no_index: None, metrics: RefCell::new(Metrics::new()), last_compaction: None })
+        Ok(Engine { wal, mt, tiles, wal_path: wal_path.to_path_buf(), dir: parent_dir(wal_path), manifest: None, segment: None, segment_suffix_csn: csn, wal_detached: false, csn, dedup, max_handle, group_open: false, group_pending: false, group_frames: Vec::new(), group_defer_append: false, group_append_us: 0, group_apply_us: 0, group_fsync_us: 0, barrier_worker: None, barrier_in_flight: 0, layout: LayoutPolicy::declared_default(), region_mode: RegionMode::Global, key_encoding: encoding, order_no_index: None, metrics: RefCell::new(Metrics::new()), last_compaction: None, merge_payback: RefCell::new(HashMap::new()) })
     }
 
     /// The CSN floor below which the active WAL file holds no records: the
@@ -1305,7 +1318,9 @@ impl Engine {
         let emitted = self.write_verified_tiles(tile_path, cutoff)?;
         self.mt.evict_through(cutoff);
         for EmittedTile { name, tile } in emitted {
-            self.tiles.push(TileHandle { tile: Arc::new(tile), name });
+            let handle = TileHandle { tile: Arc::new(tile), name };
+            self.record_published_tile(&handle);
+            self.tiles.push(handle);
         }
         Ok(())
     }
@@ -1515,7 +1530,9 @@ impl Engine {
         // 4. In-memory flip only after the durable flip.
         self.mt.evict_through(cutoff);
         for EmittedTile { name, tile } in emitted {
-            self.tiles.push(TileHandle { tile: Arc::new(tile), name });
+            let handle = TileHandle { tile: Arc::new(tile), name };
+            self.record_published_tile(&handle);
+            self.tiles.push(handle);
         }
         Ok(())
     }
@@ -1760,12 +1777,13 @@ impl Engine {
     /// differs.
     ///
     /// Under [`RegionMode::PerRegion`] the run is selected per region (never
-    /// across regions) and a region is eligible only once its own tile count
-    /// reaches its [`LayoutPolicy`] merge threshold - the slice-27 actuator. The
-    /// `max_tiles` gate below still decides whether compaction runs at all; a
-    /// region whose threshold is not yet reached is simply skipped, so a high
-    /// threshold defers that region's merges while an eager neighbour keeps
-    /// compacting.
+    /// across regions) and a region is eligible only once it has published at
+    /// least its [`LayoutPolicy`] merge threshold of NEW tiles since its last
+    /// automatic merge - the slice-27 actuator with the wave16 R2 minimum-payback
+    /// hysteresis. The `max_tiles` gate below still decides whether compaction
+    /// runs at all; a region whose payback has not yet reached its threshold is
+    /// simply skipped, so a high threshold defers that region's merges while an
+    /// eager neighbour keeps compacting.
     pub fn maybe_compact_shape(&mut self, max_merge_bytes: u64, max_tiles: usize, shape: CompactShape) -> io::Result<Option<u64>> {
         if self.tiles.len() < max_tiles || self.tiles.len() < 2 {
             return Ok(None);
@@ -1955,14 +1973,27 @@ impl Engine {
         Ok(Self::choose_run(&sizes, max_merge_bytes, max_tiles, shape))
     }
 
+    /// Increment a region's automatic-merge payback counter because a NEW tile
+    /// was published into it. Merge replacements (`merge_run`/
+    /// `merge_region_run`/`apply_compaction_job`) do NOT call this (their output
+    /// is the merge the payback already charged), and recovery (`open_impl`)
+    /// does not call it either (recovered tiles are the pre-open baseline).
+    fn record_published_tile(&self, handle: &TileHandle) {
+        if let Some(region) = tile_first_region(handle) {
+            *self.merge_payback.borrow_mut().entry(region.to_vec()).or_default() += 1;
+        }
+    }
+
     /// The list indices of a run to merge WITHIN one region, or `None` when no
     /// region is eligible. Region-partitioned compaction never merges across
     /// regions: each region's tiers are its own, so a per-region trigger is
-    /// meaningful. A region is eligible only when its OWN tile count reaches its
+    /// meaningful. A region is eligible only when it has published at least its
     /// `LayoutPolicy` merge threshold ([`LayoutPolicy::merge_min_tiles_for_region`],
-    /// today 2); among eligible regions the smallest combined run wins (ties: the
-    /// oldest list index). The run is selected by the same [`CompactShape`] policy
-    /// applied to that region's own cutoff-ordered sizes.
+    /// today 2) worth of NEW tiles since its last automatic merge (the
+    /// [`Engine::merge_payback`] minimum-payback hysteresis); among eligible
+    /// regions the smallest combined run wins (ties: the oldest list index). The
+    /// run is selected by the same [`CompactShape`] policy applied to that
+    /// region's own cutoff-ordered sizes.
     fn select_region_run(&self, max_merge_bytes: u64, max_tiles: usize, shape: CompactShape) -> io::Result<Option<Vec<usize>>> {
         let sizes: Vec<u64> = self.tiles
             .iter()
@@ -1976,20 +2007,29 @@ impl Engine {
             let region = tile_first_region(t).unwrap_or_default().to_vec();
             groups.entry(region).or_default().push(i);
         }
-        let mut best: Option<(u64, usize, Vec<usize>)> = None;
+        let mut best: Option<(u64, usize, Vec<usize>, Vec<u8>)> = None;
         for (region, idxs) in &groups {
+            if idxs.len() < 2 { continue; }
             let threshold = self.layout.merge_min_tiles_for_region(&keys::region_name(region));
-            if idxs.len() < 2 || idxs.len() < threshold as usize { continue; }
+            let payback = self.merge_payback.borrow().get(region).copied().unwrap_or(0);
+            if payback < threshold as usize { continue; }
             let region_sizes: Vec<u64> = idxs.iter().map(|&i| sizes[i]).collect();
             let (start, len) = Self::choose_run(&region_sizes, max_merge_bytes, max_tiles, shape);
             let combined: u64 = region_sizes[start..start + len].iter().sum();
             let first = idxs[start];
             let indices: Vec<usize> = idxs[start..start + len].to_vec();
-            if best.as_ref().map_or(true, |(c0, f0, _)| (combined, first) < (*c0, *f0)) {
-                best = Some((combined, first, indices));
+            if best.as_ref().map_or(true, |(c0, f0, _, _)| (combined, first) < (*c0, *f0)) {
+                best = Some((combined, first, indices, region.clone()));
             }
         }
-        Ok(best.map(|(_, _, indices)| indices))
+        // Reserve the selected region: reset its payback so it cannot be
+        // re-selected until `threshold` NEW tiles arrive. Done at selection (not
+        // apply) so the async [`Engine::compaction_job`] path does not re-select
+        // the same region while its job is still in flight.
+        if let Some((_, _, _, region)) = &best {
+            self.merge_payback.borrow_mut().insert(region.clone(), 0);
+        }
+        Ok(best.map(|(_, _, indices, _)| indices))
     }
 
     /// The run-selection core shared by [`Engine::select_run`] (whole-list) and

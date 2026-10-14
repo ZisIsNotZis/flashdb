@@ -111,11 +111,39 @@ fn an_eager_region_is_not_held_back_by_a_lazy_neighbour() {
     let mut policy = LayoutPolicy::declared_default();
     policy.set_region_merge("P|Stock", 100);
     e.set_layout_policy(policy);
-    // The eager region keeps compacting across calls while the lazy one is inert.
+    // The eager region merges once its published tiles clear its threshold...
     assert!(e.maybe_compact(u64::MAX, 2).unwrap().is_some());
-    assert!(e.maybe_compact(u64::MAX, 2).unwrap().is_some());
-    assert!(count_region(&e, "P|Order") < 3, "the eager region compacted");
+    // ...but the payback hysteresis keeps it from re-merging without new tiles,
+    // while the lazy neighbour is inert either way.
+    assert!(e.maybe_compact(u64::MAX, 2).unwrap().is_none(),
+        "no region is eligible again until it is repaid with new tiles");
     assert_eq!(count_region(&e, "P|Stock"), 8, "the lazy neighbour never moved");
+    // Two more publishes repay the eager region, so it merges again.
+    publish_region(&mut e, &files.dir, b"Order", 2);
+    assert!(e.maybe_compact(u64::MAX, 2).unwrap().is_some());
+    assert!(count_region(&e, "P|Order") < 5, "the eager region compacted again once repaid");
+    assert_eq!(count_region(&e, "P|Stock"), 8, "the lazy neighbour never moved");
+}
+
+#[test]
+fn a_region_at_its_threshold_does_not_remerge_without_new_tiles() {
+    let files = Files::new();
+    let mut e = per_region_engine(&files);
+    publish_region(&mut e, &files.dir, b"Stock", 4); // 4 tiles, threshold 2
+    let mut policy = LayoutPolicy::declared_default();
+    policy.set_region_merge("P|Stock", 2);
+    e.set_layout_policy(policy);
+    // First call merges a pair (4 published tiles >= threshold 2).
+    assert!(e.maybe_compact(u64::MAX, 2).unwrap().is_some());
+    assert_eq!(count_region(&e, "P|Stock"), 3, "one pair merged");
+    // Pre-change, the region (3 tiles, still >= 2) re-merged on the very next
+    // call: a threshold at the boundary emitted a merge per window. The
+    // minimum-payback hysteresis makes it wait for `threshold` NEW tiles.
+    assert!(e.maybe_compact(u64::MAX, 2).unwrap().is_none(),
+        "a merged region is not eligible again until it is repaid with new tiles");
+    publish_region(&mut e, &files.dir, b"Stock", 2);
+    assert!(e.maybe_compact(u64::MAX, 2).unwrap().is_some(),
+        "the region becomes eligible again once repaid with two new tiles");
 }
 
 #[test]
