@@ -271,9 +271,11 @@ latency floor above the 10 ms lag ceiling, irreducible without weakening durabil
 INPUT-tile read set (93-147 MB under 12.25x) is the next-order device/working-set cost, out of
 scope for this package.
 
-**Judging views:** §7.1 lag-only primary — rung-50 NOT sustained (median 1.5/40), rung 100
-sustained in the clean seeds (lag_p99 ~0.6-1.2 ms). Both-ceilings — 0 rps everywhere, unchanged
-(the service ceiling remains device-bound; the open §7.1 reconciliation is untouched).
+**Judging views:** §7.1 lag-only primary — rung-50 NOT sustained (static-derived 0/2/1/8,
+median 1.5/40). Rung 100 is clean in 3/4 seeds (0/20) but seed42 has one 166 ms device-
+`fdatasync`-tail breach at window 43 (no build concurrent), so rung 100 is NOT claimed sustained
+across this sample. Both-ceilings — 0 rps everywhere, unchanged (the service ceiling remains
+device-bound; the open §7.1 reconciliation is untouched).
 
 **Honest label:** pilot-grade. 4 runs = 3 independent seeds + one repeat, all lock-protected,
 one process at a time; the repeat is externally-loaded. The diagnosis correction and the
