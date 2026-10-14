@@ -43,6 +43,14 @@ const MAGIC: &[u8; 4] = b"FDB1";
 /// worker drains its queue FIFO and completions are observed in submission order.
 pub const MAX_PENDING_BARRIERS: usize = 64;
 
+/// Bounded durability cadence for a compaction build's replacement tile: the
+/// build makes its data blocks durable in chunks of at most this many bytes
+/// (`TileWriter::set_sync_every`) instead of one `finish` `sync_data`, so a
+/// 10-11 MB merge does not flush its whole dirty set in a single device burst
+/// that starves the pacer's WAL `fdatasync`. Observability/durability only:
+/// syncing never changes the encoded bytes.
+pub const COMPACT_TILE_SYNC_EVERY_BYTES: u64 = 2 * 1024 * 1024;
+
 /// Bits per *expected* entry for a tile's unique-prefix bloom under
 /// [`LayoutPolicy::declared_default`]. The tile stores this value in its
 /// superblock and bloom header; 10 implies 7 probes. The effective bits per
@@ -2475,6 +2483,7 @@ impl Engine {
         let mut bloom = (bloom_bits_per_key > 0)
             .then(|| BloomBuilder::new(expected, bloom_bits_per_key as u32));
         let mut writer = TileWriter::new(tile_path, cutoff, &digest, page_size)?;
+        writer.set_sync_every(COMPACT_TILE_SYNC_EVERY_BYTES);
         Self::stream_merged_reduction(tiles, lower, cutoff, &wal_entries, |key, value| {
             writer.push(key, value)?;
             if let Some(bloom) = bloom.as_mut() {
@@ -3881,6 +3890,7 @@ pub fn build_compaction_job(dir: &Path, job: &CompactionJob) -> io::Result<Compa
         .then(|| BloomBuilder::new(expected, job.bloom_bits_per_key as u32));
     let path = dir.join(&job.output_name);
     let mut writer = TileWriter::new(&path, job.cutoff, &digest, job.page_size)?;
+    writer.set_sync_every(COMPACT_TILE_SYNC_EVERY_BYTES);
     Engine::stream_merged_reduction(&refs, job.lower, job.cutoff, &wal_entries, |key, value| {
         writer.push(key, value)?;
         if let Some(bloom) = bloom.as_mut() {

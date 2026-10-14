@@ -1055,6 +1055,30 @@ No failures.
   `.scratch/77-drift-shape/`; gates: cargo build 0 warnings, 304 Rust + 142 Python tests green,
   `git diff --check` silent.
 
+## wave21 WP-W2 dispatch record (close the rung-50 compaction re-warm residual)
+
+- Timestamp: 2026-10-14T14:48:48+08:00 (diagnosis/design checkpoint committed `52d5a5e`) ->
+  2026-10-14T15:16:08+08:00 (measurement complete; final record committed at the hash named in
+  the ticket).
+- Action: dispatched work package W2 "warm newly published compaction output off the pacer so a
+  post-compaction read is not a cold page-in" to the single-writer `wave21/rewarm` worktree
+  (branch `wave21/rewarm`, based on master `8a4ea20`). Contract, diagnosis, design + rejected
+  alternatives, change, tests, before/after tables, both judging views, acceptance verdict and
+  residual are in `.scratch/76-compaction-rewarm/issues.md`; raw artifacts are the committed
+  `seed42/43/44/42-repeat` `.json`/`.md` in the same directory. Diagnosis: the read-ahead worker's
+  64-request lookahead is warmed once against the OLD snapshot, and a compaction publish replaces
+  tiles without rewinding the worker's warm cursor, so the next ~64 requests' POINT reads hit the
+  replacement tile cold on the pacer (the movement scan prefix self-heals via the per-refresh memo;
+  the `order_no` index tile is a sidecar and never compacted). Fix: on `Refresh`, detect a real tile
+  set change by `Arc<Tile>` pointer identity and rewind the warm cursor to the pacer's position, so
+  the lead is re-warmed against the new tiles; a same-set refresh adds no redundant work. Result:
+  post-publish windows clean in all 4 win runs (lag_p99 0.1-6.2 ms), static-derived rung-50 lag-rej
+  3/1/1/2 -> 1/2/1/1 (median 2 -> 1); 0/40 NOT reached because the remaining 1-2/40 are the
+  compaction BUILD window's device fdatasync tail (63-313 ms) + 91 ms append + 30-60 MB build I/O
+  under the 128 MiB cap (a proven device/working-set floor), not the post-publish read. Throughput
+  unchanged (static-derived 107/107/106/107 before and after). Gates: 305 Rust + 140 Python tests
+  green, cargo build 0 warnings, `git diff --check` silent.
+
 ## Integration record: wave21 lanes
 
 - Timestamp: 2026-10-14T15:41:41+08:00 (integration committed).
@@ -1085,3 +1109,34 @@ No failures.
   - `cargo test --workspace --offline` — 306 Rust tests passed, 0 failed.
   - `cd harness && uv run --with pytest pytest -q` — 146 passed.
   - `git diff --check` — silent.
+
+## wave21 WP-W2 repair dispatch record (correct the falsified diagnosis + bound the build tail)
+
+- Timestamp: 2026-10-14T16:06:00+08:00 (diagnosis correction committed `ad109f3`) ->
+  2026-10-14T16:52:38+08:00 (throttled build measured; final record committed at the hash named
+  in the ticket).
+- Action: independently-verified FAIL on WP-W2 (ticket 76). The repair corrects the falsified
+  diagnosis in place, retracts the false acceptance claim, implements a sound bounded fix for the
+  corrected cause, and re-measures. Diagnosis corrected: the rung-50 residual is the compaction
+  BUILD window's device I/O + `fdatasync` tail (raw WP-S per-window pairs: seed43 w16
+  `compact_bytes=10,165,563` breaches lag while w17 post-publish is clean at 107 us; same in
+  seed44 w15/w16 and the repeat), NOT a post-publish cold read; and "POST-publish windows clean in
+  all four runs" was false (pre-repair seed42 w19 is a post-publish lag breach at 12.58 ms whose
+  stall is a 12.6 ms WAL-`fdatasync` device-noise tail with no build concurrent). The prior
+  warm-cursor re-wind (`8aa7b29`) is kept, re-justified as a sound warm-path correctness fix, not
+  the residual fix.
+- Fix: opt-in bounded `sync_data` cadence for the compaction build (`f71899c`):
+  `TileWriter::set_sync_every` + `COMPACT_TILE_SYNC_EVERY_BYTES=2 MiB`; the off-path build makes
+  its data blocks durable in 2 MiB chunks instead of one `finish` burst, so the build's durable
+  flush is bounded to 11-32 ms (was 56-320 ms). Durability only strengthened; byte-identical
+  tile (new test `streaming_writer_periodic_sync_is_byte_identical`); ordinary publish unchanged.
+- Result (pilot, 4 runs: seeds 42/43/44 + 42 repeat, 12.25x c51, lock-protected, one process at a
+  time, box loadavg 4.4-7.1): static-derived rung-50 lag-rej **0 / 2 / 1 / 8** (median 1.5/40,
+  the 8 is the externally-loaded repeat with 526 ms-1049 ms breaches at a 0.3 MB build and
+  non-build windows). 0/40 NOT reached. The residual is proven device-bound by the
+  fsync-during-build distribution: the pacer's WAL `fdatasync` tails to 77-99 ms under the
+  build's 93-147 MB input-tile stream reads (and to 99 ms with NO build, seed44 w35) — the shared
+  device's own latency floor above the 10 ms lag ceiling. Throughput preserved (static-derived
+  ~100% at rungs 50-400; declared device-bound ~85% unchanged). Ticket updated in place with the
+  corrected diagnosis, the build-flush bound, the honest verdict and the raw
+  `repair-{seed42,seed43,seed44,seed42-repeat}.{json,md}` artifacts.
