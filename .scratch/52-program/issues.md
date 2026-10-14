@@ -871,6 +871,31 @@ No failures.
   - `cd harness && uv run --with pytest pytest -q` — 140 passed.
   - `git diff --check` — silent.
 
+## wave17 WP-S dispatch record (the decisive SS7.1 lag-only evaluation)
+
+- Timestamp: 2026-10-14T12:07:46+08:00 (plan committed `1461662`) -> 2026-10-14T13:20:24+08:00
+  (8 runs measured; final record committed at the hash named in the ticket).
+- Action: dispatched work package S "the decisive SS7.1 lag-only evaluation after the
+  startup-warm + merge-oscillation fixes" to the single-writer `wave17/eval` worktree (based on
+  integrated master, fast-forwarded to `853633a` before the plan commit). Contract, exact
+  commands, per-arm/rung tables, both judging views, T1/T2/T3 verdicts with seed counts and noise
+  band, the overall thesis statement and residual gaps are in `.scratch/71-eval-decisive/issues.md`;
+  raw artifacts are the committed `seed42/43/44/45/46/47/48/seed42-repeat.{json,md}` in the same
+  directory. Scope/result: win (T1) + adversarial (T2), arms declared/learned/static-derived,
+  full ladder 50/100/200/400 rps, 7 independent seeds (42-48) + a 42 repeat, one flashdb process
+  at a time under `MemoryMax=128MiB` and `flock /tmp/wave17-measure.lock`, box load recorded at
+  every boundary (loadavg 3.1-12.1; first 4 seeds noisier). Headline (pilot, 8 runs, NOT 10-seed):
+  rung-50 lag-rej=0 is still NOT reached under §7.1 lag-only (static-derived 1-3/40, learned
+  4-6/40, declared 39-40/40), BUT the two fixes + serial measurement lift the first positive
+  lag-only sustained rung to **rung 100** — static-derived 0/20 lag-rej in 8/8 seeds, learned
+  0/20 in 6/8, declared never sustained — which is the first positive lag-only sustained rung in
+  any multi-seed sample. The +43-57% achieved-throughput layout win is preserved
+  (learned/static 106-107 rps vs declared 70-75, +42.7-52.9%); adversarial learned matches
+  declared (median 1/40 vs 2.5/40, 0 index builds, reorg ratio median 0.928x <= 1.5x); win T3
+  reorg ratio median 0.934x with no single-run blowup (`U|Stock` 5.13-5.23 MB / 1 merge in all 8
+  seeds, max single-window actuation 11.08-11.37 MB). Gates: 304 Rust + 140 Python tests green,
+  cargo build 0 warnings, `git diff --check` silent.
+
 ## wave18 scribe-repair dispatch record (ticket 67 + 70 doc-accuracy corrections)
 
 - Timestamp: 2026-10-14T12:26:46+08:00.
