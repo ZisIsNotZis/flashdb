@@ -138,7 +138,7 @@ views of one entity in a single combined region (3 write regions instead of 6, h
 | T1 learned beats declared by >15% on the win workload | **underived** — needs the learned arm, win workload, noise band, 10-seed median/IQR on the >=10x instance |
 | T2 no >5% loss on adversarial-uniform | **underived** — same |
 | T3 reorganisation writes <=3x declared | **FAIL, 4.13-4.27x** — byte sums, unaffected by the aggregator defects and unchanged by waves 2-6 |
-| T4 drift recovery within 2 windows | **underived** — the default parameters need 6 windows, not 2 |
+| T4 drift recovery within 2 windows | **UNDERIVABLE** (measured, ticket 73, c51 12.25x, 3 seeds x 7 rates) — the scan-spike drift never drops throughput for the indexed arms (order_no index already on from the win mix + write share cut 40%->~11%); no recovery event exists; the learner's internal region re-exploration is still 6 windows, > the pre-registered 2 |
 | T5/T6/T7 external baselines | **adopted** (§7); the request-level baseline harness does not exist yet |
 
 Still missing for T1/T2/T4: the other arms (learned, static-derived), the win and drift workloads, a

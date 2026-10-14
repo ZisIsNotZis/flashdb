@@ -926,3 +926,26 @@ No failures.
   - `cargo test --workspace --offline` — 304 Rust tests passed, 0 failed.
   - `cd harness && uv run --with pytest pytest -q` — 140 passed.
   - `git diff --check` — silent.
+
+## wave19 WP-U dispatch record (measure the pre-registered T4 drift-recovery threshold)
+
+- Timestamp: 2026-10-14T13:41:18+08:00 (plan committed `20eb720`) -> 2026-10-14T14:00:58+08:00
+  (9 arm-runs measured; final record committed at the hash named in the ticket).
+- Action: dispatched work package U "measure T4 (drift recovery) on the >=10x instance" to the
+  single-writer `wave19/drift` worktree (based on integrated master `0c1b4c5`). Contract, exact
+  commands, evaluability proof, per-window tables, both judging views, the T4 verdict with seed
+  count and noise band, and residual gaps are in `.scratch/73-t4-drift/issues.md`; raw artifacts
+  are the committed `val300..val1500` and `s43_600`/`s44_600` `.json`/`.md` in the same
+  directory. Scope/result: drift workload (`scan` weight x10, win mix -> 81% scans), arms
+  declared (300 rps probe only) / learned@1.0 / static-derived, explicit drift rates 300/400/500/
+  600/800/1000/1500 rps, seeds 42 (all rates) + 43/44 (600 rps), one flashdb process at a time
+  under `MemoryMax=128MiB` and `flock /tmp/wave19-drift.lock`, box loadavg 4.7-6.1 recorded at
+  every boundary. Headline (pilot, 3 seeds x 7 rates, NOT 10-seed): **T4 is UNDERIVABLE** — the
+  integrated WP-M order_no index (already demanded by the win mix's 30% scans) plus the drift's
+  write-share cut 40% -> ~11% (the fsync-bound bottleneck) make the post-drift mix strictly no
+  harder than the pre-drift mix: static-derived pre 1485 vs post 1500 rps at 1500 offered, and no
+  post-drift throughput drop at any tested rate, so the pre-registered "recover to within 10% of
+  pre-drift throughput within 2 windows" event never occurs. The harness's internal region-level
+  re-exploration signal fires on an unrelated region (U|Customer, 6 windows) and still exceeds
+  the 2-window target, but that is not the throughput T4 the pre-registration wrote. Gates: 304
+  Rust + 140 Python tests green, cargo build 0 warnings, `git diff --check` silent.
