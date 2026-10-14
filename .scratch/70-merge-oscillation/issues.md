@@ -176,11 +176,22 @@ re-merge, which is the oscillation that actually fires.
 - `cargo test --workspace --offline`: see gates below.
 - `cd harness && uv run --with pytest pytest -q`: see gates below.
 
-## Verbatim gates (run at final HEAD)
+## Verbatim gates (run at final HEAD `1b13c8b`)
 
-1. `cargo build --workspace --offline` — 0 warnings.
-2. `cargo test --workspace --offline` — totals.
-3. `cd harness && uv run --with pytest pytest -q` — summary.
+1. `cargo build --workspace --offline` — 0 warnings:
+```
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.09s
+```
+2. `cargo test --workspace --offline` — totals: **303 passed; 0 failed; 0 ignored**
+(128 lib + 22 flashdb-load + 9 batch_commit + 5 compaction_job + 4 constraints + 3 family_colocation
++ 12 group_commit + 6 manifest_engine + 8 merge_threshold + 15 metrics + 33 multi_tile + 7 order_flow
++ 5 order_no_index + 1 partitioned_publish_cap + 5 read_requests + 3 region_compaction +
+6 region_partition + 3 replay_trace + 8 request_commit + 2 scale_bin + 3 tile_format + 3 tile_layout
++ 12 tile_read + 0 flashdb-replay + 0 flashdb-scale + 0 nvme_bench + 0 doc-tests).
+3. `cd harness && uv run --with pytest pytest -q`:
+```
+140 passed in 4.09s
+```
 4. `git diff --check` — silent (exit 0).
 
 ## Measurement protocol
@@ -195,18 +206,131 @@ cheap), full ladder 50/100/200/400, the ticket-68 exact flags (`--cap-mib 128
 Report: per-region reorg totals, the max single-window actuation, learned/declared and
 static/declared reorg ratios (T3), and rung-50 lag-rej. Record box load at every boundary.
 
+Box load (shared 12-core box; every run one flashdb process at a time, but the box carries other
+users' work — a `llama-server` at ~100% CPU/10 GB RSS was present throughout):
+
+| boundary | time | loadavg 1/5/15 |
+|---|---|---|---|
+| seed42 start | 11:08:02 | 4.89 / 6.11 / 6.76 |
+| seed42 end | 11:18:09 | 8.73 / 7.23 / 6.86 |
+| seed43 start | 11:18:40 | 7.58 / 7.10 / 6.83 |
+| seed43 end | 11:27:43 | 7.74 / 8.69 / 7.88 |
+| seed44 start | 11:27:56 | 7.37 / 8.56 / 7.85 |
+| seed44 end | 11:36:59 | 6.89 / 7.52 / 7.60 |
+| seed42-repeat start | 11:37:08 | 6.45 / 7.40 / 7.56 |
+| seed42-repeat end | 11:46:12 | 6.27 / 7.00 / 7.38 |
+
 ## Before/after tables
 
-(Pending the measurement; filled below after the runs.)
+"Before" = integrated pre-fix (ticket 68). "After" = this ticket (re-merge payback). All reorg
+bytes are the summed per-region `compaction_bytes`.
+
+### The single-region blowup is bounded (win learned, the acceptance target)
+
+| run | `U|Stock` | `P|Customer` | `U|Customer` | total reorg | max single-window |
+|---|---:|---:|---:|---:|---:|
+| before seed42 | **75.2 MB / 8** | **30.8 MB / 3** | 0 | 109.3 MB | 10.16 MB |
+| before seed42-repeat | 0 / 0 | 0 | 0 | 3.3 MB | ~0 |
+| after seed42 | 5.23 MB / 1 | 10.29 MB / 1 | 0 / 0 | 17.12 MB | 10.29 MB |
+| after seed43 | 5.23 MB / 1 | 0 / 0 | 0 / 0 | 6.88 MB | 5.23 MB |
+| after seed44 | 5.23 MB / 1 | 0 / 0 | 0 / 0 | 6.83 MB | 5.23 MB |
+| after seed42-repeat | 5.23 MB / 1 | 10.29 MB / 1 | 11.08 MB / 1 | 28.20 MB | 11.08 MB |
+
+The oscillation is gone: `U|Stock` is now **5.23 MB / 1 merge on BOTH the seed42 run and the
+same-trace repeat** (before: 75.2 MB / 8 vs 0 MB / 0). Each region does at most ONE merge per
+low-threshold exposure, and the merge is a single cheapest contiguous pair, so the max
+single-window actuation is 5.23-11.08 MB (one pair), never the repeated ~10 MB-per-window burst.
+
+### win T3 reorg ratio (learned/declared and static/declared)
+
+| seed | declared | learned | L/D | static-derived | S/D |
+|---|---:|---:|---:|---:|---:|
+| 42 | 30.72 MB | 17.12 MB | **0.56x** | 29.83 MB | 0.97x |
+| 43 | 30.72 MB | 6.88 MB | **0.22x** | 24.70 MB | 0.80x |
+| 44 | 30.72 MB | 6.83 MB | **0.22x** | 28.84 MB | 0.94x |
+| 42-repeat | 30.72 MB | 28.20 MB | **0.92x** | 29.87 MB | 0.97x |
+
+**win T3 (learned/declared) median = 0.39x** (all <= 1x; no single-run blowup).
+
+### adversarial reorg ratio (learned/declared, T2 band)
+
+| seed | declared | learned | ratio |
+|---|---:|---:|---:|
+| 42 | 30.72 MB | 29.00 MB | 0.94x |
+| 43 | 30.72 MB | 17.03 MB | 0.55x |
+| 44 | 30.72 MB | 29.79 MB | 0.97x |
+| 42-repeat | 30.72 MB | 28.40 MB | 0.92x |
+
+### win rung-50 lag-rejections (out of 40 windows) and achieved throughput
+
+| seed | declared | learned | static-derived | learned ach | declared ach |
+|---|---:|---:|---:|---:|---:|
+| 42 | 40/40 | **3/40** | 4/40 | 107.0 | 71.0 |
+| 43 | 39/40 | **6/40** | 5/40 | 107.0 | 70.0 |
+| 44 | 40/40 | **3/40** | 5/40 | 107.0 | 72.0 |
+| 42-repeat | 39/40 | **4/40** | 4/40 | 107.0 | 71.0 |
+
+Before (ticket 68) learned win rung-50 lag-rej was 3-13/40, with seed42 = **13/40** driven by the
+`U|Stock` reorg burst. After, learned sits **3/6/3/4** vs static-derived **4/5/5/4** — at or
+better than static-derived's band on 3 of 4 seeds (seed43 is +1). The throughput win is intact
+(learned 107.0 rps on every seed vs declared 70-72).
+
+### adversarial rung-50 lag-rejections
+
+| seed | declared | learned | static-derived |
+|---|---:|---:|---:|
+| 42 | 1/40 | 2/40 | 0/40 |
+| 43 | 3/40 | 1/40 | 4/40 |
+| 44 | 1/40 | 2/40 | 1/40 |
+| 42-repeat | 7/40 | 2/40 | 2/40 |
 
 ## Both judging views
 
-(Pending the measurement.)
+- **§7.1 lag-only (primary):** win rung-50 lag-rej learned 3/6/3/4 vs static-derived 4/5/5/4
+  (pre-fix 3-13/40). The learner's reorg oscillation is removed, so learned now sits in
+  static-derived's band; the remaining breaches are the read-ahead startup warm-up (windows 0-1)
+  and shared-box noise, unchanged. No arm reaches 0 lag-rej, so the strict lag-only sustained
+  score is still 0, exactly as ticket 68 — this package removes the REORG blocker, not the
+  warm-up blocker.
+- **Both ceilings (pre-registration):** sustained = 0 everywhere, unchanged — the per-group
+  `fdatasync` durability floor keeps the service ceiling rejecting ~36-40/40 rung-50 windows on
+  every arm (device-bound). Same open §7.1 reconciliation, untouched.
 
-## Acceptance verdict
+## Acceptance verdict (honest, pilot-grade)
 
-(Pending the measurement; honest, pilot-grade.)
+**4 runs = 3 independent seeds (42/43/44) + one full seed-42 repeat, 12.25x c51, shared box,
+one flashdb process at a time. NOT a 10-seed pre-registered verdict.**
+
+1. **Single-region blowup no longer recurs — PASS.** `U|Stock` is 5.23 MB / 1 merge on both the
+   seed42 run and the same-trace repeat (before: 75.2 MB / 8 vs 0 / 0); the same-trace max
+   per-region output is now bounded and consistent. Max single-window actuation 5.23-11.08 MB
+   (one cheapest pair), never a repeated burst.
+2. **win T3 ratio median <= 3x, no single-run blowup — PASS.** learned/declared median **0.39x**
+   (0.22-0.92x); static/declared median 0.96x. No run exceeds 1x.
+3. **Learned win rung-50 lag-rej improves toward static-derived — PASS.** learned 3/6/3/4 vs
+   static-derived 4/5/5/4 (pre-fix seed42 was 13/40).
+4. **No throughput regression, legitimate compaction still happens — PASS.** learned achieved
+   107.0 rps on all four runs (vs declared 70-72, the pre-fix +43-57% win intact); every arm
+   still compacts (declared 30.72 MB, learned 6.83-28.20 MB, static 24.70-29.87 MB), one pair per
+   region under the count gate.
+
+**Honest note on the T3 denominator:** the declared control's absolute reorg changed from ~7 MB
+(pre-fix) to **30.72 MB** (deterministic across seeds). The pre-fix global actuator STARVED the
+big seed regions (`U|Customer` 26 × 5.9 MB, `U|Stock` 127 × 5.2 MB) — their pairs were never the
+cheapest while the small regions kept re-merging. The fix removes that starvation: every region
+does its FIRST merge under the unchanged slice-27 count gate, so declared now folds one pair in
+each big region too (11.4 + 10.3 + 5.2 MB). That is legitimate folding (read-amplification
+reduction), and the T3 ratio is re-measured against this new declared denominator. It is reported
+verbatim rather than hidden.
 
 ## Residual items
 
-(Pending the measurement.)
+- **Lag-only sustained still 0.** The remaining static-derived/learned rung-50 breaches are the
+  read-ahead startup warm-up (windows 0-1) plus shared-box noise (ticket 67/68 residual), not the
+  reorg oscillation this package removes.
+- **Declared/static absolute reorg shifted up** (7 → 30.7 MB declared, 20.7 → 24.7-29.9 MB
+  static) for the reason above; re-measured, not a regression in the T3 ratio.
+- **4 seeds, shared box** (loadavg 4.9-8.7, a resident `llama-server` at ~100% CPU): timings are
+  pilot-grade; the deterministic byte/count numbers are the primary evidence.
+- Service ceiling remains device-bound (both-ceilings 0 everywhere); the open §7.1 reconciliation
+  is untouched and not edited.
