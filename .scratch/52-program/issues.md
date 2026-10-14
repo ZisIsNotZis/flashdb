@@ -1338,3 +1338,21 @@ No failures.
 - Gates: `cargo build --workspace --offline` 0 warnings; `cargo test --workspace --offline`
   308 passed / 0 failed / 0 ignored; `cd harness && uv run --with pytest pytest -q` 146 passed;
   `git diff --check` silent.
+
+## Final docs cleanup
+
+- Timestamp: 2026-10-14T18:58:07+08:00.
+- Action: fixed the verified non-blocking prose inaccuracies from WP-79 integration, re-checked
+  against `.scratch/79-final-eval/*.json`:
+  - `U|Stock` compaction range corrected in `.scratch/STATUS.md` and
+    `.scratch/79-final-eval/issues.md`: learned and static-derived both 5.13-5.23 MB / 1 merge
+    each (seed 43 learned = 5,133,935 B; static seeds 43/42r = 5,228,415 B; declared stays
+    5.23 MB / 1).
+  - T3 prose corrected: seed 44 defers `U|Customer`, seed 42r defers `P|Customer`.
+  - T2 prose corrected from "3 of 4 seeds" to "4 of 4 seeds".
+  - T4 drift reorg range corrected from "0-266,220 B" to "0-266,598 B".
+- Control scripts committed: `.scratch/52-program/wave21-rewarm-repair.js`,
+  `wave22-scribe-repair.js`, `wave23-final-eval.js`, `wave24-ssot.js` (commit `4de3d6f`).
+- Gates: `cargo build --workspace --offline` 0 warnings; `cargo test --workspace --offline`
+  308 passed / 0 failed / 0 ignored; `cd harness && uv run --with pytest pytest -q` 146 passed;
+  `git diff --check` silent.

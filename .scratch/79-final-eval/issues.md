@@ -177,7 +177,7 @@ Rung-50 lag-rejected windows (out of 40):
 | learned@1.0 | 0 | 1 | 2 | 3 | 1.5 |
 | static-derived | 0 | 2 | 3 | 1 | 1.5 |
 
-learned median 1.5/40 vs declared 2/40 — **at or better than declared on 3 of 4 seeds** (42: 0<2,
+learned median 1.5/40 vs declared 2/40 — **at or better than declared on 4 of 4 seeds** (42: 0<2,
 43: 1=1, 44: 2=2; 42r: 3<4), i.e. no >5% loss, within the noise. **Index builds on the 0-scan
 region: 0 on all 4 adversarial runs** (`P|StockMovement.index_output_bytes = 0`, learned final
 policy `index_order_no=False` for `P|StockMovement`) — the WP-O demand gate holds.
@@ -208,12 +208,12 @@ region; reorg ratio median 0.933x, max 0.995x <= 1.5x).
 
 **Median 0.767x, max 0.941x (every run <= 1x, <= 3x).** static/declared: 0.984/0.607/0.954/0.974x
 (median 0.964x). learned's win reorg is bimodal: seeds 42/43 complete the ~11.37 MB `U|Customer`
-merge (0.93-0.94x) while seeds 44/42r defer it (0.55-0.60x) — the slice-39 churn-control variance
+merge (0.93-0.94x) while seed 44 defers `U|Customer` and seed 42r defers `P|Customer` (0.55-0.60x) — the slice-39 churn-control variance
 under this quieter box (ticket 78 observed the same 0.554x in 1/4; here it is 2/4), always <=
 declared and with no throughput change (learned 106-107 rps in all 4).
 
-**The single-region blowup does NOT recur.** Win/learned `U|Stock` compaction is 5.23 MB / 1 merge
-in all 4 seeds (declared 5.23 MB / 1, static 5.13 MB / 1) — no ~10 MB-per-window oscillation, no
+**The single-region blowup does NOT recur.** Win/learned `U|Stock` compaction is 5.13-5.23 MB / 1 merge
+each (declared 5.23 MB / 1, static 5.13-5.23 MB / 1) — no ~10 MB-per-window oscillation, no
 75 MB swing (ticket 71/78's stable result holds on the rewarm tree).
 
 **T3 verdict: PASS** (win reorg median 0.767x, max 0.941x <= 3x; no single-region blowup).
@@ -246,7 +246,7 @@ Whole-run achieved: declared 118-121 rps (saturated), learned 1142-1174 rps (bur
 learned-vs-static post-drift gap (median): **+2.0%** (1339.9 vs 1313.8) — inside the noise band.
 `recovery_windows = {}` for learned in all 4 runs (no drift-triggered region re-exploration);
 `error_windows = 0` and `commit_rate = 1.0` everywhere; drift reorg ~0 B for all arms
-(`summary.compact_bytes_total` 0-266,220 B; see the accounting note — the write-heavy saturated
+(`summary.compact_bytes_total` 0-266,598 B; see the accounting note — the write-heavy saturated
 run does not reach a merge trigger).
 
 **T4 verdict (seed count + noise band): 3 independent seeds (42/43/44) + 1 seed-42 repeat = 4
@@ -302,10 +302,10 @@ a time under `MemoryMax=128MiB`. NOT a 10-seed pre-registered verdict.**
    +50.7% aggregate achieved, median +47.6%), outside the ~4.0% measured throughput noise band. As
    a sustained-load level, learned/static sustain rung 100-200 where declared never sustains any
    rung (unbounded margin).
-4. **T2:** rung-50 lag learned median 1.5/40 vs declared 2/40 (at/better on 3/4 seeds); 0 index
+4. **T2:** rung-50 lag learned median 1.5/40 vs declared 2/40 (at/better on 4/4 seeds); 0 index
    builds on the 0-scan region; reorg ratio median 0.933x, max 0.995x (<= 1.5x).
 5. **T3:** win reorg ratio median 0.767x, max 0.941x (every run <= 1x, <= 3x); the single-region
-   blowup does NOT recur (`U|Stock` 5.23 MB / 1 merge in all 4 seeds).
+   blowup does NOT recur (`U|Stock` 5.13-5.23 MB / 1 merge each).
 6. **T4 (write-spike): EVALUABLE and measured NOT SUPPORTED** — a real ~9% capacity drop exists,
    neither arm recovers, learned ≈ static post-drift (gap +2%), `recovery_windows = {}` in all 4
    runs.

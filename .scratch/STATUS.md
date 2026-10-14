@@ -51,7 +51,7 @@ final policy `index_order_no=False`) on all 4 runs.
 ### T3 (win reorganisation) — SUPPORTED
 
 Reorg ratio: **median 0.767x, max 0.941x <= 3x**; **no single-region blowup** — win/learned
-`U|Stock` is 5.23 MB / 1 merge in all 4 seeds.
+`U|Stock` is 5.13-5.23 MB / 1 merge each.
 
 ### T4 (write-spike drift) — EVALUABLE, measured NOT SUPPORTED
 
