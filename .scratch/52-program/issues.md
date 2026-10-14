@@ -851,3 +851,22 @@ No failures.
   with no single-run blowup; learned win rung-50 lag-rej 3/6/3/4 vs static-derived 4/5/5/4
   (pre-fix seed42 was 13/40); learned throughput 107 rps on all four runs (no regression).
   Gates: 303 Rust + 140 Python tests green, cargo build 0 warnings, `git diff --check` silent.
+
+## Integration record: wave16/startwarm + wave16/oscillation
+
+- Timestamp: 2026-10-14T12:05:27+08:00 (integration committed).
+- Action: single-writer integrator merged `wave16/startwarm` (`--no-ff`, merge commit
+  `3e064fb3264330826a47c8cf4f63a7cd3d9c5419`) and `wave16/oscillation` (`--no-ff`, merge commit
+  `fa21cef3d5604c7d4c20db11a18976c39b171a34`) into `master`. One conflict: both branches appended
+  dispatch records at the end of this file; resolved by keeping both sections in order
+  (WP-R startup warm-up, then WP-R2 merge oscillation). Engine code areas were disjoint
+  (`wave16/startwarm`: `engine/src/bin/flashdb-load.rs` + `engine/src/readahead.rs`;
+  `wave16/oscillation`: `engine/src/engine.rs` + `engine/tests/merge_threshold.rs`), so no engine
+  code conflict.
+- Final evaluation worktree created: `git worktree add -b wave17/eval
+  /home/z/vibe/worktrees/flashdb/wave17-eval master`; HEAD `fa21cef3d5604c7d4c20db11a18976c39b171a34`.
+- Combined gates (verbatim):
+  - `cargo build --workspace --offline` — Finished, 0 warnings.
+  - `cargo test --workspace --offline` — 304 Rust tests passed, 0 failed.
+  - `cd harness && uv run --with pytest pytest -q` — 140 passed.
+  - `git diff --check` — silent.
