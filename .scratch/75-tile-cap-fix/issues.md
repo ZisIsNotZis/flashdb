@@ -121,8 +121,31 @@ Files (target):
 
 ## Acceptance verdict
 
-(to be filled after the gates run)
+- Shipped default cadence runs a per-region scored workload to completion without exhausting the
+  cap: **satisfied by construction + pins** — the scored runner now ships the build harness's
+  8 MiB cadence (`SHIPPED_CADENCE_BYTES`), the engine-level pin
+  `shipped_default_cadence_keeps_a_per_region_run_under_the_cap` shows the cadence publishes no
+  tiles per cycle and one whole-window publish fits, and `cadence_refusal` allows the shipped
+  default over the 336-region/12000-write shape. (No full multi-GB cold run was executed in this
+  work package; the behaviour is pinned at the engine + harness-unit level.)
+- Cap raised/configured: **satisfied** — `manifest::MAX_TILES` 1024 -> 4096,
+  `MAX_CHAIN_PAGES` 96 -> 316, `Engine::set_max_tiles`/`Engine::max_tiles`, `flashdb-load
+  --max-tiles`, runner `--max-tiles`.
+- Incompatible cadence refused loudly up front: **satisfied** — `cold_0b.cadence_refusal` runs
+  before any arm and returns a named `ERROR:` (equal-cadence, region/cap, publish-count bounds).
+- Genuine over-cap publish still fails closed: **satisfied** —
+  `per_region_publish_over_the_cap_fails_closed` pins 12 full-region publishes then a 13th
+  `InvalidInput` with the pinned text, no partial/orphan publish.
+- All tests green: **satisfied** — 306 Rust + 144 Python, build 0 warnings, diff check silent.
 
 ## Residual
 
-(to be filled after the gates run)
+- The cadence guard is deliberately conservative (a 4 KiB WAL-byte ceiling per write and
+  active-tiles as the region upper bound), so it may refuse some configurations that would in
+  fact complete; it never allows a run it cannot prove fits. It is a guard, not a scored
+  threshold.
+- No full cold scored run was executed here (the instance build is multi-GB); the shipped-default
+  completion is pinned by the engine-level and harness-unit tests above. A full scored run with
+  the new default remains the integrator's/author's acceptance run.
+- The manifest worst-case round-trip test now round-trips 4096 255-byte-name records (316 chain
+  pages); it passes but is the heaviest manifest unit test.

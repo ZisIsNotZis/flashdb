@@ -178,10 +178,12 @@ two items flagged below remain. Load-bearing current facts:
 - The validation unit is the **request** (`docs/contracts.md`, ticket 41): a repeated `block_id`
   inside one request is refused fail-closed, and a request's uniqueness verdict does not depend on
   its neighbours.
-- The per-region publish tile-cap defect (the 16 KiB cadence exhausting `MAX_TILES = 1024`) is
-  pinned by regression test `per_region_cadence_exhausts_the_tile_cap_and_the_publish_fails`
-  (ticket 46), which pins the **current** (unfixed) behaviour. The fix is adopted but **NOT yet
-  implemented** (§7.4).
+- The per-region publish tile-cap defect (the 16 KiB cadence exhausting the 1024-tile cap) is
+  fixed and re-pinned: `manifest::MAX_TILES` is raised to 4096 (with `MAX_CHAIN_PAGES` 96 -> 316)
+  and made a per-engine configurable policy cap (`Engine::set_max_tiles`), the scored runner ships
+  the build harness's 8 MiB cadence, and a per-region run refuses an incompatible cadence loudly
+  up front. A genuine over-cap publish still fails closed. Regression pins in
+  `engine/tests/partitioned_publish_cap.rs` (ticket 46 decision, implemented in ticket 75).
 
 ## 7. Decisions adopted
 
@@ -202,12 +204,13 @@ philosophy rather than asked, and that work must not stop). Reviewable and rever
 3. **The 10x floor is a requirement, not a qualification.** The decisive T1-T4 runs satisfy it: they
    run on the >=10x instance cold51 (12.25x). An 8.17x instance is warmer than a 10x one, so a
    failure there cannot be explained away by the lower ratio.
-4. **The tile-cap fix is adopted, NOT yet implemented** (`.scratch/46-partitioned-publish-tile-cap`):
-   raise and make configurable the tile cap, make the run harness's default cadence compatible with
-   per-region publishing, and make a scored run refuse an incompatible cadence loudly instead of
-   aborting mid-run. The shipped default must be able to run the shipped engine in the documented
-   regime. `manifest::MAX_TILES` is still a hardcoded 1024 and the scored runner still ships the
-   16 KiB cadence, so this decision is pending implementation.
+4. **The tile-cap fix is implemented** (`.scratch/75-tile-cap-fix/issues.md`, branch
+   `wave21/tilecap`): the tile cap is raised (1024 -> 4096, `MAX_CHAIN_PAGES` 96 -> 316) and made
+   configurable per engine (`Engine::set_max_tiles`, `--max-tiles`), the scored runner's default
+   checkpoint/rotate cadence is the build harness's 8 MiB, and a per-region scored run refuses an
+   incompatible cadence loudly up front instead of aborting mid-run. The shipped default must be
+   able to run the shipped engine in the documented regime, and a genuine over-cap publish still
+   fails closed.
 5. **Endurance is a constraint, not a price** (`docs/objective.md`): the reorganisation write term is
    0.083-0.669% of the service-time term, so no weight can move an argmin; the objective is maximise
    sustained load subject to the latency ceiling and a write-amplitude budget.
@@ -227,7 +230,6 @@ philosophy rather than asked, and that work must not stop). Reviewable and rever
   - (b) **Keep both ceilings and treat the host/device floor as the limit** — state the durability
     floor explicitly, or make the service ceiling relative to the measured device fsync.
   - (c) **Move the WAL to a sub-10 ms-fsync device** and re-derive the metric there.
-- **Tile-cap fix** (§7.4): adopted, unimplemented.
 - **T4 / residual gaps** (ticket 73): the harness drift shape is hardcoded to `scan x10` (no CLI
   knob), so a write-spike or key-popularity-spike drift is not reachable and might still produce a
   recovery event; the drift static-derived control is derived over the full pre+post run, not a
@@ -266,8 +268,9 @@ harness (ticket 73). The next steps, in dependency order:
    judged for any both-ceilings claim and is unchanged; the lag-only rung-100 result already stands,
    but a pre-registration-consistent both-ceilings verdict cannot be stated while the service
    ceiling is device-bound.
-2. **Implement the adopted tile-cap fix** (§7.4) — raise/make configurable `MAX_TILES`, reconcile the
-   scored runner's cadence, refuse an incompatible cadence loudly.
+2. **Implement the adopted tile-cap fix** (§7.4) — DONE in `wave21/tilecap`, ticket 75: cap
+   raised/configured, scored runner cadence reconciled to 8 MiB, incompatible cadence refused
+   loudly up front.
 3. **Close the T4 evaluability gap** — add a non-scan drift shape (write-spike / key-popularity
    spike) to the harness and re-test, or state T4 as underivable-with-current-harness to the author.
 4. **Resolve the rung-50 residual** (compaction-adjacent cold reads + device fsync tail) if a clean
