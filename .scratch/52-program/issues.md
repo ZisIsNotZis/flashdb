@@ -824,3 +824,8 @@ No failures.
   (windows 28-36), not the startup warm-up. Throughput preserved (learned/static ~105-107 rps vs
   declared 69-72, +43-57%). Gates: 303 Rust + 140 Python tests green, cargo build 0 warnings,
   `git diff --check` silent.
+- Serialization note (added after the runs): all four WP-R runs were UN-lock-protected (they
+  finished before the shared-box `flock /tmp/wave16-measure.lock` rule); the concurrent
+  `wave16/oscillation` lane contaminates the lag ceiling, so the WP-R lag numbers are
+  direction-only under contention. The deterministic startup-warm evidence is unaffected; the
+  decisive serial rung-50 verdict belongs to WP-S after integration.

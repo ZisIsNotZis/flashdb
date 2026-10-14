@@ -169,6 +169,19 @@ throughout):
 | seed42-repeat start | 11:09:58 | 6.86 / 6.18 / 6.70 |
 | seed42-repeat end | 11:19:50 | 7.96 / 7.29 / 6.91 |
 
+### Serialization / contention note (supervisor guidance, added after the runs)
+
+**All four runs above are UN-lock-protected** (they completed before the shared-box serialization
+rule was issued). The sibling lane `wave16/oscillation` was measuring concurrently, which
+contaminates the lag ceiling. Under the rule "wrap the whole run in `flock /tmp/wave16-measure.lock`",
+these lag numbers must be read as **direction-only under contention**; the decisive serial
+measurement is WP-S after integration. The deterministic evidence is unaffected by contention and
+remains load-bearing: `startup_warm scan_entries=30000 index_entries=30000` in every run, and
+windows 0-2 `lag_breach_attribution total=0` in every run (the startup warm-up is gone regardless of
+contention). The mid-run residual (windows 28-36) is exactly the window class contention inflates,
+so its attribution to "compaction-adjacent cold reads + device fsync tails" is provisional, not a
+clean named cause.
+
 ## Gates (verbatim, final HEAD `25fd585`)
 
 1. `cargo build --workspace --offline` — 0 warnings:
@@ -250,10 +263,13 @@ read-ahead startup package (it is a compaction re-warm / device-durability-tail 
 windows clean; the strict 0/40 is not reached across all seeds. Both-ceilings — 0 rps everywhere,
 unchanged (service ceiling is device-bound; the open §7.1 reconciliation is untouched).
 
-**Honest label:** pilot-grade. 4 runs = 3 independent seeds + one 42 repeat on a shared box
-(loadavg 5.1-10.2), NOT a 10-seed pre-registered verdict. The fix removes the named startup
-warm-up deterministically (`startup_warm scan_entries=30000 index_entries=30000` in every run);
-it does not and cannot claim the mid-run device/compaction tail.
+**Honest label:** pilot-grade, and direction-only for lag. 4 runs = 3 independent seeds + one 42
+repeat on a shared box (loadavg 5.1-10.2), NOT a 10-seed pre-registered verdict, and NOT
+lock-protected against the concurrent `wave16/oscillation` lane (see the serialization note above).
+The fix removes the named startup warm-up deterministically (`startup_warm scan_entries=30000
+index_entries=30000` and windows 0-2 `total=0` in every run); it does not and cannot claim the
+mid-run device/compaction tail, whose lag magnitude is contention-inflated. The decisive serial
+rung-50 verdict belongs to WP-S after integration.
 
 ## Residual items
 
