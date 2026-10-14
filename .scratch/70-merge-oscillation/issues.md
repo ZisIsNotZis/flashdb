@@ -220,6 +220,17 @@ users' work — a `llama-server` at ~100% CPU/10 GB RSS was present throughout):
 | seed42-repeat start | 11:37:08 | 6.45 / 7.40 / 7.56 |
 | seed42-repeat end | 11:46:12 | 6.27 / 7.00 / 7.38 |
 
+**Serialization note (recorded after the orchestrator's `flock /tmp/wave16-measure.lock`
+guidance arrived):** all four runs were already STARTED before that guidance, so **none of them was
+lock-protected**; they ran one flashdb process at a time but not under the cross-lane lock. The
+sibling lane `wave16/startwarm` (ticket 69) was measuring concurrently during the early part: its
+`seed42-repeat` finished at 11:14, overlapping THIS ticket's `seed42` (11:08-11:18). This
+package's `seed43`/`seed44`/`seed42-repeat` started after 11:18, i.e. after the sibling finished
+at 11:14, so only the resident shared-box load (`llama-server` ~100% CPU) applied to them.
+Consequence: the lag/timing numbers here are **direction-only under contention** (as directed);
+the reorg/byte/merge-count numbers are deterministic and are the primary evidence. The decisive
+clean serial measurement is WP-S after integration, not this lane.
+
 ## Before/after tables
 
 "Before" = integrated pre-fix (ticket 68). "After" = this ticket (re-merge payback). All reorg
@@ -330,7 +341,10 @@ verbatim rather than hidden.
   reorg oscillation this package removes.
 - **Declared/static absolute reorg shifted up** (7 → 30.7 MB declared, 20.7 → 24.7-29.9 MB
   static) for the reason above; re-measured, not a regression in the T3 ratio.
-- **4 seeds, shared box** (loadavg 4.9-8.7, a resident `llama-server` at ~100% CPU): timings are
-  pilot-grade; the deterministic byte/count numbers are the primary evidence.
+- **4 seeds, shared box, no cross-lane lock** (loadavg 4.9-8.7, a resident `llama-server` at
+  ~100% CPU; `seed42` overlapped the sibling `wave16/startwarm` `seed42-repeat` until 11:14):
+  timings are direction-only under contention, per the orchestrator; the deterministic
+  byte/count numbers are the primary evidence. The clean serial measurement is WP-S after
+  integration.
 - Service ceiling remains device-bound (both-ceilings 0 everywhere); the open §7.1 reconciliation
   is untouched and not edited.
