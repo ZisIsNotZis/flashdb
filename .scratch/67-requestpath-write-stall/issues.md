@@ -246,12 +246,17 @@ Per-rung achieved throughput (after, the only thing the objective's throughput a
 Write amplification does NOT show a clean non-regression. Static-derived write amp (`reorg_bytes`
 + `index_output_bytes`, the summed per-region compaction plus index output) was seed42=21.9 /
 seed43=21.9 / seed42-repeat=30.2 MB before, but seed42new=26.4 / seed43new=94.9 /
-seed42repeatnew=98.0 MB after — 2 of 3 after-runs are 3.2-4.3x higher. The whole excess is a
-single ~69-72 MB merge (`U|Customer` 69.0 MB on seed43new, `P|Customer` 72.1 MB on
-seed42repeatnew) with zero index output, plausibly shared-box timing noise, and NOT causally tied
-to the read-path-only follow-on (a read-path change cannot cause a Customer-region compaction);
-the write-amplification non-regression criterion is therefore NOT substantiated by the current
-evidence and is left pending the WP-R re-measure.
+seed42repeatnew=98.0 MB after — 2 of 3 after-runs are 3.2-4.3x higher. The excess is NOT a single
+large merge; it is a single-region merge oscillation. On seed43new `U|Customer` emitted 6 merges
+of 11.37-11.52 MB each (11,372,547 + 5×11,524,169 = 68,993,392 B ≈ 69.0 MB); on seed42repeatnew
+`P|Customer` emitted 7 merges of 10.17-10.41 MB each (10,165,563 + 5×10,300,227 + 10,413,309 =
+72,080,007 B ≈ 72.1 MB). The largest single merge is ~11.5 MB, not ~70 MB. In seed43new the
+Customer oscillation is not the whole excess either: `P|Order` grew +5.9 MB and `U|StockMovement`
++2.3 MB, offset by `P|Stock` −4.2 MB. All of this carries zero index output, is plausibly
+shared-box timing noise, and is NOT causally tied to the read-path-only follow-on (a read-path
+change cannot cause a Customer-region compaction); the write-amplification non-regression
+criterion is therefore NOT substantiated by the current evidence and is left pending the WP-R
+re-measure.
 
 ### The write-stall is removed (per-group proof, before state seed 42)
 
