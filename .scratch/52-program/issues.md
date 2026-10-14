@@ -1110,6 +1110,29 @@ No failures.
   - `cd harness && uv run --with pytest pytest -q` — 146 passed.
   - `git diff --check` — silent.
 
+## wave22 WP-X dispatch record (combined post-wave21 evaluation)
+
+- Timestamp: 2026-10-14T15:46:27+08:00.
+- Action: dispatched work package X "the combined post-wave21 evaluation (rung-50 residual + T4 +
+  T1/T2/T3 regression)" to the single-writer `wave22/eval` worktree (branch `wave22/eval`, based on
+  integrated master `ce66f3e` carrying ticket 75 tile-cap + ticket 77 write-spike drift shape).
+  Confirmation run re-deriving the ticket 71 T1/T2/T3 win+adversarial result and the ticket 77 T4
+  write-spike result in one pass against the integrated HEAD, serialized with
+  `flock /tmp/wave21-measure.lock`, one flashdb process at a time under `MemoryMax=128MiB`.
+  Contract, exact commands, per-arm/rung tables, both judging views, T1-T4 verdicts, gates and
+  residual in `.scratch/78-eval-wave21/issues.md` (artifacts `.scratch/78-eval-wave21/*.{md,json}`).
+- Result (pilot-grade, 3 independent seeds 42/43/44 + seed-42 repeat = 4 runs per workload set,
+  20 arm-runs, box loadavg ~4.8-6.4): rung-50 lag-rej still NOT 0 (static-derived 2/40, learned
+  4-9/40, declared 39-40/40); **rung 100 lag-only sustained** (static-derived 0/20 in 4/4 seeds,
+  learned 0/20 in 2/4); T1 throughput +42.7-44.6% (median +43.9%, outside the 0.60% noise band);
+  T2 adversarial rung-50 lag learned median 2/40 vs declared 2.5/40, 0 index builds, reorg median
+  0.942x (<=1.5x); T3 win reorg median 0.564x (<=3x, every run <=1x), no single-region blowup
+  (U|Stock 5.13-5.23 MB / 1 merge); **T4 write-spike EVALUABLE and measured NOT SUPPORTED** (~10%
+  real drop, neither arm recovers, learned≈static post gap ~±1%, `recovery_windows = {}`). Both
+  ceilings 0/96 rows (service ceiling device-bound); slice-39 zero-gain holds (reorg/service
+  0.00111-0.00320). New defects: none. Gates: cargo build 0 warnings, 306 Rust + 146 Python tests
+  green, `git diff --check` silent.
+
 ## wave21 WP-W2 repair dispatch record (correct the falsified diagnosis + bound the build tail)
 
 - Timestamp: 2026-10-14T16:06:00+08:00 (diagnosis correction committed `ad109f3`) ->
@@ -1172,3 +1195,38 @@ No failures.
   - `cargo test --workspace --offline` — 308 passed; 0 failed; 0 ignored.
   - `cd harness && uv run --with pytest pytest -q` — 146 passed.
   - `git diff --check` — silent.
+
+## WP-X record repair (ticket 78 correction: T3 reorg accounting + two minor findings)
+
+- Timestamp: 2026-10-14T17:23:08+08:00.
+- Action: single-writer scribe repair of the WP-X evaluation record in `.scratch/78-eval-wave21/`
+  on branch `wave22/eval`. READ-ONLY measurement — no eval re-run; the record is repaired against
+  the committed raw JSON artifacts. Do not touch `.scratch/15-objective-v0/pre-registration.md`
+  (untouched). The blocking finding is corrected: ticket 72 established that per-window/per-region
+  reorg byte sums undercount the true reorg cost and that `summary.compact_bytes_total` (which
+  includes the final drained merge applied after the window loop) is the correct total. The WP-X
+  report had used the region sum for the win/learned T3 ratio, dropping the final-drained
+  `U|Customer` merge (11,372,547 B) in seeds 42 and 42-repeat.
+- Corrected T3 (win/learned@1.0 / declared, all from `summary.compact_bytes_total`): 0.941x (42),
+  0.554x (43), 0.918x (44), 0.928x (42-rpt) — **median 0.923x, max 0.941x**, superseding the
+  0.564x median / 0.918x max and the inverted "bimodal 0.55-0.57x in 3/4" claim in the dispatch
+  record above (truth: 0.554x in 1/4, 0.918-0.941x in 3/4). static/declared median 0.956x
+  (0.939-0.972x) unchanged. T3 verdict unchanged: <=3x PASS, every run <=1x, no single-region
+  blowup.
+- Minor corrections: (2) the "achieved fraction <= 1.0005 at every rung" claim is corrected —
+  seed43 win/learned@1.0 rung-200 reached 1.1315 (`rate_exceeded=true`) and seed42-repeat
+  win/learned@1.0 rung-400 reached 1.0040 (neither is a correctness defect). (3) the T4
+  post-drift drop is corrected to -9.4% to -10.9% (post-drift steady values straddle the 10%
+  band's lower edge ~1305 rps) and the "neither returns to the 10% band of 1450" wording is
+  softened to match the raw values; the T4 verdict stays EVALUABLE, measured NOT SUPPORTED.
+- Verified unchanged: seed/artifact set (42/43/44 + 42-repeat; 4 win+adversarial + 4 drift = 8
+  lock-protected harness invocations, 20 arm-runs), the 0.60% throughput noise band (declared
+  42-vs-42-repeat max relative diff at rung-100, 89.45 -> 89.98 rps), the T4 same-seed repeat
+  noise (learned 0.6%, static 0.9%), and the "NOT a 10-seed pre-registered verdict" disclosure.
+- Files: `.scratch/78-eval-wave21/issues.md` (T3 table/median/bimodal, slice-39, honest verdict,
+  new-defects, residual gaps, T4 wording) and the per-seed `42/42r/43/44.md` "reorg bytes"
+  columns + accounting note.
+- Gates (verbatim, run at the repair commit): `cargo build --workspace --offline` 0 warnings;
+  `cargo test --workspace --offline` 306 passed / 0 failed / 0 ignored;
+  `cd harness && uv run --with pytest pytest -q` 146 passed in 4.40s; `git diff --check` silent
+  (exit 0).
