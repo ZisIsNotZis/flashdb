@@ -589,6 +589,13 @@ pub(crate) struct TileWriter {
     started: bool,
     finished: bool,
     bloom: Option<Bloom>,
+    /// Opt-in bounded durability cadence: `flush_block` calls `sync_data` once
+    /// the accumulated unsynced data-block bytes reach this threshold. Off by
+    /// default (the ordinary publish path keeps one final `sync_data`); the
+    /// off-path compaction build sets it so a large merge does not flush its
+    /// whole dirty set in a single `finish` `sync_data`.
+    sync_every: Option<u64>,
+    unsynced: u64,
 }
 
 impl TileWriter {
@@ -622,7 +629,19 @@ impl TileWriter {
             started: false,
             finished: false,
             bloom: None,
+            sync_every: None,
+            unsynced: 0,
         })
+    }
+
+    /// Enable a bounded durability cadence: every `bytes` of data-block output
+    /// (measured since the last sync) is made durable with `sync_data` before
+    /// more is buffered. `0` disables the cadence (the default). Syncing never
+    /// changes the encoded bytes, so the written tile is byte-identical to an
+    /// un-synced write of the same stream.
+    pub(crate) fn set_sync_every(&mut self, bytes: u64) {
+        self.sync_every = (bytes > 0).then_some(bytes);
+        self.unsynced = 0;
     }
 
     /// Append one entry. Keys must be strictly increasing; anything a `Tile::write`
@@ -672,6 +691,13 @@ impl TileWriter {
         self.fences.push(Fence { first_key: std::mem::take(&mut self.first_key), offset: self.offset, len: block.len() as u32 });
         self.file.write_all(&block)?;
         self.offset = self.offset.checked_add(block.len() as u64).ok_or_else(|| invalid("tile offset overflow"))?;
+        if let Some(every) = self.sync_every {
+            self.unsynced = self.unsynced.saturating_add(block.len() as u64);
+            if self.unsynced >= every {
+                self.file.sync_data()?;
+                self.unsynced = 0;
+            }
+        }
         self.entries.clear();
         self.block_entries = 0;
         Ok(())
@@ -1503,6 +1529,34 @@ mod tests {
         let b = std::fs::read(&path_stream).unwrap();
         assert_eq!(a.len(), b.len(), "file sizes must match");
         assert_eq!(a, b, "streaming writer must be byte-identical to Tile::write");
+        let _ = std::fs::remove_file(&path_mt);
+        let _ = std::fs::remove_file(&path_stream);
+    }
+
+    /// The compaction build opts into a bounded `sync_data` cadence so a large
+    /// merge does not flush its whole dirty set in one `finish` burst. The cadence
+    /// must not change the encoded tile: a writer with an aggressive sync interval
+    /// is still byte-identical to the un-synced stream, and the tile reopens.
+    #[test]
+    fn streaming_writer_periodic_sync_is_byte_identical() {
+        let mut mt = Memtable::new();
+        for handle in 1..=3000u64 { put(&mut mt, handle, 1, &vec![b'v'; 300]); }
+        let (path_mt, tile_mt) = write_tile("writer-sync-mt", 1, &mt);
+        let path_stream = tmp("writer-sync-stream");
+        let mut w = TileWriter::new(&path_stream, 1, &[9u8; 32], DEFAULT_PAGE_SIZE).unwrap();
+        // One sync per block (the default page is 4096 B), so every `flush_block`
+        // crosses the threshold and exercises the sync branch repeatedly.
+        w.set_sync_every(1);
+        for (key, value) in mt.entries() { w.push(key, value).unwrap(); }
+        let tile_stream = w.finish().unwrap();
+        assert_eq!(tile_mt.count(), 3000);
+        assert_eq!(tile_stream.count(), 3000);
+        let a = std::fs::read(&path_mt).unwrap();
+        let b = std::fs::read(&path_stream).unwrap();
+        assert_eq!(a, b, "periodic sync must not change the encoded tile bytes");
+        // The reopened tile must read back the same entries.
+        let reopened = Tile::open(&path_stream).unwrap();
+        assert_eq!(reopened.count(), 3000);
         let _ = std::fs::remove_file(&path_mt);
         let _ = std::fs::remove_file(&path_stream);
     }
