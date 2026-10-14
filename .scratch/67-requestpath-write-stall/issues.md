@@ -136,7 +136,7 @@ worker's `BarrierResult` in FIFO order and only then records completions).
 
 ## Change
 
-Implemented at (commit to be recorded). Files:
+Implemented in two commits (`98ba12e` write-stall, `16303ef` read-path follow-on). Files:
 
 1. `engine/src/wal.rs`: `Wal::encode_frame(payload)` builds the framed bytes without
    writing (bounds + poison checks identical to `append`); `Wal::append` now calls it; new
@@ -160,6 +160,20 @@ Implemented at (commit to be recorded). Files:
    `group_phase`/`window_stall` report's `append_us` is now `completion.append_us` (the worker's
    device-bound write), so a remaining stall is still attributed to append vs fsync.
 
+### Read-path follow-on (supervisor-approved scope extension, commit `16303ef`)
+
+The write-stall fix exposed the last rung-50 breaches as COLD INDEX-TILE page-ins on the pacer
+(seed 42 static-derived windows 31/37: a 60-67 ms read -> 41-47 ms next-group lag, while a
+concurrent 129 ms `fdatasync` dispatched with only 70 us lag). The WP-M `order_no` index sidecar
+was absent from the read-ahead worker's warm view, so its point probe was never warmed.
+
+- `engine/src/engine.rs::tile_read_view()` now appends the adopted `order_no_index` tile to the
+  warm view; the index tile uses the same `U` key spelling, so `TileReadView::warm_lookup` covers
+  it with no special-casing.
+- `engine/src/index.rs`: `OrderNoIndex::tile()` shares the `Arc<Tile>`.
+- `engine/src/request.rs::request_read_lookups`: a movement scan now emits the `order_no` index
+  probe (`entity=StockMovement, field=order_no`) so the read-ahead worker warms it.
+
 ## Tests
 
 - `engine/tests/group_commit.rs::deferred_append_buffers_on_the_pacer_and_lands_on_the_worker` —
@@ -172,25 +186,116 @@ Implemented at (commit to be recorded). Files:
   strengthened: with the injected sync fault the worker appends the complete frame and then fails
   the sync, so recovery replays handle 2 (`doc2`) while the group is never acked — the
   append-happens-but-no-ack-without-fdatasync invariant.
+- `engine/src/readahead.rs::tile_read_view_includes_the_adopted_order_no_index` — NEW, fails
+  pre-change: the warm view resolves the `order_no` index probe only AFTER the index is adopted
+  (`Some(1)` vs `None`).
+- `engine/src/request.rs::request_read_lookups_extracts_the_probes_each_shape_pays` — updated: a
+  movement scan now yields the `order_no` index probe (was empty).
 - Existing overlapped tests switched to `begin_group_deferred` so they exercise the new deferred
   append path; the synchronous `end_group` path and its fault-injection test are unchanged.
 
-## Gates (verbatim; run at the implementation commit)
+## Gates (verbatim; run at final HEAD `16303ef`)
 
 1. `source $HOME/.cargo/env; cargo build --workspace --offline` — 0 warnings (no warning/error
    lines).
-2. `cargo test --workspace --offline` — totals: **301 passed; 0 failed; 0 ignored** (+2 tests).
-3. `cd harness && uv run --with pytest pytest -q` — **138 passed in ~4.5s**.
+2. `cargo test --workspace --offline` — totals: **302 passed; 0 failed; 0 ignored**
+   (128 lib + 22 flashdb-load + 9 batch_commit + 5 compaction_job + 4 constraints +
+   3 family_colocation + 12 group_commit + 6 manifest_engine + 7 merge_threshold + 15 metrics +
+   33 multi_tile + 7 order_flow + 5 order_no_index + 1 partitioned_publish_cap + 5 read_requests +
+   3 region_compaction + 6 region_partition + 3 replay_trace + 8 request_commit + 2 scale_bin +
+   3 tile_format + 3 tile_layout + 12 tile_read + 0 flashdb-replay + 0 flashdb-scale + 0 main + 0 doc-tests).
+3. `cd harness && uv run --with pytest pytest -q` — **138 passed in 4.01s**.
 4. `git diff --check` — silent (exit 0).
+
+## Measurement protocol
+
+Release binary built once per binary state (`target/release/flashdb-load`, sha256 before
+`096454c4…` / after `29222e0b…`), copied to `/tmp/wave14-writestall/`, run only from that copy,
+one process at a time. Instance `cp -a` of `/tmp/cold51/per_region-mixed` (12.25x), harness
+`cold_0b.py --workloads win --arms declared learned static-derived --lambdas 1.0`, full ladder
+50/100/200/400, `--cap-mib 128 --checkpoint-bytes 8388608 --rotate-bytes 8388608
+--compact-bytes 67108864 --ceiling-us 10000 --lag-ceiling-us 10000`, seeds 42/43 + seed-42 repeat.
+Box load avg 3.4-8.3 on 12 cores (shared; the parallel wave14-churn2 lane was measuring
+concurrently, so every timing number is noisy — WP-Q re-measures serially).
 
 ## Before/after tables
 
-(Filled after measurement.)
+"Before" = write-stall fix only (commit `98ba12e`); "after" = write-stall fix + index-tile warm
+(commit `16303ef`). Win workload, rung 50 (the acceptance rung):
+
+| run | arm | before lag-rej | after lag-rej |
+|---|---|---:|---:|
+| seed 42 | declared | 39/40 | 39/40 |
+| seed 42 | learned@1.0 | 26/40 | 26/40 |
+| seed 42 | static-derived | 4/40 | **2/40** |
+| seed 43 | static-derived | 2/40 | **2/40** |
+| seed 42 repeat | static-derived | 2/40 | **2/40** |
+
+(`learned` rung-50 stays 25-26/40 in BOTH states: that is the learner's own 36-window index
+burn-in churn, fixed by the sibling WP-O lane, not the write path. `declared` stays ~39-40/40: the
+full `P|StockMovement` scan on the pacer, not the write path.)
+
+Per-rung achieved throughput (after, the only thing the objective's throughput axis scores):
+
+| arm | r50 | r100 | r200 | r400 |
+|---|---:|---:|---:|---:|
+| declared | 50 (40/40 lag-rej) | 85-92 | 85-92 | 81-89 |
+| learned@1.0 | 50 | 100 | 199-200 | 351-400 |
+| static-derived | 50 | 100 | 200 | 354-400 |
+
+Write amplification is unchanged by construction (the change only moves WAL frame writes between
+threads; frame bytes and compaction bytes are identical) — the three after-runs' static-derived
+`reorg_bytes` are 8.0-8.9 MB, matching the before runs and WP-N.
+
+### The write-stall is removed (per-group proof, before state seed 42)
+
+`group_phase window=37 seq=50 … fsync_us=129566 completion_us=133033 due_dispatch_us=70` — a
+129.6 ms `fdatasync` on the worker, with the NEXT group dispatched only **70 us** late. Before
+this package that same tail cascaded ~54-74 ms into the next group's lag (ticket 58). Across the
+three after-runs, static-derived sees **12 groups with fsync >100 ms and 23 with fsync >50 ms, and
+none of them produces a lag breach** (the rung-50 breaches are windows 0-1 only, below). The
+pacer's `append_us` is now ~0-44 us (worker-measured); the device write is off the dispatch path.
+
+### Residual (after): static-derived rung-50 = 2/40, both windows 0-1 (startup warm-up)
+
+`lag_breach_attribution` for static-derived after, all three runs: the ONLY rung-50 breaches are
+`window=0` (total 16-27, `read_us` 503-757 ms) and `window=1` (total 1-2, `read_us` 26-28 ms),
+every one `reads=N boundary=0`. Windows 2-40 are clean. Window 0/1 is the read-ahead worker's
+cold-start warm-up: the pacer dispatches the first window's requests before the 4 ms/request warm
+has filled the lead. It is a read-path warm-up transient, NOT the durability floor (no fsync >50 ms
+produces any lag breach) and NOT the mid-rung index-tile stall the follow-on removed.
+
+Device fsync distribution (per-group `fsync_us`, static-derived, the 3 after-runs, n=20,893):
+p50 0 / p90 9,644 us / p95 12,436 us / p99 18,649 us / max 314,493 us; 1,889 >10 ms, 23 >50 ms,
+12 >100 ms. The 10 ms lag ceiling sits BELOW the device's own fsync p90-p99, yet after this
+package no fsync tail becomes schedule lag (it lands in service latency, which is the open §7.1
+service-vs-lag reconciliation, unchanged).
 
 ## Acceptance verdict
 
-(Filled after measurement.)
+**Write-path acceptance: MET.** The single pacer no longer blocks on device write latency; a
+covering `fdatasync` still gates every ack (tests); throughput and write amp are unchanged;
+ordering/newest-first/disjoint-tiles unchanged. The named blocker is removed with per-group proof.
+
+**Rung-50 lag-rej = 0: NOT reached — honest residual 2/40 (static-derived), and it is proven NOT
+write-path and NOT device-durability-bound.** The two remaining windows are the read-ahead
+worker's startup warm-up (windows 0-1), `reads=N boundary=0`; the device fsync tail (up to 314 ms)
+produces zero lag breaches. Reaching 0 would need eager startup warming of the index+scan prefix
+(a read-ahead tuning change, not a write-path change), or accepting the warm-up window as a
+cold-start transient.
+
+**Judging views:** §7.1 lag-only primary — static-derived rung-50 2/40 (was 2-4/40); NOT yet
+lag-sustained, but the write-path blocker is gone and the remaining 2 are warm-up. Both-ceilings —
+0 rps everywhere, unchanged (the service ceiling is the device fsync floor; the open §7.1
+reconciliation, not resolved here and not edited).
 
 ## Residual items
 
-(Filled after measurement.)
+- **Startup warm-up (2/40):** windows 0-1 of the read-ahead worker's cold-start. Candidate fix:
+  eager warm of the movement scan prefix + `order_no` index before the first dispatch (or a longer
+  initial lead), a read-ahead tuning change out of this write-path package.
+- **Learner rung-50 churn (25-26/40):** the WP-O sibling lane's scope, not the write path.
+- **Service ceiling:** still device-bound (fsync p90 9.6 ms / p99 18.6 ms vs a fixed 10 ms); the
+  open §7.1 primary-vs-service reconciliation is untouched and stays flagged for the author.
+- **Shared-box noise:** the parallel wave14-churn2 lane was measuring concurrently; all timings are
+  pilot-grade and WP-Q must re-measure the integrated result serially.
