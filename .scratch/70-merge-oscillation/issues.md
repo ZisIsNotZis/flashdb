@@ -176,7 +176,7 @@ re-merge, which is the oscillation that actually fires.
 - `cargo test --workspace --offline`: see gates below.
 - `cd harness && uv run --with pytest pytest -q`: see gates below.
 
-## Verbatim gates (run at final HEAD `1b13c8b`)
+## Verbatim gates (final HEAD `d63e294`; wave16 integration HEAD `853633a`)
 
 1. `cargo build --workspace --offline` — 0 warnings:
 ```
@@ -233,35 +233,53 @@ clean serial measurement is WP-S after integration, not this lane.
 
 ## Before/after tables
 
-"Before" = integrated pre-fix (ticket 68). "After" = this ticket (re-merge payback). All reorg
-bytes are the summed per-region `compaction_bytes`.
+"Before" = integrated pre-fix (ticket 68), reported as the summed per-region `compaction_bytes`.
+"After" = this ticket (re-merge payback), reported as the driver's `summary.compact_bytes_total`
+(the summed per-region `compaction_bytes` plus the final drained merge that `flashdb-load` applies
+after the window loop and attributes to no window or region). See the final-drain note below.
 
 ### The single-region blowup is bounded (win learned, the acceptance target)
 
-| run | `U|Stock` | `P|Customer` | `U|Customer` | total reorg | max single-window |
+| run | `U|Stock` | `P|Customer` | `U|Customer` | total reorg | max single merge |
 |---|---:|---:|---:|---:|---:|
-| before seed42 | **75.2 MB / 8** | **30.8 MB / 3** | 0 | 109.3 MB | 10.16 MB |
+| before seed42 | **75.2 MB / 8** | **30.8 MB / 3** | 0 | 109.3 MB | 10.30 MB |
 | before seed42-repeat | 0 / 0 | 0 | 0 | 3.3 MB | ~0 |
 | after seed42 | 5.23 MB / 1 | 10.29 MB / 1 | 0 / 0 | 17.12 MB | 10.29 MB |
-| after seed43 | 5.23 MB / 1 | 0 / 0 | 0 / 0 | 6.88 MB | 5.23 MB |
+| after seed43 | 5.23 MB / 1 | 0 / 0 | 0 / 0 | 18.26 MB | 11.37 MB |
 | after seed44 | 5.23 MB / 1 | 0 / 0 | 0 / 0 | 6.83 MB | 5.23 MB |
 | after seed42-repeat | 5.23 MB / 1 | 10.29 MB / 1 | 11.08 MB / 1 | 28.20 MB | 11.08 MB |
 
 The oscillation is gone: `U|Stock` is now **5.23 MB / 1 merge on BOTH the seed42 run and the
 same-trace repeat** (before: 75.2 MB / 8 vs 0 MB / 0). Each region does at most ONE merge per
 low-threshold exposure, and the merge is a single cheapest contiguous pair, so the max
-single-window actuation is 5.23-11.08 MB (one pair), never the repeated ~10 MB-per-window burst.
+single merge is 5.23-11.37 MB (one pair), never the repeated ~10 MB-per-window burst. The
+`after seed43` 11.37 MB entry is the final drained merge (not a window actuation); see the note
+below.
+
+**Final-drain accounting note.** `flashdb-load` applies the last in-flight compaction job after the
+window loop and adds it to `summary.compact_bytes_total`/`compact_merges`, but attributes it to no
+window or region. `after seed43` win-learned sums to 6,883,598 B / 5 merges across the per-window
+regions while `summary.compact_bytes_total` is 18,256,145 B / 6 merges, so the 6th (final drained)
+merge is 11,372,547 B ≈ 11.37 MB — one pair, still not a burst. The ticket-68 "before" figures
+reproduced above are per-region sums and undercount their own final drained merge the same way
+(e.g. before seed42 learned: 109,308,744 B reported vs 119,471,031 B summary, a 10,162,287 B final
+merge), so before-vs-after is apples-to-apples in merge count (both sides drop one final merge) but
+both sides undercount by one merge. The `before seed42` cell was the final drained merge value
+(10,162,287 B); it is corrected here to the true max single merge 10.30 MB (a 10,300,227 B
+`P|Customer` window merge). This ticket corrects the `after seed43` total/ratio/median below to the
+summary totals; the other after runs have no final-drain gap (summary == per-region sum).
 
 ### win T3 reorg ratio (learned/declared and static/declared)
 
 | seed | declared | learned | L/D | static-derived | S/D |
 |---|---:|---:|---:|---:|---:|
 | 42 | 30.72 MB | 17.12 MB | **0.56x** | 29.83 MB | 0.97x |
-| 43 | 30.72 MB | 6.88 MB | **0.22x** | 24.70 MB | 0.80x |
+| 43 | 30.72 MB | 18.26 MB | **0.59x** | 24.70 MB | 0.80x |
 | 44 | 30.72 MB | 6.83 MB | **0.22x** | 28.84 MB | 0.94x |
 | 42-repeat | 30.72 MB | 28.20 MB | **0.92x** | 29.87 MB | 0.97x |
 
-**win T3 (learned/declared) median = 0.39x** (all <= 1x; no single-run blowup).
+**win T3 (learned/declared) median = 0.5758x** (all <= 1x; no single-run blowup). Ratios
+0.557 / 0.594 / 0.222 / 0.918 (seed42 / 43 / 44 / 42-repeat).
 
 ### adversarial reorg ratio (learned/declared, T2 band)
 
@@ -277,9 +295,12 @@ single-window actuation is 5.23-11.08 MB (one pair), never the repeated ~10 MB-p
 | seed | declared | learned | static-derived | learned ach | declared ach |
 |---|---:|---:|---:|---:|---:|
 | 42 | 40/40 | **3/40** | 4/40 | 107.0 | 71.0 |
-| 43 | 39/40 | **6/40** | 5/40 | 107.0 | 70.0 |
+| 43 | 39/39 | **6/40** | 5/40 | 107.0 | 70.0 |
 | 44 | 40/40 | **3/40** | 5/40 | 107.0 | 72.0 |
 | 42-repeat | 39/40 | **4/40** | 4/40 | 107.0 | 71.0 |
+
+(`seed43` declared rung-50 emitted 39 windows in the curve, not 40, so its lag-rej is 39/39;
+`seed42-repeat` declared is 39/40 over 40 windows. All other rows are out of 40.)
 
 Before (ticket 68) learned win rung-50 lag-rej was 3-13/40, with seed42 = **13/40** driven by the
 `U|Stock` reorg burst. After, learned sits **3/6/3/4** vs static-derived **4/5/5/4** — at or
@@ -314,10 +335,10 @@ one flashdb process at a time. NOT a 10-seed pre-registered verdict.**
 
 1. **Single-region blowup no longer recurs — PASS.** `U|Stock` is 5.23 MB / 1 merge on both the
    seed42 run and the same-trace repeat (before: 75.2 MB / 8 vs 0 / 0); the same-trace max
-   per-region output is now bounded and consistent. Max single-window actuation 5.23-11.08 MB
-   (one cheapest pair), never a repeated burst.
-2. **win T3 ratio median <= 3x, no single-run blowup — PASS.** learned/declared median **0.39x**
-   (0.22-0.92x); static/declared median 0.96x. No run exceeds 1x.
+   per-region output is now bounded and consistent. Max single merge 5.23-11.37 MB
+   (one cheapest pair, including the final drained merge), never a repeated burst.
+2. **win T3 ratio median <= 3x, no single-run blowup — PASS.** learned/declared median
+   **0.5758x** (0.222-0.918x); static/declared median 0.96x. No run exceeds 1x.
 3. **Learned win rung-50 lag-rej improves toward static-derived — PASS.** learned 3/6/3/4 vs
    static-derived 4/5/5/4 (pre-fix seed42 was 13/40).
 4. **No throughput regression, legitimate compaction still happens — PASS.** learned achieved

@@ -870,3 +870,20 @@ No failures.
   - `cargo test --workspace --offline` — 304 Rust tests passed, 0 failed.
   - `cd harness && uv run --with pytest pytest -q` — 140 passed.
   - `git diff --check` — silent.
+
+## wave18 scribe-repair dispatch record (ticket 67 + 70 doc-accuracy corrections)
+
+- Timestamp: 2026-10-14T12:26:46+08:00.
+- Action: dispatched a doc-only scribe repair to the single-writer `wave18/scribe` worktree
+  (branch `wave18/scribe`, based on master `853633a`). Two independent-verifier findings fixed in
+  place, no code change and no load re-measurement: (A) ticket 67's write-amplification variance
+  was re-attributed from "a single ~69-72 MB merge" to the true single-region merge oscillation
+  (seed43new `U|Customer` 6 merges of 11.37-11.52 MB = 69.0 MB; seed42repeatnew `P|Customer`
+  7 merges of 10.17-10.41 MB = 72.1 MB; largest single merge ~11.5 MB), with the seed43new
+  `P|Order` +5.9 MB / `U|StockMovement` +2.3 MB growth offset by `P|Stock` −4.2 MB; (B) ticket 70's
+  `after seed43` win-learned reorg was corrected to the driver's summary totals (18,256,145 B /
+  6 merges, including the 11,372,547 B final drained merge), giving learned/declared 0.594x and a
+  win T3 median of 0.5758x (still <=3x), the max single merge 11.37 MB, plus the gate-header HEAD
+  (`d63e294`) and the seed43 declared 39/39 cell. Full numbers and gates are in
+  `.scratch/72-scribe-repairs/issues.md`; repair commits `1e42fdf9849d4a4aef201359b4235976a8887080`
+  and `90a256d8d9f986b44a1f35ec78655c1c3566d763`.
