@@ -713,3 +713,24 @@ warning: `VIRTUAL_ENV=/home/z/.venv` does not match the project environment path
 4. `git diff --check` — silent (exit 0).
 
 No failures.
+
+## Dispatch record: wave14/churn2 (WP-O learner burn-in churn)
+
+- Timestamp: 2026-10-14T09:08:00+08:00
+- Actor: WP-O worker (single writer, isolated worktree)
+- Base: integrated master `04b27b256efb6d6e085523bf705297400ce6208b` (wave12/accesspath merge).
+- Worktree: `git worktree add -b wave14/churn2 /home/z/vibe/worktrees/flashdb/wave14-churn2 master`
+  (HEAD `04b27b2`, clean at start).
+- Task: remove the learner-side rung-50 lag churn (WP-M's `index_order_no` axis toggles/built on a
+  0-scan region and its 12-candidate movement burn-in), so learned matches the frozen layout's lag
+  while keeping the +40-51% win. Fix = demand-gated, one-shot sticky index axis (harness-side
+  `layout_learner.py` only; engine unchanged).
+- Ticket + artifacts: `.scratch/66-learner-burnin-churn/` (contract, quantified diagnosis, design +
+  rejected alternatives, before/after tables, both judging views, verdict, residual items).
+- Final HEAD after the work: `66:` commits on `wave14/churn2` (checkpoint `8eb92e0`, code `3604161`,
+  results/ticket update — see the final commit hash in the ticket gates section).
+- Headline (pilot, 2 seeds + 1 repeat, 12.25x c51, shared box): win learned rung-50 lag-rej 5/7/3
+  vs static-derived 3/3/5 (pre-change 25-29 vs 3-4) with the index committed (1 build, 0 toggles);
+  aggregate win throughput declared 68-74 -> learned/static 107 rps (+44.6% to +57.4%); adversarial
+  learned builds 0 index (pre-change 3) and rung-50 lag-rej 0/40 = declared; adversarial reorg ratio
+  median 1.36x (pre-change 2.51x). Gates: 299 Rust + 140 Python, build 0 warnings, diff --check silent.

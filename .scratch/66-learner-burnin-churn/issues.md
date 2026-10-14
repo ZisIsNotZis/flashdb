@@ -154,12 +154,25 @@ build/adopt/retire path and the policy schema are unchanged):
 - `cd harness && uv run --with pytest pytest -q`: see gates below.
 - `cargo test --workspace --offline`: see gates below.
 
-## Verbatim gates (final HEAD, run after the change)
+## Verbatim gates (final HEAD `3604161`, run after the change)
 
-1. `cargo build --workspace --offline` — see gates section.
-2. `cargo test --workspace --offline` — see gates section.
-3. `cd harness && uv run --with pytest pytest -q` — see gates section.
-4. `git diff --check` — see gates section.
+1. `cargo build --workspace --offline` — 0 warnings:
+```
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 8.98s
+    Finished `release` profile [optimized] target(s) in 13.36s
+```
+2. `cargo test --workspace --offline` — totals: **299 passed; 0 failed; 0 ignored**
+(126 lib + 22 flashdb-load + 9 batch_commit + 5 compaction_job + 4 constraints + 3 family_colocation
++ 11 group_commit + 6 manifest_engine + 7 merge_threshold + 15 metrics + 33 multi_tile + 7 order_flow
++ 5 order_no_index + 1 partitioned_publish_cap + 5 read_requests + 3 region_compaction +
+6 region_partition + 3 replay_trace + 8 request_commit + 2 scale_bin + 3 tile_format + 3 tile_layout
++ 12 tile_read + 0 flashdb-replay + 0 flashdb-scale + 0 nvme_bench + 0 doc-tests).
+3. `cd harness && uv run --with pytest pytest -q`:
+```
+warning: `VIRTUAL_ENV=/home/z/.venv` does not match the project environment path `.venv` and will be ignored; use `--active` to target the active environment instead
+140 passed in 3.95s
+```
+4. `git diff --check` — silent (exit 0).
 
 ## Measurement protocol (WP-O re-run)
 
@@ -169,15 +182,149 @@ release binaries built once, one process at a time under
 `cold_0b.py`, `--workloads win adversarial --arms declared learned static-derived`, full ladder
 (50/100/200/400 rps). At least 2 seeds + a repeat.
 
-## Before/after tables + both judging views + verdict
+## Box load during the runs (shared, noisy)
 
-(Filled after the measurement; see the gates/verdict section at the end.)
+| invocation | start loadavg | end loadavg |
+|---|---:|---:|
+| seed42 | 8.03 | 5.51 |
+| seed43 | 4.68 | 4.08 |
+| seed42-repeat | 3.93 | 6.91 |
+
+Present at the seed42 start: a sibling worktree's `multi_tile` test at ~215% CPU (ended mid-run),
+`python3` ~99% CPU / ~2.1 GB RSS (the box's other work), `mpv` ~89% CPU, `wdavdaemon`/mdatp ~38%
+CPU. The rung-50 lag metric is noise-limited on this box (see ticket 65: declared/adversarial
+alone swung 1/40 -> 6/40 on the same trace seed); every timing number below names its load.
+
+## Results (3 runs = 2 independent seeds 42/43 + seed 42 repeated; 18 arm-runs)
+
+Release binaries: `/tmp/wave14-o-bins/` (`flashdb-load`
+`bbe19236…`, `flashdb-scale` `927f4ee5…`, `flashdb-replay` `fd944df2…`), built once from HEAD
+`3604161`. Raw artifacts committed here: `seed42.json`, `seed43.json`, `seed42-repeat.json` (plus
+rendered `.md`).
+
+### win (T1) rung-50 lag-rejections — the churn cost removed
+
+| arm | seed42 | seed43 | seed42-repeat |
+|---|---:|---:|---:|
+| declared | 39/40 | 40/40 | 40/40 |
+| learned@1.0 | **5/40** | **7/40** | **3/40** |
+| static-derived | 3/40 | 3/40 | 5/40 |
+
+Pre-change (ticket 65): learned 29/26/25/26, static-derived 4/3/3/3. learned now sits within a
+small band of static-derived (differences +2 / +4 / -2 windows) instead of +25.
+
+### win (T1) aggregate achieved rps and per-rung achieved (the +40-51% win must remain)
+
+| arm | seed42 | seed43 | seed42-repeat |
+|---|---:|---:|---:|
+| declared | 68.0 | 74.0 | 72.0 |
+| learned@1.0 | **107.0** | **107.0** | **107.0** |
+| static-derived | 107.0 | 107.0 | 107.0 |
+
+learned gain over declared: **+57.4% / +44.6% / +48.6%** (pre-change +41-51%). Per-rung achieved
+rps (50/100/200/400) — learned and static-derived hold ~100% of offered, declared collapses:
+
+| seed | declared 50/100/200/400 | learned 50/100/200/400 |
+|---|---|---|
+| seed42 | 50 / 72.1 / 78.2 / 81.6 | 50 / 100.0 / 200.0 / 399.6 |
+| seed43 | 50 / 87.5 / 90.9 / 86.1 | 50 / 100.0 / 199.9 / 400.0 |
+| seed42-repeat | 50 / 87.4 / 85.0 / 79.9 | 50 / 100.0 / 200.0 / 399.4 |
+
+The learner commits `P|StockMovement = 4096 / 200 / index_order_no=True` on all three win runs
+and the movement region never toggles the index back off.
+
+### adversarial (T2) rung-50 lag-rejections
+
+| arm | seed42 | seed43 | seed42-repeat |
+|---|---:|---:|---:|
+| declared | 0/40 | 0/40 | 0/40 |
+| learned@1.0 | **0/40** | **0/40** | **0/40** |
+| static-derived | 0/40 | 2/40 | 0/40 |
+
+learned matches declared (0/40) on all three runs.
+
+### Learner decision / index-build counts (whole run, learned@1.0)
+
+| workload+seed | movement index toggles | index builds | index_output_bytes |
+|---|---:|---:|---:|
+| win seed42 | **0** | **1** | 2,143,439 B |
+| win seed43 | **0** | **1** | 2,143,439 B |
+| win seed42-repeat | **0** | **1** | 2,143,439 B |
+| adversarial seed42 | **0** | **0** | 0 |
+| adversarial seed43 | **0** | **0** | 0 |
+| adversarial seed42-repeat | **0** | **0** | 0 |
+
+Pre-change: 5 toggles and 3 builds on EVERY workload (win and adversarial alike). The demand gate
+removes the 3 adversarial builds entirely, and the one-shot flip removes the win toggles (one
+build per run, the single off->on adoption).
+
+### Reorganisation (endurance term)
+
+win learned/declared compaction ratio (T3):
+
+| seed42 | seed43 | seed42-repeat |
+|---:|---:|---:|
+| 7.08x | 4.91x | 1.88x |
+
+(Reported as pre-registered; the win reorg ratio is not part of this package's acceptance. The
+seed42/43 blowups are the pre-existing `U|Stock`/`P|Stock` merge oscillation recorded in ticket
+65, not the index axis: `index_output_bytes` is a separate 2.14 MB on win and the movement region
+never toggles.)
+
+adversarial learned/declared compaction ratio (T2 reorg band, the acceptance axis):
+
+| seed42 | seed43 | seed42-repeat | median |
+|---:|---:|---:|---:|
+| **1.36x** | 3.39x | **0.33x** | **1.36x** |
+
+Pre-change (ticket 65): 4.63x / 0.39x / 0.30x / 6.01x, median 2.51x. The median moves from
+2.51x to **1.36x** (<=1.5x). The single seed43 outlier (3.39x) is the pre-existing `U|Stock`
+oscillation (45.2 MB / 5 merges, `index_output_bytes=0`), not the index churn this package removes;
+see Residual items.
+
+### svc-rej at rung 50 (device-bound, unchanged)
+
+win learned 37/28/32; adversarial learned 38/31/40. Every arm rejects ~28-40/40 rung-50 windows on
+the service ceiling — the per-group `fdatasync` durability floor (STATUS §3), unchanged by this
+package and reported for completeness.
+
+## Both judging views
+
+- **§7.1 lag-only (primary):** win rung-50 lag-rej learned 5/7/3 vs static-derived 3/3/5
+  (churn removed); adversarial 0/0/0 = declared. Achieved throughput on win: declared 68-74 ->
+  learned/static 107 rps (~100% at 100/200/400 vs declared 72-87/78-91/80-86).
+- **Both ceilings (pre-registration):** sustained = 0 rps everywhere, as pre-registered — the
+  service ceiling rejects ~28-40/40 rung-50 windows on every arm (device-bound). Same open §7.1
+  reconciliation as ticket 65; not resolved here.
+
+## Acceptance verdict (honest, pilot-grade)
+
+**Pilot-grade, 2 independent seeds + 1 full repeat on the 12.25x c51 instance, shared box
+(loadavg 3.9-8.0).**
+
+1. **Win churn cost removed — PASS direction.** learned rung-50 lag-rej 5/7/3 vs static-derived
+   3/3/5 (pre-change 25-29 vs 3-4); the learner's movement-region index toggles drop from 5 to 0
+   and builds from 3 to 1 per run, and it commits the index on win (4096/200/index-on) on all three
+   runs.
+2. **Win +40-51% throughput preserved — PASS.** aggregate achieved 107 vs declared 68-74 rps
+   (+44.6% to +57.4%), ~100% at 100/200/400 rps where declared collapses.
+3. **Adversarial 0-scan index builds removed — PASS.** 0 builds, 0 toggles on all three adversarial
+   runs (pre-change 3 builds each); rung-50 lag-rej 0/40 = declared 0/40.
+4. **Adversarial reorg ratio — PASS direction (median <=1.5x).** 1.36x / 3.39x / 0.33x, median
+   1.36x (pre-change median 2.51x). The 3.39x outlier is the pre-existing `U|Stock` oscillation,
+   not the index axis.
+
+Remaining cause for the still-zero lag-only sustained score (NOT this package): the per-group
+`fdatasync` durability floor breaches the lag ceiling on static-derived too (3-5/40 on win) — the
+same "necessary but not sufficient" WP-M recorded.
 
 ## Residual items
 
-- The adversarial reorg ratio may still exceed 1.5x after this fix: ticket 65 measured a
-  PRE-EXISTING `U|Customer` merge oscillation (90.2-115.3 MB on the two seed-42 runs) that this
-  package does not touch; this fix removes only the NEW index-toggle churn (6.4-13.0 MB
-  `index_output_bytes` + 2.6-12.0 MB associated compaction). Reported exactly if so.
-- Rung-50 lag on this shared box remains noise-limited: declared/adversarial itself swung 1/40 ->
-  6/40 on the same trace seed across the two ticket-65 runs. All timing numbers name their load.
+- The win T3 reorg ratio is still above 3x on seed42 (7.08x) and seed43 (4.91x) from the
+  pre-existing `U|Stock`/`P|Stock` merge oscillation (ticket 65's seed43 blowup); this package
+  removes only the index-toggle churn. Out of scope.
+- The adversarial seed43 3.39x reorg ratio is the same pre-existing `U|Stock` oscillation
+  (45.2 MB / 5 merges, 0 index bytes). Out of scope; named with evidence.
+- Rung-50 lag remains noise-limited: static-derived itself moved 3 -> 5 -> (ticket-65) 4/3/3/3
+  across runs, and declared/adversarial swung 1/40 -> 6/40 in ticket 65 on the same trace seed.
+  All numbers are pilot-grade, not a 10-seed verdict.
