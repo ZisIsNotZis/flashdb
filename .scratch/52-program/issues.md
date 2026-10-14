@@ -1140,3 +1140,35 @@ No failures.
   ~100% at rungs 50-400; declared device-bound ~85% unchanged). Ticket updated in place with the
   corrected diagnosis, the build-flush bound, the honest verdict and the raw
   `repair-{seed42,seed43,seed44,seed42-repeat}.{json,md}` artifacts.
+
+## Integration record: wave21/rewarm repair
+
+- Timestamp: 2026-10-14T17:18:42+08:00 (integration committed).
+- Action: single-writer integrator merged `wave21/rewarm` (WP-W2 compaction re-warm repair) into
+  `master` (`git merge --no-ff`, merge commit
+  `c9a95a178c472d6b7506a0f38268d6166f55cafa`). The independent repair verifier verdict was
+  **PASS** (non-blocking findings only): the corrected diagnosis (rung-50 residual = the
+  compaction BUILD window's device I/O + `fdatasync` tail, not a post-publish cold read) is
+  reproduced from the committed raw JSON; the code is sound, off-path and not metric-gaming; and
+  the ticket honestly retracts the false "post-publish windows clean" claim and reports 0/40 NOT
+  reached. Non-blocking residual: the device-bound mechanism proof (`finish_us`,
+  `stall_fsync_us`, build `read_bytes`) sits in uncommitted per-arm stderr (verifier finding 1);
+  plus a before-median arithmetic nit, a wording nit, unasserted `engine.rs` `set_sync_every`
+  call sites, and the acknowledged before/after load confound.
+- Change carried (ticket `.scratch/76-compaction-rewarm/issues.md`): the re-warm cursor rewind
+  (`8aa7b29`) is kept as a warm-path correctness fix; the compaction build gains an opt-in
+  bounded `sync_data` cadence (`COMPACT_TILE_SYNC_EVERY_BYTES = 2 MiB`, `f71899c`) so its
+  durable flush is bounded to 11-32 ms. Durability only strengthened; byte-identical tile; the
+  ordinary publish path is unchanged. Honest acceptance: static-derived rung-50 0/40 NOT reached
+  (0/2/1/8, median 1.5/40); the residual is proven device-bound (pacer WAL `fdatasync` tails
+  77-99 ms under the build's 93-147 MB stream reads, and to 99 ms with no build).
+- Conflict: one, in `.scratch/52-program/issues.md` (both `wave21/rewarm` and `master`, via the
+  wave21 lanes integration record, appended sections at the same spot after the wave20 integration
+  record). Resolved by keeping all in order (wave21 WP-1 dispatch, wave21 WP-W dispatch, wave21
+  WP-W2 dispatch, Integration record: wave21 lanes, wave21 WP-W2 repair dispatch). Code files
+  `engine/src/engine.rs`, `engine/src/readahead.rs`, `engine/src/tile.rs` auto-merged cleanly.
+- Combined gates (verbatim, run at integrated HEAD `c9a95a178c472d6b7506a0f38268d6166f55cafa`):
+  - `cargo build --workspace --offline` — Finished, 0 warnings.
+  - `cargo test --workspace --offline` — 308 passed; 0 failed; 0 ignored.
+  - `cd harness && uv run --with pytest pytest -q` — 146 passed.
+  - `git diff --check` — silent.
