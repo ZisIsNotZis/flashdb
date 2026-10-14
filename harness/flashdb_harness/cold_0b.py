@@ -128,6 +128,18 @@ RUNG_RATE_TOLERANCE = 0.02
 # pre-drift mix's highest sustained level (measured by a short pre-flight ladder on the win mix).
 DRIFT_RATE_FRACTION = 0.70
 
+# The engine's active-tile policy ceiling (flashdb_engine::engine::MAX_ACTIVE_TILES,
+# engine/src/manifest.rs MAX_TILES). The scored runner passes this through so a run's cap is
+# self-describing; the engine clamps an explicit value to this ceiling.
+MAX_TILES_DEFAULT = 4096
+# Conservative upper bound on the WAL bytes one generated order_flow write request appends.
+# The generator's fixed template measures ~1.3 KiB; 4 KiB is a ~3x ceiling used ONLY for the
+# up-front cadence-refusal guard, never for a scored threshold.
+MAX_WAL_BYTES_PER_WRITE = 4096
+# The build harness's known-compatible cadence (cold_axis_compare.py). The scored runner ships
+# this as its default so a per-region publish stays far under the cap.
+SHIPPED_CADENCE_BYTES = 8 << 20
+
 # Per-segment shape mixes (integer weights). They are the *offered* mix; every arm gets the same.
 # Write share raised from 15% to 40% (Slice 37): a per-region page size only acts on tiles written
 # AFTER the switch, so a read-dominated trace cannot measure it above the lower bound. The write
@@ -887,13 +899,14 @@ def flashdb_load_command(bins: dict, target: Path, trace: Path, plan: WorkloadPl
                          policy_path: Path, *, reload: bool, checkpoint_bytes: int,
                          rotate_bytes: int, group_requests: int, window_ms: int,
                          ceiling_us: int | None, lag_ceiling_us: int,
-                         compact_bytes: int | None) -> str:
+                         compact_bytes: int | None, max_tiles: int) -> str:
     rates = ",".join(str(r) for r in plan.rates)
     cmd = [bins["load"], str(target), str(trace),
            "--rate-rps", rates, "--segment-requests", str(plan.segment_requests),
            "--window-ms", str(window_ms), "--metrics-json", "--peak-report",
            "--group-requests", str(group_requests),
            "--checkpoint-bytes", str(checkpoint_bytes), "--rotate-bytes", str(rotate_bytes),
+           "--max-tiles", str(max_tiles),
            "--region-mode", "per_region",
            "--policy-file", str(policy_path)]
     if compact_bytes:
@@ -925,7 +938,8 @@ def run_arm(name: str, workload: str, base: Path, workroot: Path, bins: dict,
         bins, engine_dir, trace, plan, policy_path, reload=controller is not None,
         checkpoint_bytes=args.checkpoint_bytes, rotate_bytes=args.rotate_bytes,
         group_requests=args.group_requests, window_ms=args.window_ms, ceiling_us=args.ceiling_us,
-        lag_ceiling_us=args.lag_ceiling_us, compact_bytes=args.compact_bytes)
+        lag_ceiling_us=args.lag_ceiling_us, compact_bytes=args.compact_bytes,
+        max_tiles=args.max_tiles)
     print(f"+ [{workload}/{name}] {payload}", flush=True)
     live = LiveLoad(scope_command(cap_bytes, payload), env, controller=controller,
                     policy_path=policy_path, stderr_path=workroot / f"{workload}-{name}.stderr",
@@ -1172,8 +1186,11 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--cap-mib", type=int, default=192)
     ap.add_argument("--window-ms", type=int, default=1000)
     ap.add_argument("--group-requests", type=int, default=64)
-    ap.add_argument("--checkpoint-bytes", type=int, default=16384)
-    ap.add_argument("--rotate-bytes", type=int, default=16384)
+    ap.add_argument("--checkpoint-bytes", type=int, default=SHIPPED_CADENCE_BYTES)
+    ap.add_argument("--rotate-bytes", type=int, default=SHIPPED_CADENCE_BYTES)
+    ap.add_argument("--max-tiles", type=int, default=MAX_TILES_DEFAULT,
+                    help="active-tile policy cap passed to flashdb-load (clamped to the engine "
+                         "ceiling); the scored runner refuses an incompatible cadence against it")
     ap.add_argument("--compact-bytes", type=int, default=64 << 20,
                     help="merge budget for the per-window compaction actuation (Slice 37); "
                          "0 disables it and reproduces the pre-slice inert-merge path")
@@ -1277,13 +1294,23 @@ def main(argv: list[str]) -> int:
     # Traces: one per workload, emitted once and shared by every arm (equal offered load).
     plans: dict[str, WorkloadPlan] = {}
     traces: dict[str, Path] = {}
+    write_counts: list[int] = []
     for wl in a.workloads:
         plan = plan_workload(wl, a.reference_rate, a.segment_requests, drift_rate=resolved_drift_rate)
         plans[wl] = plan
         trace = workroot / f"{wl}.jsonl"
         meta = build_trace(trace, plan, a)
         traces[wl] = trace
+        write_counts.append(meta["counts"]["write"])
         print(f"trace {wl}: total={meta['total']} counts={meta['counts']} rates={plan.rates}", flush=True)
+
+    # Loud up-front refusal of an incompatible per-region cadence, BEFORE any arm runs and before
+    # any timed window: a cadence that would exhaust the cap aborts the whole scored run here with
+    # a named reason instead of failing partway through a timed arm.
+    refusal = cadence_refusal(a, bins, base, env, max(write_counts) if write_counts else 0)
+    if refusal is not None:
+        print(f"ERROR: {refusal}", file=sys.stderr)
+        return 2
 
     def key(workload: str, arm: str, lam: float | None = None) -> str:
         return f"{workload}/{arm}" + (f"@{lam}" if lam is not None else "")
@@ -1499,6 +1526,56 @@ def build_binaries(release: bool) -> dict:
     d = REPO_ROOT / "target" / ("release" if release else "debug")
     return {"scale": str(d / "flashdb-scale"), "load": str(d / "flashdb-load"),
             "replay": str(d / "flashdb-replay")}
+
+
+def _tileinfo_active_tiles(bins: dict, base: Path, env: dict) -> int:
+    """Read the instance's active-tile count read-only via `flashdb-scale tileinfo`."""
+    proc = subprocess.run([bins["scale"], "tileinfo", str(base)], cwd=REPO_ROOT,
+                          env=env, capture_output=True, text=True)
+    if proc.returncode != 0:
+        raise SystemExit(f"flashdb-scale tileinfo {base} failed (rc={proc.returncode}): "
+                         f"{proc.stderr[-2000:]}")
+    for line in proc.stdout.splitlines():
+        if "phase=tileinfo ok=true" in line:
+            active = _kv(line, "active_tiles")
+            if active is not None:
+                return int(active)
+    raise SystemExit(f"flashdb-scale tileinfo {base} reported no active_tiles line")
+
+
+def cadence_refusal(args: argparse.Namespace, bins: dict, base: Path, env: dict,
+                    write_count: int) -> str | None:
+    """Return a loud refusal reason, or None when the per-region cadence is compatible.
+
+    Sound (guaranteed completion) by construction: the guard over-estimates both the number of
+    checkpoint publishes (a conservative 4 KiB WAL-byte ceiling per write) and the tiles per
+    publish (distinct regions <= active tiles), and refuses unless that over-estimate still fits
+    the cap. It never changes a scored threshold; it only aborts a misconfigured run up front.
+    """
+    if args.checkpoint_bytes <= 0 or args.rotate_bytes <= 0:
+        return "--checkpoint-bytes and --rotate-bytes must be positive"
+    if args.max_tiles <= 0:
+        return "--max-tiles must be a positive integer"
+    if args.checkpoint_bytes != args.rotate_bytes:
+        return ("incompatible per-region cadence: --checkpoint-bytes and --rotate-bytes must match "
+                "(the paired publish/rotate protocol needs equal cadence; the shipped default is "
+                f"{SHIPPED_CADENCE_BYTES} bytes)")
+    active_tiles = _tileinfo_active_tiles(bins, base, env)
+    region_bound = max(1, active_tiles)  # distinct regions <= active tiles
+    if active_tiles >= args.max_tiles:
+        return (f"incompatible per-region cap: the instance already has {active_tiles} active tiles "
+                f"at or above --max-tiles {args.max_tiles}, so no publish can fit; raise "
+                "--max-tiles or use a global-region instance")
+    cadence = args.checkpoint_bytes
+    write_bytes = write_count * MAX_WAL_BYTES_PER_WRITE
+    max_publishes = (write_bytes + cadence - 1) // cadence
+    max_new_tiles = max_publishes * region_bound
+    if active_tiles + max_new_tiles > args.max_tiles:
+        return (f"incompatible per-region cadence: at most {max_publishes} checkpoint publishes x "
+                f"{region_bound} regions = {max_new_tiles} new tiles, plus {active_tiles} active "
+                f"tiles, exceeds --max-tiles {args.max_tiles}. Raise --checkpoint-bytes/"
+                f"--rotate-bytes (shipped default {SHIPPED_CADENCE_BYTES} bytes) or --max-tiles")
+    return None
 
 
 # ---------------------------------------------------------------------------

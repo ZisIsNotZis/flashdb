@@ -1,42 +1,44 @@
-//! Pins a verified engine-level incompatibility: a partitioned publish whose
-//! window spans more `(entity, key family)` regions than the manifest's
-//! remaining tile capacity fails, and that failure is indistinguishable from a
-//! hard cap unless the caller can rotate the cadence.
+//! Pins the fixed behaviour of the per-region publish tile cap (STATUS SS7.4).
 //!
-//! **This test documents CURRENT behaviour, not desired behaviour.** It is not a
-//! specification of what the engine should do; it is a deterministic, minimal
-//! reproduction of the abort that a scored cold run hits when it drives the
-//! runner's shipped 16 KiB checkpoint/rotate cadence on a per-region instance
-//! (`.scratch/44-first-trustworthy-curve/attempt1-default-cadence-abort/`). If a
-//! later change (a raised `manifest::MAX_TILES`, or a cadence that keeps the
-//! per-region publish count below the cap) makes this test fail, that is the
-//! intended signal that the recorded incompatibility was addressed — update the
-//! pin, do not "fix" the engine to keep the old text.
+//! A `RegionMode::PerRegion` publish emits one tile per `(entity, key family)`
+//! region present in the window. The active-tile cap is now a **configurable
+//! policy bound** (default `manifest::MAX_TILES = 4096`, see
+//! `engine/src/manifest.rs`), and the engine refuses the whole publish up front
+//! — before writing any region file — when the window's distinct regions exceed
+//! the remaining capacity. The refusal is `InvalidInput` with the pinned text
+//! below: fail closed, never a silent partial publish and never orphan region
+//! files from a refused publish.
 //!
-//! Mechanism. `manifest::MAX_TILES` is 1024 (`engine/src/manifest.rs:118`). A
-//! `RegionMode::PerRegion` publish emits one tile per region present in the
-//! window; the per-region loop checks `emitted.len() >= capacity`
-//! (`engine/src/engine.rs:1062-1063`) BEFORE opening each new region's file,
-//! where `capacity = MAX_TILES - active_tiles` (`engine/src/engine.rs:1003`). So a
-//! publish near the cap refuses to publish its later regions and returns
-//! `InvalidInput` with the pinned text below instead of silently dropping
-//! regions or panicking. The 336-region width is the region count the slice-44
-//! run actually reached (`active tiles 336` in the preserved curve).
+//! Two pins:
+//! - `per_region_publish_over_the_cap_fails_closed`: a genuine over-cap publish
+//!   still fails closed, exactly at the cap boundary.
+//! - `shipped_default_cadence_keeps_a_per_region_run_under_the_cap`: the scored
+//!   runner's shipped 8 MiB checkpoint/rotate cadence keeps a per-region run
+//!   under the cap (below the publish threshold, then one whole-window publish
+//!   fits).
+//!
+//! The 336-region width is the region count the slice-44 run actually reached
+//! (`active tiles 336` in the preserved curve), so the arithmetic reproduces the
+//! run's tile count exactly.
 
-use flashdb_engine::engine::{Engine, Op, RegionMode};
+use flashdb_engine::engine::{Engine, Op, RegionMode, MAX_ACTIVE_TILES};
 use std::fs;
 use std::io;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// One region per entity, matching the shipped runner's 336-region instance so
-/// the arithmetic below reproduces the run's tile count exactly.
+/// One region per entity, matching the shipped runner's 336-region instance.
 const REGIONS: usize = 336;
 
 /// The exact error the scored run aborted with, preserved verbatim in
 /// `.scratch/44-first-trustworthy-curve/attempt1-default-cadence-abort/adversarial-declared.stderr`.
 const PINNED_ERROR: &str =
     "active tile list is full for this publish: a partitioned publish emits one tile per region and the remaining capacity is smaller";
+
+/// The scored runner's shipped default checkpoint/rotate cadence
+/// (`harness/flashdb_harness/cold_0b.py`), matching the build harness's
+/// known-compatible 8 MiB cadence.
+const SHIPPED_CADENCE: u64 = 8 << 20;
 
 static NEXT: AtomicU64 = AtomicU64::new(0);
 
@@ -67,6 +69,13 @@ impl Files {
             dir,
         }
     }
+
+    fn tile_file_count(&self) -> usize {
+        fs::read_dir(&self.dir).unwrap()
+            .filter_map(|d| d.ok())
+            .filter(|d| d.file_name().to_string_lossy().ends_with(".tile"))
+            .count()
+    }
 }
 
 impl Drop for Files {
@@ -79,11 +88,9 @@ fn entity(i: usize) -> Vec<u8> {
     format!("E{i:03}").into_bytes()
 }
 
-/// One runner-style cadence cycle: commit a block that touches every region,
-/// then checkpoint with a deliberately tiny WAL threshold (the shipped cadence
-/// is 16 KiB; 1 byte forces a publish on every cycle, which is the same defect
-/// class at minimum size). Returns `maybe_checkpoint`'s result.
-fn cadence_cycle(e: &mut Engine, cycle: u64) -> io::Result<bool> {
+/// Commit one block that touches every region (one `PutDoc` per entity), the
+/// runner's per-cycle shape.
+fn commit_all_regions(e: &mut Engine, cycle: u64) -> io::Result<()> {
     let ops: Vec<Op> = (0..REGIONS)
         .map(|i| Op::PutDoc {
             entity: entity(i),
@@ -92,22 +99,32 @@ fn cadence_cycle(e: &mut Engine, cycle: u64) -> io::Result<bool> {
         })
         .collect();
     e.commit_block(format!("cycle-{cycle}").as_bytes(), &ops)?;
-    e.maybe_checkpoint(1)
+    Ok(())
+}
+
+/// One runner-style cadence cycle: commit a block that touches every region,
+/// then checkpoint at `threshold`. A 1-byte threshold forces a publish on every
+/// cycle (the minimum-size instance of the shipped cadence's defect class).
+fn cadence_cycle(e: &mut Engine, cycle: u64, threshold: u64) -> io::Result<bool> {
+    commit_all_regions(e, cycle)?;
+    e.maybe_checkpoint(threshold)
 }
 
 #[test]
-fn per_region_cadence_exhausts_the_tile_cap_and_the_publish_fails() {
+fn per_region_publish_over_the_cap_fails_closed() {
     let files = Files::new();
     let mut e = Engine::create(&files.wal).unwrap();
     e.set_region_mode(RegionMode::PerRegion);
+    assert_eq!(e.max_tiles(), MAX_ACTIVE_TILES, "the raised default cap is the public ceiling");
 
-    // 1024 / 336 = 3 whole cadence publishes (1008 tiles) with capacity to
-    // spare; the fourth starts with capacity 16 < 336 regions and hits the cap
-    // partway through. Assert the successes explicitly so a change to the cap or
-    // the region width surfaces here, not as a mystery panic.
-    for cycle in 1..=3u64 {
+    // 4096 / 336 = 12 whole-region publishes (4032 tiles) with capacity to
+    // spare; the 13th starts with capacity 64 < 336 regions and is refused up
+    // front. Assert the successes explicitly so a change to the cap or the
+    // region width surfaces here, not as a mystery panic.
+    let full_cycles = (e.max_tiles() / REGIONS) as u64;
+    for cycle in 1..=full_cycles {
         assert!(
-            cadence_cycle(&mut e, cycle).unwrap(),
+            cadence_cycle(&mut e, cycle, 1).unwrap(),
             "cycle {cycle} is under the cap and must checkpoint"
         );
         assert_eq!(
@@ -117,19 +134,52 @@ fn per_region_cadence_exhausts_the_tile_cap_and_the_publish_fails() {
         );
     }
 
-    let err = cadence_cycle(&mut e, 4)
-        .expect_err("the fourth cadence publish exceeds the 1024-tile cap and must fail, not succeed or panic");
+    let err = cadence_cycle(&mut e, full_cycles + 1, 1)
+        .expect_err("the next cadence publish exceeds the cap and must fail, not succeed or panic");
     assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "refused as InvalidInput");
-    assert_eq!(err.to_string(), PINNED_ERROR, "the pinned current-behaviour error text");
+    assert_eq!(err.to_string(), PINNED_ERROR, "the pinned fail-closed error text");
 
-    // The refusal happens before the manifest step, so the durable active list
-    // is still exactly the three successful cadence publishes: the failure is
-    // reported, never a silent partial publish. (The engine is left usable; the
-    // region tiles already written for the aborted publish are unreferenced
-    // orphans, which is why the run must abort rather than keep going.)
+    // The refusal happens before any region file is written and before the
+    // manifest step, so the durable active list is unchanged AND no orphan
+    // region tiles were left behind.
     assert_eq!(
         e.active_tile_cutoffs().len(),
-        REGIONS * 3,
+        REGIONS * full_cycles as usize,
         "the failed publish must not have appended any active tiles"
     );
+    assert_eq!(
+        files.tile_file_count(),
+        REGIONS * full_cycles as usize,
+        "the refused publish must not have written any orphan region tiles"
+    );
+}
+
+#[test]
+fn shipped_default_cadence_keeps_a_per_region_run_under_the_cap() {
+    let files = Files::new();
+    let mut e = Engine::create(&files.wal).unwrap();
+    e.set_region_mode(RegionMode::PerRegion);
+
+    // The shipped 8 MiB cadence keeps the run below the publish threshold for a
+    // representative number of write cycles: no tiles accumulate, so the cap is
+    // never approached by the cadence itself.
+    for cycle in 1..=5u64 {
+        commit_all_regions(&mut e, cycle).unwrap();
+        assert!(
+            !e.maybe_checkpoint(SHIPPED_CADENCE).unwrap(),
+            "cycle {cycle} stays below the shipped cadence and must not publish"
+        );
+        assert_eq!(e.active_tile_cutoffs().len(), 0, "no tiles accumulate under the cadence");
+    }
+
+    // The eventual whole-window publish (when the run's maintenance finally
+    // crosses the threshold) emits exactly one tile per region and fits the cap
+    // in a single publish.
+    assert!(e.maybe_checkpoint(1).unwrap(), "the forced final publish must checkpoint");
+    assert_eq!(
+        e.active_tile_cutoffs().len(),
+        REGIONS,
+        "one whole-window publish emits one tile per region, far under the cap"
+    );
+    assert_eq!(files.tile_file_count(), REGIONS, "exactly one tile per region was written");
 }

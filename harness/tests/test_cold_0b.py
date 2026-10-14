@@ -6,6 +6,7 @@ hand-built arm record. The long run itself is a nohup experiment; its logic must
 
 from __future__ import annotations
 
+import argparse
 import json
 import statistics
 import sys
@@ -327,14 +328,45 @@ def test_flashdb_load_command_passes_compact_bytes_only_when_actuated() -> None:
     cmd = m.flashdb_load_command(bins, "dir", "t.jsonl", plan, "p.json", reload=True,
                                  checkpoint_bytes=16384, rotate_bytes=16384, group_requests=64,
                                  window_ms=1000, ceiling_us=None, lag_ceiling_us=10_000,
-                                 compact_bytes=64 << 20)
+                                 compact_bytes=64 << 20, max_tiles=4096)
     assert "--compact-bytes 67108864" in cmd
     assert "--lag-ceiling-us 10000" in cmd
+    assert "--max-tiles 4096" in cmd
     off = m.flashdb_load_command(bins, "dir", "t.jsonl", plan, "p.json", reload=False,
                                  checkpoint_bytes=16384, rotate_bytes=16384, group_requests=64,
                                  window_ms=1000, ceiling_us=None, lag_ceiling_us=10_000,
-                                 compact_bytes=0)
+                                 compact_bytes=0, max_tiles=4096)
     assert "--compact-bytes" not in off, "0 means the pre-slice inert path, so no flag"
+
+
+def _cadence_args(checkpoint: int, rotate: int, max_tiles: int = 4096) -> argparse.Namespace:
+    return argparse.Namespace(checkpoint_bytes=checkpoint, rotate_bytes=rotate, max_tiles=max_tiles)
+
+
+def test_shipped_default_cadence_is_the_build_harness_cadence() -> None:
+    assert m.SHIPPED_CADENCE_BYTES == 8 << 20, "the scored runner ships the build harness's 8 MiB cadence"
+    assert m.MAX_TILES_DEFAULT == 4096, "the shipped cap is the raised engine ceiling"
+
+
+def test_cadence_refusal_allows_the_shipped_default_and_refuses_16k(monkeypatch) -> None:
+    monkeypatch.setattr(m, "_tileinfo_active_tiles", lambda bins, base, env: 336)
+    # The shipped default (8 MiB cadence, 4096 cap) over a 336-region / 12000-write run: fits.
+    assert m.cadence_refusal(_cadence_args(8 << 20, 8 << 20), {"scale": "x"}, Path("d"), {}, 12000) is None
+    # The old shipped 16 KiB cadence would exhaust the cap and is refused up front.
+    refusal = m.cadence_refusal(_cadence_args(16384, 16384), {"scale": "x"}, Path("d"), {}, 12000)
+    assert refusal is not None and "incompatible per-region cadence" in refusal
+
+
+def test_cadence_refusal_refuses_an_already_full_list(monkeypatch) -> None:
+    monkeypatch.setattr(m, "_tileinfo_active_tiles", lambda bins, base, env: 5000)
+    refusal = m.cadence_refusal(_cadence_args(8 << 20, 8 << 20, max_tiles=4096), {"scale": "x"}, Path("d"), {}, 0)
+    assert refusal is not None and "no publish can fit" in refusal
+
+
+def test_cadence_refusal_refuses_unequal_checkpoint_and_rotate(monkeypatch) -> None:
+    monkeypatch.setattr(m, "_tileinfo_active_tiles", lambda bins, base, env: 336)
+    refusal = m.cadence_refusal(_cadence_args(8 << 20, 16 << 20), {"scale": "x"}, Path("d"), {}, 12000)
+    assert refusal is not None and "must match" in refusal
 
 
 def test_parse_engine_open_and_summary() -> None:

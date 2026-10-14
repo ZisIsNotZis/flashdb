@@ -1016,3 +1016,17 @@ No failures.
   - `cargo test --workspace --offline` — 304 Rust tests passed, 0 failed.
   - `cd harness && uv run --with pytest pytest -q` — 140 passed.
   - `git diff --check` — silent.
+
+## wave21 WP-1 dispatch record (implement the adopted tile-cap fix, STATUS SS7.4)
+
+- Timestamp: 2026-10-14T14:53:05+08:00.
+- Action: dispatched work package W1 "implement the adopted tile-cap fix" to the single-writer
+  `wave21/tilecap` worktree (branch `wave21/tilecap`, based on `master 8a4ea20`). Contract,
+  design, change, tests and verbatim gates are in `.scratch/75-tile-cap-fix/issues.md`. Scope:
+  raise + configure `manifest::MAX_TILES` (1024 -> 4096, `MAX_CHAIN_PAGES` 96 -> 316,
+  `Engine::set_max_tiles`), refuse a partitioned publish up front before writing any region
+  file, add `--max-tiles` to `flashdb-load`, reconcile the scored runner's default cadence to
+  8 MiB, and refuse an incompatible per-region cadence loudly before any arm runs. Update the
+  regression pin and keep an over-cap fail-closed test. No threshold change; the
+  pre-registration is untouched. Judging note: measurement commands are serialized with
+  `flock /tmp/wave21-measure.lock`.

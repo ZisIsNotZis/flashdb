@@ -83,7 +83,7 @@ use std::path::Path;
 use std::io::{self, BufRead, BufReader, Write};
 use std::time::{Duration, Instant};
 
-use flashdb_engine::engine::{build_compaction_job, BarrierCompletion, CompactShape, CompactionJob, CompactionOutcome, Engine, LayoutPolicy, Op, Outcome, RegionMode, RequestOutcome, MAX_PENDING_BARRIERS};
+use flashdb_engine::engine::{build_compaction_job, BarrierCompletion, CompactShape, CompactionJob, CompactionOutcome, Engine, LayoutPolicy, Op, Outcome, RegionMode, RequestOutcome, MAX_ACTIVE_TILES, MAX_PENDING_BARRIERS};
 use flashdb_engine::index::{build_order_no_index, OrderNoIndexBuild};
 use flashdb_engine::keys::KeyEncoding;
 use flashdb_engine::metrics::WindowSnapshot;
@@ -125,6 +125,7 @@ struct Args {
     peak_report: bool,
     checkpoint_bytes: Option<u64>,
     rotate_bytes: Option<u64>,
+    max_tiles: Option<usize>,
     region_mode: Option<RegionMode>,
     key_encoding: KeyEncoding,
     compact_bytes: Option<u64>,
@@ -158,6 +159,7 @@ fn parse_args(argv: Vec<String>) -> Result<Args, String> {
         peak_report: false,
         checkpoint_bytes: None,
         rotate_bytes: None,
+        max_tiles: None,
         region_mode: None,
         key_encoding: KeyEncoding::FamilyFirst,
         compact_bytes: None,
@@ -230,6 +232,15 @@ fn parse_args(argv: Vec<String>) -> Result<Args, String> {
                     .parse().map_err(|_| "--rotate-bytes must be a positive integer")?;
                 if n == 0 { return Err("--rotate-bytes must be a positive integer".into()); }
                 args.rotate_bytes = Some(n);
+                i += 2;
+            }
+            "--max-tiles" => {
+                let n: usize = argv.get(i + 1).ok_or("--max-tiles needs a value")?
+                    .parse().map_err(|_| "--max-tiles must be a positive integer")?;
+                if n == 0 || n > MAX_ACTIVE_TILES {
+                    return Err(format!("--max-tiles must be between 1 and {MAX_ACTIVE_TILES}"));
+                }
+                args.max_tiles = Some(n);
                 i += 2;
             }
             "--compact-bytes" => {
@@ -1202,6 +1213,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(mode) = args.region_mode {
         engine.set_region_mode(mode);
     }
+    // Active-tile policy cap (configurable, clamped to the structural ceiling).
+    if let Some(n) = args.max_tiles {
+        engine.set_max_tiles(n);
+    }
     let stdout = io::stdout();
     let mut out = stdout.lock();
     writeln!(out, "device_fsync_p50_us={} device_fsync_p99_us={}",
@@ -2082,6 +2097,22 @@ mod tests {
         assert!(parse_args(vec!["b".into(), "dir".into(), "t.jsonl".into(), "--rate-rps".into(), "10".into(),
                                 "--rotate-bytes".into(), "0".into()]).is_err(),
             "a zero rotate threshold is rejected");
+    }
+
+    #[test]
+    fn max_tiles_flag_parses_and_bounds() {
+        let plain = parse_args(vec!["b".into(), "dir".into(), "t.jsonl".into(), "--rate-rps".into(), "10".into()])
+            .expect("valid args");
+        assert_eq!(plain.max_tiles, None, "the engine default is used unless requested");
+        let set = parse_args(vec!["b".into(), "dir".into(), "t.jsonl".into(), "--rate-rps".into(), "10".into(),
+                                  "--max-tiles".into(), "2048".into()]).expect("valid cap");
+        assert_eq!(set.max_tiles, Some(2048));
+        assert!(parse_args(vec!["b".into(), "dir".into(), "t.jsonl".into(), "--rate-rps".into(), "10".into(),
+                                "--max-tiles".into(), "0".into()]).is_err(),
+            "a zero cap is rejected");
+        assert!(parse_args(vec!["b".into(), "dir".into(), "t.jsonl".into(), "--rate-rps".into(), "10".into(),
+                                "--max-tiles".into(), (MAX_ACTIVE_TILES + 1).to_string()]).is_err(),
+            "a cap above the structural ceiling is rejected");
     }
 
     #[test]
