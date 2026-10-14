@@ -967,3 +967,17 @@ No failures.
   re-exploration signal fires on an unrelated region (U|Customer, 6 windows) and still exceeds
   the 2-window target, but that is not the throughput T4 the pre-registration wrote. Gates: 304
   Rust + 140 Python tests green, cargo build 0 warnings, `git diff --check` silent.
+
+## Integration record: wave19/drift
+
+- Timestamp: 2026-10-14T14:13:07+08:00 (integration committed).
+- Action: single-writer integrator merged `wave19/drift` (`--no-ff`, merge commit
+  `bcb7de1b4f28d57ca0eacfee5970a1fa90d78941`) into `master`. Docs-only merge carrying the WP-U
+  ticket 73 + artifacts (19 files under `.scratch/73-t4-drift/`, plus the dispatch entry in this
+  file and the `.scratch/STATUS.md` T4 verdict update), no code change and no load re-measurement.
+  One conflict: both `wave19/drift` and `master` (via `wave17/eval`) appended sections at the
+  same spot after the wave16 integration record; resolved by keeping both in order (wave17
+  integration record, then wave19 WP-U dispatch record).
+- Wave20 SSOT worktree created: `git worktree add -b wave20/ssot
+  /home/z/vibe/worktrees/flashdb/wave20-ssot master`; HEAD
+  `bcb7de1b4f28d57ca0eacfee5970a1fa90d78941`.
