@@ -1172,3 +1172,16 @@ No failures.
   - `cargo test --workspace --offline` — 308 passed; 0 failed; 0 ignored.
   - `cd harness && uv run --with pytest pytest -q` — 146 passed.
   - `git diff --check` — silent.
+
+## WP-79 final combined evaluation: setup dispatch record
+
+- Timestamp: 2026-10-14T17:23:27+08:00.
+- Action: dispatched the final combined post-integration evaluation (ticket 79) to the
+  single-writer `wave23/final-eval` worktree, based on fully integrated master
+  `48b0488af5d9db1c2252c727e9389bfb06ecdc09` (tilecap + driftshape + rewarm repair).
+- Worktree: `/home/z/vibe/worktrees/flashdb/wave23-final-eval` (branch `wave23/final-eval`).
+- Release build: `cargo build --workspace --release --offline` — Finished in 15.67s, 0 warnings;
+  measured binaries `target/release/flashdb-load`, `flashdb-scale`, `flashdb-replay`.
+- Instance: fresh cold copy `cp -a /tmp/cold51/per_region-mixed /tmp/wave23-eval/per_region-mixed`;
+  1,643,925,811 B (12.25x).
+- Contract: arms/seed/verdict deliverable and gates live in `.scratch/79-final-eval/issues.md`.
