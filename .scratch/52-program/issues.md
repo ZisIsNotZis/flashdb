@@ -1054,3 +1054,26 @@ No failures.
   pilot-grade, 3 seeds + 1 repeat, NOT the 10-seed matrix. Ticket + artifacts in
   `.scratch/77-drift-shape/`; gates: cargo build 0 warnings, 304 Rust + 142 Python tests green,
   `git diff --check` silent.
+
+## wave22 WP-X dispatch record (combined post-wave21 evaluation)
+
+- Timestamp: 2026-10-14T15:46:27+08:00.
+- Action: dispatched work package X "the combined post-wave21 evaluation (rung-50 residual + T4 +
+  T1/T2/T3 regression)" to the single-writer `wave22/eval` worktree (branch `wave22/eval`, based on
+  integrated master `ce66f3e` carrying ticket 75 tile-cap + ticket 77 write-spike drift shape).
+  Confirmation run re-deriving the ticket 71 T1/T2/T3 win+adversarial result and the ticket 77 T4
+  write-spike result in one pass against the integrated HEAD, serialized with
+  `flock /tmp/wave21-measure.lock`, one flashdb process at a time under `MemoryMax=128MiB`.
+  Contract, exact commands, per-arm/rung tables, both judging views, T1-T4 verdicts, gates and
+  residual in `.scratch/78-eval-wave21/issues.md` (artifacts `.scratch/78-eval-wave21/*.{md,json}`).
+- Result (pilot-grade, 3 independent seeds 42/43/44 + seed-42 repeat = 4 runs per workload set,
+  20 arm-runs, box loadavg ~4.8-6.4): rung-50 lag-rej still NOT 0 (static-derived 2/40, learned
+  4-9/40, declared 39-40/40); **rung 100 lag-only sustained** (static-derived 0/20 in 4/4 seeds,
+  learned 0/20 in 2/4); T1 throughput +42.7-44.6% (median +43.9%, outside the 0.60% noise band);
+  T2 adversarial rung-50 lag learned median 2/40 vs declared 2.5/40, 0 index builds, reorg median
+  0.942x (<=1.5x); T3 win reorg median 0.564x (<=3x, every run <=1x), no single-region blowup
+  (U|Stock 5.13-5.23 MB / 1 merge); **T4 write-spike EVALUABLE and measured NOT SUPPORTED** (~10%
+  real drop, neither arm recovers, learned≈static post gap ~±1%, `recovery_windows = {}`). Both
+  ceilings 0/96 rows (service ceiling device-bound); slice-39 zero-gain holds (reorg/service
+  0.00111-0.00320). New defects: none. Gates: cargo build 0 warnings, 306 Rust + 146 Python tests
+  green, `git diff --check` silent.
