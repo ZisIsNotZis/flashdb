@@ -803,3 +803,24 @@ No failures.
   1.34x); win reorg ratio median 2.41x with the single-region blowup recurring (75 MB `U|Stock` on
   seed42 vs 0 MB on the same-trace repeat). Gates: 302 Rust + 140 Python tests green, cargo build
   0 warnings, `git diff --check` silent.
+
+## wave16 WP-R dispatch record (startup warm-up)
+
+- Timestamp: 2026-10-14T10:38:55+08:00 (checkpoint committed) -> 2026-10-14T11:19:50+08:00 (measured;
+  final record at the hash named in the ticket).
+- Action: dispatched work package R1 "eagerly warm the win scan + its index at run start" to the
+  single-writer `wave16/startwarm` worktree (branch based on integrated master `e78d036`). Contract,
+  diagnosis, design + rejected alternatives, change, tests, verbatim gates, before/after tables,
+  both judging views, acceptance verdict and residuals are in `.scratch/69-startup-warm/issues.md`;
+  raw artifacts are the committed `seed42/43/44/seed42-repeat.{json,md}` in the same directory.
+- Scope/result: win workload, arms declared/learned/static-derived, full ladder 50/100/200/400 rps,
+  3 independent seeds (42/43/44) + a 42 repeat, one process at a time under `MemoryMax=128MiB`, box
+  load recorded at every boundary (loadavg 5.1-10.2). Headline (pilot, 4 runs, NOT 10-seed): the
+  read-ahead STARTUP warm-up is eliminated — static-derived windows 0-2 are clean in all four runs
+  (first-3 lag p99 110-4,407 us, all `total=0`) via eager index build+adopt + a bounded synchronous
+  `warm_startup` pass (`scan_entries=30000 index_entries=30000` every run); strict rung-50
+  lag-rej=0 is reached on seed42-repeat (0/40) but not across all seeds (static-derived 3/2/1/0),
+  the residual 1-3/40 being mid-run compaction-adjacent cold reads + device fdatasync tails
+  (windows 28-36), not the startup warm-up. Throughput preserved (learned/static ~105-107 rps vs
+  declared 69-72, +43-57%). Gates: 303 Rust + 140 Python tests green, cargo build 0 warnings,
+  `git diff --check` silent.

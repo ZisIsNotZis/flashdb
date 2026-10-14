@@ -121,33 +121,149 @@ below).
 
 ## Change
 
-(TODO after implementation; commits and files.)
+Two commits (`599027a` checkpoint, `25fd585` implementation). Files:
+
+1. `engine/src/readahead.rs`:
+   - `TileReadView::warm_prefix_range(prefix)` — walks a whole key prefix across every tile that
+     could contain it and returns how many rows it yielded (read for page-cache priming only).
+   - `warm_scan_prefix` now delegates its prefix walk to `warm_prefix_range` (behaviour unchanged).
+   - `TileReadView::warm_startup()` — one bounded synchronous warm-up pass: walks the movement
+     `P|StockMovement` primary prefix (the scan fallback read set) and, when adopted, the
+     `U|StockMovement|order_no` index-tile prefix (every index block the point probe could touch).
+     Returns the two entry counts via the new `StartupWarm` struct.
+2. `engine/src/bin/flashdb-load.rs::run`:
+   - When the frozen policy wants the index at open (`order_no_index_wanted`), build + fsync + adopt
+     it EAGERLY (synchronous, before `t0`), then run `tile_read_view().warm_startup()` as a bounded
+     synchronous warm-up pass, and only THEN spawn the read-ahead worker (so its initial view already
+     includes the index tile). The steady-state async `manage_order_no_index` is unchanged.
 
 ## Tests
 
-(TODO after implementation.)
+- `engine/src/readahead.rs::warm_startup_walks_the_scan_prefix_and_the_adopted_index` — NEW, fails
+  pre-change: before adoption the pass walks the scan prefix but `index_entries == 0`; after
+  `adopt_order_no_index` it walks the index tile (`index_entries >= 2`). Pins the eager warm the
+  driver performs before the timed windows.
 
 ## Measurement
 
-(TODO; harness `cold_0b.py --workloads win --arms declared learned static-derived`, seeds >=3 + a
-repeat, on `cp -a` copies of `/tmp/cold51/per_region-mixed`, one process at a time.)
+Release binary built once from HEAD `25fd585` (`flashdb-load` sha256
+`e3c879efcbd8b86441939ae23b7b557b450f6373c11a2eb92e55106dd6031bc8`), used via the harness's
+`--release` resolution of `target/release` (no rebuild between seeds; the harness's `build_binaries`
+re-run is a no-op). Instance `cp -a` copies of `/tmp/cold51/per_region-mixed` (12.25x =
+1,643,925,811 B / 128 MiB). Harness `cold_0b.py --workloads win --arms declared learned
+static-derived --lambdas 1.0`, full ladder 50/100/200/400 rps, `--cap-mib 128
+--checkpoint-bytes 8388608 --rotate-bytes 8388608 --compact-bytes 67108864 --ceiling-us 10000
+--lag-ceiling-us 10000`. Seeds 42/43/44 (3 independent) + seed 42 repeat (noise band), one arm
+process at a time. Every static-derived run printed `startup_warm scan_entries=30000
+index_entries=30000` (the eager pass deterministically walked all 30,000 movement docs and all
+30,000 index entries).
 
-## Gates (verbatim)
+Box load at boundaries (shared 12-core box; llama-server ~99% CPU + mpv ~91% CPU present
+throughout):
 
-(TODO after implementation.)
+| boundary | time | loadavg 1/5/15 |
+|---|---|---|---|
+| seed42 start | 10:43:40 | 8.19 / 7.40 / 6.80 |
+| seed43 start | 10:51:13 | 10.16 / 8.67 / 7.51 |
+| seed44 start | 11:00:37 | 6.62 / 6.97 / 7.21 |
+| seed42-repeat start | 11:09:58 | 6.86 / 6.18 / 6.70 |
+| seed42-repeat end | 11:19:50 | 7.96 / 7.29 / 6.91 |
+
+## Gates (verbatim, final HEAD `25fd585`)
+
+1. `cargo build --workspace --offline` — 0 warnings:
+```
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 9.44s
+```
+2. `cargo test --workspace --offline` — totals: **303 passed; 0 failed; 0 ignored**
+   (129 lib + 22 flashdb-load + 9 batch_commit + 5 compaction_job + 4 constraints +
+   3 family_colocation + 12 group_commit + 6 manifest_engine + 7 merge_threshold + 15 metrics +
+   33 multi_tile + 7 order_flow + 5 order_no_index + 1 partitioned_publish_cap + 5 read_requests +
+   3 region_compaction + 6 region_partition + 3 replay_trace + 8 request_commit + 2 scale_bin +
+   3 tile_format + 3 tile_layout + 12 tile_read + 0 flashdb-replay + 0 flashdb-scale + 0 main + 0
+   doc-tests; +1 test from this ticket).
+3. `cd harness && uv run --with pytest pytest -q`:
+```
+140 passed in 4.60s
+```
+4. `git diff --check` — silent (exit 0).
 
 ## Before/after tables
 
-(TODO after measurement.)
+"Before" = WP-Q integrated HEAD (ticket 68); "after" = this package (`25fd585`). Win workload,
+rung 50, 40 windows.
+
+**static-derived rung-50 lag-rejected windows** (the acceptance rung):
+
+| run | before (all windows 0-2) | after (windows, all mid-run) |
+|---|---:|---:|
+| seed42 | 3/40 | 3/40 (28, 34, 36) |
+| seed43 | 2/40 | 2/40 (29, 30) |
+| seed44 | 2/40 | 1/40 (29) |
+| seed42-repeat | 3/40 | **0/40** |
+
+**First-3-window lag p99 (us) — the startup warm-up that was the named cause:**
+
+| run | before window 0/1/2 | after window 0/1/2 |
+|---|---|---|
+| seed42 | breaching (WP-Q) | 2,626 / 4,407 / 2,616 |
+| seed43 | breaching (WP-Q) | 931 / 2,399 / 110 |
+| seed44 | breaching (WP-Q) | 446 / 1,608 / 129 |
+| seed42-repeat | breaching (WP-Q) | 3,064 / 3,022 / 556 |
+
+Every after-run's window 0/1/2 `lag_breach_attribution total=0` and `lag_ceiling_breached=false`:
+the startup warm-up is gone. The residual breaches are all mid-run (windows 28-36), adjacent to the
+compaction merges that grow ~826 KB-1.3 MB in the second half of the run (see residual cause).
+
+**Achieved throughput (aggregate, the objective's throughput axis must not regress):**
+
+| arm | before (4 seeds) | after (4 seeds) |
+|---|---|---|
+| declared | 68 / 75 / 69 / 71 | 69 / 69 / 71 / 72 |
+| learned@1.0 | 107 / 107 / 106 / 107 | 106 / 105 / 106 / 106 |
+| static-derived | 107 / 107 / 107 / 107 | 107 / 105 / 106 / 106 |
+
+Per-rung achieved (50/100/200/400) static-derived after: 50 / 100 / 199.7-200 / 316.9-398.0 —
+unchanged shape; the 400-rung 317-398 spread is the shared-box noise band, not a regression.
+learned-vs-declared achieved-throughput win preserved (+43-57% aggregate, matching WP-Q).
 
 ## Acceptance verdict
 
-(TODO.)
+**Startup warm-up: ELIMINATED (the package's objective).** Every after-run has windows 0-2 clean on
+the lag ceiling (first-3 lag p99 110-4,407 us, all `total=0`), versus WP-Q where ALL of
+static-derived's breaches were windows 0-2. The eager index build+adopt + the bounded synchronous
+`warm_startup` pass removed the cold-start full scan and index-tile page-in.
+
+**Rung-50 lag-rej = 0/40 across >=3 seeds: NOT reached — 1 of 4 runs (seed42-repeat) reached 0;
+the residual 1-3/40 are a DIFFERENT, evidenced cause (mid-run, not startup).** The remaining
+breaches are all in windows 28-36, adjacent to the larger compaction merges (~826 KB-1.3 MB in the
+run's second half):
+- seed43 window 29/30 `read_us` 116/152 ms with 2.38 MB / 0.9 MB actual device reads (cold
+  page-ins on the pacer) and 63/189 ms device `fdatasync` tails;
+- seed42 window 28 `read_us` 202 ms with a 437 ms device `fdatasync` tail (`max_lag_us` 158 ms);
+- seed44 window 29 is the same single-window compaction-adjacent read stall.
+This is the compaction tile-replacement cold-read + device-fsync-tail class ticket 68 called
+"shared-box noise, not a named mechanism", NOT the startup warm-up. It is out of scope for a
+read-ahead startup package (it is a compaction re-warm / device-durability-tail axis).
+
+**Judging views:** §7.1 lag-only primary — static-derived 3/2/1/0 (was 3/2/2/3), with the startup
+windows clean; the strict 0/40 is not reached across all seeds. Both-ceilings — 0 rps everywhere,
+unchanged (service ceiling is device-bound; the open §7.1 reconciliation is untouched).
+
+**Honest label:** pilot-grade. 4 runs = 3 independent seeds + one 42 repeat on a shared box
+(loadavg 5.1-10.2), NOT a 10-seed pre-registered verdict. The fix removes the named startup
+warm-up deterministically (`startup_warm scan_entries=30000 index_entries=30000` in every run);
+it does not and cannot claim the mid-run device/compaction tail.
 
 ## Residual items
 
-- learned's own demand-gated window 0-1 (index OFF until the first scan-demand flip) is the WP-O
-  learner design and is NOT a read-warm-up defect; it is out of scope here (the R2 lane owns the
-  separate merge oscillation).
+- **Mid-run compaction-adjacent cold reads + device fsync tails (1-3/40):** the exact remaining
+  cause of the non-zero seeds, evidenced above. Not the startup warm-up; a separate
+  compaction-re-warm / device-durability axis, out of scope here.
+- **learned's own demand-gated window 0-2 (index OFF until the first scan-demand flip):** the WP-O
+  learner design (ticket 66). learned after: 5/4/4/7 vs static 3/2/1/0 — the extra windows are the
+  demand-gate full scan (windows 0-2/3, CPU-bound, not warmable) plus the same mid-run noise; on
+  seed42-repeat the learner also shows windows 24-39 from the separate `U|Stock` merge oscillation
+  (R2 lane).
 - Service ceiling remains device-bound (both-ceilings 0 everywhere); the open §7.1 reconciliation is
   untouched.
