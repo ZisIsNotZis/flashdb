@@ -222,25 +222,28 @@ region (PASS); reorg ratio median 0.942x <= 1.5x with no outlier (clean PASS).
 
 | seed | declared B | learned B | ratio |
 |---|---:|---:|---:|
-| 42 | 30,720,572 | 17,533,306 | 0.571x |
+| 42 | 30,720,572 | 28,905,853 | 0.941x |
 | 43 | 30,720,572 | 17,029,067 | 0.554x |
 | 44 | 30,720,572 | 28,200,076 | 0.918x |
-| 42-rpt | 30,720,572 | 17,123,547 | 0.557x |
+| 42-rpt | 30,720,572 | 28,496,094 | 0.928x |
 
-**Median 0.564x, max 0.918x (every run <= 1x, comfortably <= 3x).** static/declared median 0.956x
-(0.939-0.972x). learned's win reorg is now bimodal: 3 of 4 seeds (~0.55-0.57x) defer the
-`U|Customer` first merge (~11.2 MB) plus `P|Order`/`P|StockMovement`, while 1 seed (44) merges them
-(0.918x). This is learner churn-control variance under this quieter box, NOT a regression: the
+**Median 0.923x, max 0.941x (every run <= 1x, comfortably <= 3x).** static/declared median 0.956x
+(0.939-0.972x). Reorg totals here are `summary.compact_bytes_total`, the driver's run total that
+includes the final drained merge applied after the window loop (ticket 72); the per-window/per-region
+`compaction_bytes` sum undercounts by that final merge. learned's win reorg is bimodal: 1 seed (43,
+0.554x) defers the `U|Customer` merge (~11.37 MB), while the other 3 seeds (42/44/42-rpt,
+0.918-0.941x) complete it. This is learner churn-control variance under this quieter box, NOT a
+regression: the
 engine's compaction trigger is unchanged (`compaction_job(budget, COMPACT_MIN_TILES=2, …)`, the
 `max_tiles` cap does not enter the merge decision — verified against `8a4ea20..ce66f3e`), and
 learned aggregate throughput is unchanged (106-107 rps). The lower-reorg mode is the churn budget
-deferring a marginal ~11 MB merge with no throughput penalty.
+deferring the ~11.37 MB `U|Customer` merge with no throughput penalty.
 
 **The single-region blowup does NOT recur.** Win/learned `U|Stock` compaction is
 **5.13-5.23 MB / 1 merge in all 4 seeds** (declared 5.23 MB / 1, static 5.13 MB / 1) — no
 ~10 MB-per-window oscillation, no 75 MB swing.
 
-**T3 verdict:** win reorg ratio median 0.564x (<= 3x), every run <= 1x, no single-region blowup —
+**T3 verdict:** win reorg ratio median 0.923x (<= 3x), every run <= 1x, no single-region blowup —
 **PASS**.
 
 ### T4 (drift, write-spike shape) — R=1450, write x10, pre=6 segments
@@ -261,7 +264,7 @@ run-tail windows — ticket 77's method):
 | s42-rpt | learned@1.0 | (1450 offered) | 1302.4 | 89.8% |
 
 The pre-drift (win) capacity is ~1450-1475 rps (static holds 1450 at 1450 offered); the post-drift
-(write x10) steady throughput is **1291.7-1314.3 rps**, a real **-9.9% to -11.0%** drop (far
+(write x10) steady throughput is **1291.7-1314.3 rps**, a real **-9.4% to -10.9%** drop (far
 outside the same-seed repeat noise below). learned's pre is a catch-up backlog sum (windows 0-2 are
 its demand-gated index burn-in), so its clean pre-drift is the offered 1450 rps it sustains after
 burn-in. Whole-run achieved: learned 1136-1159 rps (burn-in drag), static 1332-1352 rps.
@@ -275,7 +278,8 @@ for learned in all 4 runs (no drift-triggered region re-exploration); `error_win
 arm (learned@1.0 + static-derived), 8 arm-runs total; same-seed repeat noise ~0.9% on the
 post-drift quantity.** T4 is EVALUABLE (a real drop exists) and is **MEASURED NOT SUPPORTED** — the
 learner does not recover and static-derived does not recover measurably slower. Both arms drop
-~10% at the write-spike drift and neither returns to the 10% band of 1450 pre-drift; the learner
+~9-11% at the write-spike drift and their post-drift steady values straddle the 10% band's lower
+edge (~1305 rps), so neither recovers to the 1450 pre-drift capacity; the learner
 never triggers drift re-exploration and its post steady throughput (median ~1307 rps) is
 indistinguishable from static-derived's (median ~1306 rps). Confirms ticket 77's null on the
 integrated tree.
@@ -300,8 +304,8 @@ integrated tree.
 Learned win reward-term ratios over the 4 seeds: reorg/service = **0.00111 .. 0.00320**,
 index/service = **0.00014 .. 0.00025**. The reorganisation write term remains a tiny fraction of
 the service term, so the lambda sweep still cannot move any candidate's argmin — the slice-39
-zero-gain conclusion holds at this revision (and the lower reorg in 3/4 seeds only shrinks the
-reorg term further).
+zero-gain conclusion holds at this revision (the reorg write term stays a fraction of a percent of
+service even under the corrected `summary.compact_bytes_total` total of ticket 72).
 
 ## Honest verdict (pilot-grade)
 
@@ -321,7 +325,7 @@ time under `MemoryMax=128MiB`. NOT a 10-seed pre-registered verdict.**
    rung.
 4. **T2:** rung-50 lag learned median 2/40 vs declared 2.5/40 (at/better than declared on 3/4
    seeds); 0 index builds on the 0-scan region; reorg ratio median 0.942x, max 0.962x (<= 1.5x).
-5. **T3:** win reorg ratio median 0.564x, max 0.918x (every run <= 1x, <= 3x); the single-region
+5. **T3:** win reorg ratio median 0.923x, max 0.941x (every run <= 1x, <= 3x); the single-region
    blowup does NOT recur (`U|Stock` 5.13-5.23 MB / 1 merge in all 4 seeds).
 6. **T4 (write-spike): EVALUABLE and measured NOT SUPPORTED** — a real ~10% capacity drop exists,
    neither arm recovers, learned ≈ static post-drift (gap ~±1%), `recovery_windows = {}` in all 4
@@ -340,14 +344,18 @@ score at any rung (service ceiling device-bound, 0/96 rows); a 10-seed pre-regis
 ## New defects
 
 None introduced. No new correctness, durability, or amplification defect appeared in the 20
-arm-runs (0 error windows everywhere, `cgroup_peak` = the 128 MiB cap on every run, achieved
-fraction <= 1.0005 at every rung, the cadence guard refused nothing). One observation to record,
-not a defect: learned's win reorg is bimodal across seeds (~0.55-0.57x in 3/4, 0.918x in 1/4) and
-its adversarial reorg is the mirror image vs ticket 71 (now 0.93-0.96x, no 0.6x seeds) — this is
-the slice-39 churn-control budget/cooldown deferring a marginal `U|Customer` merge depending on the
-box-load-dependent service-time observations, with no throughput change and learned reorg staying
-<= declared (<=1x) in every seed. The engine's compaction trigger is verified unchanged
-(`COMPACT_MIN_TILES = 2`, not the 1024 -> 4096 cap), so this is learner variance, not a regression.
+arm-runs (0 error windows everywhere, `cgroup_peak` = the 128 MiB cap on every run, the cadence
+guard refused nothing). Achieved fraction was <= 1.0005 at all but two rungs: seed43
+win/learned@1.0 rung-200 reached 1.1315 (`rate_exceeded=true`, the rung overran its offered
+schedule) and seed42-repeat win/learned@1.0 rung-400 reached 1.0040; neither is a correctness
+defect (`commit_rate = 1.0`, 0 error windows). One observation to record, not a defect: learned's
+win reorg is bimodal across seeds (0.554x in 1/4, 0.918-0.941x in 3/4) and its adversarial reorg is
+uniform at 0.925-0.962x (no ~0.6x seeds, unlike ticket 71's two low adversarial seeds) — this is
+the slice-39 churn-control budget/cooldown deferring the ~11.37 MB `U|Customer` merge in seed 43
+depending on the box-load-dependent service-time observations, with no throughput change and
+learned reorg staying <= declared (<=1x) in every seed. The engine's compaction trigger is verified
+unchanged (`COMPACT_MIN_TILES = 2`, not the 1024 -> 4096 cap), so this is learner variance, not a
+regression.
 
 ## Gates (verbatim, final HEAD, run after the measurement)
 
@@ -378,9 +386,9 @@ warning: `VIRTUAL_ENV=/home/z/.venv` does not match the project environment path
 - **learned's demand-gated window 0-2** (index OFF until the first scan-demand flip) plus box noise
   remains the systematic difference between learned and static-derived at rung 50/100 (seed43
   learned rung-100 = 5/20 and 76 rps, the noisiest arm-run of the batch).
-- **learned's reorg is load-sensitive/bimodal** (win 0.55-0.92x, adversarial 0.93-0.96x), from the
-  slice-39 churn budget deferring a marginal merge; always <= declared (<=1x) and no throughput
-  effect, but the per-seed reorg total is not a stable constant.
+- **learned's reorg is load-sensitive/bimodal** (win 0.554-0.941x, adversarial 0.93-0.96x), from
+  the slice-39 churn budget deferring the ~11.37 MB `U|Customer` merge in seed 43; always <=
+  declared (<=1x) and no throughput effect, but the per-seed reorg total is not a stable constant.
 - **Service ceiling remains device-bound** (both-ceilings 0/96 rows; device fsync p50 6.6 ms /
   p99 13.4 ms vs a fixed 10 ms). The open §7.1 reconciliation is untouched.
 - **3 independent seeds + 1 repeat, not 10; shared box** (loadavg ~4.8-6.4, quieter than WP-S).
