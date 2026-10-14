@@ -981,3 +981,20 @@ No failures.
 - Wave20 SSOT worktree created: `git worktree add -b wave20/ssot
   /home/z/vibe/worktrees/flashdb/wave20-ssot master`; HEAD
   `bcb7de1b4f28d57ca0eacfee5970a1fa90d78941`.
+
+## wave20 WP-V dispatch record (final SSOT refresh to the T1-T4 state)
+
+- Timestamp: 2026-10-14T14:20:17+08:00.
+- Action: dispatched work package V "refresh the current-fact SSOT to the completed T1/T2/T3/T4
+  state" to the single-writer `wave20/ssot` worktree (branch `wave20/ssot`, based on integrated
+  master after the wave19/drift merge). Doc-only: `.scratch/STATUS.md` was rewritten in place to
+  the adopted §7.1 lag-only primary reading and the ticket 71/73 re-derived thresholds — rung 100
+  lag-sustained (static-derived 8/8, learned 6/8 seeds; declared never), rung 50 0/40 NOT reached
+  (residual: compaction-adjacent cold reads + device fsync tail), +42.7-52.9% throughput (median
+  +48.6%, outside the 2.48% noise band), T2 reorg median 0.928x (<=1.5x), T3 win reorg median
+  0.934x (<=3x) with no single-region blowup, T4 UNDERIVABLE per ticket 73; the engine-latency
+  facts (compaction off-path, overlapped barrier + deferred append, non-blocking boundary,
+  read-ahead + eager startup warm; 304 Rust / 140 Python tests) and the open author items (§7.1
+  ceiling reconciliation, tile-cap fix §7.4 adopted-unimplemented, T4/residual gaps) were stated
+  with ticket paths. Change log and ticket sources in `.scratch/74-ssot-final/issues.md`.
+  Gates: cargo build 0 warnings, 304 Rust + 140 Python tests green, `git diff --check` silent.
