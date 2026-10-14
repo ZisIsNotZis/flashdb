@@ -1054,3 +1054,34 @@ No failures.
   pilot-grade, 3 seeds + 1 repeat, NOT the 10-seed matrix. Ticket + artifacts in
   `.scratch/77-drift-shape/`; gates: cargo build 0 warnings, 304 Rust + 142 Python tests green,
   `git diff --check` silent.
+
+## Integration record: wave21 lanes
+
+- Timestamp: 2026-10-14T15:41:41+08:00 (integration committed).
+- Action: single-writer integrator merged the two wave21 lanes whose independent verifiers PASSed
+  into `master` (base at integration start `8a4ea20`, clean). Order and merge commits
+  (`git merge --no-ff`):
+  - `wave21/tilecap` -> `30acb4a83356369da0d11c16723175d1632f3d69` (WP-W1 tile-cap fix; verifier PASS, non-blocking findings only). Code + engine/harness tests + `.scratch/STATUS.md` + ticket 75.
+  - `wave21/driftshape` -> `ce66f3e4c437962c611efcfb33a3efde4cba85cf` (WP-W3 write-spike drift shape; verifier PASS, non-blocking findings only). Harness code + tests + ticket 77 + artifacts.
+  - `wave21/rewarm` (WP-W2 compaction re-warm): **NOT merged** — independent verifier verdict
+    **FAIL** with two blocking findings: (1) its diagnosis is contradicted by the raw data — the
+    rung-50 breaches are the compaction BUILD-window device tails (e.g. seed43 w16
+    `compact_bytes=10165563` with the breach; w17 post-publish `lag_p99=107us` clean), not
+    post-publish cold reads; (2) its acceptance claim "post-publish windows clean in all four
+    runs" is false (after seed42, w18 applies and w19 is a lag breach). The fix has no demonstrated
+    effect; the lane must be repaired (correct diagnosis: the residual is the compaction build's
+    own device I/O + fdatasync tail, not a read-warm gap) and re-verified. Ticket
+    `.scratch/76-compaction-rewarm/issues.md` stays open.
+- Conflicts: one, in `.scratch/52-program/issues.md` (both `wave21/tilecap` and `wave21/driftshape`
+  appended a dispatch entry at the same spot after the wave20 integration record). Resolved by
+  keeping both in order (wave21 WP-1 dispatch record, then wave21 WP-W dispatch record). The code
+  files shared by the two branches (`harness/flashdb_harness/cold_0b.py`,
+  `harness/tests/test_cold_0b.py`) auto-merged cleanly.
+- Eval worktree created: `git worktree add -b wave22/eval
+  /home/z/vibe/worktrees/flashdb/wave22-eval master`; HEAD
+  `ce66f3e4c437962c611efcfb33a3efde4cba85cf` (== master HEAD after both merges).
+- Combined gates (verbatim, run at integrated HEAD `ce66f3e4c437962c611efcfb33a3efde4cba85cf`):
+  - `cargo build --workspace --offline` — Finished, 0 warnings.
+  - `cargo test --workspace --offline` — 306 Rust tests passed, 0 failed.
+  - `cd harness && uv run --with pytest pytest -q` — 146 passed.
+  - `git diff --check` — silent.
