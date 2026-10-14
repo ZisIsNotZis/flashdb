@@ -887,3 +887,17 @@ No failures.
   (`d63e294`) and the seed43 declared 39/39 cell. Full numbers and gates are in
   `.scratch/72-scribe-repairs/issues.md`; repair commits `1e42fdf9849d4a4aef201359b4235976a8887080`
   and `90a256d8d9f986b44a1f35ec78655c1c3566d763`.
+
+## Integration record: wave18/scribe
+
+- Timestamp: 2026-10-14T12:37:12+08:00 (integration committed).
+- Action: single-writer integrator merged `wave18/scribe` (`--no-ff`, merge commit
+  `e1184b4f07104b629a4d709c9db3ee9560ce9a7c`) into `master`. Docs-only merge (4 files under
+  `.scratch/`: `.scratch/52-program/issues.md`, `.scratch/67-requestpath-write-stall/issues.md`,
+  `.scratch/70-merge-oscillation/issues.md`, and new `.scratch/72-scribe-repairs/issues.md`),
+  no conflicts, no code change and no load re-measurement.
+- Combined gates (verbatim):
+  - `cargo build --workspace --offline` — Finished, 0 warnings.
+  - `cargo test --workspace --offline` — 304 Rust tests passed, 0 failed.
+  - `cd harness && uv run --with pytest pytest -q` — 140 passed.
+  - `git diff --check` — silent.
