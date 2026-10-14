@@ -94,15 +94,69 @@ def test_order_no_index_axis_is_offered_only_for_the_movement_region():
     learner = ll.LayoutLearner(seed=0)
     # The base candidate set stays 6 everywhere.
     assert learner._candidates_for("P|Stock") == ll.DEFAULT_CANDIDATES
-    # The movement primary region doubles to 12: the same 6 layouts, with and
-    # without the order_no secondary access path.
-    movement = learner._candidates_for(ll.INDEXED_REGION)
-    assert len(movement) == 12
-    assert {c.index_order_no for c in movement} == {False, True}
-    assert movement[:6] == ll.DEFAULT_CANDIDATES
-    # Every indexed candidate is the same page/merge grid with the flag set.
-    assert all(c.page_size in (4096, 65536) and c.merge_min_tiles in (2, 8, 200)
-               for c in movement)
+    assert learner._candidates_for(ll.INDEXED_REGION) == ll.DEFAULT_CANDIDATES
+    # The index axis is NOT a 12-candidate cross product: it is the same 6-grid
+    # with the flag set, offered only after the movement region has served a
+    # scan request (WP-O demand gate).
+    indexed = learner._index_on_candidates()
+    assert len(indexed) == 6
+    assert all(c.index_order_no for c in indexed)
+    assert {(c.page_size, c.merge_min_tiles) for c in indexed} == {
+        (c.page_size, c.merge_min_tiles) for c in ll.DEFAULT_CANDIDATES}
+
+
+def test_movement_region_never_offers_the_index_without_scan_demand():
+    """WP-O: a 0-scan `P|StockMovement` (adversarial) must never explore the index axis.
+
+    This is the regression the pre-change learner failed: it offered 12 movement
+    candidates (6 base x {index off, on}) unconditionally, so it toggled/built a
+    ~2.14 MB index for zero read benefit on a region whose scan count is 0.
+    """
+    region = ll.INDEXED_REGION
+    learner = ll.LayoutLearner(min_samples=2, stability_window=2, margin=0.05,
+                               drift_margin=10.0, seed=0)
+    selection: dict = {}
+    for i in range(30):
+        learner.observe(ll.WindowTelemetry(window=i, rate_rps=50.0, regions={
+            region: stats(region, count=0, mean_ns=0.0)}))
+        selection = learner.selections()
+    assert region in selection
+    assert selection[region].index_order_no is False
+    assert set(learner.pulls(region)) == set(ll.DEFAULT_CANDIDATES)
+    assert all(not c.index_order_no for c in learner.pulls(region))
+
+
+def test_movement_region_flips_to_index_on_once_scan_demand_appears_and_stays():
+    """WP-O: scan demand flips the movement region to the index-on grid exactly once.
+
+    The index is sticky thereafter (index-off candidates are gone), so the learner
+    toggles the axis at most once per run instead of once per candidate change.
+    """
+    region = ll.INDEXED_REGION
+    learner = ll.LayoutLearner(min_samples=2, stability_window=2, margin=0.05,
+                               drift_margin=10.0, seed=0)
+    selection: dict = {}
+    for i in range(12):
+        learner.observe(ll.WindowTelemetry(window=i, rate_rps=50.0, regions={
+            region: stats(region, count=0, mean_ns=0.0)}))
+        selection = learner.selections()
+    assert selection[region].index_order_no is False
+    # The first window with a real scan request justifies the index.
+    learner.observe(ll.WindowTelemetry(window=12, rate_rps=50.0, regions={
+        region: stats(region, count=100, mean_ns=40_000_000.0)}))
+    selection = learner.selections()
+    assert selection[region].index_order_no is True
+    # Index-on is sticky: every later selection stays index-on and the candidate
+    # set is exactly the 6 index-on layouts (page_size x merge, no off-variants).
+    for i in range(13, 40):
+        learner.observe(ll.WindowTelemetry(window=i, rate_rps=50.0, regions={
+            region: stats(region, count=100, mean_ns=120.0)}))
+        selection = learner.selections()
+    assert selection[region].index_order_no is True
+    indexed = {ll.LayoutCandidate(c.page_size, c.merge_min_tiles, True)
+               for c in ll.DEFAULT_CANDIDATES}
+    assert set(learner.pulls(region)) == indexed
+    assert all(c.index_order_no for c in learner.pulls(region))
 
 
 def test_policy_document_emits_the_order_no_index_flag():
