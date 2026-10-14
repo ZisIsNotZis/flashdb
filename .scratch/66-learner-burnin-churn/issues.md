@@ -154,7 +154,7 @@ build/adopt/retire path and the policy schema are unchanged):
 - `cd harness && uv run --with pytest pytest -q`: see gates below.
 - `cargo test --workspace --offline`: see gates below.
 
-## Verbatim gates (final HEAD `08661b4`, run after the change)
+## Verbatim gates (final HEAD `f8f898b`, run after the change)
 
 1. `cargo build --workspace --offline` — 0 warnings:
 ```
