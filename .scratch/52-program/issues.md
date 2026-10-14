@@ -829,3 +829,25 @@ No failures.
   `wave16/oscillation` lane contaminates the lag ceiling, so the WP-R lag numbers are
   direction-only under contention. The deterministic startup-warm evidence is unaffected; the
   decisive serial rung-50 verdict belongs to WP-S after integration.
+
+## wave16 WP-R2 dispatch record (bound the single-region merge oscillation)
+
+- Timestamp: 2026-10-14T10:50:00+08:00 (diagnosis committed) -> 2026-10-14T11:47:00+08:00
+  (measured; final record committed at the hash named in the ticket).
+- Action: dispatched work package R2 "bound the single-region merge oscillation so one region
+  cannot blow up the reorganisation and the lag" to the single-writer `wave16/oscillation`
+  worktree (based on integrated master, HEAD `1b13c8b` after the fix). Contract, diagnosis,
+  design + rejected alternatives, change, tests, verbatim gates, before/after tables, both
+  judging views, acceptance verdict and residuals are in `.scratch/70-merge-oscillation/issues.md`;
+  raw artifacts are the committed `seed42/43/44/seed42-repeat.{json,md}` in the same directory.
+- Scope/result: re-merge minimum-payback hysteresis in `Engine::select_region_run` (first merge
+  keeps the slice-27 absolute-count gate; a region is re-admitted only after `merge_min_tiles`
+  NEW tiles since its post-merge floor), one engine file + one new/updated regression test. Win
+  (T1) + adversarial (T2), arms declared/learned/static-derived, full ladder 50/100/200/400 rps,
+  3 independent seeds (42/43/44) + a 42 repeat, one process at a time under `MemoryMax=128MiB`,
+  box load recorded at every boundary (loadavg 4.9-8.7). Headline (pilot, 4 runs, NOT 10-seed):
+  the `U|Stock` blowup is bounded and same-trace-consistent (5.23 MB / 1 merge on BOTH seed42 and
+  the repeat, vs 75.2 MB / 8 vs 0 MB pre-fix); win T3 learned/declared median 0.39x (0.22-0.92x)
+  with no single-run blowup; learned win rung-50 lag-rej 3/6/3/4 vs static-derived 4/5/5/4
+  (pre-fix seed42 was 13/40); learned throughput 107 rps on all four runs (no regression).
+  Gates: 303 Rust + 140 Python tests green, cargo build 0 warnings, `git diff --check` silent.
