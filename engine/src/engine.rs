@@ -2627,10 +2627,18 @@ impl Engine {
     /// read-ahead worker (slice 58). Tiles are immutable after publish, so the
     /// snapshot only needs to be refreshed when publish/compaction replaces one.
     pub fn tile_read_view(&self) -> crate::readahead::TileReadView {
-        crate::readahead::TileReadView::new(
-            Arc::new(self.tiles.iter().map(|t| t.tile.clone()).collect()),
-            self.key_encoding,
-        )
+        // The read-ahead worker warms the exact blocks the authoritative reads
+        // touch. With the WP-M `order_no` index adopted, a movement scan's first
+        // probe is the index tile (a sidecar OUTSIDE `self.tiles`), so include it
+        // here too; otherwise every scan would cold-page-in the index on the
+        // pacer (the residual WP-P found at rung 50). The index tile uses the
+        // same `U` key spelling, so `TileReadView::warm_lookup` probes it with no
+        // special-casing. It is a pure hint: warming it never feeds a decision.
+        let mut tiles = self.tiles.iter().map(|t| t.tile.clone()).collect::<Vec<_>>();
+        if let Some(index) = &self.order_no_index {
+            tiles.push(index.tile());
+        }
+        crate::readahead::TileReadView::new(Arc::new(tiles), self.key_encoding)
     }
 
     /// Install the provisional layout policy the two tile write paths (publish and

@@ -110,6 +110,12 @@ pub fn build_order_no_index(
 }
 
 impl OrderNoIndex {
+    /// The index tile (an `Arc<Tile>`) for the read-ahead worker's warm view.
+    /// Sharing it is safe: the tile is immutable after `TileWriter::finish`.
+    pub(crate) fn tile(&self) -> Arc<Tile> {
+        Arc::clone(&self.tile)
+    }
+
     /// Probe the index for `order_no`. `Some(handle)` when the index holds a live
     /// entry, `None` otherwise (absent entry or no index). Never authoritative:
     /// the caller cross-checks the returned document and falls back to the scan
