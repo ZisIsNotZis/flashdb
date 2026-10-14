@@ -885,4 +885,5 @@ No failures.
   6 merges, including the 11,372,547 B final drained merge), giving learned/declared 0.594x and a
   win T3 median of 0.5758x (still <=3x), the max single merge 11.37 MB, plus the gate-header HEAD
   (`d63e294`) and the seed43 declared 39/39 cell. Full numbers and gates are in
-  `.scratch/72-scribe-repairs/issues.md`; repair commit `1e42fdf9849d4a4aef201359b4235976a8887080`.
+  `.scratch/72-scribe-repairs/issues.md`; repair commits `1e42fdf9849d4a4aef201359b4235976a8887080`
+  and `90a256d8d9f986b44a1f35ec78655c1c3566d763`.

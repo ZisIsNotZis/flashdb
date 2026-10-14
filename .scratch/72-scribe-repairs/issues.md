@@ -66,4 +66,5 @@ on all four runs, compacts 6.83-28.20 MB).
 
 ## Commit
 
-Repair commit: `1e42fdf9849d4a4aef201359b4235976a8887080`.
+Repair commits: `1e42fdf9849d4a4aef201359b4235976a8887080` (REPAIR A + B) and
+`90a256d8d9f986b44a1f35ec78655c1c3566d763` (ticket-70 before-seed42 max single merge 10.30 MB).
