@@ -781,3 +781,25 @@ No failures.
   2. `cargo test --workspace --offline` — 302 passed; 0 failed (exit 0).
   3. `cd harness && uv run --with pytest pytest -q` — 140 passed (exit 0).
   4. `git diff --check` — silent (exit 0).
+
+## wave15 WP-Q dispatch record (final SS7.1 lag-only evaluation)
+
+- Timestamp: 2026-10-14T09:30:00+08:00 (plan committed) -> 2026-10-14T10:13:00+08:00 (measured;
+  final record committed at the hash named in the ticket).
+- Action: dispatched work package Q "the final SS7.1 lag-only evaluation after the churn +
+  write-stall fixes" to the single-writer `wave15/eval` worktree (integrated master `b7958bc`,
+  both WP-O `wave14/churn2` and WP-P `wave14/writestall` merged). Contract, exact commands,
+  protocol, both judging views, per-arm/rung tables, T1/T2/T3 verdicts, noise band and residual
+  gaps are in `.scratch/68-eval-final/issues.md`; raw artifacts are the committed
+  `seed42/43/44/seed42-repeat.{json,md}` in the same directory.
+- Scope/result: win (T1) + adversarial (T2), arms declared/learned/static-derived, full ladder
+  50/100/200/400 rps, 3 independent seeds (42/43/44) + a 42 repeat, one process at a time under
+  `MemoryMax=128MiB`, box load recorded at every boundary (loadavg 3.9-9.1). Headline (pilot,
+  4 runs, NOT 10-seed): rung-50 lag-rej=0 is NOT reached under the §7.1 lag-only primary —
+  win declared 39-40/40, learned 3-13/40, static-derived 2-3/40 (startup warm-up windows 0-2 +
+  a `U|Stock` merge-oscillation blowup on seed42); the +43-57% achieved-throughput layout win is
+  preserved (learned/static 107 rps vs declared 68-75) but does not convert to a positive lag-
+  sustained score; adversarial learned matches declared (0/40, 0 index builds, reorg ratio median
+  1.34x); win reorg ratio median 2.41x with the single-region blowup recurring (75 MB `U|Stock` on
+  seed42 vs 0 MB on the same-trace repeat). Gates: 302 Rust + 140 Python tests green, cargo build
+  0 warnings, `git diff --check` silent.
