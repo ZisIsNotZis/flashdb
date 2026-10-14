@@ -926,3 +926,21 @@ No failures.
   - `cargo test --workspace --offline` — 304 Rust tests passed, 0 failed.
   - `cd harness && uv run --with pytest pytest -q` — 140 passed.
   - `git diff --check` — silent.
+
+## Integration record: wave17/eval
+
+- Timestamp: 2026-10-14T13:35:31+08:00 (integration committed).
+- Action: single-writer integrator merged `wave17/eval` (`--no-ff`, merge commit
+  `0c1b4c5b98f54186a133f7d8c4fdba689f2442c8`) into `master`. Docs-only merge carrying the WP-S
+  ticket 71 + artifacts (17 files under `.scratch/71-eval-decisive/`, plus the dispatch entry in
+  this file), no code change and no load re-measurement. One conflict: both `wave17/eval` and
+  `master` (via `wave18/scribe`) appended sections at the same spot after the wave16 integration
+  record; resolved by keeping both in order (wave17 WP-S dispatch record, then wave18 sections).
+- T4 worktree created: `git worktree add -b wave19/drift
+  /home/z/vibe/worktrees/flashdb/wave19-drift master`; HEAD
+  `0c1b4c5b98f54186a133f7d8c4fdba689f2442c8`.
+- Combined gates (verbatim):
+  - `cargo build --workspace --offline` — Finished, 0 warnings.
+  - `cargo test --workspace --offline` — 304 Rust tests passed, 0 failed.
+  - `cd harness && uv run --with pytest pytest -q` — 140 passed.
+  - `git diff --check` — silent.
