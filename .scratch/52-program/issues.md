@@ -998,3 +998,21 @@ No failures.
   ceiling reconciliation, tile-cap fix §7.4 adopted-unimplemented, T4/residual gaps) were stated
   with ticket paths. Change log and ticket sources in `.scratch/74-ssot-final/issues.md`.
   Gates: cargo build 0 warnings, 304 Rust + 140 Python tests green, `git diff --check` silent.
+
+## Integration record: wave20/ssot
+
+- Timestamp: 2026-10-14T14:33:03+08:00 (integration committed).
+- Action: single-writer integrator merged `wave20/ssot` (`--no-ff`, merge commit
+  `94efd536b72320eed550725e88e4bce3261b74e1`) into `master`. Docs-only merge carrying the
+  verified SSOT refresh (`.scratch/STATUS.md` rewrite + ticket 74), no code change and no load
+  re-measurement. One conflict: both `wave20/ssot` and `master` (via `a8094be`) appended sections
+  at the same spot after the wave19 integration record; resolved by keeping both in order (wave19
+  integration record, then wave20 WP-V dispatch record).
+- Final master HEAD: `94efd536b72320eed550725e88e4bce3261b74e1` (integration merge commit); this
+  record and the `wave20-final-integrate.js` control script are committed immediately after as
+  the final follow-up commit.
+- Combined gates (verbatim):
+  - `cargo build --workspace --offline` — Finished, 0 warnings.
+  - `cargo test --workspace --offline` — 304 Rust tests passed, 0 failed.
+  - `cd harness && uv run --with pytest pytest -q` — 140 passed.
+  - `git diff --check` — silent.
