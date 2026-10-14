@@ -762,3 +762,16 @@ No failures.
   write-path acceptance MET; rung-50 lag-rej=0 NOT reached (residual 2/40 warm-up transient), both
   judging views reported, pre-registration untouched. Gates: 302 Rust + 138 Python tests green,
   cargo build 0 warnings, `git diff --check` silent.
+
+## wave15 WP-Q dispatch record (final SS7.1 lag-only evaluation)
+
+- Timestamp: 2026-10-14T09:30:00+08:00 (plan committed; measurement to follow).
+- Action: dispatched work package Q "the final SS7.1 lag-only evaluation after the churn +
+  write-stall fixes" to the single-writer `wave15/eval` worktree (integrated master `b7958bc`,
+  both WP-O `wave14/churn2` and WP-P `wave14/writestall` merged). Contract, exact commands,
+  protocol and both judging views are in `.scratch/68-eval-final/issues.md`.
+- Scope: win (T1) + adversarial (T2) workloads, arms declared/learned/static-derived, full ladder
+  50/100/200/400 rps, 3 independent seeds (42/43/44) + a 42 repeat for the noise band, one
+  process at a time under `MemoryMax=128MiB`, box load recorded at every boundary. Reports the
+  §7.1 lag-only primary reading (with the harness's both-ceilings `sustained` artifact flagged
+  separately), T1/T2/T3, any new defect, and the slice-39 zero-gain status.
