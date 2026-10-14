@@ -1030,3 +1030,27 @@ No failures.
   regression pin and keep an over-cap fail-closed test. No threshold change; the
   pre-registration is untouched. Judging note: measurement commands are serialized with
   `flock /tmp/wave21-measure.lock`.
+
+## wave21 WP-W dispatch record (drift shape for T4)
+
+- Timestamp: 2026-10-14T15:23:30+08:00.
+- Action: dispatched work package W "close the T4 evaluability gap with a non-scan drift shape"
+  to the single-writer `wave21/driftshape` worktree (branch `wave21/driftshape`, based on
+  integrated master `8a4ea20`). Code+measurement package: harness gains `--drift-shape
+  {scan,write}`, `--drift-factor`, and `--drift-pre-segments` (defaults preserve the ticket-73
+  scan-spike trace exactly; scan drift stays selectable), plus tests (142 Python tests). The
+  write-spike drift (`write` weight x10, write share 40% -> ~87%) is capacity-reducing: on the
+  12.25x c51 instance static-derived pre-drift 1460 rps -> post-drift ~1260 rps at 1500 offered,
+  so rate 1450 sits below pre-drift capacity and above post-drift capacity (the recovery event T4
+  needs now exists). T4 re-tested at 1450 rps with pre=6 segments (drift boundary 12,000
+  requests): 3 seeds (42/43/44) + seed-42 repeat, learned@1.0 + static-derived per run,
+  `flock /tmp/wave21-measure.lock` on every run, box loadavg 4.48-8.85. **Honest T4 verdict: now
+  EVALUABLE and measured NOT SUPPORTED** — the learner does not recover and static-derived does
+  not recover measurably slower: the learner never triggers drift re-exploration
+  (`recovery_windows = {}` in all 8 arm-runs), its post-drift steady throughput median 1266.5 rps
+  is indistinguishable from static-derived's 1292.0 rps (-2.0% inside the ~8% same-seed repeat
+  noise), and the write-spike floor is policy-independent (the page-size/merge/index knobs cannot
+  reduce the write-heavy mix cost). The pre->post drop (~11%) is real (outside the ~8% noise);
+  pilot-grade, 3 seeds + 1 repeat, NOT the 10-seed matrix. Ticket + artifacts in
+  `.scratch/77-drift-shape/`; gates: cargo build 0 warnings, 304 Rust + 142 Python tests green,
+  `git diff --check` silent.
