@@ -136,15 +136,52 @@ worker's `BarrierResult` in FIFO order and only then records completions).
 
 ## Change
 
-(Filled after implementation.)
+Implemented at (commit to be recorded). Files:
+
+1. `engine/src/wal.rs`: `Wal::encode_frame(payload)` builds the framed bytes without
+   writing (bounds + poison checks identical to `append`); `Wal::append` now calls it; new
+   `Wal::record_appended(len)` advances `valid_len` when a worker append is observed successful;
+   `sync_handle` doc updated to the append+barrier role.
+2. `engine/src/engine.rs`:
+   - `Engine.group_frames: Vec<u8>` (open group's buffered frames) and
+     `Engine.group_defer_append: bool` (set by the new `Engine::begin_group_deferred`).
+   - `begin_group` keeps the historical synchronous mode; `begin_group_deferred` opens the
+     overlapped-append mode; `commit_block_inner` (barrier=false) buffers the frame in deferred
+     mode and appends inline in synchronous mode.
+   - `end_group` fails closed on a deferred-append group (never silently drops buffered frames).
+   - `WalSyncJob` -> `WalAppendSyncJob { handle, frames, fail }`: the worker `write_all`s the
+     group's frames then `sync_data`s; `run()` returns `(result, append_us, fsync_us,
+     appended_bytes)`.
+   - `BarrierResult`/`BarrierCompletion` carry `append_us` (worker-measured device write) and
+     `appended_bytes`; `observe_barrier_result` advances `valid_len` via `record_appended` on
+     success and poisons on failure exactly as before.
+3. `engine/src/replay.rs`: `submit_requests_grouped` uses `begin_group_deferred`; doc updated.
+4. `engine/src/bin/flashdb-load.rs`: `PendingGroup` drops its submit-time `append_us`; the
+   `group_phase`/`window_stall` report's `append_us` is now `completion.append_us` (the worker's
+   device-bound write), so a remaining stall is still attributed to append vs fsync.
 
 ## Tests
 
-(Filled after implementation.)
+- `engine/tests/group_commit.rs::deferred_append_buffers_on_the_pacer_and_lands_on_the_worker` —
+  NEW, fails pre-change: after `commit_block_grouped` the WAL length and record count are still 0
+  (append deferred off the pacer) while `csn()` is 1; after the barrier the frame is durable and
+  recoverable.
+- `engine/src/engine.rs::end_group_refuses_a_deferred_append_group` — NEW: `end_group` fails closed
+  on a deferred-append group instead of dropping buffered frames.
+- `engine/src/engine.rs::overlapped_barrier_sync_error_fails_closed_and_poisons_the_wal` —
+  strengthened: with the injected sync fault the worker appends the complete frame and then fails
+  the sync, so recovery replays handle 2 (`doc2`) while the group is never acked — the
+  append-happens-but-no-ack-without-fdatasync invariant.
+- Existing overlapped tests switched to `begin_group_deferred` so they exercise the new deferred
+  append path; the synchronous `end_group` path and its fault-injection test are unchanged.
 
-## Gates (verbatim)
+## Gates (verbatim; run at the implementation commit)
 
-(Filled after implementation.)
+1. `source $HOME/.cargo/env; cargo build --workspace --offline` — 0 warnings (no warning/error
+   lines).
+2. `cargo test --workspace --offline` — totals: **301 passed; 0 failed; 0 ignored** (+2 tests).
+3. `cd harness && uv run --with pytest pytest -q` — **138 passed in ~4.5s**.
+4. `git diff --check` — silent (exit 0).
 
 ## Before/after tables
 

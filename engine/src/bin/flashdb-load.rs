@@ -663,7 +663,10 @@ struct GroupPhaseReport {
     /// Schedule lag of the group's first member (issue minus its due time): the
     /// pacer was this late observing the request as ready.
     due_dispatch_us: u64,
-    /// Sum of the engine's per-block WAL `append` time inside this group.
+    /// Sum of the engine's per-block WAL `append` time inside this group. For
+    /// an overlapped group (slice 67) this is the barrier worker's device-bound
+    /// `write_all` time (reported in the barrier completion), not the pacer's
+    /// cheap frame encode/buffer.
     append_us: u64,
     /// Sum of the engine's memtable `apply` time inside this group.
     apply_us: u64,
@@ -696,8 +699,6 @@ struct PendingGroup {
     first_due_us: f64,
     /// Dispatch clock, for the group's completion elapsed time.
     started: Instant,
-    /// Engine WAL append elapsed (us), drained at submit.
-    append_us: u64,
     /// Engine memtable apply elapsed (us), drained at submit.
     apply_us: u64,
     /// Requests whose block executed successfully (acked when the barrier
@@ -875,7 +876,7 @@ fn finalize_one_pending_group(
     *window_fsync_sum = window_fsync_sum.saturating_add(completion.fsync_us);
     let report = GroupPhaseReport {
         due_dispatch_us: (group.issue_us - group.first_due_us).max(0.0) as u64,
-        append_us: group.append_us,
+        append_us: completion.append_us,
         apply_us: group.apply_us,
         fsync_us: completion.fsync_us,
         maintain_us: 0,
@@ -1452,7 +1453,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         issue_us,
                         first_due_us: due_us,
                         started,
-                        append_us,
                         apply_us,
                         ok_count,
                         err_count,

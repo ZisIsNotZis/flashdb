@@ -17,6 +17,7 @@ use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::sync::Arc;
@@ -727,11 +728,30 @@ pub struct Engine {
     /// [`Engine::end_group`] knows a barrier is owed. An empty group takes no
     /// `sync` (nothing was appended). Reset by `begin_group`/`end_group`.
     group_pending: bool,
+    /// Accumulated WAL frame bytes for the open grouped commit (slice 67). The
+    /// pacer builds each frame via [`Wal::encode_frame`] and buffers it here
+    /// instead of calling [`Wal::append`], so the device-bound `write_all`
+    /// happens on the barrier worker off the request path. Cleared by
+    /// `begin_group`/`end_group`/`submit_group`; left intact when `submit_group`
+    /// fails at the in-flight cap so the caller drains and retries the SAME
+    /// group's already-buffered frames.
+    group_frames: Vec<u8>,
+    /// True when the open group was begun with
+    /// [`Engine::begin_group_deferred`] (the overlapped path): each grouped
+    /// commit buffers its WAL frame instead of appending inline, and the whole
+    /// group's frames are written by the barrier worker at
+    /// [`Engine::submit_group`]. False for [`Engine::begin_group`] (the
+    /// synchronous [`Engine::end_group`] path), which keeps the historical
+    /// per-block inline append.
+    group_defer_append: bool,
     /// Sum of the per-group WAL `append` elapsed time (us) since the last
     /// [`Engine::take_group_phase_us`]. Observational only (slice 55): never
     /// persisted and never read on any correctness path; it attributes the
     /// request-path WAL append separately from the memtable apply and the
-    /// durability barrier.
+    /// durability barrier. In the grouped path (slice 67) the device-bound
+    /// `write_all` runs on the barrier worker, so this counter measures only
+    /// the pacer's cheap frame encode/buffer; the worker's real append time is
+    /// reported in [`BarrierCompletion::append_us`].
     group_append_us: u64,
     /// Sum of the per-group memtable `apply` elapsed time (us) since the last
     /// [`Engine::take_group_phase_us`]. Observational only (slice 55): never
@@ -834,71 +854,100 @@ pub struct GroupPhase {
     pub fsync_us: u64,
 }
 
-/// One overlapped WAL-barrier job: a duplicated handle to the live WAL file the
-/// worker must `fdatasync`. The handle shares the open file description with the
-/// main writer, so flushing it covers every append the main writer made before
-/// the job was submitted.
-struct WalSyncJob {
+/// One overlapped WAL append+barrier job (slice 67): the open group's buffered
+/// frames plus a duplicated handle to the live WAL file. The worker appends the
+/// frames and then `fdatasync`s the file; the handle shares the open file
+/// description with the main writer, so both the append and the sync land on the
+/// same inode/offset the recovery path reads.
+struct WalAppendSyncJob {
     handle: File,
-    /// Test-only: when armed, the worker reports an `fdatasync` failure instead
-    /// of calling the OS, so the fail-closed barrier path is exercisable
-    /// deterministically. Compiled out of the shipping API.
+    /// The group's WAL frame bytes, built on the pacer by
+    /// [`Wal::encode_frame`] and buffered by [`Engine::commit_block_inner`].
+    /// The worker `write_all`s these verbatim, so the on-disk framing is
+    /// byte-identical to the synchronous path.
+    frames: Vec<u8>,
+    /// Test-only: when armed, the worker appends the frames and then reports an
+    /// `fdatasync` failure instead of calling the OS, so the fail-closed
+    /// barrier path is exercisable deterministically. Compiled out of the
+    /// shipping API.
     #[cfg(test)]
     fail: bool,
 }
 
-impl WalSyncJob {
-    fn sync(self) -> io::Result<()> {
+impl WalAppendSyncJob {
+    /// Append the buffered frames to the shared WAL handle, then `fdatasync`.
+    /// Returns `(result, append_us, fsync_us, appended_bytes)`. A failed append
+    /// returns `Err` without syncing (nothing was appended) and with
+    /// `appended_bytes == 0`; the injected test fault appends first and then
+    /// fails the sync, so a complete-but-unacknowledged frame is recoverable —
+    /// exactly the synchronous path's prefix semantics.
+    fn run(self) -> (io::Result<()>, u64, u64, u64) {
+        let append_t0 = Instant::now();
+        if let Err(e) = (&self.handle).write_all(&self.frames) {
+            let append_us = append_t0.elapsed().as_micros() as u64;
+            return (Err(e), append_us, 0, 0);
+        }
+        let append_us = append_t0.elapsed().as_micros() as u64;
+        let appended_bytes = self.frames.len() as u64;
         #[cfg(test)]
         {
             if self.fail {
-                return Err(io::Error::new(io::ErrorKind::Other, "injected overlapped WAL sync failure"));
+                return (Err(io::Error::new(io::ErrorKind::Other, "injected overlapped WAL sync failure")),
+                    append_us, 0, appended_bytes);
             }
         }
-        self.handle.sync_data()
+        let sync_t0 = Instant::now();
+        let result = self.handle.sync_data();
+        let fsync_us = sync_t0.elapsed().as_micros() as u64;
+        (result, append_us, fsync_us, appended_bytes)
     }
 }
 
 /// The worker's completion report for one barrier.
 struct BarrierResult {
     result: io::Result<()>,
+    /// The WAL append (`write_all`) elapsed time (us) measured on the worker
+    /// thread (slice 67): the device-bound write the pacer no longer blocks on.
+    append_us: u64,
     /// The `fdatasync` elapsed time (us) measured on the worker thread.
     fsync_us: u64,
+    /// The frame bytes the worker appended for this group.
+    appended_bytes: u64,
     /// The wall-clock instant the `fdatasync` returned on the worker thread.
     completed_at: Instant,
 }
 
-/// Observed completion of one overlapped WAL barrier (slice 56): the
-/// worker-measured `fdatasync` elapsed time and the instant the sync returned.
-/// The load driver uses `completed_at` (not its own drain time) as the group's
-/// completion, so service latency includes the barrier but not the later
-/// window-boundary drain.
+/// Observed completion of one overlapped WAL barrier (slice 56/67): the
+/// worker-measured WAL append + `fdatasync` elapsed times and the instant the
+/// sync returned. The load driver uses `completed_at` (not its own drain time)
+/// as the group's completion, so service latency includes the barrier but not
+/// the later window-boundary drain.
 #[derive(Clone, Copy, Debug)]
 pub struct BarrierCompletion {
+    pub append_us: u64,
     pub fsync_us: u64,
     pub completed_at: Instant,
 }
 
-/// A single background thread that runs overlapped WAL barriers in FIFO order.
-/// The FIFO queue is what preserves barrier ordering: the main writer submits
-/// jobs in group order, the worker processes them one at a time, and completions
-/// are reported back in the same order.
+/// A single background thread that runs overlapped WAL append+barrier jobs in
+/// FIFO order. The FIFO queue is what preserves ordering: the main writer
+/// submits jobs in group order, the worker appends each group's frames and
+/// `fdatasync`s them one at a time, and completions are reported back in the
+/// same order.
 struct BarrierWorker {
-    job_tx: mpsc::Sender<WalSyncJob>,
+    job_tx: mpsc::Sender<WalAppendSyncJob>,
     result_rx: mpsc::Receiver<BarrierResult>,
 }
 
 impl BarrierWorker {
     fn spawn() -> Self {
-        let (job_tx, job_rx) = mpsc::channel::<WalSyncJob>();
+        let (job_tx, job_rx) = mpsc::channel::<WalAppendSyncJob>();
         let (result_tx, result_rx) = mpsc::channel::<BarrierResult>();
         std::thread::spawn(move || {
             for job in job_rx {
-                let t0 = Instant::now();
-                let result = job.sync();
-                let fsync_us = t0.elapsed().as_micros() as u64;
+                let (result, append_us, fsync_us, appended_bytes) = job.run();
                 let completed_at = Instant::now();
-                if result_tx.send(BarrierResult { result, fsync_us, completed_at }).is_err() {
+                if result_tx.send(BarrierResult { result, append_us, fsync_us, appended_bytes, completed_at }).is_err() {
                     break;
                 }
             }
@@ -925,6 +974,8 @@ impl Engine {
             max_handle: 0,
             group_open: false,
             group_pending: false,
+            group_frames: Vec::new(),
+            group_defer_append: false,
             group_append_us: 0,
             group_apply_us: 0,
             group_fsync_us: 0,
@@ -1135,7 +1186,7 @@ impl Engine {
         drop(records);
         drop(covered);
         Self::trim_retained_heap();
-        Ok(Engine { wal, mt, tiles, wal_path: wal_path.to_path_buf(), dir: parent_dir(wal_path), manifest: None, segment: None, segment_suffix_csn: csn, wal_detached: false, csn, dedup, max_handle, group_open: false, group_pending: false, group_append_us: 0, group_apply_us: 0, group_fsync_us: 0, barrier_worker: None, barrier_in_flight: 0, layout: LayoutPolicy::declared_default(), region_mode: RegionMode::Global, key_encoding: encoding, order_no_index: None, metrics: RefCell::new(Metrics::new()), last_compaction: None })
+        Ok(Engine { wal, mt, tiles, wal_path: wal_path.to_path_buf(), dir: parent_dir(wal_path), manifest: None, segment: None, segment_suffix_csn: csn, wal_detached: false, csn, dedup, max_handle, group_open: false, group_pending: false, group_frames: Vec::new(), group_defer_append: false, group_append_us: 0, group_apply_us: 0, group_fsync_us: 0, barrier_worker: None, barrier_in_flight: 0, layout: LayoutPolicy::declared_default(), region_mode: RegionMode::Global, key_encoding: encoding, order_no_index: None, metrics: RefCell::new(Metrics::new()), last_compaction: None })
     }
 
     /// The CSN floor below which the active WAL file holds no records: the
@@ -2984,12 +3035,30 @@ impl Engine {
     /// caller that forgets `end_group` therefore fails closed instead of
     /// silently committing through a path its barrier never covered.
     pub fn begin_group(&mut self) -> io::Result<()> {
+        self.begin_group_impl(false)
+    }
+
+    /// Open an overlapped-append commit group (slice 67): identical to
+    /// [`Engine::begin_group`] except each [`Engine::commit_block_grouped`]
+    /// buffers its WAL frame instead of appending inline, and the whole group's
+    /// frames are written by the barrier worker at [`Engine::submit_group`]
+    /// (append, then `fdatasync`, off the request path). A group opened this way
+    /// must be ended with [`Engine::submit_group`], never [`Engine::end_group`]
+    /// (which fails closed on a deferred group rather than silently dropping the
+    /// buffered frames).
+    pub fn begin_group_deferred(&mut self) -> io::Result<()> {
+        self.begin_group_impl(true)
+    }
+
+    fn begin_group_impl(&mut self, defer_append: bool) -> io::Result<()> {
         self.ensure_attached()?;
         if self.group_open {
             return Err(io::Error::new(io::ErrorKind::Other, "a commit group is already open"));
         }
         self.group_open = true;
         self.group_pending = false;
+        self.group_frames.clear();
+        self.group_defer_append = defer_append;
         Ok(())
     }
 
@@ -3003,7 +3072,8 @@ impl Engine {
             return Err(io::Error::new(io::ErrorKind::Other, "no commit group is open; begin_group first"));
         }
         // Any attempt owes a barrier: a failed append poisons the WAL and must
-        // surface in `end_group`'s sync, not be silently skipped as empty.
+        // surface in the group's barrier (synchronous `end_group` or the
+        // overlapped `submit_group` drain), not be silently skipped as empty.
         self.group_pending = true;
         self.commit_block_inner(block_id, ops, false)
     }
@@ -3030,6 +3100,15 @@ impl Engine {
         if !self.group_open {
             return Err(io::Error::new(io::ErrorKind::Other, "no commit group is open; begin_group first"));
         }
+        if self.group_defer_append {
+            // A deferred group's frames are buffered and only written by the
+            // barrier worker; ending it with the synchronous barrier would
+            // fdatasync nothing and drop the group's unappended bytes. Fail
+            // closed instead of silently acking a group whose WAL frames were
+            // never written.
+            return Err(io::Error::new(io::ErrorKind::Other,
+                "a deferred-append group must end with submit_group, not end_group"));
+        }
         // The synchronous barrier path must not race an overlapped barrier still
         // in flight: a synchronous `wal.sync()` would cover another group's
         // appended-but-unacknowledged bytes out of order (and the overlapped path
@@ -3043,6 +3122,8 @@ impl Engine {
         } else { Ok(()) };
         self.group_open = false;
         self.group_pending = false;
+        self.group_frames.clear();
+        self.group_defer_append = false;
         result
     }
 
@@ -3115,11 +3196,14 @@ impl Engine {
             let submitted = self.submit_overlapped_barrier();
             self.group_open = false;
             self.group_pending = false;
+            self.group_defer_append = false;
             submitted?;
             Ok(true)
         } else {
             self.group_open = false;
             self.group_pending = false;
+            self.group_frames.clear();
+            self.group_defer_append = false;
             Ok(false)
         }
     }
@@ -3133,8 +3217,10 @@ impl Engine {
         self.ensure_attached()?;
         let handle = self.wal.sync_handle()?;
         let worker = self.barrier_worker.get_or_insert_with(BarrierWorker::spawn);
-        let job = WalSyncJob {
+        let frames = std::mem::take(&mut self.group_frames);
+        let job = WalAppendSyncJob {
             handle,
+            frames,
             #[cfg(test)]
             fail: self.wal.take_barrier_error(),
         };
@@ -3208,7 +3294,14 @@ impl Engine {
     /// [`Engine::end_group`].
     fn observe_barrier_result(&mut self, result: BarrierResult) -> io::Result<BarrierCompletion> {
         match result.result {
-            Ok(()) => Ok(BarrierCompletion { fsync_us: result.fsync_us, completed_at: result.completed_at }),
+            Ok(()) => {
+                // The worker appended this group's frames before syncing, so the
+                // valid-length watermark advances here (off the request path).
+                // Every `valid_len` consumer already runs with no barrier in
+                // flight, so it never needs the bytes of a still-pending group.
+                self.wal.record_appended(result.appended_bytes);
+                Ok(BarrierCompletion { append_us: result.append_us, fsync_us: result.fsync_us, completed_at: result.completed_at })
+            }
             Err(e) => {
                 self.wal.poison();
                 Err(e)
@@ -3278,14 +3371,37 @@ impl Engine {
         }
 
         let payload = encode_payload(csn, block_id, ops);
-        let append_t0 = Instant::now();
-        self.wal.append(&payload)?;
-        self.group_append_us = self.group_append_us.saturating_add(append_t0.elapsed().as_micros() as u64);
-        self.record_commit_regions(ops);
         if barrier {
+            let append_t0 = Instant::now();
+            self.wal.append(&payload)?;
+            self.group_append_us = self.group_append_us.saturating_add(append_t0.elapsed().as_micros() as u64);
+            self.record_commit_regions(ops);
             let sync_t0 = Instant::now();
             self.wal.sync()?;
             self.group_fsync_us = self.group_fsync_us.saturating_add(sync_t0.elapsed().as_micros() as u64);
+        } else if self.group_defer_append {
+            // Overlapped-append grouped commit (slice 67): defer the
+            // device-bound WAL `write_all` off the pacer. Build the frame on
+            // the pacer (crc32c + a small memcpy, no device I/O) and buffer it;
+            // the barrier worker appends and `fdatasync`s the whole group off
+            // the request path, so a slow device write lands in the worker's
+            // headroom instead of the next dispatch's schedule lag. The frame
+            // bytes are identical to the synchronous path, and `encode_frame`
+            // fails closed exactly as `Wal::append` would (poisoned WAL /
+            // out-of-bounds payload).
+            let frame_t0 = Instant::now();
+            let frame = self.wal.encode_frame(&payload)?;
+            self.group_append_us = self.group_append_us.saturating_add(frame_t0.elapsed().as_micros() as u64);
+            self.group_frames.extend_from_slice(&frame);
+            self.record_commit_regions(ops);
+        } else {
+            // Synchronous deferred-barrier group (slice 23): append inline on
+            // the pacer, exactly as the historical path; `end_group` takes the
+            // single covering `fdatasync`.
+            let append_t0 = Instant::now();
+            self.wal.append(&payload)?;
+            self.group_append_us = self.group_append_us.saturating_add(append_t0.elapsed().as_micros() as u64);
+            self.record_commit_regions(ops);
         }
 
         let apply_t0 = Instant::now();
@@ -4195,7 +4311,7 @@ mod tests {
         let mut e = Engine::create(&p).unwrap();
         e.commit_block(b"base", &[Op::PutDoc { entity: b"E".to_vec(), handle: 1, doc: b"doc1".to_vec() }]).unwrap();
 
-        e.begin_group().unwrap();
+        e.begin_group_deferred().unwrap();
         e.commit_block_grouped(b"b1", &[Op::PutDoc { entity: b"E".to_vec(), handle: 2, doc: b"doc2".to_vec() }]).unwrap();
         e.wal.arm_barrier_error();
         assert!(e.submit_group().unwrap(), "a write group submits a barrier");
@@ -4212,6 +4328,8 @@ mod tests {
 
         let e = Engine::open(&p).unwrap();
         assert_eq!(get_ok(&e, "E", 1), Some(b"doc1".to_vec()), "the acknowledged base survives recovery");
+        assert_eq!(get_ok(&e, "E", 2), Some(b"doc2".to_vec()),
+            "the worker appended the complete frame before the injected sync failure, so recovery replays it (same prefix semantics as the synchronous path)");
         remove(&p);
     }
 
@@ -4226,11 +4344,11 @@ mod tests {
         let mut e = Engine::create(&p).unwrap();
         e.commit_block(b"base", &[Op::PutDoc { entity: b"E".to_vec(), handle: 1, doc: b"doc1".to_vec() }]).unwrap();
 
-        e.begin_group().unwrap();
+        e.begin_group_deferred().unwrap();
         e.commit_block_grouped(b"b1", &[Op::PutDoc { entity: b"E".to_vec(), handle: 2, doc: b"doc2".to_vec() }]).unwrap();
         assert!(e.submit_group().unwrap());
 
-        e.begin_group().unwrap();
+        e.begin_group_deferred().unwrap();
         e.commit_block_grouped(b"b2", &[Op::PutDoc { entity: b"E".to_vec(), handle: 3, doc: b"doc3".to_vec() }]).unwrap();
         e.wal.arm_barrier_error();
         assert!(e.submit_group().unwrap());
@@ -4242,7 +4360,7 @@ mod tests {
         assert_eq!(err.kind(), std::io::ErrorKind::Other, "the second (injected) barrier fails in its own turn");
         assert_eq!(e.pending_barriers(), 0);
 
-        e.begin_group().unwrap();
+        e.begin_group_deferred().unwrap();
         assert!(e.commit_block_grouped(b"b3", &[Op::PutDoc { entity: b"E".to_vec(), handle: 4, doc: b"doc4".to_vec() }]).is_err(),
             "the writer is poisoned after the failing barrier");
         remove(&p);
@@ -4257,14 +4375,14 @@ mod tests {
         let p = tmp("overlapped_cap.wal");
         let mut e = Engine::create(&p).unwrap();
         for i in 0..MAX_PENDING_BARRIERS {
-            e.begin_group().unwrap();
+            e.begin_group_deferred().unwrap();
             e.commit_block_grouped(format!("cap{i}").as_bytes(),
                 &[Op::PutDoc { entity: b"E".to_vec(), handle: (i as u64) + 1, doc: b"d".to_vec() }]).unwrap();
             assert!(e.submit_group().unwrap(), "barrier {i} submits below the cap");
         }
         assert_eq!(e.pending_barriers(), MAX_PENDING_BARRIERS);
 
-        e.begin_group().unwrap();
+        e.begin_group_deferred().unwrap();
         e.commit_block_grouped(b"blocked",
             &[Op::PutDoc { entity: b"E".to_vec(), handle: 65, doc: b"d".to_vec() }]).unwrap();
         assert!(e.submit_group().is_err(), "the cap reached is a fail-closed error");
@@ -4297,6 +4415,19 @@ mod tests {
         assert!(e.end_group().is_err(), "end_group refuses a barrier in flight");
 
         assert!(e.wait_group_barrier().is_ok(), "the overlapped barrier still completes");
+        remove(&p);
+    }
+
+    /// `end_group` must fail closed on a deferred-append group instead of
+    /// `fdatasync`ing nothing and silently dropping the group's buffered frames
+    /// (slice 67). A deferred group is only ever ended by `submit_group`.
+    #[test]
+    fn end_group_refuses_a_deferred_append_group() {
+        let p = tmp("end_group_deferred.wal");
+        let mut e = Engine::create(&p).unwrap();
+        e.begin_group_deferred().unwrap();
+        e.commit_block_grouped(b"b1", &[Op::PutDoc { entity: b"E".to_vec(), handle: 1, doc: b"d".to_vec() }]).unwrap();
+        assert!(e.end_group().is_err(), "end_group refuses a deferred-append group");
         remove(&p);
     }
 
