@@ -108,8 +108,8 @@ automatic merge; absent means "never merged" (the slice-27 count gate applies).
 Written only in `select_region_run`. `RefCell` is required because
 `select_region_run` and the async `compaction_job` both run under `&self`; the
 engine already uses `RefCell` for metrics and is single-writer. It is never
-persisted: a reopen forgets every floor, which only defers (never forbids) the
-next merge.
+persisted: a reopen forgets every floor, so a region re-enters the first-merge count gate (the
+payback only ever defers a re-merge, never forbids a merge).
 
 ### Measured correction (recorded before the code was committed)
 

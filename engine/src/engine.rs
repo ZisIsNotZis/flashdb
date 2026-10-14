@@ -784,8 +784,9 @@ pub struct Engine {
     /// minimum-payback hysteresis stops a threshold sitting at a region's current
     /// tile count from re-triggering a merge on every publish, which is the
     /// single-region oscillation that made a hot region emit several large merges
-    /// back-to-back. Never persisted: a reopen forgets the floor, which defers
-    /// (never forbids) a region's next merge. `RefCell` because
+    /// back-to-back. Never persisted: a reopen forgets every floor, so a region
+    /// re-enters the first-merge count gate (the payback only ever defers a
+    /// re-merge, never forbids a merge). `RefCell` because
     /// [`Engine::select_region_run`] runs under `&self`.
     merge_floor: RefCell<HashMap<Vec<u8>, usize>>,
     /// Whether a write path partitions its output one tile per `(entity, key
