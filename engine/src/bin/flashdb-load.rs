@@ -1227,12 +1227,43 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // when the driver drops it at the end of `run`.
     let mut compaction_worker = args.compact_bytes.map(|_| CompactionWorker::spawn(probe_dir(&args.target)));
 
+    // Derived secondary access path (WP-M): an off-request-path `order_no ->
+    // StockMovement handle` index, built only when the policy requests it. The
+    // build runs on a background thread from the current tile snapshot; the
+    // authoritative read path falls back to the full scan until the result is
+    // adopted (and on every miss/mismatch after). `None` = no build in flight.
+    let index_dir = probe_dir(&args.target);
+    let mut index_build_rx: Option<std::sync::mpsc::Receiver<io::Result<OrderNoIndexBuild>>> = None;
+    // Startup warm-up (WP-R): when the frozen policy wants the index at open,
+    // build and adopt it EAGERLY — bounded, synchronous, before the timed
+    // windows begin — so window 0 already serves the index instead of a cold
+    // full-entity scan. This is the same off-path build that would otherwise run
+    // async and be adopted one window boundary later (ticket 67/68).
+    if !args.dry_run && order_no_index_wanted(&engine.layout_policy()) {
+        let view = engine.tile_read_view();
+        let build = build_order_no_index(&index_dir, &view, "order-no-index.tile")?;
+        let output_bytes = build.output_bytes;
+        File::open(&index_dir)?.sync_all()?;
+        engine.adopt_order_no_index(build.index);
+        engine.record_order_no_index_build(output_bytes);
+    }
+    if !args.dry_run {
+        // Bounded synchronous warm-up pass before the timed windows: prime the
+        // movement scan prefix and, when adopted, the `order_no` index tile, so
+        // the first scans are page-cache hits independent of the worker's pacing.
+        // Purely observational; the walked rows are discarded.
+        let warm = engine.tile_read_view().warm_startup()?;
+        eprintln!("startup_warm scan_entries={} index_entries={}",
+            warm.scan_entries, warm.index_entries);
+    }
+
     // Read-ahead tile warming (slice 58): a background worker pre-reads the tile
     // blocks of the next few requests so a slow cold page-in happens off the
     // pacer and lands in the worker's headroom, not the next dispatch's lag.
-    // Purely a cache warm; the authoritative read still runs inline with
-    // newest-first memtable-over-tile precedence. Off in --dry-run (no engine
-    // reads to warm).
+    // Spawned AFTER the eager adopt + warm above, so its initial view already
+    // includes the adopted index tile. Purely a cache warm; the authoritative
+    // read still runs inline with newest-first memtable-over-tile precedence.
+    // Off in --dry-run (no engine reads to warm).
     let mut read_ahead = if args.dry_run {
         None
     } else {
@@ -1241,17 +1272,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             engine.tile_read_view(),
         ))
     };
-
-    // Derived secondary access path (WP-M): an off-request-path `order_no ->
-    // StockMovement handle` index, built only when the policy requests it. The
-    // build runs on a background thread from the current tile snapshot; the
-    // authoritative read path falls back to the full scan until the result is
-    // adopted (and on every miss/mismatch after). `None` = no build in flight.
-    let index_dir = probe_dir(&args.target);
-    let mut index_build_rx: Option<std::sync::mpsc::Receiver<io::Result<OrderNoIndexBuild>>> = None;
-    if !args.dry_run && order_no_index_wanted(&engine.layout_policy()) {
-        index_build_rx = Some(spawn_order_no_index_build(index_dir.clone(), engine.tile_read_view()));
-    }
 
     let t0 = Instant::now();
     // `due_us` is ALWAYS the due time of the next request to issue, so an unissued request never
