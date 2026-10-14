@@ -80,31 +80,45 @@ a hot region being merged one ~10 MB pair per window toward a threshold it will 
 ~100 more windows; the learner's threshold exploration repeatedly re-arms it (2/8 make it
 eligible, 200 stops it, 2 re-arms it, ...).
 
-## Design (chosen): minimum-payback hysteresis on the per-region trigger
+## Design (chosen): minimum-payback hysteresis on the per-region RE-merge
 
-Reuse the existing `merge_min_tiles` knob but change what it gates: a region is eligible for its
-NEXT automatic merge only after it has PUBLISHED at least `merge_min_tiles` NEW tiles since its
-last automatic merge (or since open). Selecting a region resets its payback counter to zero.
+Reuse the existing `merge_min_tiles` knob but split what it gates:
 
-- **First merge is unchanged.** For a region created during the run, the number of published tiles
-  equals its tile count, so `payback >= threshold` reproduces the old `count >= threshold` gate
-  exactly for the first merge.
-- **Re-merge now requires new data.** After a merge the counter is 0, so the region must publish
-  `threshold` more tiles before it is eligible again. A threshold at (or far below) the region's
-  current count can no longer re-trigger a merge every window.
-- **The merge always folds the cheapest pair** (unchanged `choose_run`), so the output is bounded
-  by the region's smallest tiles — the freshly-published ones, not the ~5 MB seed tiers — and the
-  seed tiers stay deferred until new data genuinely justifies folding them.
-- **General, not workload-specific.** It is the same rule for every region and every threshold;
-  it only changes the automatic re-merge cadence, never the merge mechanics, the explicit
-  `compact()`, or the read/write/durability paths.
+- **First merge is the slice-27 gate, unchanged.** A region is eligible for its
+  FIRST automatic merge once its OWN tile count reaches `merge_min_tiles`
+  (`count >= threshold`). A fresh region behaves exactly as before, and a
+  recovered hot region (`U|Stock` at 121 tiles) is still eligible when the
+  learner lowers its threshold.
+- **Re-merge now requires new data.** Selecting a region records its post-merge
+  tile count as a per-region **floor**; the region is re-admitted only once
+  `count - floor >= merge_min_tiles`, i.e. after it has published `threshold`
+  NEW tiles since its last merge. A threshold at (or far below) the region's
+  current count can therefore trigger at most ONE merge and then must be repaid
+  with new tiles before the next one - the ~10 MB-per-window repeat is removed.
+- **The merge always folds the cheapest contiguous run** (unchanged
+  `choose_run`), so a single actuation is bounded by one pair; the re-merge gate
+  is what bounds the REPEAT.
+- **General, not workload-specific.** It is the same rule for every region and
+  every threshold; it only changes the automatic re-merge cadence, never the
+  merge mechanics, the explicit `compact()`, or the read/write/durability paths.
 
-State: `Engine.merge_payback: RefCell<HashMap<Vec<u8>, usize>>`, keyed by the raw region prefix,
-incremented by `record_published_tile` in the two publish paths (`build_tile`, `publish_tile`) and
-read/reset in `select_region_run`. `RefCell` is required because `select_region_run` and the async
-`compaction_job` both run under `&self`; the engine already uses `RefCell` for metrics and is
-single-writer. It is never persisted: a reopen restarts every region's payback at zero, which only
-defers (never forbids) the next merge.
+State: `Engine.merge_floor: RefCell<HashMap<Vec<u8>, usize>>`, keyed by the raw
+region prefix, recording the region's tile count immediately after its last
+automatic merge; absent means "never merged" (the slice-27 count gate applies).
+Written only in `select_region_run`. `RefCell` is required because
+`select_region_run` and the async `compaction_job` both run under `&self`; the
+engine already uses `RefCell` for metrics and is single-writer. It is never
+persisted: a reopen forgets every floor, which only defers (never forbids) the
+next merge.
+
+### Measured correction (recorded before the code was committed)
+
+The first design gated the FIRST merge on new-tiles-since-open too; a sanity run
+showed that defers ALL compaction for a short load (declared reorg 0 B, because
+the load publishes fewer than 2 new tiles per region). That fails "legitimate
+compaction still happens" and makes the T3 ratio 0/0. The revised design keeps
+the first merge on the absolute-count gate and applies the payback only to the
+re-merge, which is the oscillation that actually fires.
 
 ### Rejected alternatives
 
@@ -141,15 +155,16 @@ defers (never forbids) the next merge.
 ## Change
 
 `engine/src/engine.rs`:
-- New `Engine.merge_payback: RefCell<HashMap<Vec<u8>, usize>>`, documented, initialized empty in
-  both constructors (`create`, `open_impl`).
-- New `Engine::record_published_tile(&self, &TileHandle)` increments the tile's region counter;
-  called from `build_tile` and `publish_tile` for each published tile (merge replacements and
-  recovery do NOT call it).
-- `select_region_run`: eligibility changed from `idxs.len() >= threshold` to
-  `payback >= threshold` (still requires `>= 2` tiles); the selected region's counter is reset to
-  0 at selection so the async `compaction_job` path cannot re-select the same region while its job
-  is in flight. Doc comments updated.
+- New `Engine.merge_floor: RefCell<HashMap<Vec<u8>, usize>>`, documented, initialized empty in
+  both constructors (`create`, `open_impl`). It records a region's tile count immediately after
+  its last automatic merge; absent = never merged.
+- `select_region_run`: a never-merged region keeps the slice-27 absolute-count gate
+  (`count >= threshold`); a merged region is re-admitted only when `count - floor >= threshold`
+  (at least `merge_min_tiles` NEW tiles since its floor). The selected region's floor is recorded
+  at selection (so the async `compaction_job` path cannot re-select the same region while its job
+  is in flight). Doc comments updated.
+- No publish-path change: the floor is derived from the region's current tile count and the chosen
+  run length, so `build_tile`/`publish_tile` are untouched.
 
 `engine/tests/merge_threshold.rs`:
 - `an_eager_region_is_not_held_back_by_a_lazy_neighbour` updated for the payback semantics.
