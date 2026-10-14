@@ -1008,9 +1008,9 @@ No failures.
   re-measurement. One conflict: both `wave20/ssot` and `master` (via `a8094be`) appended sections
   at the same spot after the wave19 integration record; resolved by keeping both in order (wave19
   integration record, then wave20 WP-V dispatch record).
-- Final master HEAD: `94efd536b72320eed550725e88e4bce3261b74e1` (integration merge commit); this
-  record and the `wave20-final-integrate.js` control script are committed immediately after as
-  the final follow-up commit.
+- Merge commit: `94efd536b72320eed550725e88e4bce3261b74e1`.
+- Final master HEAD: the follow-up commit carrying this record (see `git rev-parse HEAD`;
+  reported in the dispatch run).
 - Combined gates (verbatim):
   - `cargo build --workspace --offline` — Finished, 0 warnings.
   - `cargo test --workspace --offline` — 304 Rust tests passed, 0 failed.
