@@ -762,3 +762,22 @@ No failures.
   write-path acceptance MET; rung-50 lag-rej=0 NOT reached (residual 2/40 warm-up transient), both
   judging views reported, pre-registration untouched. Gates: 302 Rust + 138 Python tests green,
   cargo build 0 warnings, `git diff --check` silent.
+
+## Integration record: wave14/churn2 + wave14/writestall
+
+- Timestamp: 2026-10-14T09:27:46+08:00
+- Actor: integrator (single writer, master)
+- Merge 1: `git merge --no-ff wave14/churn2` -> commit `2b5f73941ae99c0830901a9ca9b55e118b3291c0`
+  (branch tip `3bd4656169c96ab0ce84dbfa3fb5363234de1174`). No conflict.
+- Merge 2: `git merge --no-ff wave14/writestall` -> commit `b7958bcca92f9cedecde72c5da6e47d70709d53d`
+  (branch tip `c551ecc869de961f6b6f9e6997798ddab631515f`). One content conflict in the shared
+  `.scratch/52-program/issues.md` (both branches appended their dispatch record at the same tail
+  anchor after "No failures."). Resolved minimally by keeping both sections in order (churn2 then
+  writestall), no content dropped or rewritten.
+- Re-evaluation worktree: `git worktree add -b wave15/eval /home/z/vibe/worktrees/flashdb/wave15-eval master`
+  (HEAD `b7958bcca92f9cedecde72c5da6e47d70709d53d`).
+- Combined gates (master `b7958bc`):
+  1. `cargo build --workspace --offline` — Finished, 0 warnings (exit 0).
+  2. `cargo test --workspace --offline` — 302 passed; 0 failed (exit 0).
+  3. `cd harness && uv run --with pytest pytest -q` — 140 passed (exit 0).
+  4. `git diff --check` — silent (exit 0).
