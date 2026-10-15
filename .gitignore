@@ -13,6 +13,7 @@ __pycache__/
 # Common local caches and temporary workspaces
 node_modules/
 .pi/
+.cgroup
 worktrees/
 .worktrees/
 .DS_Store
