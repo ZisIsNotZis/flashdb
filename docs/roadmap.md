@@ -58,7 +58,23 @@ generator shapes + headroom harness).
 - The L2 co-location go/no-go (M2 proposes; it does not apply a product-design change).
 - Any external-compute or paid-service use.
 
+## Milestone status (current)
+
+- **M1 — external baseline scoreboard: delivered artefact, gate CANNOT-VERIFY.** The harness
+  (`baseline_0b.py`) and the corrected scoreboard (`report.md`/`report.json`, commit `43b1297`) passed
+  a fresh narrow review (PASS for the correction). The milestone gate is not met: **T6 has no
+  measurement at >=10x** (the only evaluable reading is 0.50x declared / 1.00x learned against 3x,
+  a FAIL), and **T5/T7 pass on throughput (deficit 1.001 at 12.546x) but the sustained half is
+  not-robustly-determined** (one contended run: no arm sustained). Open items: a quiet-box repeat of
+  run B, a >=10x ladder for T6 (~8 h per single seed; the pre-registration asks for 10 seeds), and
+  the 10-seed aggregation. Mechanical facts: oracle PASS for all arms including the 10x flashdb
+  read-back; one latency rule including the growth clause; sqlite durability observed; run B
+  provenance recorded. Environment: the literal `cargo build/test --workspace --offline` fails at
+  resolution on this box (lock pins crates.io, cache is mirrors.aliyun.com); the pinned-aliyun
+  `--config` command builds and passes 308 tests / 168 pytest.
+- **M2 — join-heavy workload descriptors: in progress** (ticket 81).
+
 ## Current milestone
 
-M1 — External baseline scoreboard. Work packages, owners, acceptance and budget live in
-`.scratch/80-external-baselines/issues.md`.
+M2 — Motivating join-heavy workload descriptors and the layout-space recommendation. Work packages,
+owners, acceptance and budget live in `.scratch/81-join-heavy-workloads/issues.md`.

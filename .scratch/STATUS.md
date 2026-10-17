@@ -3,8 +3,9 @@
 Current single source of truth for project state. Facts only: every number names its conditions.
 History and process live in the tickets, not here.
 
-The remaining work is sequenced as milestones in [`docs/roadmap.md`](../docs/roadmap.md); the current
-milestone is M1 (external baseline scoreboard, ticket 80).
+The remaining work is sequenced as milestones in [`docs/roadmap.md`](../docs/roadmap.md).
+M1 is delivered but its gate is CANNOT-VERIFY (T6 at >=10x unmeasured); the current milestone is M2
+(join-heavy workload descriptors, ticket 81).
 
 ## 1. Bound revision and instance
 
