@@ -3,6 +3,9 @@
 Current single source of truth for project state. Facts only: every number names its conditions.
 History and process live in the tickets, not here.
 
+The remaining work is sequenced as milestones in [`docs/roadmap.md`](../docs/roadmap.md); the current
+milestone is M1 (external baseline scoreboard, ticket 80).
+
 ## 1. Bound revision and instance
 
 - **Bound revision (final integrated master, WP-79):** `482e3a1bd2a0c12dff4e0f3f758cd8a29556fed2`.
