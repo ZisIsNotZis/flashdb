@@ -27,9 +27,11 @@ A window is rejected when its per-request **schedule-lag p99 exceeds 10,000 us**
 no arm has its own rule. Service latency is reported beside the rule, not used by it.
 
 One process at a time for every run: `flock /tmp/m1-measure.lock`, held for a whole rung. Run A's
-load average was recorded before and after every rung: 1.47-5.16 (1-minute) on 8 cores, in
-`runs/m1-measure/loadavg.jsonl` — with the 5.16 reading immediately before the 400 rps rung, which is
-the rung where every arm is rejected. **Run B's boundaries were not load-average-recorded**: it was
+load average was recorded before and after every rung: 1.47-2.54 (1-minute) on 8 cores, in
+`runs/m1-measure/loadavg.jsonl`; the 400 rps rung — the one where every arm is rejected — began with a
+1.47 reading, and its own closing reading is missing (the runner was edited while that rung was in
+flight, §7.5). A 5.16 reading appeared between the 100 and 200 rps rungs, when the other tenants were
+busiest. **Run B's boundaries were not load-average-recorded**: it was
 driven by direct arm invocations rather than by the ladder runner, and its 1-minute load average is
 therefore unknown (the surrounding half hour read 2-3 on 8 cores). That is a measurement gap, stated
 rather than papered over; it matters because the scheduler — not the engine — decides a 12.5 ms lag
