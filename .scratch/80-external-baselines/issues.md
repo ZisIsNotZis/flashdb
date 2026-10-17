@@ -288,8 +288,8 @@ probes/s, so a 10^7-cell read-back is 16 min-1.6 h of verification per flashdb a
 `scripts/m1-ladder-run.sh` runs `50 x [1,2,4,8]` rps, 20 s of offered load per rung, all four arms,
 one process at a time under `flock /tmp/m1-measure.lock`, each engine in its own capped scope, with
 the machine's load average recorded before and after every rung. The instance is
-`customers=30000, skus=30000, locs=4` (120k cells + 30k customers = 150k docs; flashdb 18.7 MB,
-sqlite 11.8 MB, postgres 21.2 MB). That is 0.09-0.16x of the 128 MiB cap, i.e. NOT the
+`customers=30000, skus=30000, locs=4` (120k cells + 30k customers = 150k docs; flashdb 18.6-23.8 MB across rungs,
+sqlite 11.8 MB, postgres 21.2 MB). That is 0.09-0.19x of the 128 MiB cap, i.e. NOT the
 pre-registered >=10x regime; every number from it is PROVISIONAL and is reported as a harness check,
 never as the T5/T6/T7 verdict.
 
@@ -345,7 +345,7 @@ one process at a time, each engine in its own 128 MiB cgroup.
 - **flashdb's read-back at 10x is DEFERRED and this is the one acceptance criterion the regime run
   misses.** The arm is measured; its inventory verification was not run because at 10.6M cells it costs
   16 min-1.6 h per arm even after the streaming rewrite. The same oracle passes on the same code at
-  0.14x (11 checks) and on the SQL arms at 10x (12 checks each).
+  0.15-0.19x (11 checks) and on the SQL arms at 10x (12 checks each).
 
 ### Verification cost fixes made for this run
 

@@ -42,7 +42,7 @@ UNVERIFIED = (
     " ~6 min of seeding plus a read-back of 16 min-1.6 h at 10.6M cells; run B measured the 1x rung"
     " only.",
     "The inventory oracle at >=10x for the flashdb arms: run B's flashdb read-back is DEFERRED (same"
-    " cost), while sqlite's and postgres's oracles passed at 10x and flashdb's passed at 0.14x.",
+    " cost), while sqlite's and postgres's oracles passed at 10x and flashdb's passed at 0.15-0.19x.",
     "The pre-registered 10-seed median/IQR aggregation: both runs are one seed.",
     "Run B's load average at its rung boundaries: not captured (direct invocations), so the single"
     " rejected flashdb window cannot be attributed to the engine or the machine from this run.",
@@ -56,7 +56,7 @@ SUMMARY = (
     " it; but the same run shows both baselines SUSTAINING the rung with zero rejected windows (lag"
     " p99 6.1 ms and 2.2 ms) while flashdb-declared fails the sustained rule on one window of twenty"
     " (12.5 ms), so T5's number is evidence that flashdb's throughput is not behind, not that it is"
-    " as well behaved. In the warm 0.14x ladder the ordering reverses and flashdb is not the fastest"
+    " as well behaved. In the warm 0.15-0.19x ladder the ordering reverses and flashdb is not the fastest"
     " arm above 100 rps (sqlite sustains 200 cleanly, both flashdb arms are rejected at 200, T6 there"
     " 2.0x against the 3x line). T6 at the pre-registered regime - the actual external-superiority"
     " claim - remains unevaluated, and no result here supports a claim that flashdb beats postgres or"

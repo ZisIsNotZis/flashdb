@@ -11,7 +11,7 @@ setup, verification as a separate step — are recorded in
 
 | run | instance (docs) | flashdb data | regime | rungs | what it is |
 |---|---|---|---|---|---|
-| A. harness check | 30k customers, 30k skus x 4 loc | 18.7 MB | **0.14x** of the 128 MiB cap | 50/100/200/400 rps, 20 s each | the full ladder, every arm, every rung — PROVISIONAL, not the verdict |
+| A. harness check | 30k customers, 30k skus x 4 loc | 18.6-23.8 MB | **0.15-0.19x** of the 128 MiB cap | 50/100/200/400 rps, 20 s each | the full ladder, every arm, every rung — PROVISIONAL, not the verdict |
 | B. regime run | 200k customers, 2.65M skus x 4 loc | 1.68 GB | **12.5x** of the cap | 50 rps (the pre-registered 1x rung), 20 s | T5/T7 evaluated here; T6 has no ladder at this regime |
 
 Every number carries its conditions. **The pre-registered floor is data >= 10x the memory budget
@@ -37,7 +37,7 @@ therefore unknown (the surrounding half hour read 2-3 on 8 cores). That is a mea
 rather than papered over; it matters because the scheduler — not the engine — decides a 12.5 ms lag
 p99 at 50 rps.
 
-## 2. Table A — the ladder (harness check, PROVISIONAL, data 0.14x of the cap)
+## 2. Table A — the ladder (harness check, PROVISIONAL, data 0.15-0.19x of the cap)
 
 Instance: 120,000 stock cells (30k skus x 4 loc) + 30,000 customers, seed 42, zipf theta 1.0, one
 frozen trace per rung (`runs/m1-measure/rung-<rps>/manifest.json`), 20 windows per rung, batch B=64
@@ -100,7 +100,7 @@ because their encodings are smaller, and no threshold was changed to make that r
 
 ## 4. The inventory oracle, per arm, on the measured run
 
-| arm | run A (0.14x) | run B (12.5x) |
+| arm | run A (0.15-0.19x) | run B (12.5x) |
 |---|---|---|
 | flashdb-declared | PASS (11 checks) | **not run** — see §7, the read-back costs 16 min-1.6 h at this size; the arm's run record says `oracle: DEFERRED` |
 | flashdb-learned | PASS (11 checks) | not run (same wiring as declared in M1) |
@@ -145,7 +145,7 @@ sqlite/postgres; **2x** is the fail line; 10x is a design failure. Metric used: 
   0.1% gap satisfies it. Under the stricter reading of the validity rule (throughput from rejected
   windows is not counted) flashdb has no *sustained* level at this rung while postgres does — its
   single rejected window is the whole difference, and it is disclosed above rather than averaged away.
-- At the harness-check regime (run A, 0.14x, **PROVISIONAL**): slower baseline = sqlite at 50.00 rps
+- At the harness-check regime (run A, 0.15-0.19x, **PROVISIONAL**): slower baseline = sqlite at 50.00 rps
   (postgres 50.00), flashdb-declared 49.95 rps → deficit **1.001** → within 1.5x. Note that at 50
   rps the offered rate is the ceiling for every arm, so the metric cannot distinguish headroom; it is
   a non-inferiority check by construction, and the discriminating quantity is the highest sustained
@@ -211,7 +211,7 @@ baselines **sustaining** the rung cleanly (0 rejections, lag p99 6.1 ms for sqli
 postgres) while flashdb-declared fails the sustained rule on one window of twenty (lag p99 12.5 ms).
 T5's number is therefore not evidence that flashdb is *as good* at 12.5x; it is evidence that flashdb's
 throughput is not behind, plus a tail-latency miss that a second seed would have to confirm or retire.
-Fourth, in the warm 0.14x instance the ordering reverses and flashdb is not the fastest arm at any rung
+Fourth, in the warm 0.15-0.19x instance the ordering reverses and flashdb is not the fastest arm at any rung
 above 100 rps: sqlite sustains 200 cleanly, both flashdb arms are rejected at 200, and T6 there is 2.0x
 against the pre-registered 3x. Fifth, T6 at the pre-registered regime — the actual external-superiority
 claim — **remains unevaluated**: it needs a ladder at 10x, and a 10x flashdb arm-run costs ~6 min of
