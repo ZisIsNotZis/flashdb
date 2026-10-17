@@ -143,7 +143,7 @@ sqlite/postgres; **2x** is the fail line; 10x is a design failure. Metric used: 
   sqlite at 50.00 rps (postgres also 50.00) → deficit **1.001** → **within the 1.5x requirement**, and
   more than 10x inside the 2x fail line. Reading made explicit: T5 names a *throughput gap*, and a
   0.1% gap satisfies it. Under the stricter reading of the validity rule (throughput from rejected
-  windows is not counted) flashdb has no *sustained* level at this rung while postgres does — its
+  windows is not counted) flashdb has no *sustained* level at this rung while both baselines do — its
   single rejected window is the whole difference, and it is disclosed above rather than averaged away.
 - At the harness-check regime (run A, 0.15-0.19x, **PROVISIONAL**): slower baseline = sqlite at 50.00 rps
   (postgres 50.00), flashdb-declared 49.95 rps → deficit **1.001** → within 1.5x. Note that at 50
