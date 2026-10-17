@@ -27,8 +27,9 @@ pre-registered threshold is changed here.
 - Rung-50 lag is not sustained; the both-ceilings service ceiling is device-bound; §7.1
   primary-vs-service reconciliation is open.
 - The motivating join-heavy shapes (star-schema fan-out, multi-hop traceability, as-of join,
-  anti-join) are not in the generator; the current win is per-region access-shape adaptation, not
-  cross-entity co-location (ticket 29).
+  anti-join) are now in the generator and measured structurally (ticket 81); the current win is
+  per-region access-shape adaptation, not cross-entity co-location (ticket 29), and the M2 analysis
+  puts the remaining headroom in placement only for the star-schema fan-out.
 - Evidence is 3 independent seeds + 1 repeat, not the pre-registered 10.
 
 ## Milestones
@@ -72,7 +73,7 @@ generator shapes + headroom harness).
   provenance recorded. Environment: the literal `cargo build/test --workspace --offline` fails at
   resolution on this box (lock pins crates.io, cache is mirrors.aliyun.com); the pinned-aliyun
   `--config` command builds and passes 308 tests / 168 pytest.
-- **M2 — join-heavy workload descriptors: in progress** (ticket 81).
+- **M2 — join-heavy workload descriptors: descriptors + recommendation delivered; gate UNMET (2/4); author decision needed on the ≥10x/learned-vs-declared item.** Ticket 81's `report.md` delivers the four descriptors (§2, `descriptors.json`, corpus `ecc271e4…`) and the per-shape recommendation (§0, §4): L2 co-location is required for `star_fanout` (page size alone helps only its 5-row tail, and is a net loss on the median), `multi_hop` is fan-out-volume-dominated (1,216 read groups / 1,583 child rows per request) so neither axis alone is sufficient, `as_of` is not layout-bound, and `anti_join` is not determinable and points against L2. Two of the four M2 acceptance items are met (descriptors measured, explicit recommendation); two are **unmet** — a headroom measurement at ≥10x and learned-vs-declared headroom with the latency rule — because the engine cannot execute any of the shapes (no multi-row `$block.field` binding, a validator that admits only `cust -> take`, no aggregate-to-write); the item-by-item table is `report.md` §8. Closing the gate needs that engine work plus the M-B run, or an explicit author waiver of the ≥10x item. No per-region space replaced, no pre-registered threshold changed, and the L2 go/no-go remains the author's.
 
 ## Current milestone
 
