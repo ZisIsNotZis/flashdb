@@ -2,7 +2,7 @@
 # The M1 external-baseline run: one frozen trace, three arms, each in its own 128 MiB scope.
 #
 #   scripts/m1-baseline-run.sh [--workdir DIR] [--requests N] [--rate R] [--arms a,b,c]
-#                              [--cap-mib M] [--skip-build]
+#                              [--on-hand N] [--cap-mib M] [--skip-build]
 #
 # What it guarantees:
 #   * one process at a time: the whole run holds `flock /tmp/m1-measure.lock`;
@@ -31,6 +31,10 @@ CUSTOMERS=200
 SKUS=500
 LOCS=4
 BATCH=64
+# The seeded `Stock.on_hand` per cell. The scored rung keeps it high enough that the guard passes
+# (the pre-registered workload's shape); a low value forces the guard's `else` branch, which is how
+# the backorder arm of the oracle is exercised end to end.
+ON_HAND=1000000
 ARMS=flashdb-declared,sqlite,postgres
 SKIP_BUILD=0
 PAYLOADS=$REPO/.tmp/m1-run
@@ -46,6 +50,7 @@ while [ $# -gt 0 ]; do
         --skus) SKUS=$2; shift 2 ;;
         --locs) LOCS=$2; shift 2 ;;
         --batch) BATCH=$2; shift 2 ;;
+        --on-hand) ON_HAND=$2; shift 2 ;;
         --seed) SEED=$2; shift 2 ;;
         --cap-mib) CAP_MIB=$2; shift 2 ;;
         --arms) ARMS=$2; shift 2 ;;
@@ -59,7 +64,11 @@ done
 exec 9>"$LOCK"
 flock -w 7200 9 || die "another M1 run holds $LOCK after 2h; nothing was measured"
 
-mkdir -p "$WORKDIR" "$PAYLOADS"
+# Resolve the work directory against the caller's CWD once: the arm payloads `cd` into the harness,
+# so a relative path handed to them would silently land inside harness/ instead.
+mkdir -p "$WORKDIR"
+WORKDIR=$(cd "$WORKDIR" && pwd)
+mkdir -p "$PAYLOADS"
 
 # crates.io is unreachable from this box; the distro's aliyun mirror carries the sparse index and
 # the crate files, so the build is pinned to it by flags and touches no user or host config.
@@ -82,7 +91,8 @@ build_binaries() {
 prepare() {
     ( cd "$HARNESS" && uv run python -m flashdb_harness.baseline_0b prepare \
         --workdir "$WORKDIR" --seed "$SEED" --requests "$REQUESTS" --rate "$RATE" \
-        --customers "$CUSTOMERS" --skus "$SKUS" --locs "$LOCS" --batch "$BATCH" )
+        --customers "$CUSTOMERS" --skus "$SKUS" --locs "$LOCS" --batch "$BATCH" \
+        --on-hand "$ON_HAND" )
 }
 
 # Every arm runs inside its own capped scope. The payload is a file, not a quoted `bash -c`
