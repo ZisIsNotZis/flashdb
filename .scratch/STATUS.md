@@ -4,8 +4,11 @@ Current single source of truth for project state. Facts only: every number names
 History and process live in the tickets, not here.
 
 The remaining work is sequenced as milestones in [`docs/roadmap.md`](../docs/roadmap.md).
-M1 is delivered but its gate is CANNOT-VERIFY (T6 at >=10x unmeasured); the current milestone is M2
-(join-heavy workload descriptors, ticket 81).
+M1 is delivered but its gate is CANNOT-VERIFY (T6 at >=10x unmeasured). M2's analysis slice is
+delivered and merged, but its gate is UNMET (2/4): the >=10x and learned-vs-declared headroom
+measurements need three engine capabilities that do not exist (multi-row `$block.field` binding, a
+validator wider than `cust -> take`, aggregate-to-write). The author decision is M-B engine work vs
+an explicit waiver of the >=10x item. No later milestone is authorised until that is decided.
 
 ## 1. Bound revision and instance
 
