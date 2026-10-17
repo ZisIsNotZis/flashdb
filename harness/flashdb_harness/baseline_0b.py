@@ -30,11 +30,18 @@ What is reused, and why nothing here re-spells it
 
 The rule a rung is scored by (the ticket's, applied identically to every arm)
 -----------------------------------------------------------------------------
-A window is REJECTED when its per-request schedule-lag p99 exceeds `LAG_CEILING_US` (10,000 us,
-the pre-registration's 10 ms bound) or any request in it errored. A rung is SUSTAINED iff its
-achieved rate is within 5% of the offered rate (`cold_0b.SUSTAINED_TOLERANCE`) and zero windows
-were rejected. `summarize_curve` adds its `rate_exceeded` guard: an achieved rate above the offer
-is a measurement error, never a sustain.
+A window is REJECTED when
+  * its per-request schedule-lag p99 exceeds `LAG_CEILING_US` (10,000 us, the pre-registration's
+    10 ms bound), named `lag_ceiling`; or
+  * lag has GROWN for `LAG_GROWTH_WINDOWS` (3) consecutive windows -- a window counts toward the
+    growth streak when its p99 breached or when any of its requests lagged past the ceiling even
+    though the p99 did not -- named `lag_saturation`; or
+  * any request in it errored, named `errors`.
+The three flags are exactly `flashdb-load`'s (`late_growth_windows`/`saturated` and
+`reject_reason`), so the SQL arms and the flashdb arms are rejected by the same instrument. A rung
+is SUSTAINED iff its achieved rate is within 5% of the offered rate
+(`cold_0b.SUSTAINED_TOLERANCE`) and zero windows were rejected. `summarize_curve` adds its
+`rate_exceeded` guard: an achieved rate above the offer is a measurement error, never a sustain.
 
 Latency definitions, and why two are recorded
 ---------------------------------------------
@@ -52,9 +59,13 @@ Durability, one disclosed batch size
 Every arm commits one durable batch per group: sqlite `journal_mode=WAL, synchronous=FULL` and one
 COMMIT per group; postgres `fsync=on, synchronous_commit=on` (the disclosed `scripts/baseline-env.sh`
 config) and one COMMIT per group; flashdb `--group-requests B` (one WAL barrier per group, the
-driver acks after the barrier). At the offered rates this work package runs, a group is one
-request (the batch ceiling never binds) and the measured `mean_group_size` in the run record says
-so. `batch` is recorded on every arm so a later rung at a higher rate stays comparable.
+driver acks after the barrier). Each arm's settings are read BACK from the engine and recorded, not
+taken from the code that set them: sqlite's `journal_mode`/`synchronous` via `PRAGMA` after the bulk
+load (`SqliteArm.require_measured_durability`, because the seeding path runs journal-less and a
+`PRAGMA` that cannot be applied raises nothing), postgres's via the server's own `SHOW`. At the
+offered rates this work package runs, a group is one request (the batch ceiling never binds) and the
+measured `mean_group_size` in the run record says so. `batch` is recorded on every arm so a later
+rung at a higher rate stays comparable.
 
 Usage (driven by `scripts/m1-baseline-run.sh`; the three steps are separate so each arm can run
 inside its own memory-capped scope)::
@@ -77,6 +88,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -90,6 +102,10 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 # The pre-registration's schedule-lag bound; the same value `flashdb-load --lag-ceiling-us`
 # defaults to, and the one this harness passes to the driver explicitly.
 LAG_CEILING_US = 10_000
+# Consecutive windows whose lag grew before a rung is called saturated: `flashdb-load`'s
+# `late_growth_windows >= 3` (`engine/src/bin/flashdb-load.rs`). Named here because the SQL arms
+# must apply the same clause, not a weaker one.
+LAG_GROWTH_WINDOWS = 3
 DEFAULT_WINDOW_MS = 1_000
 # `cold_0b`'s shipped `--group-requests` cadence. Named once here so every arm states the batch it
 # actually ran with.
@@ -111,9 +127,19 @@ SEED_ENV = {"FLASHDB_SEED_CHECKPOINT_BYTES": str(8 << 20),
 # sqlite's page cache in KiB (`PRAGMA cache_size`, negative = KiB). sqlite's engine runs inside the
 # arm's own process, so the engine's cache is stated here and the process is capped in the runner.
 SQLITE_CACHE_KIB = 8_192
-# The line `scoped_command` appends: the engine cgroup's own `memory.peak`, read from inside it.
+# The `PRAGMA synchronous` value the measured path requires. That pragma's scale is its own
+# (0 OFF, 1 NORMAL, 2 FULL, 3 EXTRA) and is NOT the C API's `SQLITE_SYNC_*` flag constants.
+SQLITE_SYNCHRONOUS_FULL = 2
+# The line `scoped_command` prepends and appends: the engine cgroup's own `memory.current` at the
+# start of the invocation and its `memory.peak`, both read from inside it.
+SCOPE_START_PREFIX = "scope_memory_start_bytes="
 ENGINE_PEAK_PREFIX = "engine_memory_peak_bytes="
 SEED_PEAK_PREFIX = "seed_memory_peak_bytes="
+# How often the measured-phase sampler reads `memory.current` (see `MemoryPeakSampler`).
+MEMORY_SAMPLE_INTERVAL_S = 0.05
+# The cgroup a runner-invoked arm's engine lives in when the engine is NOT in the arm's own cgroup
+# (postgres: the server runs in its own scope and the client is outside it).
+ENGINE_CGROUP_ENV = "M1_ENGINE_CGROUP"
 # The seeded `Stock.on_hand` every cell starts at (uniform: `on_hand_jitter=0`), which is what makes
 # the oracle's `on_hand == initial - sum(delta)` check checkable without a second table.
 DEFAULT_ON_HAND = 1_000_000
@@ -411,7 +437,7 @@ class SqlArm:
 
 
 class SqlArmError(RuntimeError):
-    """A request the arm must refuse (the adapter refuses it too)."""
+    """A request the arm must refuse (the adapter refuses it too), or a setting it must have held."""
 
 
 def _chunks(rows, size: int):
@@ -452,6 +478,31 @@ class SqliteArm(SqlArm):
     def _set_measured_durability(self) -> None:
         for pragma in ("journal_mode=WAL", "synchronous=FULL"):
             self.cur.execute(f"PRAGMA {pragma}")
+
+    def observed_durability(self) -> dict:
+        """The connection's durability, read BACK from sqlite rather than assumed from the setter.
+
+        `PRAGMA journal_mode=WAL` that cannot be applied returns the old mode and raises nothing,
+        and the seeding path deliberately runs with `journal_mode=OFF, synchronous=OFF`, so the
+        measured path depends on this restore actually having taken effect.
+        """
+        self.cur.execute("PRAGMA journal_mode")
+        mode = str(self.cur.fetchone()[0]).lower()
+        self.cur.execute("PRAGMA synchronous")
+        sync = int(self.cur.fetchone()[0])
+        return {"journal_mode": mode, "synchronous": sync,
+                "synchronous_name": "FULL" if sync == SQLITE_SYNCHRONOUS_FULL else str(sync)}
+
+    def require_measured_durability(self) -> dict:
+        """Fail loudly unless the measured path ran under WAL + `synchronous=FULL`."""
+        observed = self.observed_durability()
+        if (observed["journal_mode"], observed["synchronous"]) != ("wal",
+                                                                  SQLITE_SYNCHRONOUS_FULL):
+            raise SqlArmError(
+                f"sqlite measured path is not WAL + synchronous=FULL: observed"
+                f" journal_mode={observed['journal_mode']}"
+                f" synchronous={observed['synchronous']}")
+        return observed
 
     def begin_bulk_load(self) -> None:
         # Setup only (no request is issued while these settings are in force): no rollback journal
@@ -557,11 +608,19 @@ def percentile_us(samples: list[float], q: float) -> int:
     return int(ordered[max(0, min(rank - 1, len(ordered) - 1))])
 
 
-def _reject_reason(lag_breached: bool, errored: bool) -> str | None:
-    """The window's rejection, spelled as `flashdb-load`'s `reject_reason` spells it."""
+def _reject_reason(lag_breached: bool, errored: bool, saturated: bool = False) -> str | None:
+    """The window's rejection, spelled as `flashdb-load`'s `reject_reason` spells it.
+
+    The driver names the service ceiling first, then the lag ceiling, then the growth rule (kept
+    distinct from a single ceiling breach) and the errors last
+    (`engine/src/bin/flashdb-load.rs` `reject_reason`). This harness passes no service ceiling, so
+    only the other three can fire, and they are spelled identically.
+    """
     parts = []
     if lag_breached:
         parts.append("lag_ceiling")
+    if saturated and not lag_breached:
+        parts.append("lag_saturation")
     if errored:
         parts.append("errors")
     return "+".join(parts) if parts else None
@@ -581,6 +640,10 @@ class WindowSamples:
         self.index = 0
         self.next_end_us = float(self.window_us)
         self.cum_completed = 0
+        # The lag-growth streak: consecutive windows in which lag grew (a breached p99, or any
+        # request past the ceiling). It is the driver's `late_growth_windows`, carried ACROSS
+        # windows, so `reset` must not clear it.
+        self.late_growth_windows = 0
         self.records: list[dict] = []
         self.reset(0.0)
 
@@ -613,10 +676,27 @@ class WindowSamples:
             self.works.append(work_us)
         self.min_lag_us = min([self.min_lag_us, *(int(x) for x in lag_us)])
 
+    def late_requests(self) -> int:
+        """Requests in this window whose schedule lag passed the ceiling (the driver's `window_late`)."""
+        return sum(1 for lag in self.lags if lag > self.lag_ceiling_us)
+
+    def advance_growth(self) -> None:
+        """Extend or reset the lag-growth streak with the window just closed.
+
+        `flashdb-load` does this once per emitted window, on `behind || window_late > 0`, and a
+        window with no requests at all resets the streak. Called by `flush`, which is the one place
+        a window is closed, so the streak can never be advanced twice for one window.
+        """
+        if percentile_us(self.lags, 0.99) > self.lag_ceiling_us or self.late_requests() > 0:
+            self.late_growth_windows += 1
+        else:
+            self.late_growth_windows = 0
+
     def snapshot(self, end_us: float, rate_fallback: float) -> dict:
         lag_p99 = percentile_us(self.lags, 0.99)
         lag_breached = lag_p99 > self.lag_ceiling_us
         errored = self.errors > 0
+        saturated = self.late_growth_windows >= LAG_GROWTH_WINDOWS
         return {
             "window": self.index,
             "rate_rps": self.rate or rate_fallback,
@@ -646,11 +726,18 @@ class WindowSamples:
             "service_ceiling_breached": False,
             "lag_ceiling_us": self.lag_ceiling_us,
             "lag_ceiling_breached": lag_breached,
-            "invalid": lag_breached or errored,
-            "reject_reason": _reject_reason(lag_breached, errored),
+            # The growth clause's own inputs, recorded so a reader (or a re-scoring pass) can see
+            # WHY a window was saturated instead of taking the verdict on trust. The driver emits
+            # neither, so `cold_0b.window_records` ignores them for its own windows.
+            "late_requests": self.late_requests(),
+            "late_growth_windows": self.late_growth_windows,
+            "saturated": saturated,
+            "invalid": lag_breached or errored or saturated,
+            "reject_reason": _reject_reason(lag_breached, errored, saturated),
         }
 
     def flush(self, end_us: float, rate_fallback: float) -> None:
+        self.advance_growth()
         self.records.append(self.snapshot(end_us, rate_fallback))
         self.index += 1
         self.reset(end_us)
@@ -682,15 +769,17 @@ def scoped_command(cmd: list[str], cap_mib: int, peak_prefix: str) -> list[str]:
 
     The measured memory budget is the STORAGE ENGINE's. `flashdb-load` is the engine's own driver,
     so it runs here, in its own scope, exactly as the published T1-T4 runs put `flashdb-load` under
-    the cap (`cold_0b`) while the Python harness that scores the windows stayed outside it. The
-    child appends the scope's `memory.peak` as its last line, read from inside the cgroup before it
-    exits, so the peak belongs to this invocation and to nothing else.
+    the cap (`cold_0b`) while the Python harness that scored the windows stayed outside it. The
+    child reports the scope's `memory.current` before the command runs and its `memory.peak` after,
+    both read from inside the cgroup, so the peak belongs to this invocation and to nothing else.
     """
     inner = " ".join(shlex.quote(part) for part in cmd)
+    cgroup = '$(grep "^0::" /proc/self/cgroup | cut -d: -f3)'
     script = (
+        f'cg="/sys/fs/cgroup{cgroup}"; '
+        f'echo "{SCOPE_START_PREFIX}$(cat $cg/memory.current 2>/dev/null || echo 0)"; '
         f"{inner}; rc=$?; "
-        'peak=$(cat /sys/fs/cgroup$(grep "^0::" /proc/self/cgroup | cut -d: -f3)/memory.peak'
-        ' 2>/dev/null || echo 0); '
+        f'peak=$(cat $cg/memory.peak 2>/dev/null || echo 0); '
         f'echo "{peak_prefix}$peak"; exit $rc'
     )
     return ["systemd-run", "--user", "--scope", "-q",
@@ -705,17 +794,81 @@ def _peak_from_log(lines: list[str], prefix: str) -> int | None:
     return None
 
 
-def cgroup_peak_bytes() -> int | None:
-    """The scope's `memory.peak`, read from inside the cgroup (None outside a scope)."""
+def cgroup_self_path() -> Path | None:
+    """This process's own cgroup v2 directory, or `None` outside cgroup v2."""
     try:
         for line in Path("/proc/self/cgroup").read_text().splitlines():
             if line.startswith("0::"):
-                peak = Path("/sys/fs/cgroup" + line[3:] + "/memory.peak")
-                if peak.exists():
-                    return int(peak.read_text())
+                return Path("/sys/fs/cgroup" + line[3:])
     except OSError:
         return None
     return None
+
+
+def cgroup_peak_bytes(cgroup: Path | None = None) -> int | None:
+    """A cgroup's `memory.peak` (default: this process's own; None when unreadable)."""
+    path = cgroup if cgroup is not None else cgroup_self_path()
+    if path is None:
+        return None
+    try:
+        return int((path / "memory.peak").read_text())
+    except (OSError, ValueError):
+        return None
+
+
+class MemoryPeakSampler:
+    """Sample a cgroup's `memory.current` across the MEASURED phase and report its maximum.
+
+    Why sampling rather than `memory.peak`: the arm's capped scope also holds the SEED (the runner
+    caps sqlite's whole arm step, and the postgres server scope holds the server across its bulk
+    load), and this kernel ignores a reset of `memory.peak` (the write is accepted and has no
+    effect), so a lifetime peak would report CONSTRUCTION memory as serving pressure. The maximum of
+    sampled `memory.current` from the start of the measured phase bounds the SERVING peak. It is a
+    sampled maximum, hence a lower bound on the kernel's true high-water mark, so the record carries
+    the method and the sample count instead of implying an exact peak.
+    """
+
+    def __init__(self, cgroup: Path | None, interval_s: float = MEMORY_SAMPLE_INTERVAL_S) -> None:
+        self.cgroup = cgroup
+        self.interval_s = interval_s
+        self.samples: list[int] = []
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def _read(self) -> int | None:
+        if self.cgroup is None:
+            return None
+        try:
+            return int((self.cgroup / "memory.current").read_text())
+        except (OSError, ValueError):
+            return None
+
+    def _poll(self) -> None:
+        while not self._stop.wait(self.interval_s):
+            value = self._read()
+            if value is not None:
+                self.samples.append(value)
+
+    def start(self) -> "MemoryPeakSampler":
+        value = self._read()
+        if value is not None:
+            self.samples.append(value)
+            self._thread = threading.Thread(target=self._poll, daemon=True)
+            self._thread.start()
+        return self
+
+    def stop(self) -> dict:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join()
+        if not self.samples:
+            return {"peak_bytes": None, "start_bytes": None, "samples": 0,
+                    "method": f"unavailable: {self.cgroup} has no readable memory.current",
+                    "scope": "measured phase"}
+        return {"peak_bytes": max(self.samples), "start_bytes": self.samples[0],
+                "samples": len(self.samples),
+                "method": f"sampled memory.current every {int(self.interval_s * 1000)} ms",
+                "scope": "measured phase"}
 
 
 def run_sql_arm(
@@ -724,6 +877,7 @@ def run_sql_arm(
     requests,
     batch: int = DEFAULT_BATCH,
     window_ms: int = DEFAULT_WINDOW_MS,
+    engine_cgroup: Path | None = None,
 ) -> dict:
     """Replay the trace against one SQL arm and return its run record.
 
@@ -731,7 +885,12 @@ def run_sql_arm(
     front of it, so a long trace costs no more memory than its batch. The loop is closed: a batch is
     executed and committed before the next one is dispatched, so a slow commit shows up as schedule
     lag on the next request rather than as hidden queueing.
+
+    `engine_cgroup` is the cgroup the ENGINE ran in: this process's own for sqlite (embedded), the
+    server's scope for postgres. Its `memory.current` is sampled across this measured phase only, so
+    the reported peak is serving pressure and never the bulk load that preceded it.
     """
+    sampler = MemoryPeakSampler(engine_cgroup).start()
     due, rates = build_schedule(manifest)
     total = len(due)
     stream = iter(requests)
@@ -768,6 +927,7 @@ def run_sql_arm(
         i = j
     end_us = now_us()
     windows.finish(end_us, rates[-1])
+    engine_memory = sampler.stop()
 
     lines = [json.dumps(r, sort_keys=True) for r in windows.records]
     parsed = window_records(lines, window_ms)
@@ -783,7 +943,7 @@ def run_sql_arm(
         "max_group_size": max_group,
         "elapsed_s": (end_us - due[0]) / 1e6,
         "counters": counters,
-        "cgroup_peak_bytes": cgroup_peak_bytes(),
+        "engine_memory": engine_memory,
         "windows": parsed,
         "curve": summarize_curve(parsed, None),
         "windows_jsonl": lines,
@@ -878,10 +1038,17 @@ def run_flashdb_arm(
                      "first_error": summary.get("first_error")},
         "summary": summary,
         "instance_bytes": _dir_bytes(instance),
+        "instance_files": _largest_files(instance),
         "engine_cap_mib": engine_cap_mib,
-        "seed_cap_mib": seed_cap_mib,
-        "seed_peak_bytes": seed_peak,
-        "cgroup_peak_bytes": engine_peak,
+        "engine_memory": {
+            "peak_bytes": engine_peak,
+            "start_bytes": _peak_from_log(lines, SCOPE_START_PREFIX),
+            "samples": None,
+            "method": "exact memory.peak of the flashdb-load invocation's own scope, read inside it",
+            "scope": "measured phase only: the instance is BUILT in a separate construction scope",
+        },
+        "construction_memory": {"cap_mib": seed_cap_mib, "peak_bytes": seed_peak},
+        "arm_scope_peak_bytes": None,
         "windows": windows,
         "curve": summarize_curve(windows, None),
         "windows_jsonl": [json.dumps(w, sort_keys=True) for w in windows],
@@ -914,11 +1081,31 @@ def _dir_bytes(path: Path) -> int:
     return sum(p.stat().st_size for p in path.rglob("*") if p.is_file())
 
 
+def _largest_files(path: Path, limit: int = 4) -> dict[str, int]:
+    """The instance's biggest files by name, so a footprint can be re-derived from the record.
+
+    The total alone cannot be audited: a 12x ratio is only meaningful when a reader can see how much
+    of it is dataset and how much is the live WAL, and the tiles themselves are git-ignored.
+    """
+    files = sorted((p for p in path.rglob("*") if p.is_file()),
+                   key=lambda p: p.stat().st_size, reverse=True)
+    return {p.name: p.stat().st_size for p in files[:limit]}
+
+
 def _db_bytes(path: Path) -> int:
     """sqlite's on-disk footprint: the database file plus its WAL and shared-memory sidecars."""
-    return sum(p.stat().st_size for p in
-               (path, path.with_suffix(path.suffix + "-wal"),
-                path.with_suffix(path.suffix + "-shm")) if p.exists())
+    return sum(_sqlite_files(path).values())
+
+
+def _sqlite_files(path: Path) -> dict[str, int]:
+    """`{"db": n, "wal": n, "shm": n}` for the sidecars that exist (a footprint breakdown)."""
+    out = {}
+    for name, candidate in (("db", path),
+                            ("wal", path.with_suffix(path.suffix + "-wal")),
+                            ("shm", path.with_suffix(path.suffix + "-shm"))):
+        if candidate.exists():
+            out[name] = candidate.stat().st_size
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -1212,15 +1399,20 @@ def render_scoreboard(records: list[dict], manifest: dict, spec: dict) -> str:
         SCOREBOARD_HEADER,
     ]
     lines += [scoreboard_row(record) for record in records]
-    lines += ["", "## Durability, oracle and footprint per arm", "",
-              "| arm | durability | oracle | cgroup peak MiB | mean group size |",
-              "|---|---|---|---|---|"]
+    lines += ["", "## Durability, oracle and memory per arm", "",
+              "| arm | durability | oracle | cap MiB | serving peak MiB | peak scope |"
+              " arm-scope peak MiB | mean group size |",
+              "|---|---|---|---|---|---|---|---|"]
     for record in records:
-        peak = record.get("cgroup_peak_bytes")
+        memory = record.get("engine_memory") or {}
+        peak = memory.get("peak_bytes")
         peak_col = f"{peak / (1 << 20):.1f}" if peak is not None else "not measured"
+        scope_peak = record.get("arm_scope_peak_bytes")
+        scope_col = f"{scope_peak / (1 << 20):.1f}" if scope_peak is not None else "-"
         lines.append(
             f"| {record['arm']} | {record['durability']} | {record['oracle']['status']} |"
-            f" {peak_col} | {record['mean_group_size']:.2f} |")
+            f" {record.get('engine_cap_mib')} | {peak_col} | {memory.get('scope', '-')} |"
+            f" {scope_col} | {record['mean_group_size']:.2f} |")
     return "\n".join(lines) + "\n"
 
 
@@ -1256,6 +1448,10 @@ def cmd_prepare(args: argparse.Namespace) -> int:
         "lag_ceiling_us": LAG_CEILING_US,
         "order_flow_requests": order_flows,
         "trace_sha256": manifest["trace_sha256"],
+        # The exact invocation that produced this work directory's trace/spec; the runner adds its
+        # own `runner` block (argv, caps, lock) after `prepare`, so a committed run names the
+        # command that made it instead of a plausible alternative.
+        "argv": [Path(sys.argv[0]).name, *sys.argv[1:]],
     })
     blocks = write_seed_trace(workdir / "seed.jsonl", manifest, args.on_hand)
     print(f"trace {workdir / 'trace.jsonl'}: requests={manifest['total_requests']}"
@@ -1301,16 +1497,26 @@ def cmd_arm(args: argparse.Namespace) -> int:
         seed_t0 = time.perf_counter()
         arm.seed(customers, stock)
         seed_s = time.perf_counter() - seed_t0
+        # Read the durability back BEFORE the measured phase: the bulk load ran under
+        # journal_mode=OFF / synchronous=OFF and a PRAGMA that cannot be applied fails silently.
+        observed_durability = arm.require_measured_durability()
         record = run_sql_arm(arm, manifest, iter_requests(trace), spec["batch"],
-                             spec["window_ms"])
+                             spec["window_ms"], engine_cgroup=cgroup_self_path())
         record["seed_s"] = seed_s
         record["sqlite_cache_kib"] = args.sqlite_cache_kib
+        record["durability_observed"] = observed_durability
+        record["engine_cap_mib"] = args.engine_cap_mib
+        record["arm_scope_peak_bytes"] = cgroup_peak_bytes()
+        record["arm_scope_peak_scope"] = ("this process's capped scope over the whole arm step"
+                                          " (bulk load + measured phase)")
+        record["sqlite_files"] = _sqlite_files(db)
         record["data_bytes"] = _db_bytes(db)
         add_verify_index(arm)
         record["oracle"] = oracle_sql(arm, manifest, record["counters"],
                                       spec["order_flow_requests"], spec["on_hand"])
     elif name == "postgres":
-        record = run_postgres_arm(name, manifest, spec, iter_requests(trace))
+        record = run_postgres_arm(name, manifest, spec, iter_requests(trace),
+                                  args.engine_cap_mib)
     else:
         raise SystemExit(f"unknown arm {name!r}; expected one of {FLASHDB_ARMS + SQL_ARMS}")
     record["trace_sha256"] = manifest["trace_sha256"]
@@ -1326,7 +1532,8 @@ def cmd_arm(args: argparse.Namespace) -> int:
           f" sustained={record['verdict']['sustained']}"
           f" highest={record['verdict']['highest_sustained_rps']:.0f} rps"
           f" rejected_windows={record['verdict']['rejected_windows']}"
-          f" cgroup_peak={record['cgroup_peak_bytes']}"
+          f" serving_peak={record['engine_memory']['peak_bytes']}"
+          f" cap_mib={record['engine_cap_mib']}"
           f" sha256={record['trace_sha256']}")
     return 0
 
@@ -1365,8 +1572,15 @@ def cmd_verify(args: argparse.Namespace) -> int:
     return 0
 
 
-def run_postgres_arm(name: str, manifest: dict, spec: dict, requests) -> dict:
-    """The postgres arm against the user-space cluster `scripts/baseline-env.sh` provides."""
+def run_postgres_arm(name: str, manifest: dict, spec: dict, requests,
+                     engine_cap_mib: int = ENGINE_CAP_MIB) -> dict:
+    """The postgres arm against the user-space cluster `scripts/baseline-env.sh` provides.
+
+    The engine here is the SERVER, in its own capped scope; this client is outside it. The runner
+    passes that scope's cgroup as `M1_ENGINE_CGROUP`, so the client can sample the SERVER's
+    `memory.current` across the measured phase instead of charging the instrument's memory to the
+    engine.
+    """
     import psycopg  # imported here: only this arm needs it, and only inside its capped scope
 
     def connect(dbname: str):
@@ -1386,14 +1600,18 @@ def run_postgres_arm(name: str, manifest: dict, spec: dict, requests) -> dict:
         seed_t0 = time.perf_counter()
         arm.seed(customers, stock)
         seed_s = time.perf_counter() - seed_t0
-        record = run_sql_arm(arm, manifest, requests, spec["batch"], spec["window_ms"])
+        engine_cgroup = Path(os.environ[ENGINE_CGROUP_ENV]) if os.environ.get(
+            ENGINE_CGROUP_ENV) else None
+        record = run_sql_arm(arm, manifest, requests, spec["batch"], spec["window_ms"],
+                             engine_cgroup=engine_cgroup)
         record["seed_s"] = seed_s
         record["durability"] = PostgresArm.durability
-        # The engine here is the SERVER, which runs in its own cgroup; this client cannot read that
-        # cgroup's peak, so the runner's payload patches this field from the server scope's own
-        # `memory.peak` after the arm -- and it stays null rather than publishing the instrument's.
-        record["cgroup_peak_bytes"] = None
-        record["engine_peak_source"] = "postgres server scope (patched by the runner payload)"
+        record["engine_cap_mib"] = engine_cap_mib
+        # The server scope's LIFETIME peak (bulk load + measured phase) is patched by the runner
+        # after this client step; it is an arm-scope number, never the serving peak.
+        record["arm_scope_peak_bytes"] = None
+        record["arm_scope_peak_scope"] = ("the postgres server scope's lifetime (bulk load +"
+                                          " measured phase); the client runs outside it")
         add_verify_index(arm)
         record["oracle"] = oracle_sql(arm, manifest, record["counters"],
                                       spec["order_flow_requests"], spec["on_hand"])

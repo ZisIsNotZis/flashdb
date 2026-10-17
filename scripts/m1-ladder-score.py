@@ -6,8 +6,10 @@ invented. The pre-registered conditions are quoted in the output so a reader can
 arithmetic against the pre-registration rather than against this script:
 
   T5  at the 1x rung, flashdb within 1.5x of the slower of sqlite/postgres; 2x is the fail line;
-  T6  at the highest common offered level, flashdb reaches >= 3x the best baseline's sustained
-      throughput under the same latency rule;
+  T6  at the highest common offered level, flashdb reaches >= 3x the best baseline's SUSTAINED
+      throughput under the same latency rule -- reported with both readings, the pre-registered one
+      at the top rung (evaluable only when a baseline sustained that rung) and the
+      sustained-vs-sustained one (highest sustained level per arm);
   T7  the declared arm alone already passes T5.
 
 The same latency rule is applied to every arm by `cold_0b.summarize_curve`, which scores each arm's
@@ -92,19 +94,25 @@ def load_rungs(root: Path) -> list[dict]:
                 "reject_reasons": curve.get("reject_reasons", {}),
                 "sustained": curve.get("sustained"),
                 "errors": sum(w.get("errors", 0) for w in []) or data["counters"].get("errors"),
-                "cgroup_peak_bytes": data.get("cgroup_peak_bytes"),
-                "engine_cap_mib": data.get("engine_cap_mib"),
-                "seed_peak_bytes": data.get("seed_peak_bytes"),
                 "data_bytes": data.get("data_bytes") or data.get("instance_bytes"),
+                "footprint_files": data.get("instance_files") or data.get("sqlite_files"),
                 "oracle": data["oracle"]["status"],
                 "oracle_checks": len(data["oracle"].get("checks", [])),
                 "mean_group_size": data.get("mean_group_size"),
                 "seed_s": data.get("seed_s"),
                 "oracle_s": data.get("oracle_s"),
                 "durability": data.get("durability"),
+                "durability_observed": data.get("durability_observed"),
                 "sqlite_cache_kib": data.get("sqlite_cache_kib"),
                 "postgres_settings": data.get("postgres_settings"),
-                "engine_peak_source": data.get("engine_peak_source"),
+                # Memory, kept in its two scopes: `engine_memory` is the SERVING peak measured over
+                # the measured phase, `construction_memory`/`arm_scope_peak_bytes` are the seeding
+                # and lifetime numbers. A seeding peak is never read as serving pressure.
+                "engine_cap_mib": data.get("engine_cap_mib"),
+                "engine_memory": data.get("engine_memory"),
+                "construction_memory": data.get("construction_memory"),
+                "arm_scope_peak_bytes": data.get("arm_scope_peak_bytes"),
+                "arm_scope_peak_scope": data.get("arm_scope_peak_scope"),
             }
         rungs.append({
             "offered_rps": offered,
@@ -118,9 +126,21 @@ def load_rungs(root: Path) -> list[dict]:
     return rungs
 
 
-def sustained_verdict(arm: dict) -> float:
-    """An arm's highest sustained offered level (0 when it sustained no level at all)."""
-    return arm["achieved_rps"] if arm.get("sustained") else 0.0
+def sustained_level(rungs: list[dict], arm: str) -> dict | None:
+    """An arm's HIGHEST SUSTAINED offered level, with the achieved rate it held there.
+
+    The replacement for the retired `sustained_verdict()` helper: a sustained reading is the highest
+    level the arm actually sustained under the rule, never the achieved rate at a higher rung it did
+    not sustain.
+    """
+    best = None
+    for rung in rungs:
+        value = rung["arms"].get(arm)
+        if not value or not value.get("sustained") or not value.get("achieved_rps"):
+            continue
+        if best is None or value["achieved_rps"] > best["achieved_rps"]:
+            best = {"offered_rps": rung["offered_rps"], "achieved_rps": value["achieved_rps"]}
+    return best
 
 
 def deficit(flashdb_rps: float, baseline_rps: float) -> float:
@@ -165,49 +185,127 @@ def t5(rung: dict) -> dict:
 
 
 def t6(rungs: list[dict]) -> dict:
-    """High-load superiority at the highest common offered level."""
+    """High-load superiority at the highest common offered level, sustained against sustained.
+
+    The pre-registered condition is ">= 3x the best baseline's SUSTAINED throughput under the same
+    latency rule" AT the highest common offered level. An achieved rate at a level the arm did not
+    sustain is not a sustained rate, so it can be neither the numerator nor the denominator of that
+    ratio. Two readings are therefore produced from the same records:
+
+    * `at_top_rung` -- the pre-registered comparison. It is evaluable only when a baseline SUSTAINED
+      the highest common offered level; otherwise the ratio has no denominator there, and the honest
+      answer is that it is not evaluable rather than a substitute number.
+    * `sustained_reading` -- each flashdb arm's highest SUSTAINED level (whichever offered level that
+      was) against the best baseline's highest sustained level. That reading crosses offered levels,
+      so it is labelled as such and never presented as the pre-registered comparison.
+    """
     common = [r for r in rungs if all(arm in r["arms"] for arm in ARMS)]
     if not common:
         return {"evaluable": False, "reason": "no rung ran every arm"}
     if len(common) < 2:
-        # T6 compares the highest common offered level with what a baseline sustained ELSEWHERE on the
-        # ladder; with one level it would compare a rung with itself and always read ~1.0x.
+        # T6 compares the highest common offered level with a sustained baseline reading; with one
+        # level it would compare a rung with itself and always read ~1.0x.
         return {"evaluable": False,
                 "reason": "a single offered level is not a ladder; T6 needs at least two levels"}
     top = common[-1]
-    best_baseline_level = 0.0
-    best_baseline_arm = None
-    for rung in common:
-        for arm in BASELINES:
-            value = rung["arms"][arm]
-            if value["sustained"] and value["achieved_rps"] > best_baseline_level:
-                best_baseline_level = value["achieved_rps"]
-                best_baseline_arm = (arm, rung["offered_rps"])
+    baselines_sustained = {arm: bool(top["arms"][arm]["sustained"]) for arm in BASELINES}
+    denominator = max((top["arms"][arm]["achieved_rps"] for arm in BASELINES
+                       if top["arms"][arm]["sustained"]), default=0.0)
     out = {
-        "evaluable": best_baseline_level > 0,
-        "highest_common_offered_rps": top["offered_rps"],
         "condition": f"at the highest common offered level ({top['offered_rps']:.0f} rps) flashdb"
-                     f" must reach >= {T6_MULTIPLE}x the best baseline's sustained throughput"
-                     " under the same latency rule",
-        "best_baseline_sustained": {"rps": best_baseline_level, "arm_rung": best_baseline_arm},
-        "arms": {},
+                     f" must reach >= {T6_MULTIPLE}x the best baseline's SUSTAINED throughput under"
+                     " the same latency rule",
+        "highest_common_offered_rps": top["offered_rps"],
+        "at_top_rung": {
+            "evaluable": denominator > 0,
+            "baselines_sustained": baselines_sustained,
+            "baseline_denominator_rps": denominator,
+            "arms": {arm: {"achieved_rps": top["arms"][arm]["achieved_rps"],
+                           "sustained": top["arms"][arm]["sustained"],
+                           "invalid_windows": top["arms"][arm]["invalid_windows"],
+                           "reject_reasons": top["arms"][arm]["reject_reasons"]}
+                     for arm in FLASHDB},
+        },
+        "sustained_reading": {"arms": {}, "crosses_offered_levels": True},
     }
-    if not out["evaluable"]:
-        out["reason"] = ("no baseline sustained any offered level under the rule, so the"
-                         " denominator does not exist")
-        return out
+    if denominator <= 0:
+        out["at_top_rung"]["reason"] = (
+            f"no baseline sustained {top['offered_rps']:.0f} rps under the rule"
+            f" ({baselines_sustained}), so the pre-registered ratio has no denominator at the"
+            " highest common offered level")
+        out["at_top_rung"]["multiple_of_best_baseline"] = None
+        out["at_top_rung"]["pass"] = None
+    else:
+        for value in out["at_top_rung"]["arms"].values():
+            multiple = value["achieved_rps"] / denominator
+            value["multiple_of_best_baseline"] = round(multiple, 3)
+            value["pass"] = bool(value["sustained"]) and multiple >= T6_MULTIPLE
+        out["at_top_rung"]["pass"] = all(v["pass"]
+                                         for v in out["at_top_rung"]["arms"].values())
+    best_baseline = None
+    for arm in BASELINES:
+        level = sustained_level(rungs, arm)
+        if level and (best_baseline is None
+                      or level["achieved_rps"] > best_baseline["achieved_rps"]):
+            best_baseline = {**level, "arm": arm}
+    out["sustained_reading"]["best_baseline"] = best_baseline
     for arm in FLASHDB:
-        value = top["arms"][arm]
-        multiple = (value["achieved_rps"] / best_baseline_level) if best_baseline_level else 0.0
-        out["arms"][arm] = {
-            "achieved_rps_at_top_rung": value["achieved_rps"],
-            "sustained_at_top_rung": value["sustained"],
-            "invalid_windows": value["invalid_windows"],
-            "reject_reasons": value["reject_reasons"],
+        level = sustained_level(rungs, arm)
+        if level is None or best_baseline is None:
+            out["sustained_reading"]["arms"][arm] = {
+                "highest_sustained": level,
+                "multiple_of_best_baseline": None,
+                "pass": False,
+                "reason": ("the arm sustained no offered level" if level is None
+                           else "no baseline sustained any offered level"),
+            }
+            continue
+        multiple = level["achieved_rps"] / best_baseline["achieved_rps"]
+        out["sustained_reading"]["arms"][arm] = {
+            "highest_sustained": level,
             "multiple_of_best_baseline": round(multiple, 3),
             "pass": multiple >= T6_MULTIPLE,
         }
+    out["evaluable"] = out["at_top_rung"]["evaluable"]
     return out
+
+
+def t6_verdict_row(t6: dict) -> dict:
+    """The merged report's one-line T6 verdict: both readings, never one without the other.
+
+    `at_top_rung` is the pre-registered comparison and says why it is or is not evaluable;
+    `sustained_vs_sustained` is the reading that uses sustained levels only.
+    """
+    top = t6.get("at_top_rung", {})
+    reading = t6.get("sustained_reading", {})
+    arms = top.get("arms", {})
+    return {
+        "condition": t6.get("condition"),
+        "highest_common_offered_rps": t6.get("highest_common_offered_rps"),
+        "evaluable": bool(t6.get("evaluable")),
+        "reason": top.get("reason") or t6.get("reason"),
+        "baselines_sustained": top.get("baselines_sustained"),
+        "baseline_denominator_rps": top.get("baseline_denominator_rps"),
+        "at_top_rung": {arm: {"sustained": v.get("sustained"),
+                              "achieved_rps": v.get("achieved_rps"),
+                              "invalid_windows": v.get("invalid_windows"),
+                              "reject_reasons": v.get("reject_reasons"),
+                              "multiple_of_best_baseline":
+                                  v.get("multiple_of_best_baseline"),
+                              "pass": v.get("pass")}
+                        for arm, v in arms.items()} if arms else
+                       {arm: {"multiple_of_best_baseline": v.get("multiple_of_best_baseline"),
+                              "pass": v.get("pass")} for arm, v in t6.get("arms", {}).items()},
+        "sustained_vs_sustained": {
+            "crosses_offered_levels": True,
+            "best_baseline": reading.get("best_baseline"),
+            "arms": {arm: {"highest_sustained": v.get("highest_sustained"),
+                           "multiple_of_best_baseline": v.get("multiple_of_best_baseline"),
+                           "pass": v.get("pass"),
+                           "reason": v.get("reason")}
+                     for arm, v in reading.get("arms", {}).items()},
+        },
+    }
 
 
 def main(argv: list[str]) -> int:
@@ -231,17 +329,7 @@ def main(argv: list[str]) -> int:
                       "t5": {arm: {"deficit_vs_slower_baseline": v["deficit_vs_slower_baseline"],
                                    "pass": v["pass"]}
                              for arm, v in run["t5"].get("arms", {}).items()},
-                      "t6": ({"evaluable": False, "reason": run["t6"].get("reason")}
-                             if not run["t6"].get("evaluable") else
-                             {"evaluable": True,
-                              "highest_common_offered_rps":
-                                  run["t6"]["highest_common_offered_rps"],
-                              "best_baseline_sustained_rps":
-                                  run["t6"]["best_baseline_sustained"]["rps"],
-                              "arms": {arm: {"multiple_of_best_baseline":
-                                                 v["multiple_of_best_baseline"],
-                                             "pass": v["pass"]}
-                                       for arm, v in run["t6"]["arms"].items()}}),
+                      "t6": t6_verdict_row(run["t6"]),
                       "t7": {"pass": run["t7"]["pass"],
                              "deficit_vs_slower_baseline":
                                  run["t7"]["deficit_vs_slower_baseline"]},

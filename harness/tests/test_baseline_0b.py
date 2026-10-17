@@ -2,12 +2,14 @@
 
 The scored properties are: one seed yields one trace (so every arm measures the same work), that
 trace is the adapter's dialect unchanged, the pacer's schedule is the offered rate accumulated as
-intervals, a window's lag/error rule rejects a rung, and the inventory oracle passes a committed
-trace and fails a corrupted one.
+intervals, a window's lag/CEILING/GROWTH/error rule rejects a rung exactly where `flashdb-load`
+rejects it, sqlite's measured durability is read back from sqlite rather than assumed from the
+setter, and both inventory oracles pass a consistent state and fail a corrupted one (the flashdb
+oracle through a synthetic replayed iterable, so it has a negative control without the binaries).
 
 What these tests do NOT cover: the postgres arm (needs the user-space cluster and psycopg) and the
-flashdb arm (needs the Rust binaries). Both are exercised by `scripts/m1-baseline-run.sh` and
-evidenced in the ticket's build record.
+flashdb arm's own run (needs the Rust binaries). Both are exercised by
+`scripts/m1-baseline-run.sh` and evidenced in the ticket's measurement record.
 """
 
 import hashlib
@@ -145,3 +147,197 @@ def test_oracle_fails_loudly_on_a_duplicate_order_number():
     arm.cur.execute("INSERT INTO backorder (order_no, sku, qty) VALUES (?, ?, ?)", taken)
     with pytest.raises(b0.OracleViolation, match="no_duplicate_order_no"):
         b0.oracle_sql(arm, manifest, counters, order_flows, TINY_ON_HAND)
+
+
+# ---------------------------------------------------------------------------
+# The latency rule is ONE rule: the SQL reducer must reject what `flashdb-load` rejects
+# ---------------------------------------------------------------------------
+# `engine/src/bin/flashdb-load.rs` grows `late_growth_windows` by one on `behind || window_late > 0`
+# and resets it otherwise, calls a window `saturated` at 3 consecutive such windows, and names
+# `lag_saturation` in `reject_reason` when the ceiling did not itself fire. `window_late` counts
+# requests whose (clamped) schedule lag passed the ceiling -- which is why a window can grow with its
+# p99 still under the ceiling: one late request in 201 (the real shape at rung 200, where
+# `windows-flashdb-declared.jsonl` window 17 has lag p99 7,400 us and `reject_reason:
+# lag_saturation`). This is the agreement the M1 acceptance asks for, against the same inputs.
+FLASHDB_LOAD_GROWTH_WINDOWS = 3
+
+
+def _flashdb_load_rejections(windows: list[tuple[int, int, int]]) -> list[str | None]:
+    """`flashdb-load`'s per-window verdict, transcribed from the driver's own source.
+
+    Each window is `(lag_p99_us, window_late, errors)`. The harness passes no service ceiling, so
+    the driver's service-ceiling branch cannot fire here and the transcription has none.
+    """
+    streak = 0
+    reasons: list[str | None] = []
+    for lag_p99, window_late, errors in windows:
+        behind = lag_p99 > b0.LAG_CEILING_US
+        streak = streak + 1 if (behind or window_late > 0) else 0
+        saturated = streak >= FLASHDB_LOAD_GROWTH_WINDOWS
+        parts = []
+        if behind:
+            parts.append("lag_ceiling")
+        if saturated and not behind:
+            parts.append("lag_saturation")
+        if errors:
+            parts.append("errors")
+        reasons.append("+".join(parts) or None)
+    return reasons
+
+
+def _reduce_lag_windows(late_per_window: list[int], requests_per_window: int = 201):
+    """Emit one window per entry with that many requests past the ceiling.
+
+    Returns the emitted window records (what `windows-<arm>.jsonl` holds, including the growth
+    clause's own inputs) and the scored records `summarize_curve` reads.
+    """
+    windows = b0.WindowSamples(window_ms=1000)
+    for index, late in enumerate(late_per_window):
+        lags = [200.0] * (requests_per_window - late) + [20_000.0] * late
+        windows.batch(lags, [lag + 500.0 for lag in lags], 500.0, 200.0, 0)
+        windows.flush((index + 1) * 1_000_000.0, 200.0)
+    emitted = list(windows.records)
+    lines = [json.dumps(record, sort_keys=True) for record in emitted]
+    return emitted, window_records(lines, 1000)
+
+
+def test_lag_growth_is_rejected_exactly_where_flashdb_load_rejects_it():
+    """3 consecutive windows that each grow (one late request, p99 under the ceiling) saturate."""
+    # The third growing window is the first the growth clause rejects; a clean one resets the streak.
+    emitted, records = _reduce_lag_windows([1, 1, 1, 0])
+    assert [record["late_requests"] for record in emitted] == [1, 1, 1, 0]
+    assert all(record["lag_ceiling_breached"] is False for record in emitted)
+    assert all(record["lag_p99_us"] <= b0.LAG_CEILING_US for record in emitted)
+    assert [record["invalid"] for record in emitted] == [False, False, True, False]
+    assert [record["reject_reason"] for record in emitted] == [None, None, "lag_saturation", None]
+
+    # Agreement with the driver's own rule on the same per-window inputs (the p99 it computed, the
+    # late count it counts, the errors it counts).
+    inputs = [(record["lag_p99_us"], record["late_requests"], record["errors"])
+              for record in emitted]
+    assert [record["reject_reason"] for record in emitted] == _flashdb_load_rejections(inputs)
+
+    curve = summarize_curve(records, None)
+    assert curve[0]["reject_reasons"] == {"lag_saturation": 1}
+    assert curve[0]["invalid_windows"] == 1
+    assert curve[0]["sustained"] is False
+
+
+def test_the_growth_streak_resets_on_a_clean_window():
+    """Two growing windows, one clean one, two growing ones: never three in a row, so no rejection."""
+    emitted, records = _reduce_lag_windows([1, 1, 0, 1, 1])
+    inputs = [(record["lag_p99_us"], record["late_requests"], record["errors"])
+              for record in emitted]
+    assert [record["reject_reason"] for record in emitted] == [None] * 5
+    assert [record["reject_reason"] for record in emitted] == _flashdb_load_rejections(inputs)
+    assert summarize_curve(records, None)[0]["sustained"] is True
+
+
+def test_a_clean_window_series_is_not_saturated():
+    """A control: the growth clause must not invent a rejection out of an undisturbed rung."""
+    emitted, records = _reduce_lag_windows([0, 0, 0, 0])
+    assert [record["reject_reason"] for record in emitted] == [None] * 4
+    assert [record["saturated"] for record in emitted] == [False] * 4
+    assert summarize_curve(records, None)[0]["sustained"] is True
+
+
+# ---------------------------------------------------------------------------
+# sqlite's durability is OBSERVED before the measured phase, not assumed from the setter
+# ---------------------------------------------------------------------------
+def test_sqlite_measured_durability_is_read_back(tmp_path):
+    arm = b0.sqlite_arm(tmp_path / "observed.db")
+    assert arm.require_measured_durability() == {
+        "journal_mode": "wal", "synchronous": b0.SQLITE_SYNCHRONOUS_FULL,
+        "synchronous_name": "FULL"}
+
+
+def test_sqlite_seed_restores_measured_durability(tmp_path):
+    """The bulk load runs with journal_mode=OFF -- the bulk load must hand back a WAL database."""
+    _emitted, manifest, _requests, _order_flows = tiny_trace()
+    arm = b0.sqlite_arm(tmp_path / "seeded.db")
+    customers, stock = b0.seed_docs(manifest, TINY_ON_HAND)
+    arm.seed(customers, stock)
+    observed = arm.require_measured_durability()
+    assert observed["journal_mode"] == "wal"
+    assert observed["synchronous"] == b0.SQLITE_SYNCHRONOUS_FULL
+
+
+def test_sqlite_durability_read_back_catches_a_failed_restore(tmp_path):
+    """A `PRAGMA journal_mode=WAL` that did not take effect must stop the run, not pass silently."""
+    arm = b0.sqlite_arm(tmp_path / "regressed.db")
+    arm.cur.execute("PRAGMA journal_mode=OFF")
+    arm.cur.execute("PRAGMA synchronous=OFF")
+    with pytest.raises(b0.SqlArmError, match="not WAL"):
+        arm.require_measured_durability()
+
+
+# ---------------------------------------------------------------------------
+# The flashdb oracle's negative controls: a synthetic replayed iterable that must FAIL
+# ---------------------------------------------------------------------------
+FLASHDB_ORACLE_MANIFEST = {"n_sku": 1, "n_loc": 1, "n_customers": 1}
+FLASHDB_ORACLE_INITIAL = 1000
+
+
+def _replayed(*, cell_on_hand=995, movement_delta=-5, movement_order_no="O000001",
+              scan_order_no="O000001", movement_cell=("S000001", "L000"),
+              probe_cell=("S000001", "L000"), drop_cell=False, customer_row=True):
+    """One replayed probe stream in `flashdb-replay`'s dialect: movements, customer, cell.
+
+    `blocks.q` is `request.BlockResult` in Rust (`status`, `csn`, `row`), which is the shape
+    `oracle_flashdb` reads.
+    """
+    movements = {"q": {"status": "ok", "csn": 3, "row": [
+        {"movement_no": "M000001", "sku": movement_cell[0], "loc": movement_cell[1],
+         "delta": movement_delta, "order_no": movement_order_no}]}}
+    customer = {"q": {"status": "ok", "csn": 3,
+                      "row": {"email": "a@b"} if customer_row else None}}
+    cell = {"q": {"status": "ok", "csn": 3, "row": None if drop_cell else {
+        "sku": probe_cell[0], "loc": probe_cell[1], "on_hand": cell_on_hand}}}
+    for target, blocks in (
+        (f"probe-movements:{scan_order_no}", movements),
+        ("probe-customer:a@b", customer),
+        (f"probe-stock:{probe_cell[0]}:{probe_cell[1]}", cell),
+    ):
+        yield {"id": target, "blocks": blocks}
+
+
+def _flashdb_oracle_counters(**overrides) -> dict:
+    counters = {"take": 1, "errors": 0, "first_error": None}
+    counters.update(overrides)
+    return counters
+
+
+def test_flashdb_oracle_passes_a_consistent_synthetic_replay():
+    result = b0.oracle_flashdb(_replayed(), FLASHDB_ORACLE_MANIFEST,
+                               _flashdb_oracle_counters(), FLASHDB_ORACLE_INITIAL)
+    assert result["status"] == "PASS"
+    assert all(check["ok"] for check in result["checks"])
+    assert {check["check"] for check in result["checks"]} >= {
+        "on_hand_matches_movements", "every_movement_cell_probed", "cell_count"}
+
+
+@pytest.mark.parametrize("corruption, expected", [
+    ({"cell_on_hand": 994}, "on_hand_matches_movements"),
+    ({"cell_on_hand": -1, "movement_delta": -1001}, "on_hand_non_negative"),
+    ({"drop_cell": True}, "stock_cell_present"),
+    ({"movement_order_no": "O000002"}, "movement_order_no_matches"),
+    # The movement books its delta against a cell that is never read back: the arithmetic per cell
+    # still holds for the cell that IS read, so only the fold can catch it.
+    ({"movement_cell": ("S000002", "L000"), "cell_on_hand": 1000}, "every_movement_cell_probed"),
+    ({"customer_row": False}, "customer_present"),
+])
+def test_flashdb_oracle_negative_controls_fail_loudly(corruption, expected):
+    """Every corruption of the synthetic replay must raise, naming the check that caught it."""
+    with pytest.raises(b0.OracleViolation, match=expected):
+        b0.oracle_flashdb(_replayed(**corruption), FLASHDB_ORACLE_MANIFEST,
+                          _flashdb_oracle_counters(), FLASHDB_ORACLE_INITIAL)
+
+
+@pytest.mark.parametrize("overrides, expected", [
+    ({"errors": 1, "first_error": "req-7: boom"}, "no_request_errors"),
+    ({"take": 2}, "movement_count_is_committed_takes"),
+])
+def test_flashdb_oracle_negative_controls_on_the_committed_counters(overrides, expected):
+    with pytest.raises(b0.OracleViolation, match=expected):
+        b0.oracle_flashdb(_replayed(), FLASHDB_ORACLE_MANIFEST,
+                          _flashdb_oracle_counters(**overrides), FLASHDB_ORACLE_INITIAL)

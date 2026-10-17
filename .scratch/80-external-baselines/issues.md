@@ -112,8 +112,11 @@ cd harness && uv run --with pytest pytest -q
 ```
 
 Each arm therefore ran as `systemd-run --user --scope -p MemoryMax=128M -p MemorySwapMax=0 bash
-<payload>` under `flock /tmp/m1-measure.lock`, one at a time. The postgres arm starts and stops its
-server **inside** the same scope, so the cap covers the server as well as the client.
+<payload>` under `flock /tmp/m1-measure.lock`, one at a time. The postgres arm starts the server in
+its own named scope (`m1-pg-postgres-<pid>.scope`) and runs the CLIENT outside it: the cap covers
+the SERVER (the engine) only, not the client. This corrects an earlier sentence in this record that
+said the scope covered "the server as well as the client"; it never did, and the measurement
+record's per-arm memory table below already states the boundary correctly.
 
 ### The frozen trace
 
