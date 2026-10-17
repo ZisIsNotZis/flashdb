@@ -1,0 +1,12 @@
+# Regenerable state of an M1 run: everything here comes back from `spec.json` + the seed, so it is
+# not committed. The evidence IS committed: manifest.json (the trace sha256), spec.json (the
+# parameters, batch and on_hand), windows-<arm>.jsonl, run-<arm>.json and scoreboard.{md,json}.
+trace.jsonl
+seed.jsonl
+instance-*/
+probe-*.jsonl
+probe-*.log
+driver-*.log
+*.db
+*.db-wal
+*.db-shm
