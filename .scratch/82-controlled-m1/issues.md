@@ -1,5 +1,18 @@
 # 82 - controlled T5/T6/T7 verdict on the low-spec laptop (M1, decidable)
 
+## Status: measured, decidable
+
+5 paired blocks x rungs 50/100/200 x 3 arms at 12.546x of the 128 MiB cap, on AC / power profile
+`performance` / EPP `performance` / 3.6 GHz, with a 0.2 ms machine lag floor and a 9.8 ms device
+fsync floor, **re-measured after the two fairness fixes the f70d91c report named** (sqlite's WAL
+checkpoint policy stated and probed; both SQL pacers made open loop like `flashdb-load`). All three
+arms sustained 50 and 100 rps in 5/5 blocks; at 200 rps sqlite and postgres sustained 5/5 and
+flashdb 3/5. **T5 PASS** (deficit 1.001 against 1.5x; flashdb sustained 50 rps in 5/5 blocks),
+**T7 PASS**, **T6 FAIL** (1.00x against the pre-registered 3x, a ratio bounded at 1.0526 for any pair
+of arms at one offered level). The verdicts, the per-metric defects and their smallest fixes are in
+`report.md`; the machine-readable document is `report.json`; the raw evidence is `runs/`, including
+the checkpoint probe under `runs/probe-checkpoint/`.
+
 ## Objective
 
 Make T5/T6/T7 decidable at the pre-registered >=10x regime on the available machine (Intel i5-8350U,

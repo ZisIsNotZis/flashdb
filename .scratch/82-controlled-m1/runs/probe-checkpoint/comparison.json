@@ -1,0 +1,73 @@
+{
+  "design": "the same restored snapshot, trace, pacer, cap and machine state at one rung; only PRAGMA wal_autocheckpoint differs (1000 = sqlite's compiled default, 0 = deferred to the post-run wal_checkpoint(TRUNCATE))",
+  "question": "does sqlite's WAL auto-checkpoint, not the rung, produce the ~254 ms stall the f70d91c controlled arm-runs show?",
+  "rows": {
+    "0": {
+      "achieved_rps": 50.0,
+      "errors": 0,
+      "group_elapsed_us": 0,
+      "lag_p50_us": 2.0,
+      "lag_p99_us": 2354,
+      "max_group_size": 1,
+      "mean_group_size": 1.0,
+      "pacing": "open loop: dispatch on the due schedule, one worker executes and commits each group and acks on completion (flashdb-load's shape)",
+      "reject_reasons": {},
+      "rejected_windows": 0,
+      "service_p50_us": 3498.5,
+      "service_p99_us": 20503,
+      "sustained": true,
+      "wal": {
+        "autocheckpoint_pages": 0,
+        "checkpoint": {
+          "at": "after the measured phase, before the oracle",
+          "pragma": "wal_checkpoint(TRUNCATE)",
+          "result": [
+            0,
+            0,
+            0
+          ]
+        },
+        "data_bytes_after_checkpoint": 542052352,
+        "files_after_checkpoint": {
+          "db": 541986816,
+          "shm": 65536,
+          "wal": 0
+        },
+        "journal_size_limit": -1,
+        "wal_bytes_after_run": 17744872
+      },
+      "wal_autocheckpoint_pages": 0,
+      "work_dir": "autocheckpoint-0"
+    },
+    "1000": {
+      "achieved_rps": 50.0,
+      "errors": 0,
+      "group_elapsed_us": 0,
+      "lag_p50_us": 2.0,
+      "lag_p99_us": 1206,
+      "max_group_size": 13,
+      "mean_group_size": 1.012,
+      "pacing": "open loop: dispatch on the due schedule, one worker executes and commits each group and acks on completion (flashdb-load's shape)",
+      "reject_reasons": {},
+      "rejected_windows": 0,
+      "service_p50_us": 1385.5,
+      "service_p99_us": 272442,
+      "sustained": true,
+      "wal": {
+        "autocheckpoint_pages": 1000,
+        "checkpoint": null,
+        "data_bytes_after_checkpoint": 546147856,
+        "files_after_checkpoint": {
+          "db": 541986816,
+          "shm": 32768,
+          "wal": 4128272
+        },
+        "journal_size_limit": -1,
+        "wal_bytes_after_run": 4128272
+      },
+      "wal_autocheckpoint_pages": 1000,
+      "work_dir": "autocheckpoint-1000"
+    }
+  },
+  "schema": "flashdb.m1.sqlite-checkpoint-probe.v1"
+}

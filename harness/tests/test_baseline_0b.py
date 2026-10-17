@@ -15,6 +15,7 @@ flashdb arm's own run (needs the Rust binaries). Both are exercised by
 import hashlib
 import json
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -242,13 +243,148 @@ def test_a_clean_window_series_is_not_saturated():
 
 
 # ---------------------------------------------------------------------------
+# The pacer's two shapes: closed loop (the device floor) and open loop (the SQL arms, flashdb-load's)
+# ---------------------------------------------------------------------------
+OPEN_LOOP_RATE = 100          # 10 ms between requests
+OPEN_LOOP_COMMIT_S = 0.03     # three times the inter-arrival time: the commit cannot keep up
+
+
+def _slow_executor(commit_s, calls):
+    """An `execute_batch` that records the group it was handed and then pays a slow commit."""
+    def execute_batch(payloads):
+        calls.append([payload["id"] for payload in payloads])
+        time.sleep(commit_s)
+        return {"take": len(payloads), "backorder": 0, "miss": 0, "errors": 0, "first_error": None}
+    return execute_batch
+
+
+def _paced(count: int):
+    return ({"id": index} for index in range(count))
+
+
+def test_open_loop_pacer_does_not_charge_dispatch_for_the_commit():
+    """The fairness fix: an open-loop client is scored on its SCHEDULE, not on its own commit.
+
+    A 30 ms commit carrying a 10 ms schedule cannot keep up either way -- `batch=2` caps the batch
+    at two requests per commit while three arrive -- and the difference is where the cost lands.
+    Closed loop (the floor's shape) it lands in schedule lag; open loop (the SQL arms', and
+    flashdb-load's) the dispatch keeps to the schedule and the cost lands in the per-request
+    service latency the report reads beside the rule.
+    """
+    manifest = {"segments": [{"offered_rate": OPEN_LOOP_RATE, "count": 40}], "total_requests": 40}
+    due, rates = b0.build_schedule(manifest)
+    closed_calls, open_calls = [], []
+    closed = b0.run_paced_loop(due, rates, _paced(40), 2, 200,
+                               _slow_executor(OPEN_LOOP_COMMIT_S, closed_calls))
+    opened = b0.run_paced_loop(due, rates, _paced(40), 2, 200,
+                               _slow_executor(OPEN_LOOP_COMMIT_S, open_calls), open_loop=True)
+
+    assert closed["curve"][0]["lag_p99_us"] > 100_000   # dispatch queued behind the commit
+    assert opened["curve"][0]["lag_p99_us"] < 50_000    # dispatch stayed on the schedule
+    assert opened["curve"][0]["p99_us"] >= 25_000       # the commit's cost did not vanish, it moved
+    assert opened["max_group_size"] <= 2
+    for paced in (closed, opened):
+        assert paced["requests_run"] == 40
+        assert paced["counters"] == {b0.TAKE: 40, b0.BACKORDER: 0, b0.MISS: 0, "errors": 0,
+                                     "first_error": None}
+    assert [i for call in open_calls for i in call] == list(range(40))
+
+
+def test_open_loop_pacer_commits_one_group_of_the_requests_already_ready():
+    """One durable commit per group, the same `batch` cap, and no group held open to fill."""
+    manifest = {"segments": [{"offered_rate": 50, "count": 60}], "total_requests": 60}
+    due, rates = b0.build_schedule(manifest)
+    calls = []
+    paced = b0.run_paced_loop(due, rates, _paced(60), 8, 200, _slow_executor(0.05, calls),
+                              open_loop=True)
+    # Every request executed exactly once, in schedule order: a group is a prefix of the ready queue.
+    assert [i for call in calls for i in call] == list(range(60))
+    assert paced["groups"] == len(calls)          # one durable commit per group
+    assert paced["requests_run"] == sum(len(call) for call in calls)
+    assert 1 < paced["max_group_size"] <= 8        # ready requests batched, never past the cap
+    assert paced["mean_group_size"] == paced["requests_run"] / paced["groups"]
+
+
+def test_run_sql_arm_records_the_pacing_it_ran(tmp_path):
+    """The run record must state the client shape, because the lag rule reads differently in each."""
+    _emitted, manifest, requests, _order_flows = tiny_trace()
+    open_arm = b0.sqlite_arm(tmp_path / "open.db")
+    open_arm.seed(*b0.seed_docs(manifest, TINY_ON_HAND))
+    opened = b0.run_sql_arm(open_arm, manifest, iter(requests), open_loop=True)
+    assert opened["pacing"].startswith("open loop")
+    assert opened["counters"]["errors"] == 0
+    assert opened["requests_run"] == len(requests)
+
+    closed_arm = b0.sqlite_arm(tmp_path / "closed.db")
+    closed_arm.seed(*b0.seed_docs(manifest, TINY_ON_HAND))
+    closed = b0.run_sql_arm(closed_arm, manifest, iter(requests), open_loop=False)
+    assert closed["pacing"].startswith("closed loop")
+    assert closed["requests_run"] == len(requests)
+
+
+# ---------------------------------------------------------------------------
 # sqlite's durability is OBSERVED before the measured phase, not assumed from the setter
 # ---------------------------------------------------------------------------
 def test_sqlite_measured_durability_is_read_back(tmp_path):
     arm = b0.sqlite_arm(tmp_path / "observed.db")
     assert arm.require_measured_durability() == {
         "journal_mode": "wal", "synchronous": b0.SQLITE_SYNCHRONOUS_FULL,
-        "synchronous_name": "FULL"}
+        "synchronous_name": "FULL", "wal_autocheckpoint_pages": 0, "journal_size_limit": -1}
+
+
+def test_sqlite_wal_autocheckpoint_is_stated_read_back_and_checked(tmp_path):
+    """The WAL policy is a statement the run makes, so the read-back must hold it, not sqlite's."""
+    stated = b0.sqlite_arm(tmp_path / "stated.db", wal_autocheckpoint=4000)
+    assert stated.require_measured_durability()["wal_autocheckpoint_pages"] == 4000
+    # A connection whose policy drifted from the stated one must stop the run, not pass silently.
+    stated.wal_autocheckpoint = 1000
+    with pytest.raises(b0.SqlArmError, match="wal_autocheckpoint"):
+        stated.require_measured_durability()
+
+
+def test_the_deferred_checkpoint_is_recorded_and_truncates_the_wal(tmp_path):
+    """`wal_autocheckpoint=0` defers sqlite's checkpoint out of the measured phase, and it is run
+    and recorded after it, so the WAL bytes the run deferred and the write-back are both visible."""
+    db = tmp_path / "deferred.db"
+    arm = b0.sqlite_arm(db, wal_autocheckpoint=0)
+    arm.cur.execute("CREATE TABLE probe (value INTEGER)")
+    for value in range(200):
+        arm.cur.execute("BEGIN IMMEDIATE")
+        arm.cur.execute("INSERT INTO probe (value) VALUES (?)", (value,))
+        arm.cur.execute("COMMIT")
+    record = b0.sqlite_wal_record(arm, db)
+    assert record["autocheckpoint_pages"] == 0
+    assert record["wal_bytes_after_run"] > 0
+    assert record["checkpoint"]["pragma"] == "wal_checkpoint(TRUNCATE)"
+    assert record["files_after_checkpoint"].get("wal", 0) == 0
+    assert record["data_bytes_after_checkpoint"] >= 200 * 8
+    # A successful truncating checkpoint reports (0, 0, 0) on this build, so the frames it moved are
+    # named by the PASSIVE row recorded beside it -- the TRUNCATE row alone evidences nothing.
+    busy, frames_in_wal, frames_moved = record["passive_checkpoint"]["result"]
+    assert busy == 0
+    assert frames_in_wal > 0
+    assert frames_moved == frames_in_wal
+
+
+def test_the_deferred_write_back_is_refused_when_the_frames_were_not_moved():
+    """Negative control: a deferred write-back the record cannot evidence must stop the run.
+
+    The committed ticket-82 records show `wal_bytes_after_run` in the tens of MB beside a
+    `wal_checkpoint(TRUNCATE)` row of `(0, 0, 0)`, which on this sqlite build is exactly what a
+    SUCCESSFUL truncating checkpoint returns -- and also what an already-empty WAL returns. The
+    verdict on the write-back therefore rests on the PASSIVE row, and these cases are the ones it
+    must refuse.
+    """
+    unmoved = {"pragma": "wal_checkpoint(PASSIVE)", "result": [0, 0, 0]}
+    with pytest.raises(b0.SqlArmError, match="did not move every WAL frame"):
+        b0._require_deferred_write_back(17_703_672, unmoved, {"db": 1, "wal": 0})
+    partially = {"pragma": "wal_checkpoint(PASSIVE)", "result": [0, 4_321, 4_000]}
+    with pytest.raises(b0.SqlArmError, match="did not move every WAL frame"):
+        b0._require_deferred_write_back(17_703_672, partially, {"db": 1, "wal": 0})
+    with pytest.raises(b0.SqlArmError, match="left a WAL"):
+        b0._require_deferred_write_back(0, unmoved, {"db": 1, "wal": 512})
+    # An empty WAL is a state the record CAN describe: nothing was deferred, nothing had to move.
+    b0._require_deferred_write_back(0, unmoved, {"db": 1})
 
 
 def test_sqlite_seed_restores_measured_durability(tmp_path):
@@ -341,3 +477,126 @@ def test_flashdb_oracle_negative_controls_on_the_committed_counters(overrides, e
     with pytest.raises(b0.OracleViolation, match=expected):
         b0.oracle_flashdb(_replayed(), FLASHDB_ORACLE_MANIFEST,
                           _flashdb_oracle_counters(**overrides), FLASHDB_ORACLE_INITIAL)
+
+
+# ---------------------------------------------------------------------------
+# Ticket 82's controlled protocol: the pre-load snapshot, the device floor, the machine state and
+# the scorer's arithmetic. Each test binds one thing the controlled run's evidence depends on.
+# ---------------------------------------------------------------------------
+def test_instance_snapshot_round_trip_is_byte_identical_and_detects_a_changed_snapshot(tmp_path):
+    """A restore succeeds only on the bytes the snapshot recorded (ticket 82's stop condition)."""
+    live_root = tmp_path / "live"
+    instance = live_root / "instance-flashdb-declared"
+    instance.mkdir(parents=True)
+    (instance / "manifest").write_bytes(b"manifest-bytes")
+    (instance / "tile-1.tile").write_bytes(b"tile-bytes")
+    snapshot_dir = tmp_path / "snapshot"
+    snap = b0.snapshot_instance("flashdb-declared", tmp_path, snapshot_dir, live_root)
+    digest, total, files = b0.tree_sha256(instance)
+    assert (snap["sha256"], snap["bytes"], snap["files"]) == (digest, total, files)
+
+    # Serving the trace mutates the live instance; a restore has to put the seeded bytes back.
+    (instance / "tile-1.tile").write_bytes(b"changed by the measured load")
+    (instance / "wal").write_bytes(b"new file")
+    state = b0.restore_instance("flashdb-declared", tmp_path, snapshot_dir, live_root)
+    assert state["verified"] is True
+    assert b0.tree_sha256(instance)[0] == digest
+    assert not (instance / "wal").exists()
+
+    # The snapshot is the reference, so a snapshot whose bytes changed must stop the run instead of
+    # quietly measuring a different state.
+    (snapshot_dir / "flashdb-declared" / "tile-1.tile").write_bytes(b"tampered")
+    with pytest.raises(SystemExit, match="does NOT reproduce the seeded state"):
+        b0.restore_instance("flashdb-declared", tmp_path, snapshot_dir, live_root)
+
+
+def test_sqlite_snapshot_is_a_single_file_and_restores(tmp_path):
+    """sqlite's instance is one file; its `-wal`/`-shm` sidecars are not part of the snapshot."""
+    db = b0.instance_path("sqlite", tmp_path, tmp_path / "live")
+    db.parent.mkdir(parents=True)
+    db.write_bytes(b"SQLite format 3\x00" + b"x" * 100)
+    (Path(f"{db}-wal")).write_bytes(b"wal")
+    snap = b0.snapshot_instance("sqlite", tmp_path, tmp_path / "snapshot", tmp_path / "live")
+    assert snap["files"] == 1
+    b0.restore_instance("sqlite", tmp_path, tmp_path / "snapshot", tmp_path / "live")
+    assert db.read_bytes().startswith(b"SQLite format 3")
+    assert not Path(f"{db}-wal").exists()
+
+
+def test_instance_path_names_the_instance_of_each_arm(tmp_path):
+    live = tmp_path / "live"
+    assert b0.instance_path("flashdb-declared", tmp_path, live) == live / "instance-flashdb-declared"
+    assert b0.instance_path("sqlite", tmp_path, live) == live / "sqlite.db"
+    assert b0.instance_path("sqlite", tmp_path) == tmp_path / "sqlite.db"
+    assert b0.instance_path("postgres", tmp_path, live).name == "data"
+
+
+def test_prepare_reuses_the_frozen_seed_trace_by_link_and_records_its_digest(tmp_path):
+    """Every rung and block of a controlled run must be seeded from one frozen dataset."""
+    frozen = tmp_path / "frozen-seed.jsonl"
+    frozen.write_text('{"block":"seed-00000000","docs":[]}\n', encoding="utf-8")
+    manifest = {"n_customers": 1, "n_sku": 1, "n_loc": 1, "seed": 1}
+    record = b0.prepare_seed_trace(tmp_path / "seed.jsonl", manifest, str(frozen))
+    assert record["method"] == "hard link"
+    assert record["sha256"] == b0.file_sha256(frozen)
+    assert b0.file_sha256(tmp_path / "seed.jsonl") == record["sha256"]
+    assert (tmp_path / "seed.jsonl").read_text() == frozen.read_text()
+
+    regenerated = b0.prepare_seed_trace(tmp_path / "seed.jsonl", manifest, None)
+    assert regenerated["method"] == "generate"
+    assert regenerated["bytes"] > 0
+
+
+def test_device_floor_runs_the_arms_pacer_with_no_engine(tmp_path):
+    """The floor is measured by the same pacer and window rule as the arms, with no engine."""
+    manifest = {"segments": [{"offered_rate": 100, "count": 40}], "total_requests": 40}
+    due, rates = b0.build_schedule(manifest)
+    for bench in ("idle", "fsync"):
+        paced = b0.run_floor_bench(bench, due, rates, b0.DEFAULT_BATCH, 200, tmp_path / f"{bench}.dat")
+        assert paced["requests_run"] == 40
+        assert paced["counters"]["errors"] == 0
+        row = paced["curve"][0]
+        assert row["offered_rps"] == 100
+        assert row["windows"] >= 1
+        # The fsync bench pays a durable commit per request, so its service latency is the device's.
+        if bench == "fsync":
+            assert row["p99_us"] >= row["lag_p99_us"] >= 0
+            assert (tmp_path / "fsync.dat").stat().st_size == 40 * len(
+                json.dumps({"bench": "fsync", "record": "x" * 256}).encode())
+        else:
+            assert row["p99_us"] >= 0
+
+
+def test_machine_state_records_the_fields_the_lag_rule_depends_on():
+    state = b0.machine_state()
+    for key in ("ac_online", "power_profile", "governor", "epp", "scaling_cur_freq_khz",
+                "loadavg", "nproc", "top_cpu", "concurrent_work"):
+        assert key in state
+    # The governor NAME is not the frequency state on this platform, so the state carries the EPP
+    # hint and the effective frequency beside it rather than relying on that one word.
+    assert isinstance(state["epp"], list) and state["epp"]
+    assert isinstance(state["scaling_cur_freq_khz"], list) and state["scaling_cur_freq_khz"]
+    assert state["governor"] is not None
+    assert not state["concurrent_work"], state["concurrent_work"]
+
+
+def test_the_arm_step_passes_every_keyword_its_arm_builders_accept():
+    """`cmd_arm`'s calls and the arm builders' signatures must agree.
+
+    This is a structural check because the failure it catches is structural: the postgres arm step
+    was written to pass `verify`/`restored`/`database` while `run_postgres_arm` accepted neither
+    some of them, and the TypeError surfaced only after a 7-minute seed and a 2.2 GB restore, halfway
+    through the first measured block. The keyword sets are asserted here instead.
+    """
+    import inspect
+
+    for function, required in (
+        (b0.run_postgres_arm, {"restored", "database", "verify", "engine_cap_mib"}),
+        (b0.run_flashdb_load, {"engine_cap_mib", "instance_root", "batch", "window_ms"}),
+        (b0.run_flashdb_arm, {"engine_cap_mib", "seed_cap_mib"}),
+        (b0.seed_flashdb_instance, {"seed_cap_mib", "instance_root"}),
+        (b0.seed_sqlite_instance, {"instance_root", "cache_kib"}),
+    ):
+        params = set(inspect.signature(function).parameters)
+        missing = required - params
+        assert not missing, f"{function.__name__} does not accept {sorted(missing)}"

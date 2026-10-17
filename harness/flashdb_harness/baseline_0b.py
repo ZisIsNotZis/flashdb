@@ -26,7 +26,10 @@ What is reused, and why nothing here re-spells it
 * The pacer contract: requests become READY at their cumulative scheduled due time; a batch is
   formed only from requests already ready, capped at `batch`, and is never held open to fill. That
   is `flashdb-load`'s arrivals model (`ready_group`), and it is why a rung's achieved rate is
-  bounded by its offered rate.
+  bounded by its offered rate. The SQL arms dispatch on that schedule and let a worker execute and
+  commit the group (`run_paced_loop(open_loop=True)`), exactly as `flashdb-load`'s dispatcher does
+  not wait for its barrier; only the device floor keeps the closed-loop shape, where the next
+  group waits for the previous commit.
 
 The rule a rung is scored by (the ticket's, applied identically to every arm)
 -----------------------------------------------------------------------------
@@ -78,6 +81,7 @@ inside its own memory-capped scope)::
 from __future__ import annotations
 
 import argparse
+import datetime
 import hashlib
 import json
 import math
@@ -130,6 +134,17 @@ SQLITE_CACHE_KIB = 8_192
 # The `PRAGMA synchronous` value the measured path requires. That pragma's scale is its own
 # (0 OFF, 1 NORMAL, 2 FULL, 3 EXTRA) and is NOT the C API's `SQLITE_SYNC_*` flag constants.
 SQLITE_SYNCHRONOUS_FULL = 2
+# sqlite's WAL auto-checkpoint, in pages, STATED and recorded per run instead of left to sqlite's
+# compiled default (1000 pages ~ 4 MiB). 0 defers the checkpoint out of the measured phase: the
+# automatic checkpoint runs on the committing thread, and against the 10x instance (542 MB) the
+# write-back blocks that thread for ~254 ms, which is what the f70d91c arm-runs show as a lag p99 of
+# 254 ms at every crossing with a 3 ms IQR. The deferred checkpoint is run once, after the measured
+# phase, by `sqlite_wal_record` (`PRAGMA wal_checkpoint(TRUNCATE)`, whose result is recorded beside
+# the `PASSIVE` row that names the frames it moved), and the run record states the policy, the WAL
+# bytes it deferred and both checkpoint rows. A probe with 1000 pages against 0 is
+# committed beside ticket 82's report (`runs/probe-checkpoint/`): the 254 ms stall follows the
+# setting, not the rung.
+SQLITE_WAL_AUTOCHECKPOINT_PAGES = 0
 # The line `scoped_command` prepends and appends: the engine cgroup's own `memory.current` at the
 # start of the invocation and its `memory.peak`, both read from inside it.
 SCOPE_START_PREFIX = "scope_memory_start_bytes="
@@ -145,6 +160,21 @@ ENGINE_CGROUP_ENV = "M1_ENGINE_CGROUP"
 DEFAULT_ON_HAND = 1_000_000
 
 SPEC_SCHEMA = "flashdb.baseline.run-spec.v1"
+# The pristine pre-load instance (ticket 82's controlled protocol): the dataset is built ONCE per
+# arm, copied aside, and copied back before every measured arm-run, so an arm-run measures the
+# SERVING path only. Refusing to re-seed inside the loop is what makes a 20 s run cost 20 s.
+SNAPSHOT_SCHEMA = "flashdb.baseline.instance-snapshot.v1"
+# The device floor's record: how much schedule lag and durable-commit latency this machine shows
+# with NO engine in the path, measured with the arms' own pacer and window rule.
+FLOOR_SCHEMA = "flashdb.baseline.device-floor.v1"
+# The one database the postgres arm seeds and measures when the instance is restored from a
+# snapshot: a fixed name is what lets the pre-load state be a filesystem copy of the whole cluster
+# instead of a per-run `CREATE DATABASE` plus an 11-minute bulk load.
+POSTGRES_DATABASE = "m1-controlled"
+# What must NOT be running while an arm is measured (ticket 82: "no subagents, builds, or seed
+# jobs during the measured phase"). The desktop applications are allowed; the measured run is
+# paired within one machine state, so a steady desktop load is a controlled condition.
+CONCURRENT_WORK_PATTERNS = ("cargo", "rustc", "flashdb-scale", "seed-inventory", "baseline_0b")
 
 # flashdb arms and the policy each runs. M1 wires both names to the same declared-default wiring;
 # `flashdb-learned` exists as a separate arm name so the scoreboard's shape is stable when a
@@ -256,6 +286,135 @@ def file_sha256(path: Path) -> str:
         for chunk in iter(lambda: fh.read(1 << 20), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def tree_sha256(root: Path) -> tuple[str, int, int]:
+    """`(sha256, bytes, files)` over a directory tree: every relative path, size and byte.
+
+    A restored instance is compared against its snapshot by this digest. Copying 1.7 GB back only
+    proves a copy ran; the digest is what shows the bytes are the SEEDED ones, which is ticket 82's
+    stop condition ("a snapshot restore cannot reproduce the seeded state").
+    """
+    digest = hashlib.sha256()
+    total = 0
+    files = 0
+    for path in sorted(p for p in root.rglob("*") if p.is_file()):
+        size = path.stat().st_size
+        digest.update(f"{path.relative_to(root).as_posix()}\0{size}\0".encode())
+        with open(path, "rb") as fh:
+            for chunk in iter(lambda: fh.read(1 << 20), b""):
+                digest.update(chunk)
+        total += size
+        files += 1
+    return digest.hexdigest(), total, files
+
+
+# ---------------------------------------------------------------------------
+# The pre-load instance: build once, snapshot, restore before every arm-run
+# ---------------------------------------------------------------------------
+def postgres_data_dir() -> Path:
+    """The cluster's data directory: the postgres arm's INSTANCE (the engine's whole state)."""
+    return Path(os.environ.get("M1_PG_ROOT", "/var/tmp/m1-pg")) / "data"
+
+
+def instance_path(name: str, workdir: Path, instance_root: Path | None = None) -> Path:
+    """The live (mutable) pre-load instance of one arm.
+
+    `instance_root` lets the controlled protocol keep ONE live instance per arm across many work
+    directories: a snapshot is restored into it before every run, so the rung a run belongs to
+    decides the work directory its records land in, never which bytes the engine read.
+    """
+    root = Path(instance_root) if instance_root else workdir
+    if name in FLASHDB_ARMS:
+        return root / f"instance-{name}"
+    if name == "sqlite":
+        return root / "sqlite.db"
+    if name == "postgres":
+        return postgres_data_dir()
+    raise SystemExit(f"unknown arm {name!r}; expected one of {FLASHDB_ARMS + SQL_ARMS}")
+
+
+def _remove(path: Path) -> None:
+    if path.is_dir():
+        shutil.rmtree(path)
+    elif path.exists():
+        path.unlink()
+
+
+def snapshot_instance(name: str, workdir: Path, snapshot_dir: Path,
+                      instance_root: Path | None = None) -> dict:
+    """Copy the live pre-load instance aside and record the digest that identifies it."""
+    live = instance_path(name, workdir, instance_root)
+    if not live.exists():
+        raise SystemExit(f"no live instance at {live}; run the instance build step first")
+    snapshot_dir.mkdir(parents=True, exist_ok=True)
+    target = snapshot_dir / (f"{name}.db" if live.is_file() else name)
+    _remove(target)
+    started = time.perf_counter()
+    if live.is_dir():
+        shutil.copytree(live, target, symlinks=True)
+        digest, total, files = tree_sha256(target)
+    else:
+        shutil.copy2(live, target)
+        digest, total, files = file_sha256(target), target.stat().st_size, 1
+    record = {
+        "schema": SNAPSHOT_SCHEMA,
+        "arm": name,
+        "live_path": str(live),
+        "snapshot_path": str(target),
+        "sha256": digest,
+        "bytes": total,
+        "files": files,
+        "snapshot_s": round(time.perf_counter() - started, 3),
+        "at": datetime.datetime.now().isoformat(timespec="seconds"),
+        "source": "the pre-load state built by `build-instance` (seeded; no request served)",
+    }
+    _write_json(snapshot_dir / f"{name}.json", record)
+    print(f"snapshot {name}: {total} bytes, {files} files, sha256={digest}")
+    return record
+
+
+def restore_instance(name: str, workdir: Path, snapshot_dir: Path,
+                     instance_root: Path | None = None) -> dict:
+    """Put the snapshot back as the live instance and FAIL LOUDLY unless its digest matches."""
+    meta_path = snapshot_dir / f"{name}.json"
+    if not meta_path.exists():
+        raise SystemExit(f"no snapshot for {name} at {meta_path}; run the snapshot step first")
+    meta = _read_json(meta_path)
+    live = instance_path(name, workdir, instance_root)
+    source = Path(meta["snapshot_path"])
+    if not source.exists():
+        raise SystemExit(f"snapshot file {source} recorded by {meta_path} is missing")
+    started = time.perf_counter()
+    _remove(live)
+    for sidecar in (Path(f"{live}-wal"), Path(f"{live}-shm")):
+        sidecar.unlink(missing_ok=True)
+    if source.is_dir():
+        shutil.copytree(source, live, symlinks=True)
+        digest, total, files = tree_sha256(live)
+    else:
+        shutil.copy2(source, live)
+        digest, total, files = file_sha256(live), live.stat().st_size, 1
+    if digest != meta["sha256"]:
+        raise SystemExit(
+            f"restore of {name} does NOT reproduce the seeded state: {live} digests to {digest}"
+            f" but the snapshot is {meta['sha256']}; stopping instead of measuring something else")
+    state = {
+        "arm": name,
+        "from": str(source),
+        "to": str(live),
+        "sha256": digest,
+        "snapshot_sha256": meta["sha256"],
+        "verified": True,
+        "bytes": total,
+        "files": files,
+        "restore_s": round(time.perf_counter() - started, 3),
+        "at": datetime.datetime.now().isoformat(timespec="seconds"),
+    }
+    # The arm step quotes this record instead of re-describing the restore: the bytes it measured
+    # are the bytes this digest covers.
+    _write_json((Path(instance_root) if instance_root else workdir) / f"restore-{name}.json", state)
+    return state
 
 
 # ---------------------------------------------------------------------------
@@ -458,11 +617,13 @@ class SqliteArm(SqlArm):
     int_type = "INTEGER"
     durability = "sqlite WAL + synchronous=FULL, one COMMIT per batch"
 
-    def __init__(self, conn: sqlite3.Connection) -> None:
+    def __init__(self, conn: sqlite3.Connection,
+                 wal_autocheckpoint: int = SQLITE_WAL_AUTOCHECKPOINT_PAGES) -> None:
         # Autocommit at the Python level: the transaction is explicit, so a batch's boundaries are
         # the pacer's and not sqlite3's implicit ones.
         conn.isolation_level = None
         super().__init__(conn)
+        self.wal_autocheckpoint = int(wal_autocheckpoint)
         self._set_measured_durability()
 
     def set_engine_memory(self, cache_kib: int) -> None:
@@ -476,25 +637,37 @@ class SqliteArm(SqlArm):
         self.cur.execute(f"PRAGMA cache_size = -{cache_kib}")
 
     def _set_measured_durability(self) -> None:
-        for pragma in ("journal_mode=WAL", "synchronous=FULL"):
+        for pragma in ("journal_mode=WAL", "synchronous=FULL",
+                       f"wal_autocheckpoint={self.wal_autocheckpoint}"):
             self.cur.execute(f"PRAGMA {pragma}")
 
     def observed_durability(self) -> dict:
-        """The connection's durability, read BACK from sqlite rather than assumed from the setter.
+        """The connection's durability and WAL policy, read BACK from sqlite rather than assumed.
 
         `PRAGMA journal_mode=WAL` that cannot be applied returns the old mode and raises nothing,
         and the seeding path deliberately runs with `journal_mode=OFF, synchronous=OFF`, so the
-        measured path depends on this restore actually having taken effect.
+        measured path depends on this restore actually having taken effect. The WAL
+        auto-checkpoint is read back for the same reason: it decides whether the measured phase
+        pays sqlite's checkpoint stall, so leaving it an unstated default would hide a parameter
+        from the record. `journal_size_limit` is sqlite's own cap (or -1) and is recorded so the
+        WAL cannot grow past a bound no reader was told about.
         """
         self.cur.execute("PRAGMA journal_mode")
         mode = str(self.cur.fetchone()[0]).lower()
         self.cur.execute("PRAGMA synchronous")
         sync = int(self.cur.fetchone()[0])
+        self.cur.execute("PRAGMA wal_autocheckpoint")
+        autocheckpoint = int(self.cur.fetchone()[0])
+        self.cur.execute("PRAGMA journal_size_limit")
+        journal_size_limit = int(self.cur.fetchone()[0])
         return {"journal_mode": mode, "synchronous": sync,
-                "synchronous_name": "FULL" if sync == SQLITE_SYNCHRONOUS_FULL else str(sync)}
+                "synchronous_name": "FULL" if sync == SQLITE_SYNCHRONOUS_FULL else str(sync),
+                "wal_autocheckpoint_pages": autocheckpoint,
+                "journal_size_limit": journal_size_limit}
 
     def require_measured_durability(self) -> dict:
-        """Fail loudly unless the measured path ran under WAL + `synchronous=FULL`."""
+        """Fail loudly unless the measured path ran under WAL + `synchronous=FULL` + the stated
+        auto-checkpoint, so a parameter the report cites is the one the engine held."""
         observed = self.observed_durability()
         if (observed["journal_mode"], observed["synchronous"]) != ("wal",
                                                                   SQLITE_SYNCHRONOUS_FULL):
@@ -502,6 +675,11 @@ class SqliteArm(SqlArm):
                 f"sqlite measured path is not WAL + synchronous=FULL: observed"
                 f" journal_mode={observed['journal_mode']}"
                 f" synchronous={observed['synchronous']}")
+        if observed["wal_autocheckpoint_pages"] != self.wal_autocheckpoint:
+            raise SqlArmError(
+                f"sqlite measured path is not on the stated wal_autocheckpoint="
+                f"{self.wal_autocheckpoint}: observed"
+                f" {observed['wal_autocheckpoint_pages']}")
         return observed
 
     def begin_bulk_load(self) -> None:
@@ -565,12 +743,88 @@ def add_verify_index(arm: SqlArm) -> None:
     arm.commit()
 
 
-def sqlite_arm(path: str | Path = ":memory:", cache_kib: int = SQLITE_CACHE_KIB) -> SqliteArm:
-    """A sqlite arm on `path` (`:memory:` by default), schema created, page cache stated."""
-    arm = SqliteArm(sqlite3.connect(str(path)))
+def sqlite_arm(path: str | Path = ":memory:", cache_kib: int = SQLITE_CACHE_KIB,
+               create_schema: bool = True,
+               wal_autocheckpoint: int = SQLITE_WAL_AUTOCHECKPOINT_PAGES) -> SqliteArm:
+    """A sqlite arm on `path` (`:memory:` by default), page cache stated, schema created.
+
+    `create_schema=False` opens an instance that ALREADY has the schema: a restored snapshot. The
+    schema belongs to the pre-load state, so re-creating it there would be a setup step inside the
+    measurement loop (and would fail loudly, which is how this was found).
+
+    The connection accepts the arm's commit worker on another thread (`check_same_thread=False`):
+    the open-loop pacer executes and commits one group at a time from ONE worker thread, and the
+    read-back, the oracle and the checkpoint run on this thread after that worker has joined.
+    """
+    arm = SqliteArm(sqlite3.connect(str(path), check_same_thread=False), wal_autocheckpoint)
     arm.set_engine_memory(cache_kib)
-    arm.create_schema()
+    if create_schema:
+        arm.create_schema()
     return arm
+
+
+def sqlite_wal_record(arm: SqliteArm, db: Path) -> dict:
+    """Record the WAL policy and, when the automatic checkpoint is deferred, run it here.
+
+    Called after the measured phase and before the oracle: with `wal_autocheckpoint=0` the WAL keeps
+    every frame the run wrote, so the state the run measured is exactly the state the checkpoint
+    then writes back. The checkpoint is the maintenance sqlite would otherwise have paid on its
+    committing thread, so it is recorded (WAL bytes, result, files) rather than done silently.
+
+    The `TRUNCATE` row alone cannot evidence the move: on this build a successful truncating
+    checkpoint reports `(0, 0, 0)` because it reads the state AFTER the truncation, and an
+    already-empty WAL reports the same tuple. The deferred frames are therefore named first by a
+    `PASSIVE` checkpoint, whose `(busy, frames_in_wal, frames_moved)` is recorded beside the
+    `TRUNCATE` row, and the run stops unless that row shows every frame moved and the `TRUNCATE`
+    left no WAL behind.
+    """
+    observed = arm.observed_durability()
+    before = _sqlite_files(db)
+    passive = None
+    checkpoint = None
+    if observed["wal_autocheckpoint_pages"] == 0:
+        arm.cur.execute("PRAGMA wal_checkpoint(PASSIVE)")
+        row = arm.cur.fetchone() or ()
+        passive = {"pragma": "wal_checkpoint(PASSIVE)",
+                   "result": [int(value) for value in row] if row else None,
+                   "at": "after the measured phase, before the TRUNCATE checkpoint"}
+        arm.cur.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        row = arm.cur.fetchone() or ()
+        checkpoint = {"pragma": "wal_checkpoint(TRUNCATE)",
+                      "result": [int(value) for value in row] if row else None,
+                      "at": "after the measured phase, before the oracle"}
+    after = _sqlite_files(db)
+    if checkpoint is not None:
+        _require_deferred_write_back(before.get("wal", 0), passive, after)
+    return {"autocheckpoint_pages": observed["wal_autocheckpoint_pages"],
+            "journal_size_limit": observed["journal_size_limit"],
+            "wal_bytes_after_run": before.get("wal", 0),
+            "passive_checkpoint": passive,
+            "checkpoint": checkpoint,
+            "files_after_checkpoint": after,
+            "data_bytes_after_checkpoint": _db_bytes(db)}
+
+
+def _require_deferred_write_back(wal_bytes_after_run: int, passive: dict,
+                                files_after: dict) -> None:
+    """Stop unless the deferred frames provably moved from the WAL into the database.
+
+    `wal_bytes_after_run` says the WAL still held those bytes at the end of the measured phase. The
+    `PASSIVE` row must then name those frames and move all of them into the database with `busy = 0`
+    (this process is the only connection, so no reader can block a checkpoint), and the `TRUNCATE`
+    must leave no WAL file. Anything else is a state the record cannot describe, and a record that
+    cannot describe the write-back must not be written.
+    """
+    busy, frames_in_wal, frames_moved = (list(passive["result"] or ()) + [0, 0, 0])[:3]
+    if wal_bytes_after_run > 0 and (busy or frames_in_wal == 0 or frames_moved != frames_in_wal):
+        raise SqlArmError(
+            f"the deferred checkpoint did not move every WAL frame: wal_bytes_after_run="
+            f"{wal_bytes_after_run} but wal_checkpoint(PASSIVE) reported (busy, frames_in_wal,"
+            f" frames_moved) = ({busy}, {frames_in_wal}, {frames_moved})")
+    if files_after.get("wal", 0):
+        raise SqlArmError(
+            f"wal_checkpoint(TRUNCATE) left a WAL of {files_after['wal']} bytes; the record cannot"
+            f" claim the deferred write-back happened")
 
 
 # ---------------------------------------------------------------------------
@@ -871,27 +1125,59 @@ class MemoryPeakSampler:
                 "scope": "measured phase"}
 
 
-def run_sql_arm(
-    arm: SqlArm,
-    manifest: dict,
+def run_paced_loop(
+    due: list[float],
+    rates: list[float],
     requests,
-    batch: int = DEFAULT_BATCH,
-    window_ms: int = DEFAULT_WINDOW_MS,
-    engine_cgroup: Path | None = None,
+    batch: int,
+    window_ms: int,
+    execute_batch,
+    open_loop: bool = False,
 ) -> dict:
-    """Replay the trace against one SQL arm and return its run record.
+    """The ONE pacer: replay `due`/`rates` through `execute_batch`, one window sample per second.
 
-    `requests` is an ITERABLE of parsed requests, not a list: the pacer pulls only the batch in
-    front of it, so a long trace costs no more memory than its batch. The loop is closed: a batch is
-    executed and committed before the next one is dispatched, so a slow commit shows up as schedule
-    lag on the next request rather than as hidden queueing.
+    `due[i]` is request `i`'s ready instant (microseconds from the start), `requests` yields the
+    payloads in the same order, and `execute_batch(list_of_payloads)` returns the per-batch counters
+    (`take`/`backorder`/`miss`/`errors`/`first_error`).
 
-    `engine_cgroup` is the cgroup the ENGINE ran in: this process's own for sqlite (embedded), the
-    server's scope for postgres. Its `memory.current` is sampled across this measured phase only, so
-    the reported peak is serving pressure and never the bulk load that preceded it.
+    `open_loop` selects which side of the commit the DISPATCH waits on, and nothing else:
+
+    * `False` (closed loop, the device floor's shape): a group is executed and committed before the
+      next one is dispatched, so a slow commit shows up as schedule lag on the next request.
+    * `True` (open loop, `flashdb-load`'s shape and the SQL arms'): the pacer dispatches a request
+      at its due instant into a ready queue and a worker executes and commits the group, acking on
+      completion. The durable commit no longer holds the next dispatch back, so the schedule-lag
+      rule scores the pacer's own wakeup for both engines and an engine's stall is scored where
+      `flashdb-load` puts it, in the per-request service latency. A group is formed from the
+      requests already ready when the worker picks them up, capped at `batch` and never held open
+      to fill; one durable commit per group and the same `batch` cap in both shapes.
+
+    `run_sql_arm` and the device floor both call this, so the machine's floor and the arms are
+    measured by ONE pacer instead of two implementations that could drift apart.
     """
-    sampler = MemoryPeakSampler(engine_cgroup).start()
-    due, rates = build_schedule(manifest)
+    if open_loop:
+        counters, windows, groups, max_group, end_us = _open_loop_replay(
+            due, rates, requests, batch, window_ms, execute_batch)
+    else:
+        counters, windows, groups, max_group, end_us = _closed_loop_replay(
+            due, rates, requests, batch, window_ms, execute_batch)
+    lines = [json.dumps(r, sort_keys=True) for r in windows.records]
+    parsed = window_records(lines, window_ms)
+    return {
+        "requests_run": len(due),
+        "groups": groups,
+        "mean_group_size": len(due) / groups if groups else 0.0,
+        "max_group_size": max_group,
+        "elapsed_s": (end_us - due[0]) / 1e6,
+        "counters": counters,
+        "windows": parsed,
+        "curve": summarize_curve(parsed, None),
+        "windows_jsonl": lines,
+    }
+
+
+def _closed_loop_replay(due, rates, requests, batch, window_ms, execute_batch):
+    """Dispatch the next group only after the previous one's commit returned (the floor's shape)."""
     total = len(due)
     stream = iter(requests)
     windows = WindowSamples(window_ms)
@@ -913,7 +1199,7 @@ def run_sql_arm(
             pending.append(next(stream))
         j = i + len(pending)
         start = now_us()
-        state = arm.execute_batch(pending)
+        state = execute_batch(pending)
         done = now_us()
         groups += 1
         max_group = max(max_group, j - i)
@@ -922,32 +1208,122 @@ def run_sql_arm(
         if counters["first_error"] is None:
             counters["first_error"] = state["first_error"]
         windows.batch([start - due[k] for k in range(i, j)],
-                      [done - due[k] for k in range(i, j)],
-                      done - start, rates[i], state["errors"])
+                      [done - due[k] for k in range(i, j)], done - start, rates[i], state["errors"])
         i = j
     end_us = now_us()
     windows.finish(end_us, rates[-1])
-    engine_memory = sampler.stop()
+    return counters, windows, groups, max_group, end_us
 
-    lines = [json.dumps(r, sort_keys=True) for r in windows.records]
-    parsed = window_records(lines, window_ms)
+
+def _open_loop_replay(due, rates, requests, batch, window_ms, execute_batch):
+    """Dispatch on the due schedule, execute and commit in a worker, ack on completion.
+
+    The pacer thread does only what `flashdb-load`'s dispatcher does: wait for the due instant and
+    hand the request over. The worker owns the connection, takes the requests already ready (at
+    most `batch`), executes and commits them as ONE durable group, and stamps their completion. The
+    lock covers bookkeeping only, never `execute_batch`, so a running commit cannot delay dispatch.
+    """
+    total = len(due)
+    stream = iter(requests)
+    windows = WindowSamples(window_ms)
+    counters = {TAKE: 0, BACKORDER: 0, MISS: 0, "errors": 0, "first_error": None}
+    stats = {"groups": 0, "max_group": 0}
+    t0 = time.perf_counter_ns()
+
+    def now_us() -> float:
+        return (time.perf_counter_ns() - t0) / 1000.0
+
+    condition = threading.Condition()
+    ready: list[tuple[int, float, dict]] = []  # (request index, dispatch us, payload)
+    dispatched_all = False
+
+    def worker() -> None:
+        while True:
+            with condition:
+                while not ready and not dispatched_all:
+                    condition.wait(0.05)
+                if not ready:
+                    return  # every request dispatched and every group acked
+                pending = ready[:batch]
+                del ready[:len(pending)]
+            start = now_us()
+            outcome = execute_batch([payload for _, _, payload in pending])
+            done = now_us()
+            with condition:
+                windows.flush_through(done, rates[pending[0][0]])
+                windows.batch([dispatched - due[index] for index, dispatched, _ in pending],
+                              [done - due[index] for index, _, _ in pending],
+                              done - start, rates[pending[0][0]], outcome["errors"])
+                for key in (TAKE, BACKORDER, MISS, "errors"):
+                    counters[key] += outcome[key]
+                if counters["first_error"] is None:
+                    counters["first_error"] = outcome["first_error"]
+                stats["groups"] += 1
+                stats["max_group"] = max(stats["max_group"], len(pending))
+
+    thread = threading.Thread(target=worker, name="m1-commit-worker", daemon=True)
+    thread.start()
+    try:
+        for index in range(total):
+            _wait_until(t0, due[index])
+            now = now_us()
+            payload = next(stream)
+            with condition:
+                windows.flush_through(now, rates[index])
+                ready.append((index, now, payload))
+                condition.notify()
+    finally:
+        with condition:
+            dispatched_all = True
+            condition.notify_all()
+        thread.join()
+    end_us = now_us()
+    windows.finish(end_us, rates[-1])
+    return counters, windows, stats["groups"], stats["max_group"], end_us
+
+
+def run_sql_arm(
+    arm: SqlArm,
+    manifest: dict,
+    requests,
+    batch: int = DEFAULT_BATCH,
+    window_ms: int = DEFAULT_WINDOW_MS,
+    engine_cgroup: Path | None = None,
+    open_loop: bool = True,
+) -> dict:
+    """Replay the trace against one SQL arm and return its run record.
+
+    `requests` is an ITERABLE of parsed requests, not a list: the pacer pulls only the batch in
+    front of it, so a long trace costs no more memory than its batch.
+
+    `engine_cgroup` is the cgroup the ENGINE ran in: this process's own for sqlite (embedded), the
+    server's scope for postgres. Its `memory.current` is sampled across this measured phase only, so
+    the reported peak is serving pressure and never the bulk load that preceded it.
+
+    `open_loop` is the fairness fix the f70d91c report named (§9.3) and it defaults ON: flashdb's
+    driver submits its durable barrier to a background worker and keeps dispatching, so scoring a
+    SQL arm whose dispatch waits for its own commit against the same schedule-lag rule charges the
+    synchronous arm for a difference in client shape, not in engine behaviour. Both shapes run one
+    durable commit per group with the same `batch` cap; `pacing` in the record states which ran.
+    """
+    sampler = MemoryPeakSampler(engine_cgroup).start()
+    due, rates = build_schedule(manifest)
+    paced = run_paced_loop(due, rates, requests, batch, window_ms, arm.execute_batch,
+                           open_loop=open_loop)
+    engine_memory = sampler.stop()
     return {
         "arm": arm.name,
         "durability": arm.durability,
+        "pacing": ("open loop: dispatch on the due schedule, one worker executes and commits each"
+                   " group and acks on completion (flashdb-load's shape)" if open_loop else
+                   "closed loop: the group's commit is acked before the next dispatch"),
         "batch": batch,
         "window_ms": window_ms,
         "lag_ceiling_us": LAG_CEILING_US,
-        "requests_run": total,
-        "groups": groups,
-        "mean_group_size": total / groups if groups else 0.0,
-        "max_group_size": max_group,
-        "elapsed_s": (end_us - due[0]) / 1e6,
-        "counters": counters,
+        **paced,
         "engine_memory": engine_memory,
-        "windows": parsed,
-        "curve": summarize_curve(parsed, None),
-        "windows_jsonl": lines,
     }
+
 
 
 # ---------------------------------------------------------------------------
@@ -969,28 +1345,25 @@ def flashdb_load_command(bins: Path, instance: Path, trace: Path, manifest: dict
     return cmd
 
 
-def run_flashdb_arm(
+def seed_flashdb_instance(
     name: str,
-    manifest: dict,
     workdir: Path,
     bins: Path,
-    order_flow_requests: int,
-    batch: int = DEFAULT_BATCH,
-    window_ms: int = DEFAULT_WINDOW_MS,
-    engine_cap_mib: int = ENGINE_CAP_MIB,
     seed_cap_mib: int = SEED_CAP_MIB,
+    instance_root: Path | None = None,
 ) -> dict:
-    """Seed a fresh instance, run the trace in the engine's own capped scope, parse its windows.
+    """Build the pre-load (seeded) flashdb instance ONCE, inside its construction cap.
 
-    Two scopes, two budgets, both recorded: the dataset is BUILT under `seed_cap_mib` (construction
-    is heavier than serving, slice 51's measured convention) and the measured load runs under
-    `engine_cap_mib`. The harness itself is the instrument and stays outside both.
+    Construction is heavier than serving (the seed memtable holds the whole dimension set), so this
+    runs under `seed_cap_mib`; the measured load that follows runs under `engine_cap_mib`. Both are
+    recorded. The seeding trace is the frozen one in the work directory, hashed here so every arm's
+    instance can be shown to come from the same bytes.
     """
-    instance = workdir / f"instance-{name}"
+    instance = instance_path(name, workdir, instance_root)
     if instance.exists():
         shutil.rmtree(instance)
+    instance.parent.mkdir(parents=True, exist_ok=True)
     seed_path = workdir / "seed.jsonl"
-    trace = workdir / "trace.jsonl"
     seed_t0 = time.perf_counter()
     seeded = subprocess.run(
         scoped_command([str(bins / "flashdb-scale"), "seed-inventory", str(instance),
@@ -999,7 +1372,43 @@ def run_flashdb_arm(
     seed_s = time.perf_counter() - seed_t0
     if seeded.returncode != 0:
         raise RuntimeError(f"seed-inventory failed (rc={seeded.returncode}): {seeded.stderr[-2000:]}")
-    seed_peak = _peak_from_log(seeded.stdout.splitlines(), SEED_PEAK_PREFIX)
+    counts = {key: int(value) for key, value in
+              re.findall(r"(blocks|docs|customers|stocks)=(\d+)", seeded.stdout)}
+    return {
+        "arm": name,
+        "seeded_counts": counts,
+        "seed_s": seed_s,
+        "seed_trace": str(seed_path),
+        "seed_trace_sha256": file_sha256(seed_path),
+        "construction_memory": {"cap_mib": seed_cap_mib,
+                                "peak_bytes": _peak_from_log(seeded.stdout.splitlines(),
+                                                             SEED_PEAK_PREFIX)},
+        "instance_bytes": _dir_bytes(instance),
+        "instance_files": _largest_files(instance),
+        "at": datetime.datetime.now().isoformat(timespec="seconds"),
+    }
+
+
+def run_flashdb_load(
+    name: str,
+    manifest: dict,
+    workdir: Path,
+    bins: Path,
+    order_flow_requests: int,
+    batch: int = DEFAULT_BATCH,
+    window_ms: int = DEFAULT_WINDOW_MS,
+    engine_cap_mib: int = ENGINE_CAP_MIB,
+    instance_root: Path | None = None,
+) -> dict:
+    """Serve the trace through `flashdb-load` in the instance's own engine cap and parse its windows.
+
+    The instance is the PRE-LOAD one (restored from the snapshot by the controlled protocol); this
+    function serves and measures, and never seeds.
+    """
+    instance = instance_path(name, workdir, instance_root)
+    if not instance.exists():
+        raise SystemExit(f"no instance at {instance}; build or restore it before running the arm")
+    trace = workdir / "trace.jsonl"
     cmd = flashdb_load_command(bins, instance, trace, manifest, batch, window_ms)
     driver_log = workdir / f"driver-{name}.log"
     t0 = time.perf_counter()
@@ -1026,7 +1435,6 @@ def run_flashdb_arm(
         "window_ms": window_ms,
         "lag_ceiling_us": LAG_CEILING_US,
         "requests_run": requests_run,
-        "seed_s": seed_s,
         "groups": groups,
         "mean_group_size": requests_run / groups if groups else 0.0,
         "max_group_size": max((w["max_group_size"] for w in windows), default=0),
@@ -1047,12 +1455,39 @@ def run_flashdb_arm(
             "method": "exact memory.peak of the flashdb-load invocation's own scope, read inside it",
             "scope": "measured phase only: the instance is BUILT in a separate construction scope",
         },
-        "construction_memory": {"cap_mib": seed_cap_mib, "peak_bytes": seed_peak},
         "arm_scope_peak_bytes": None,
         "windows": windows,
         "curve": summarize_curve(windows, None),
         "windows_jsonl": [json.dumps(w, sort_keys=True) for w in windows],
     }
+
+
+def run_flashdb_arm(
+    name: str,
+    manifest: dict,
+    workdir: Path,
+    bins: Path,
+    order_flow_requests: int,
+    batch: int = DEFAULT_BATCH,
+    window_ms: int = DEFAULT_WINDOW_MS,
+    engine_cap_mib: int = ENGINE_CAP_MIB,
+    seed_cap_mib: int = SEED_CAP_MIB,
+) -> dict:
+    """Seed a fresh instance, then serve the trace under the engine's own cap (the M1 path).
+
+    Two scopes, two budgets, both recorded: the dataset is BUILT under `seed_cap_mib` (construction
+    is heavier than serving, slice 51's measured convention) and the measured load runs under
+    `engine_cap_mib`. This is the one-shot path the ticket-80 runs used; the ticket-82 controlled
+    protocol builds the instance once (`build-instance`) and calls `run_flashdb_load` on restored
+    instances instead, so an arm-run costs its own 20 s and not a 7-12 minute seed.
+    """
+    seeded = seed_flashdb_instance(name, workdir, bins, seed_cap_mib)
+    record = run_flashdb_load(name, manifest, workdir, bins, order_flow_requests, batch, window_ms,
+                              engine_cap_mib)
+    record["seed_s"] = seeded["seed_s"]
+    record["construction_memory"] = seeded["construction_memory"]
+    return record
+
 
 
 # Every key of the driver's `load_summary` line this harness reads. `first_error` is a quoted Rust
@@ -1417,6 +1852,358 @@ def render_scoreboard(records: list[dict], manifest: dict, spec: dict) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Building the pre-load instance once per arm (ticket 82's controlled protocol)
+# ---------------------------------------------------------------------------
+def postgres_connect(dbname: str):
+    """A psycopg connection to the user-space cluster `scripts/baseline-env.sh` provides."""
+    import psycopg  # imported here: only the postgres arm needs it
+
+    return psycopg.connect(host=os.environ["M1_PGHOST"], port=os.environ["M1_PGPORT"],
+                           user=os.environ["M1_PGUSER"], dbname=dbname, autocommit=True)
+
+
+def seed_sqlite_instance(workdir: Path, manifest: dict, spec: dict, cache_kib: int,
+                         instance_root: Path | None = None,
+                         wal_autocheckpoint: int = SQLITE_WAL_AUTOCHECKPOINT_PAGES) -> dict:
+    """Build sqlite's pre-load instance: schema + dimension rows, ONE bulk transaction.
+
+    Seeding is setup, so it runs journal-less (`SqliteArm.begin_bulk_load`) and the measured
+    durability is restored and READ BACK before the connection closes. The close checkpoints the
+    WAL into the database file, which is what makes the snapshot a single stable file.
+    """
+    db = instance_path("sqlite", workdir, instance_root)
+    for stale in (db, Path(f"{db}-wal"), Path(f"{db}-shm")):
+        stale.unlink(missing_ok=True)
+    db.parent.mkdir(parents=True, exist_ok=True)
+    arm = sqlite_arm(db, cache_kib, wal_autocheckpoint=wal_autocheckpoint)
+    customers, stock = seed_docs(manifest, spec["on_hand"])
+    seed_t0 = time.perf_counter()
+    arm.seed(customers, stock)
+    seed_s = time.perf_counter() - seed_t0
+    observed = arm.require_measured_durability()
+    counts = {"customers": _scalar(arm, "SELECT count(*) FROM customer"),
+              "stocks": _scalar(arm, "SELECT count(*) FROM stock")}
+    arm.conn.close()
+    return {
+        "arm": "sqlite",
+        "seeded_counts": counts,
+        "seed_s": seed_s,
+        "durability_observed": observed,
+        "sqlite_cache_kib": cache_kib,
+        "instance_bytes": _db_bytes(db),
+        "sqlite_files": _sqlite_files(db),
+        "at": datetime.datetime.now().isoformat(timespec="seconds"),
+    }
+
+
+def seed_postgres_instance(manifest: dict, spec: dict, database: str = POSTGRES_DATABASE,
+                           engine_cap_mib: int = ENGINE_CAP_MIB) -> dict:
+    """Build postgres's pre-load instance: one named database, schema + rows, one transaction.
+
+    The database NAME is fixed (not `m1_<arm>_<pid>`) on purpose: the cluster's data directory is
+    the arm's instance, and a fixed name is what lets the pre-load state be a filesystem copy of the
+    whole cluster instead of a re-seed per arm-run.
+    """
+    with postgres_connect("postgres") as admin:
+        admin.execute(f'DROP DATABASE IF EXISTS "{database}"')
+        admin.execute(f'CREATE DATABASE "{database}"')
+    conn = postgres_connect(database)
+    conn.autocommit = False
+    try:
+        arm = PostgresArm(conn)
+        arm.create_schema()
+        customers, stock = seed_docs(manifest, spec["on_hand"])
+        seed_t0 = time.perf_counter()
+        arm.seed(customers, stock)
+        seed_s = time.perf_counter() - seed_t0
+        counts = {"customers": _scalar(arm, "SELECT count(*) FROM customer"),
+                  "stocks": _scalar(arm, "SELECT count(*) FROM stock")}
+        data_bytes = _scalar(arm, "SELECT pg_database_size(current_database())")
+    finally:
+        conn.close()
+    return {
+        "arm": "postgres",
+        "database": database,
+        "seeded_counts": counts,
+        "seed_s": seed_s,
+        "data_bytes": data_bytes,
+        "postgres_settings": {"shared_buffers": "see run record", "fsync": "on",
+                              "synchronous_commit": "on"},
+        "engine_cap_mib": engine_cap_mib,
+        "at": datetime.datetime.now().isoformat(timespec="seconds"),
+    }
+
+
+def build_instance(name: str, manifest: dict, spec: dict, workdir: Path, bins: Path,
+                   instance_root: Path | None, seed_cap_mib: int, engine_cap_mib: int,
+                   sqlite_cache_kib: int, database: str,
+                   wal_autocheckpoint: int = SQLITE_WAL_AUTOCHECKPOINT_PAGES) -> dict:
+    """Build one arm's pre-load instance and CHECK it holds the dataset the manifest describes.
+
+    The check is what ties the two seeding paths together: flashdb is seeded from the frozen
+    `seed.jsonl` and the SQL arms from `seed_docs(manifest)`, so an equal customer/stock count on
+    every arm is the evidence that all three were seeded from the same rows.
+    """
+    if name in FLASHDB_ARMS:
+        record = seed_flashdb_instance(name, workdir, bins, seed_cap_mib, instance_root)
+    elif name == "sqlite":
+        record = seed_sqlite_instance(workdir, manifest, spec, sqlite_cache_kib, instance_root,
+                                      wal_autocheckpoint)
+    elif name == "postgres":
+        record = seed_postgres_instance(manifest, spec, database, engine_cap_mib)
+    else:
+        raise SystemExit(f"unknown arm {name!r}")
+    counts = record.get("seeded_counts") or {}
+    expected = {"customers": int(manifest["n_customers"]),
+                "stocks": int(manifest["n_sku"]) * int(manifest["n_loc"])}
+    for key, want in expected.items():
+        if key in counts and counts[key] != want:
+            raise SystemExit(f"{name} seeded {counts[key]} {key} but the manifest describes"
+                             f" {want}; the pre-load instance is not the frozen dataset")
+    record["expected_counts"] = expected
+    return record
+
+
+def cmd_build_instance(args: argparse.Namespace) -> int:
+    """Build (seed) the pre-load instance of each requested arm; no request is served here."""
+    workdir = Path(args.workdir).resolve()
+    manifest, spec, _trace = _load_workdir(workdir)
+    instance_root = Path(args.instance_root).resolve() if args.instance_root else None
+    records = {}
+    for name in args.arms:
+        records[name] = build_instance(name, manifest, spec, workdir, Path(args.bins),
+                                       instance_root, args.seed_cap_mib, args.engine_cap_mib,
+                                       args.sqlite_cache_kib, args.database,
+                                       args.sqlite_wal_autocheckpoint)
+        print(f"build-instance {name}: seed_s={records[name]['seed_s']:.1f}"
+              f" bytes={records[name].get('instance_bytes') or records[name].get('data_bytes')}")
+    path = Path(args.out) if args.out else workdir / "instance-build.json"
+    _write_json(path, records)
+    if args.snapshot_dir:
+        for name in args.arms:
+            snapshot_instance(name, workdir, Path(args.snapshot_dir).resolve(), instance_root)
+    return 0
+
+
+def cmd_snapshot(args: argparse.Namespace) -> int:
+    workdir = Path(args.workdir).resolve()
+    instance_root = Path(args.instance_root).resolve() if args.instance_root else None
+    for name in args.arms:
+        snapshot_instance(name, workdir, Path(args.snapshot_dir).resolve(), instance_root)
+    return 0
+
+
+def cmd_restore(args: argparse.Namespace) -> int:
+    workdir = Path(args.workdir).resolve()
+    instance_root = Path(args.instance_root).resolve() if args.instance_root else None
+    for name in args.arms:
+        state = restore_instance(name, workdir, Path(args.snapshot_dir).resolve(), instance_root)
+        print(f"restore {name}: {state['bytes']} bytes from {state['from']}"
+              f" (sha256 verified, {state['restore_s']:.1f} s)")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# The device floor: how much lag this machine shows with NO engine in the path
+# ---------------------------------------------------------------------------
+def run_floor_bench(bench: str, due: list[float], rates: list[float], batch: int,
+                    window_ms: int, target: Path) -> dict:
+    """One floor bench, measured by the arms' own pacer and window rule.
+
+    `idle` paces the schedule and does nothing per request, so its schedule lag IS the machine's
+    own wakeup/scheduler floor. `fsync` writes a small record and fsyncs once per request, so its
+    per-request service latency is the device's durable-commit floor for the same one-commit-per-
+    request durability every arm runs at these rates.
+    """
+    requests = ({"id": index} for index in range(len(due)))
+    if bench == "idle":
+        def execute(_batch) -> dict:
+            return {TAKE: 0, BACKORDER: 0, MISS: 0, "errors": 0, "first_error": None}
+        closer = None
+    elif bench == "fsync":
+        target.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        payload = json.dumps({"bench": "fsync", "record": "x" * 256}).encode()
+
+        def execute(batch_) -> dict:
+            for _ in batch_:
+                os.write(fd, payload)
+                os.fsync(fd)
+            return {TAKE: 0, BACKORDER: 0, MISS: 0, "errors": 0, "first_error": None}
+
+        def closer() -> None:
+            os.close(fd)
+    else:
+        raise SystemExit(f"unknown floor bench {bench!r}; expected idle or fsync")
+    try:
+        paced = run_paced_loop(due, rates, requests, batch, window_ms, execute)
+    finally:
+        if closer is not None:
+            closer()
+    (target.parent / f"windows-floor-{bench}.jsonl").write_text(
+        "\n".join(paced["windows_jsonl"]) + "\n", encoding="utf-8")
+    paced["windows_file"] = f"windows-floor-{bench}.jsonl"
+    paced["file_bytes"] = target.stat().st_size if target.exists() else 0
+    return paced
+
+
+def cmd_floor(args: argparse.Namespace) -> int:
+    """Measure the device floor (idle schedule lag + fsync commit latency), no engine involved."""
+    out = Path(args.out).resolve()
+    out.parent.mkdir(parents=True, exist_ok=True)
+    manifest = {"segments": [{"offered_rate": args.rate, "count": args.requests}],
+                "total_requests": args.requests}
+    due, rates = build_schedule(manifest)
+    benches = {}
+    for bench in ("idle", "fsync"):
+        benches[bench] = run_floor_bench(bench, due, rates, args.batch, args.window_ms,
+                                        out.parent / f"floor-{bench}.dat")
+    payload = {
+        "schema": FLOOR_SCHEMA,
+        "rate_rps": args.rate,
+        "requests": args.requests,
+        "window_ms": args.window_ms,
+        "batch": args.batch,
+        "lag_ceiling_us": LAG_CEILING_US,
+        "at": datetime.datetime.now().isoformat(timespec="seconds"),
+        "machine": machine_state(),
+        "engine": "none: an idle pacer and a file fsync, no storage engine in the path",
+        "benches": {name: {key: value for key, value in paced.items() if key != "windows_jsonl"}
+                    for name, paced in benches.items()},
+    }
+    _write_json(out, payload)
+    for name, bench in benches.items():
+        row = bench["curve"][0]
+        print(f"floor {name}: lag p99 {row['lag_p99_us']} us, service p99 {row['p99_us']} us,"
+              f" rejected {row['invalid_windows']}/{row['windows']} windows,"
+              f" achieved {row['achieved_rps']:.1f} rps")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Machine state: what the schedule-lag rule is sensitive to, recorded at every boundary
+# ---------------------------------------------------------------------------
+def _read_text(path: str) -> str | None:
+    try:
+        return Path(path).read_text().strip()
+    except OSError:
+        return None
+
+
+def _power_profile() -> str | None:
+    try:
+        done = subprocess.run(["powerprofilesctl", "get"], capture_output=True, text=True,
+                              timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return done.stdout.strip() or None
+
+
+def _top_cpu_processes(limit: int = 6) -> list[dict]:
+    """The busiest CPU consumers at this instant, so the state is recorded rather than promised."""
+    try:
+        done = subprocess.run(["ps", "-eo", "pcpu=,comm=,args=", "--sort=-pcpu"],
+                              capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    rows = []
+    for line in done.stdout.splitlines()[1:]:
+        parts = line.split(None, 2)
+        if len(parts) < 2:
+            continue
+        rows.append({"pcpu": float(parts[0]), "comm": parts[1],
+                     "args": (parts[2] if len(parts) > 2 else "")[:160]})
+        if len(rows) >= limit:
+            break
+    return rows
+
+
+def _concurrent_work() -> list[dict]:
+    """Processes that would invalidate the measured phase (builds, extra harnesses, seed jobs).
+
+    The desktop applications (firefox, gnome-shell, the `pi` agent) are NOT on this list: an arm is
+    compared only against itself and its paired arms within one machine state, so a steady desktop
+    load is a controlled condition, while a compiler, a second harness or a seed job is not.
+    """
+    found = []
+    try:
+        done = subprocess.run(["ps", "-eo", "pid=,ppid=,stat=,args="], capture_output=True,
+                              text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return found
+    # This process and its ANCESTORS are the instrument itself (the harness, the runner's payload,
+    # the orchestrating shell). Everything else that matches is a second job on the box.
+    own = set()
+    pid = os.getpid()
+    while pid and pid not in own:
+        own.add(pid)
+        try:
+            stat = Path(f"/proc/{pid}/stat").read_text()
+            pid = int(stat.rsplit(")", 1)[1].split()[1])
+        except (OSError, IndexError, ValueError):
+            break
+    for line in done.stdout.splitlines():
+        parts = line.split(None, 3)
+        if len(parts) < 4:
+            continue
+        if parts[2].startswith("Z") or int(parts[0]) in own:
+            continue
+        args = parts[3]
+        for pattern in CONCURRENT_WORK_PATTERNS:
+            if pattern in args:
+                found.append({"pid": int(parts[0]), "pattern": pattern, "args": args[:160]})
+                break
+    return found
+
+
+def machine_state() -> dict:
+    """AC, power profile, EPP, effective frequency, load and the busiest processes.
+
+    The governor NAME is not a statement about this platform: on this intel_pstate laptop it reads
+    `powersave` even when the EPP hint and the effective frequency are both at maximum, which is why
+    AC, the power profile, the EPP hint and `scaling_cur_freq` are recorded together instead.
+    """
+    cpu_dirs = sorted(Path("/sys/devices/system/cpu").glob("cpu[0-9]*"))
+    ac = [line for path in sorted(Path("/sys/class/power_supply").glob("A*"))
+          for line in [_read_text(str(path / "online"))] if line is not None]
+    loadavg = _read_text("/proc/loadavg") or ""
+    return {
+        "at": datetime.datetime.now().isoformat(timespec="seconds"),
+        "ac_online": ac,
+        "power_profile": _power_profile(),
+        "governor": _read_text("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor"),
+        "epp": sorted({_read_text(str(cpu / "cpufreq/energy_performance_preference")) or "n/a"
+                       for cpu in cpu_dirs}),
+        "scaling_cur_freq_khz": sorted({_read_text(str(cpu / "cpufreq/scaling_cur_freq")) or "n/a"
+                                        for cpu in cpu_dirs}),
+        "scaling_max_freq_khz": _read_text("/sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq"),
+        "nproc": os.cpu_count(),
+        "loadavg": loadavg,
+        "top_cpu": _top_cpu_processes(),
+        "concurrent_work": _concurrent_work(),
+    }
+
+
+def cmd_machine_state(args: argparse.Namespace) -> int:
+    """Append one machine-state record; `--phase` names the boundary it was taken at."""
+    out = Path(args.out).resolve()
+    out.parent.mkdir(parents=True, exist_ok=True)
+    state = machine_state()
+    state["phase"] = args.phase
+    state["arm"] = args.arm
+    state["rung"] = args.rung
+    with open(out, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(state, sort_keys=True) + "\n")
+    if state["concurrent_work"]:
+        print(f"machine-state {args.phase}: CONCURRENT WORK {state['concurrent_work']}",
+              file=sys.stderr)
+        return 3
+    print(f"machine-state {args.phase}: loadavg={state['loadavg'].split()[0]}"
+          f" epp={','.join(state['epp'])} freq_khz={','.join(state['scaling_cur_freq_khz'])}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # CLI steps: prepare (trace + manifest + seed), arm (one arm), report
 # ---------------------------------------------------------------------------
 def _write_json(path: Path, payload) -> None:
@@ -1439,6 +2226,8 @@ def cmd_prepare(args: argparse.Namespace) -> int:
     # the Rust pacer's document is unchanged.
     requests = [json.loads(line) for line in trace_bytes.decode().splitlines()]
     order_flows = sum(1 for r in requests if "take" in r["blocks"])
+    seed_record = prepare_seed_trace(workdir / "seed.jsonl", manifest, args.seed_trace,
+                                     args.on_hand)
     _write_json(workdir / "manifest.json", manifest)
     _write_json(workdir / "spec.json", {
         "schema": SPEC_SCHEMA,
@@ -1448,16 +2237,51 @@ def cmd_prepare(args: argparse.Namespace) -> int:
         "lag_ceiling_us": LAG_CEILING_US,
         "order_flow_requests": order_flows,
         "trace_sha256": manifest["trace_sha256"],
+        "seed_trace": seed_record,
         # The exact invocation that produced this work directory's trace/spec; the runner adds its
         # own `runner` block (argv, caps, lock) after `prepare`, so a committed run names the
         # command that made it instead of a plausible alternative.
         "argv": [Path(sys.argv[0]).name, *sys.argv[1:]],
     })
-    blocks = write_seed_trace(workdir / "seed.jsonl", manifest, args.on_hand)
     print(f"trace {workdir / 'trace.jsonl'}: requests={manifest['total_requests']}"
-          f" order_flow={order_flows} seed_blocks={blocks}"
+          f" order_flow={order_flows} seed_bytes={seed_record['bytes']}"
+          f" seed_sha256={seed_record['sha256']}"
           f" sha256={manifest['trace_sha256']}")
     return 0
+
+
+def prepare_seed_trace(seed_path: Path, manifest: dict, seed_trace: str | None,
+                       on_hand: int = DEFAULT_ON_HAND) -> dict:
+    """Provide the seeding trace and record the digest every arm's instance is built from.
+
+    `seed_trace` re-uses a FROZEN trace instead of regenerating one: ticket 82 fixes the pre-load
+    dataset once (`runs/m1-10x/rung-50/seed.jsonl`), and every rung and every block of the controlled
+    protocol is seeded from those bytes. The file is hard-linked where possible (it is 1.4 GB and a
+    controlled run has fifteen work directories) and its digest is recorded in the spec, so "the
+    same rows" is a check rather than a claim. The one-line-per-document dialect is also how the
+    frozen trace is checked against this work directory's manifest dimensions.
+    """
+    if seed_trace:
+        source = Path(seed_trace).resolve()
+        if not source.exists():
+            raise SystemExit(f"--seed-trace {source} does not exist")
+        seed_path.unlink(missing_ok=True)
+        try:
+            os.link(source, seed_path)
+            method = "hard link"
+        except OSError:
+            shutil.copyfile(source, seed_path)
+            method = "copy"
+        # The row COUNT the trace holds is checked where it can be checked cheaply and exactly:
+        # against the instance each arm built (`build_instance` compares the seeded doc counts with
+        # this manifest's dimensions). What is recorded here is the digest, so every rung and every
+        # block of a controlled run can be shown to have used one frozen pre-load dataset.
+        return {"source": str(source), "method": method,
+                "bytes": seed_path.stat().st_size, "sha256": file_sha256(seed_path)}
+    blocks = write_seed_trace(seed_path, manifest, on_hand)
+    return {"source": "regenerated from the manifest's own seed and dimensions",
+            "method": "generate", "blocks": blocks, "bytes": seed_path.stat().st_size,
+            "sha256": file_sha256(seed_path)}
 
 
 def _load_workdir(workdir: Path) -> tuple[dict, dict, Path]:
@@ -1473,13 +2297,31 @@ def _load_workdir(workdir: Path) -> tuple[dict, dict, Path]:
 
 
 def cmd_arm(args: argparse.Namespace) -> int:
+    """Serve one arm over the prepared trace and write its run record.
+
+    `--restored` is ticket 82's controlled path: the pre-load instance has already been put back by
+    the `restore` step, so this step SEEDS NOTHING and measures the serving path only. Without it
+    the step behaves exactly as the ticket-80 runs did (build a fresh instance, then serve it).
+    """
     workdir = Path(args.workdir).resolve()
     manifest, spec, trace = _load_workdir(workdir)
     name = args.arm
+    instance_root = Path(args.instance_root).resolve() if args.instance_root else None
+    if args.restored and instance_root is None:
+        # The restored instance is the ONLY instance this run may use; if it lives under a shared
+        # root, the arm has to be told, or it would silently seed a fresh one in the workdir and
+        # measure that instead.
+        raise SystemExit("--restored requires --instance-root: the restore writes the instance"
+                         " outside this work directory")
     if name in FLASHDB_ARMS:
-        record = run_flashdb_arm(name, manifest, workdir, Path(args.bins),
-                                 spec["order_flow_requests"], spec["batch"], spec["window_ms"],
-                                 args.engine_cap_mib, args.seed_cap_mib)
+        if args.restored:
+            record = run_flashdb_load(name, manifest, workdir, Path(args.bins),
+                                      spec["order_flow_requests"], spec["batch"],
+                                      spec["window_ms"], args.engine_cap_mib, instance_root)
+        else:
+            record = run_flashdb_arm(name, manifest, workdir, Path(args.bins),
+                                     spec["order_flow_requests"], spec["batch"], spec["window_ms"],
+                                     args.engine_cap_mib, args.seed_cap_mib)
         if args.skip_verify:
             # The read-back is verification, not workload: it is the `verify` step's job and it runs
             # outside the engine's memory budget (see `run_flashdb_probes`).
@@ -1489,15 +2331,25 @@ def cmd_arm(args: argparse.Namespace) -> int:
             record["oracle"] = _verify_flashdb(name, manifest, workdir, Path(args.bins), trace,
                                                spec, record)
     elif name == "sqlite":
-        db = workdir / f"{name}.db"
-        for stale in (db, db.with_suffix(".db-wal"), db.with_suffix(".db-shm")):
-            stale.unlink(missing_ok=True)
-        arm = sqlite_arm(db, args.sqlite_cache_kib)
-        customers, stock = seed_docs(manifest, spec["on_hand"])
-        seed_t0 = time.perf_counter()
-        arm.seed(customers, stock)
-        seed_s = time.perf_counter() - seed_t0
-        # Read the durability back BEFORE the measured phase: the bulk load ran under
+        db = instance_path(name, workdir, instance_root)
+        if args.restored:
+            # The database IS the restored snapshot: deleting and re-seeding it would replace the
+            # controlled pre-load state with a construction step again.
+            if not db.exists():
+                raise SystemExit(f"no restored sqlite instance at {db}")
+            arm = sqlite_arm(db, args.sqlite_cache_kib, create_schema=False,
+                             wal_autocheckpoint=args.sqlite_wal_autocheckpoint)
+            seed_s = 0.0
+        else:
+            for stale in (db, Path(f"{db}-wal"), Path(f"{db}-shm")):
+                stale.unlink(missing_ok=True)
+            arm = sqlite_arm(db, args.sqlite_cache_kib,
+                             wal_autocheckpoint=args.sqlite_wal_autocheckpoint)
+            customers, stock = seed_docs(manifest, spec["on_hand"])
+            seed_t0 = time.perf_counter()
+            arm.seed(customers, stock)
+            seed_s = time.perf_counter() - seed_t0
+        # Read the durability back BEFORE the measured phase: the seeding path runs under
         # journal_mode=OFF / synchronous=OFF and a PRAGMA that cannot be applied fails silently.
         observed_durability = arm.require_measured_durability()
         record = run_sql_arm(arm, manifest, iter_requests(trace), spec["batch"],
@@ -1509,17 +2361,30 @@ def cmd_arm(args: argparse.Namespace) -> int:
         record["arm_scope_peak_bytes"] = cgroup_peak_bytes()
         record["arm_scope_peak_scope"] = ("this process's capped scope over the whole arm step"
                                           " (bulk load + measured phase)")
+        # The WAL policy is a measured-phase parameter, and with the automatic checkpoint deferred
+        # the checkpoint itself runs here: after the run, before the oracle, and recorded.
+        record["sqlite_wal"] = sqlite_wal_record(arm, db)
         record["sqlite_files"] = _sqlite_files(db)
         record["data_bytes"] = _db_bytes(db)
-        add_verify_index(arm)
-        record["oracle"] = oracle_sql(arm, manifest, record["counters"],
-                                      spec["order_flow_requests"], spec["on_hand"])
+        if args.skip_oracle:
+            record["oracle"] = {"status": "DEFERRED", "checks": [],
+                                "reason": "--skip-oracle: the restored instance is byte-identical in"
+                                          " every block, so the inventory is verified once per arm"}
+        else:
+            add_verify_index(arm)
+            record["oracle"] = oracle_sql(arm, manifest, record["counters"],
+                                          spec["order_flow_requests"], spec["on_hand"])
     elif name == "postgres":
         record = run_postgres_arm(name, manifest, spec, iter_requests(trace),
-                                  args.engine_cap_mib)
+                                  args.engine_cap_mib, restored=args.restored,
+                                  database=args.database, verify=not args.skip_oracle)
     else:
         raise SystemExit(f"unknown arm {name!r}; expected one of {FLASHDB_ARMS + SQL_ARMS}")
     record["trace_sha256"] = manifest["trace_sha256"]
+    record["instance_root"] = str(instance_root) if instance_root else str(workdir)
+    record["restored"] = bool(args.restored)
+    if args.restored:
+        record["restore"] = _read_json(instance_root / f"restore-{name}.json")
     record["verdict"] = arm_verdict(record["curve"])
     # The windows are written once, as their own JSONL: the run record cites that file rather than
     # carrying a second copy of the same samples.
@@ -1577,38 +2442,42 @@ def cmd_verify(args: argparse.Namespace) -> int:
 
 
 def run_postgres_arm(name: str, manifest: dict, spec: dict, requests,
-                     engine_cap_mib: int = ENGINE_CAP_MIB) -> dict:
+                     engine_cap_mib: int = ENGINE_CAP_MIB, restored: bool = False,
+                     database: str = POSTGRES_DATABASE, verify: bool = True) -> dict:
     """The postgres arm against the user-space cluster `scripts/baseline-env.sh` provides.
 
     The engine here is the SERVER, in its own capped scope; this client is outside it. The runner
     passes that scope's cgroup as `M1_ENGINE_CGROUP`, so the client can sample the SERVER's
     `memory.current` across the measured phase instead of charging the instrument's memory to the
     engine.
+
+    `restored` selects ticket 82's controlled path: the cluster's data directory has already been
+    put back from the snapshot, so the pre-load database exists and nothing may be created, seeded
+    or dropped here. Without it the arm builds its own per-run database, exactly as the ticket-80
+    runs did.
     """
-    import psycopg  # imported here: only this arm needs it, and only inside its capped scope
-
-    def connect(dbname: str):
-        return psycopg.connect(host=os.environ["M1_PGHOST"], port=os.environ["M1_PGPORT"],
-                               user=os.environ["M1_PGUSER"], dbname=dbname, autocommit=True)
-
-    dbname = f"m1_{name}_{os.getpid()}"
-    with connect("postgres") as admin:
-        admin.execute(f'DROP DATABASE IF EXISTS "{dbname}"')
-        admin.execute(f'CREATE DATABASE "{dbname}"')
+    dbname = database if restored else f"m1_{name}_{os.getpid()}"
+    if not restored:
+        with postgres_connect("postgres") as admin:
+            admin.execute(f'DROP DATABASE IF EXISTS "{dbname}"')
+            admin.execute(f'CREATE DATABASE "{dbname}"')
     try:
-        conn = connect(dbname)
+        conn = postgres_connect(dbname)
         conn.autocommit = False
         arm = PostgresArm(conn)
-        arm.create_schema()
-        customers, stock = seed_docs(manifest, spec["on_hand"])
-        seed_t0 = time.perf_counter()
-        arm.seed(customers, stock)
-        seed_s = time.perf_counter() - seed_t0
+        seed_s = 0.0
+        if not restored:
+            arm.create_schema()
+            customers, stock = seed_docs(manifest, spec["on_hand"])
+            seed_t0 = time.perf_counter()
+            arm.seed(customers, stock)
+            seed_s = time.perf_counter() - seed_t0
         engine_cgroup = Path(os.environ[ENGINE_CGROUP_ENV]) if os.environ.get(
             ENGINE_CGROUP_ENV) else None
         record = run_sql_arm(arm, manifest, requests, spec["batch"], spec["window_ms"],
                              engine_cgroup=engine_cgroup)
         record["seed_s"] = seed_s
+        record["database"] = dbname
         record["durability"] = PostgresArm.durability
         record["engine_cap_mib"] = engine_cap_mib
         # The server scope's LIFETIME peak (bulk load + measured phase) is patched by the runner
@@ -1616,22 +2485,41 @@ def run_postgres_arm(name: str, manifest: dict, spec: dict, requests,
         record["arm_scope_peak_bytes"] = None
         record["arm_scope_peak_scope"] = ("the postgres server scope's lifetime (bulk load +"
                                           " measured phase); the client runs outside it")
-        add_verify_index(arm)
-        record["oracle"] = oracle_sql(arm, manifest, record["counters"],
-                                      spec["order_flow_requests"], spec["on_hand"])
+        if verify:
+            add_verify_index(arm)
+            record["oracle"] = oracle_sql(arm, manifest, record["counters"],
+                                          spec["order_flow_requests"], spec["on_hand"])
+        else:
+            record["oracle"] = {"status": "DEFERRED", "checks": [],
+                                "reason": "--skip-oracle: the restored instance is byte-identical in"
+                                          " every block, so the inventory is verified once per arm"}
         record["postgres_settings"] = {
             "synchronous_commit": _setting(conn, "synchronous_commit"),
             "fsync": _setting(conn, "fsync"),
             "shared_buffers": _setting(conn, "shared_buffers"),
             "server_version": _setting(conn, "server_version"),
+            "data_directory": _setting(conn, "data_directory"),
+            "unix_socket_directories": _setting(conn, "unix_socket_directories"),
         }
+        # A restored run must measure the cluster whose data directory this harness restored. A
+        # `M1_PG_ROOT` that reaches the restore but not the server starts a DIFFERENT cluster, and
+        # the run would then report one cluster's latency under the other one's footprint.
+        if restored:
+            expected = postgres_data_dir().resolve()
+            served = Path(record["postgres_settings"]["data_directory"]).resolve()
+            if served != expected:
+                raise SystemExit(
+                    f"the server is serving {served} but this run restored {expected}; check that"
+                    " M1_PG_ROOT reaches both the harness and the server")
         # The arm's data:memory ratio is reported from the server's own catalog, not from a guess.
         record["data_bytes"] = _scalar(arm, "SELECT pg_database_size(current_database())")
         conn.close()
     finally:
-        with connect("postgres") as admin:
-            admin.execute(f'DROP DATABASE IF EXISTS "{dbname}"')
+        if not restored:
+            with postgres_connect("postgres") as admin:
+                admin.execute(f'DROP DATABASE IF EXISTS "{dbname}"')
     return record
+
 
 
 def _setting(conn, name: str) -> str:
@@ -1678,6 +2566,9 @@ def main(argv: list[str]) -> int:
     prep.add_argument("--locs", type=int, default=4)
     prep.add_argument("--theta", type=float, default=1.0)
     prep.add_argument("--on-hand", type=int, default=DEFAULT_ON_HAND)
+    prep.add_argument("--seed-trace", default=None,
+                      help="re-use this frozen seeding trace (hard-linked, digest recorded) instead"
+                           " of regenerating one from the manifest")
     prep.add_argument("--batch", type=int, default=DEFAULT_BATCH)
     prep.add_argument("--window-ms", type=int, default=DEFAULT_WINDOW_MS)
     prep.set_defaults(func=cmd_prepare)
@@ -1693,9 +2584,73 @@ def main(argv: list[str]) -> int:
                      help="transient budget for `seed-inventory` (construction, not serving)")
     arm.add_argument("--sqlite-cache-kib", type=int, default=SQLITE_CACHE_KIB,
                      help="sqlite `PRAGMA cache_size` in KiB (its engine is embedded)")
+    arm.add_argument("--sqlite-wal-autocheckpoint", type=int,
+                     default=SQLITE_WAL_AUTOCHECKPOINT_PAGES,
+                     help="sqlite `PRAGMA wal_autocheckpoint` in pages, stated and recorded per run"
+                          " (0 defers the checkpoint to the post-run `wal_checkpoint(TRUNCATE)`)")
     arm.add_argument("--skip-verify", action="store_true",
                      help="defer the flashdb read-back to the `verify` step (outside the engine cap)")
+    arm.add_argument("--restored", action="store_true",
+                     help="the pre-load instance was restored from its snapshot: seed nothing, just"
+                          " serve (ticket 82's controlled path)")
+    arm.add_argument("--instance-root", default=None,
+                     help="directory holding the live instance the arm serves (default: workdir);"
+                          " required with --restored")
+    arm.add_argument("--database", default=POSTGRES_DATABASE,
+                     help="the postgres database the restored instance holds")
+    arm.add_argument("--skip-oracle", action="store_true",
+                     help="defer the SQL inventory oracle (the restored state is the same in every"
+                          " block, so it is verified once per arm and not once per block)")
     arm.set_defaults(func=cmd_arm)
+
+    build = sub.add_parser("build-instance",
+                           help="build (seed) the pre-load instance of each arm; serves nothing")
+    build.add_argument("--workdir", required=True)
+    build.add_argument("--arms", type=_arm_names, default=list(ARM_NAMES))
+    build.add_argument("--bins", default=str(REPO_ROOT / "target" / "release"))
+    build.add_argument("--instance-root", default=None)
+    build.add_argument("--snapshot-dir", default=None,
+                       help="copy the instance aside right after building it")
+    build.add_argument("--engine-cap-mib", type=int, default=ENGINE_CAP_MIB)
+    build.add_argument("--seed-cap-mib", type=int, default=SEED_CAP_MIB)
+    build.add_argument("--sqlite-cache-kib", type=int, default=SQLITE_CACHE_KIB)
+    build.add_argument("--sqlite-wal-autocheckpoint", type=int,
+                       default=SQLITE_WAL_AUTOCHECKPOINT_PAGES)
+    build.add_argument("--database", default=POSTGRES_DATABASE)
+    build.add_argument("--out", default=None)
+    build.set_defaults(func=cmd_build_instance)
+
+    snap = sub.add_parser("snapshot", help="copy each arm's pre-load instance aside (with a digest)")
+    snap.add_argument("--workdir", required=True)
+    snap.add_argument("--arms", type=_arm_names, default=list(ARM_NAMES))
+    snap.add_argument("--snapshot-dir", required=True)
+    snap.add_argument("--instance-root", default=None)
+    snap.set_defaults(func=cmd_snapshot)
+
+    restore = sub.add_parser("restore",
+                             help="put each arm's snapshot back and verify its digest")
+    restore.add_argument("--workdir", required=True)
+    restore.add_argument("--arms", type=_arm_names, default=list(ARM_NAMES))
+    restore.add_argument("--snapshot-dir", required=True)
+    restore.add_argument("--instance-root", default=None)
+    restore.set_defaults(func=cmd_restore)
+
+    floor = sub.add_parser("floor",
+                           help="measure the device floor (idle schedule lag + fsync latency)")
+    floor.add_argument("--out", required=True)
+    floor.add_argument("--rate", type=int, default=200)
+    floor.add_argument("--requests", type=int, default=4_000)
+    floor.add_argument("--window-ms", type=int, default=DEFAULT_WINDOW_MS)
+    floor.add_argument("--batch", type=int, default=DEFAULT_BATCH)
+    floor.set_defaults(func=cmd_floor)
+
+    state = sub.add_parser("machine-state",
+                           help="record the machine state at an arm-run boundary")
+    state.add_argument("--out", required=True)
+    state.add_argument("--phase", required=True)
+    state.add_argument("--arm", default=None)
+    state.add_argument("--rung", default=None)
+    state.set_defaults(func=cmd_machine_state)
 
     verify = sub.add_parser("verify", help="run a flashdb arm's deferred inventory read-back")
     verify.add_argument("--workdir", required=True)

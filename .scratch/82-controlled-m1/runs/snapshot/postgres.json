@@ -1,0 +1,12 @@
+{
+  "arm": "postgres",
+  "at": "2026-10-17T20:56:11",
+  "bytes": 2201362806,
+  "files": 1361,
+  "live_path": "/home/z/vibe/flashdb/.scratch/82-controlled-m1/runs/pg/data",
+  "schema": "flashdb.baseline.instance-snapshot.v1",
+  "sha256": "7f9a4ea8edb0c1a287a201389ab08aba61e82bd8cdd92f51fe64ddf48cad1b92",
+  "snapshot_path": "/home/z/vibe/flashdb/.scratch/82-controlled-m1/runs/snapshot/postgres",
+  "snapshot_s": 10.615,
+  "source": "the pre-load state built by `build-instance` (seeded; no request served)"
+}

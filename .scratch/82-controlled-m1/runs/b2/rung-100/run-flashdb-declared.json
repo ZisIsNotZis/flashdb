@@ -1,0 +1,106 @@
+{
+  "arm": "flashdb-declared",
+  "arm_scope_peak_bytes": null,
+  "batch": 64,
+  "counters": {
+    "backorder": 0,
+    "errors": 0,
+    "first_error": null,
+    "miss": 0,
+    "take": 1366
+  },
+  "curve": [
+    {
+      "achieved_fraction": 0.9995,
+      "achieved_rps": 99.95,
+      "ceiling_rejected_windows": 0,
+      "compact_bytes": 0,
+      "early_dispatches": 0,
+      "error_windows": 0,
+      "group_elapsed_us": 215245,
+      "groups": 2000,
+      "groups_over_service_ceiling": 0,
+      "invalid_windows": 0,
+      "lag_ceiling_rejected_windows": 0,
+      "lag_p50_us": 84.5,
+      "lag_p95_us": 114,
+      "lag_p99_us": 371,
+      "max_group_size": 1,
+      "mean_group_size": 1.0,
+      "min_lag_us": 1,
+      "offered_rps": 100.0,
+      "p50_us": 3626.0,
+      "p95_us": 167260,
+      "p99_us": 201985,
+      "rate_exceeded": false,
+      "reject_reasons": {},
+      "service_ceiling_rejected_windows": 0,
+      "sustained": true,
+      "valid_windows": 20,
+      "windows": 20
+    }
+  ],
+  "durability": "flashdb --group-requests 64 (one WAL barrier per group)",
+  "elapsed_s": 20.003,
+  "engine_cap_mib": 128,
+  "engine_memory": {
+    "method": "exact memory.peak of the flashdb-load invocation's own scope, read inside it",
+    "peak_bytes": 64561152,
+    "samples": null,
+    "scope": "measured phase only: the instance is BUILT in a separate construction scope",
+    "start_bytes": 3776512
+  },
+  "groups": 2000,
+  "instance_bytes": 1684767398,
+  "instance_files": {
+    "tile-154.tile": 10958445,
+    "tile-228.tile": 10868619,
+    "tile-4218.tile": 10842579,
+    "tile-77.tile": 10958445
+  },
+  "instance_root": "/home/z/vibe/flashdb/.scratch/82-controlled-m1/runs/live",
+  "lag_ceiling_us": 10000,
+  "max_group_size": 1,
+  "mean_group_size": 1.0,
+  "oracle": {
+    "checks": [],
+    "order_no_uniqueness": "deferred to the verify step",
+    "status": "DEFERRED"
+  },
+  "policy": "declared default (no learner controller wired in M1)",
+  "requests_run": 2000,
+  "restore": {
+    "arm": "flashdb-declared",
+    "at": "2026-10-18T00:11:02",
+    "bytes": 1683012213,
+    "files": 158,
+    "from": "/home/z/vibe/flashdb/.scratch/82-controlled-m1/runs/snapshot/flashdb-declared",
+    "restore_s": 4.647,
+    "sha256": "67b3d10c23bca301881278ab8bb739110c725d0bcd8e852124e2a2901acd37ac",
+    "snapshot_sha256": "67b3d10c23bca301881278ab8bb739110c725d0bcd8e852124e2a2901acd37ac",
+    "to": "/home/z/vibe/flashdb/.scratch/82-controlled-m1/runs/live/instance-flashdb-declared",
+    "verified": true
+  },
+  "restored": true,
+  "summary": {
+    "completed": 2000,
+    "early_dispatches": 0,
+    "elapsed_ms": 20003,
+    "else_used": 0,
+    "errors": 0,
+    "first_error": null,
+    "invalid_windows": 0,
+    "lag_ceiling_rejected_windows": 0,
+    "requests": 2000,
+    "windows": 20
+  },
+  "trace_sha256": "583f9b4c3c5b3ebe4974822a3e26e1ed80e4f3ad0dc0a5c80153fbb390eb8443",
+  "verdict": {
+    "highest_sustained_rps": 100.0,
+    "reject_reasons": {},
+    "rejected_windows": 0,
+    "sustained": true
+  },
+  "window_ms": 1000,
+  "windows_file": "windows-flashdb-declared.jsonl"
+}

@@ -1,0 +1,20 @@
+# Regenerable state of a controlled M1 run: everything below comes back from the frozen seed trace
+# plus `run-spec.json`, so it is not committed. The evidence IS committed: per (block, rung)
+# {manifest,spec,trace}.json, run-<arm>.json, windows-<arm>.jsonl, machine-state.jsonl,
+# loadavg.jsonl, the floor records, the snapshot digests and report.json.
+trace.jsonl
+seed.jsonl
+instance-*
+live/
+snapshot/*
+!snapshot/*.json
+pg/
+floor/*/floor-*.dat
+driver-*.log
+probe-*.jsonl
+probe-*.log
+*.db
+*.db-wal
+*.db-shm
+pg.log
+stdout.log

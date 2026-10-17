@@ -1,0 +1,172 @@
+{
+  "arm": "postgres",
+  "arm_scope_peak_bytes": 50253824,
+  "arm_scope_peak_scope": "the postgres server scope's lifetime (bulk load + measured phase); the client runs outside it",
+  "batch": 64,
+  "counters": {
+    "backorder": 0,
+    "errors": 0,
+    "first_error": null,
+    "miss": 0,
+    "take": 2785
+  },
+  "curve": [
+    {
+      "achieved_fraction": 1.0,
+      "achieved_rps": 200.0,
+      "ceiling_rejected_windows": 0,
+      "compact_bytes": 0,
+      "early_dispatches": 0,
+      "error_windows": 0,
+      "group_elapsed_us": 0,
+      "groups": 3969,
+      "groups_over_service_ceiling": 0,
+      "invalid_windows": 0,
+      "lag_ceiling_rejected_windows": 0,
+      "lag_p50_us": 1.0,
+      "lag_p95_us": 11,
+      "lag_p99_us": 968,
+      "max_group_size": 6,
+      "mean_group_size": 1.0078105316200554,
+      "min_lag_us": 0,
+      "offered_rps": 200.0,
+      "p50_us": 2170.0,
+      "p95_us": 32088,
+      "p99_us": 51910,
+      "rate_exceeded": false,
+      "reject_reasons": {},
+      "service_ceiling_rejected_windows": 0,
+      "sustained": true,
+      "valid_windows": 20,
+      "windows": 20
+    }
+  ],
+  "data_bytes": 1104369343,
+  "database": "m1-controlled",
+  "durability": "postgres fsync=on + synchronous_commit=on (baseline-env.sh), one COMMIT per batch",
+  "elapsed_s": 19.995788817,
+  "engine_cap_mib": 128,
+  "engine_memory": {
+    "method": "sampled memory.current every 50 ms",
+    "peak_bytes": 41926656,
+    "samples": 399,
+    "scope": "measured phase",
+    "start_bytes": 18632704
+  },
+  "groups": 3969,
+  "instance_root": "/home/z/vibe/flashdb/.scratch/82-controlled-m1/runs/live",
+  "lag_ceiling_us": 10000,
+  "max_group_size": 6,
+  "mean_group_size": 1.0078105316200554,
+  "oracle": {
+    "checks": [
+      {
+        "check": "on_hand_matches_movements",
+        "detail": "stock(S000011,L000).on_hand=1000000, initial 1000000 + sum(delta) 0 = 1000000",
+        "ok": true,
+        "subjects": 10600000
+      },
+      {
+        "check": "on_hand_non_negative",
+        "detail": "stock(S000011,L000).on_hand=1000000",
+        "ok": true,
+        "subjects": 10600000
+      },
+      {
+        "check": "cell_count",
+        "detail": "10600000 stock cells, expected 10600000 (2650000 sku x 4 loc)",
+        "ok": true,
+        "subjects": 1
+      },
+      {
+        "check": "no_duplicate_order_no",
+        "detail": "0 order numbers appear in both/again: []",
+        "ok": true,
+        "subjects": 1
+      },
+      {
+        "check": "movement_count_is_committed_takes",
+        "detail": "2785 movements, 2785 committed take blocks",
+        "ok": true,
+        "subjects": 1
+      },
+      {
+        "check": "order_count_is_committed_takes",
+        "detail": "2785 orders, 2785 committed take blocks",
+        "ok": true,
+        "subjects": 1
+      },
+      {
+        "check": "backorder_count_is_committed_fallbacks",
+        "detail": "0 backorders, 0 committed fallbacks",
+        "ok": true,
+        "subjects": 1
+      },
+      {
+        "check": "every_order_flow_accounted",
+        "detail": "2785 take + 0 backorder + 0 miss against 2785 order_flow requests",
+        "ok": true,
+        "subjects": 1
+      },
+      {
+        "check": "no_skipped_take",
+        "detail": "0 order_flow requests found no customer (every seeded email exists)",
+        "ok": true,
+        "subjects": 1
+      },
+      {
+        "check": "movement_deltas_match_order_lines",
+        "detail": "every movement has its order, with delta == -qty and the same sku",
+        "ok": true,
+        "subjects": 1
+      },
+      {
+        "check": "movement_delta_sum",
+        "detail": "sum(delta) over movements == -sum(qty) over fulfilled orders",
+        "ok": true,
+        "subjects": 1
+      },
+      {
+        "check": "stock_decrements_match_orders",
+        "detail": "sum(on_hand) == 10600000 cells x 1000000 - taken qty",
+        "ok": true,
+        "subjects": 1
+      }
+    ],
+    "order_no_uniqueness": "queried",
+    "status": "PASS"
+  },
+  "pacing": "open loop: dispatch on the due schedule, one worker executes and commits each group and acks on completion (flashdb-load's shape)",
+  "postgres_settings": {
+    "data_directory": "/home/z/vibe/flashdb/.scratch/82-controlled-m1/runs/pg/data",
+    "fsync": "on",
+    "server_version": "18.6 (Ubuntu 18.6-3build2)",
+    "shared_buffers": "16MB",
+    "synchronous_commit": "on",
+    "unix_socket_directories": "/home/z/vibe/flashdb/.scratch/82-controlled-m1/runs/pg/socket"
+  },
+  "requests_run": 4000,
+  "restore": {
+    "arm": "postgres",
+    "at": "2026-10-18T00:06:58",
+    "bytes": 2201362806,
+    "files": 1361,
+    "from": "/home/z/vibe/flashdb/.scratch/82-controlled-m1/runs/snapshot/postgres",
+    "restore_s": 6.956,
+    "sha256": "7f9a4ea8edb0c1a287a201389ab08aba61e82bd8cdd92f51fe64ddf48cad1b92",
+    "snapshot_sha256": "7f9a4ea8edb0c1a287a201389ab08aba61e82bd8cdd92f51fe64ddf48cad1b92",
+    "to": "/home/z/vibe/flashdb/.scratch/82-controlled-m1/runs/pg/data",
+    "verified": true
+  },
+  "restored": true,
+  "seed_s": 0.0,
+  "trace_sha256": "6472cf46477e037b67820a4fa5a7da9d46e1241e6d8d33f89e10f89b22b8f93f",
+  "verdict": {
+    "highest_sustained_rps": 200.0,
+    "reject_reasons": {},
+    "rejected_windows": 0,
+    "sustained": true
+  },
+  "window_ms": 1000,
+  "windows_file": "windows-postgres.jsonl"
+}

@@ -1,0 +1,123 @@
+{
+  "arm": "sqlite",
+  "arm_scope_peak_bytes": 102584320,
+  "arm_scope_peak_scope": "this process's capped scope over the whole arm step (bulk load + measured phase)",
+  "batch": 64,
+  "counters": {
+    "backorder": 0,
+    "errors": 0,
+    "first_error": null,
+    "miss": 0,
+    "take": 2785
+  },
+  "curve": [
+    {
+      "achieved_fraction": 1.0,
+      "achieved_rps": 200.0,
+      "ceiling_rejected_windows": 0,
+      "compact_bytes": 0,
+      "early_dispatches": 0,
+      "error_windows": 0,
+      "group_elapsed_us": 0,
+      "groups": 3971,
+      "groups_over_service_ceiling": 0,
+      "invalid_windows": 0,
+      "lag_ceiling_rejected_windows": 0,
+      "lag_p50_us": 1.0,
+      "lag_p95_us": 4,
+      "lag_p99_us": 33,
+      "max_group_size": 7,
+      "mean_group_size": 1.007302946361118,
+      "min_lag_us": 0,
+      "offered_rps": 200.0,
+      "p50_us": 3418.0,
+      "p95_us": 36717,
+      "p99_us": 51717,
+      "rate_exceeded": false,
+      "reject_reasons": {},
+      "service_ceiling_rejected_windows": 0,
+      "sustained": true,
+      "valid_windows": 20,
+      "windows": 20
+    }
+  ],
+  "data_bytes": 542494720,
+  "durability": "sqlite WAL + synchronous=FULL, one COMMIT per batch",
+  "durability_observed": {
+    "journal_mode": "wal",
+    "journal_size_limit": -1,
+    "synchronous": 2,
+    "synchronous_name": "FULL",
+    "wal_autocheckpoint_pages": 0
+  },
+  "elapsed_s": 19.995285596000002,
+  "engine_cap_mib": 128,
+  "engine_memory": {
+    "method": "sampled memory.current every 50 ms",
+    "peak_bytes": 102510592,
+    "samples": 398,
+    "scope": "measured phase",
+    "start_bytes": 19910656
+  },
+  "groups": 3971,
+  "instance_root": "/home/z/vibe/flashdb/.scratch/82-controlled-m1/runs/live",
+  "lag_ceiling_us": 10000,
+  "max_group_size": 7,
+  "mean_group_size": 1.007302946361118,
+  "oracle": {
+    "checks": [],
+    "reason": "--skip-oracle: the restored instance is byte-identical in every block, so the inventory is verified once per arm",
+    "status": "DEFERRED"
+  },
+  "pacing": "open loop: dispatch on the due schedule, one worker executes and commits each group and acks on completion (flashdb-load's shape)",
+  "requests_run": 4000,
+  "restore": {
+    "arm": "sqlite",
+    "at": "2026-10-18T00:12:16",
+    "bytes": 541876224,
+    "files": 1,
+    "from": "/home/z/vibe/flashdb/.scratch/82-controlled-m1/runs/snapshot/sqlite.db",
+    "restore_s": 1.436,
+    "sha256": "46c6f1e1e2a149f8e55bb4f29a39b2ca57a53d1a50daa0ae5a3e30c2d4367130",
+    "snapshot_sha256": "46c6f1e1e2a149f8e55bb4f29a39b2ca57a53d1a50daa0ae5a3e30c2d4367130",
+    "to": "/home/z/vibe/flashdb/.scratch/82-controlled-m1/runs/live/sqlite.db",
+    "verified": true
+  },
+  "restored": true,
+  "seed_s": 0.0,
+  "sqlite_cache_kib": 8192,
+  "sqlite_files": {
+    "db": 542330880,
+    "shm": 163840,
+    "wal": 0
+  },
+  "sqlite_wal": {
+    "autocheckpoint_pages": 0,
+    "checkpoint": {
+      "at": "after the measured phase, before the oracle",
+      "pragma": "wal_checkpoint(TRUNCATE)",
+      "result": [
+        0,
+        0,
+        0
+      ]
+    },
+    "data_bytes_after_checkpoint": 542494720,
+    "files_after_checkpoint": {
+      "db": 542330880,
+      "shm": 163840,
+      "wal": 0
+    },
+    "journal_size_limit": -1,
+    "wal_bytes_after_run": 72606792
+  },
+  "trace_sha256": "6472cf46477e037b67820a4fa5a7da9d46e1241e6d8d33f89e10f89b22b8f93f",
+  "verdict": {
+    "highest_sustained_rps": 200.0,
+    "reject_reasons": {},
+    "rejected_windows": 0,
+    "sustained": true
+  },
+  "window_ms": 1000,
+  "windows_file": "windows-sqlite.jsonl"
+}

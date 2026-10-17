@@ -1,0 +1,35 @@
+{
+  "argv": "scripts/m1-controlled-run.sh --phase blocks --since 2026-10-18T00:02:18 ",
+  "arms": [
+    "flashdb-declared",
+    "sqlite",
+    "postgres"
+  ],
+  "blocks": 5,
+  "dataset": {
+    "batch": 64,
+    "customers": 200000,
+    "locs": 4,
+    "on_hand": 1000000,
+    "seed": 42,
+    "skus": 2650000
+  },
+  "engine_cap_mib": 128,
+  "frozen_source": "/home/z/vibe/flashdb/.scratch/80-external-baselines/runs/m1-10x/rung-50",
+  "lock": "/tmp/m1-measure.lock",
+  "postgres_database": "m1-controlled",
+  "postgres_root": "/home/z/vibe/flashdb/.scratch/82-controlled-m1/runs/pg",
+  "repo": "/home/z/vibe/flashdb",
+  "rungs": [
+    50,
+    100,
+    200
+  ],
+  "schema": "flashdb.m1.controlled-run.v1",
+  "seconds_per_arm_run": 20,
+  "seed_cap_mib": 512,
+  "sqlite": {
+    "cache_kib": 8192,
+    "wal_autocheckpoint_pages": 0
+  }
+}
