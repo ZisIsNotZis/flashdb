@@ -232,6 +232,11 @@ scripts/m1-baseline-run.sh --workdir .scratch/80-external-baselines/runs/m1-10x/
 uv run python scripts/m1-ladder-score.py --root .scratch/80-external-baselines/runs/m1-10x
 ```
 
+`report.json` is the single machine-readable document: `runs[0]` is the ladder, `runs[1]` the regime
+run, `verdicts[]` is one row per threshold per run with its condition and arithmetic, and
+`unverified[]` / `summary` are §7-§8 of this report in the same form (they are the same content, not a
+second verdict).
+
 Raw evidence committed beside this report: `runs/m1-measure/rung-<rps>/{manifest,spec,run-<arm>,
 windows-<arm>}.json(l)` and `runs/m1-10x/rung-50/…` (the trace, the instances, the sqlite file and the
 driver/probe logs stay out of git per `runs/.gitignore`; everything is regenerable from the seed and

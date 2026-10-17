@@ -34,6 +34,36 @@ T6_MULTIPLE = 3.0
 # The regime floor: data >= 10x the memory budget (`pre-registration.md` §"Instance size").
 REGIME_FLOOR = 10.0
 
+# The milestone's unverified list and its honest summary, kept beside the arithmetic so the JSON
+# carries them too (the long form with the numbers is `report.md` §7-§8; this is the same content, not
+# a second verdict). Anything listed here is NOT a pass.
+UNVERIFIED = (
+    "T6 at the pre-registered regime: it needs a ladder at >=10x, and one 10x flashdb arm-run costs"
+    " ~6 min of seeding plus a read-back of 16 min-1.6 h at 10.6M cells; run B measured the 1x rung"
+    " only.",
+    "The inventory oracle at >=10x for the flashdb arms: run B's flashdb read-back is DEFERRED (same"
+    " cost), while sqlite's and postgres's oracles passed at 10x and flashdb's passed at 0.14x.",
+    "The pre-registered 10-seed median/IQR aggregation: both runs are one seed.",
+    "Run B's load average at its rung boundaries: not captured (direct invocations), so the single"
+    " rejected flashdb window cannot be attributed to the engine or the machine from this run.",
+)
+SUMMARY = (
+    "The instrument works: one harness drives four arms over one frozen trace at matched durability,"
+    " each engine in its own 128 MiB cgroup, and the inventory oracle passes everywhere it was run"
+    " except the one flashdb case disclosed. At the pre-registered regime (flashdb 1.68 GB = 12.55x"
+    " of the cap, one seed, the 1x rung) T5 passes by an enormous margin - flashdb-declared 49.95 rps"
+    " against sqlite's and postgres's 50.00, a deficit of 1.001 against the 1.5x line - and T7 with"
+    " it; but the same run shows both baselines SUSTAINING the rung with zero rejected windows (lag"
+    " p99 6.1 ms and 2.2 ms) while flashdb-declared fails the sustained rule on one window of twenty"
+    " (12.5 ms), so T5's number is evidence that flashdb's throughput is not behind, not that it is"
+    " as well behaved. In the warm 0.14x ladder the ordering reverses and flashdb is not the fastest"
+    " arm above 100 rps (sqlite sustains 200 cleanly, both flashdb arms are rejected at 200, T6 there"
+    " 2.0x against the 3x line). T6 at the pre-registered regime - the actual external-superiority"
+    " claim - remains unevaluated, and no result here supports a claim that flashdb beats postgres or"
+    " sqlite at scale, a claim about the learned arm (in M1 it is the declared wiring), or a claim"
+    " about drift and reorg cost."
+)
+
 
 def read_json(path: Path):
     return json.loads(path.read_text(encoding="utf-8"))
@@ -219,7 +249,9 @@ def main(argv: list[str]) -> int:
                                  "provisional": run["regime"]["provisional"],
                                  "data_to_cap": {arm: v["data_to_cap"]
                                                  for arm, v in run["footprint"].items()}},
-                  } for run in runs]}
+                  } for run in runs],
+                  "unverified": list(UNVERIFIED),
+                  "summary": SUMMARY}
         out = Path(a.out) if a.out else Path(a.merge[0]).parent.parent / "report.json"
         out.write_text(json.dumps(merged, sort_keys=True, indent=2) + "\n", encoding="utf-8")
         print(f"wrote {out}")
