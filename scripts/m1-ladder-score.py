@@ -41,34 +41,55 @@ REGIME_FLOOR = 10.0
 # a second verdict). Anything listed here is NOT a pass.
 UNVERIFIED = (
     "T6 at the pre-registered regime: it needs a ladder at >=10x, and one 10x flashdb arm-run costs"
-    " ~6 min of seeding plus a read-back of 16 min-1.6 h at 10.6M cells; run B measured the 1x rung"
-    " only.",
-    "The inventory oracle at >=10x for the flashdb arms: run B's flashdb read-back is DEFERRED (same"
-    " cost), while sqlite's and postgres's oracles passed at 10x and flashdb's passed at 0.15-0.19x.",
+    " 416 s of seeding plus a 38 min read-back at 10.6M cells; run B measured the 1x rung only.",
+    "The sustained-rule outcome at the regime rung is not robustly determined: the committed run B"
+    " was measured at loadavg 6.1-8.3 on 8 cores and no arm sustained 50 rps (flashdb 12 of 20"
+    " windows rejected, sqlite 1 of 20 with a 1.97 s stall, postgres 3 of 20), while the earlier"
+    " pre-fix run on the same seed and data (loadavg not recorded, its provenance defect) had"
+    " sqlite and postgres clean and flashdb 1 of 20. A quiet-box repeat decides it.",
     "The pre-registered 10-seed median/IQR aggregation: both runs are one seed.",
-    "Run B's load average at its rung boundaries: not captured (direct invocations), so the single"
-    " rejected flashdb window cannot be attributed to the engine or the machine from this run.",
+    "Run A's rung-400 comparison: the SQL arms' windows were re-measured on 2026-10-17 at loadavg"
+    " 2.2-4.1 rather than the 1.5-2.5 of the first ladder, so its numbers are a second measurement"
+    " of the same traces, not the first one repaired.",
 )
 SUMMARY = (
-    "The instrument works: one harness drives four arms over one frozen trace at matched durability,"
-    " each engine in its own 128 MiB cgroup, and the inventory oracle passes everywhere it was run"
-    " except the one flashdb case disclosed. At the pre-registered regime (flashdb 1.68 GB = 12.55x"
-    " of the cap, one seed, the 1x rung) T5 passes by an enormous margin - flashdb-declared 49.95 rps"
-    " against sqlite's and postgres's 50.00, a deficit of 1.001 against the 1.5x line - and T7 with"
-    " it; but the same run shows both baselines SUSTAINING the rung with zero rejected windows (lag"
-    " p99 6.1 ms and 2.2 ms) while flashdb-declared fails the sustained rule on one window of twenty"
-    " (12.5 ms), so T5's number is evidence that flashdb's throughput is not behind, not that it is"
-    " as well behaved. In the warm 0.15-0.19x ladder the ordering reverses and flashdb is not the fastest"
-    " arm above 100 rps (sqlite sustains 200 cleanly, both flashdb arms are rejected at 200, T6 there"
-    " 2.0x against the 3x line). T6 at the pre-registered regime - the actual external-superiority"
-    " claim - remains unevaluated, and no result here supports a claim that flashdb beats postgres or"
-    " sqlite at scale, a claim about the learned arm (in M1 it is the declared wiring), or a claim"
-    " about drift and reorg cost."
+    "The instrument works, and its two acceptance-shaped holes are closed or named. One harness"
+    " drives four arms over one frozen trace (same sha256 per rung on every arm) at matched"
+    " durability, each engine in its own 128 MiB scope, under one latency rule - the lag ceiling,"
+    " the 3-consecutive-window growth clause and errors, bound by a test to flashdb-load's own"
+    " verdicts - and every inventory oracle passes everywhere it was run, now including flashdb's"
+    " 10x read-back (12 checks over 10.6M cells). At the pre-registered regime (flashdb 1.68 GB ="
+    " 12.546x of the cap, one seed, the 1x rung) all three arms hold 50 rps with zero errors and"
+    " T5's throughput deficit is 1.001 against the 1.5x line, and T7 with it; but that run was"
+    " contended (loadavg 6.1-8.3): flashdb was rejected on 12 of 20 windows, sqlite on 1 (a 1.97 s"
+    " stall) and postgres on 3, so NO arm sustained the rung there, while the earlier pre-fix run"
+    " on the same seed and data had both baselines clean. T5's throughput reading therefore"
+    " reproduces across both runs and its sustained reading does not: the T5/T7 verdict is not"
+    " robustly determined and needs a quiet-box repeat. T6 at the regime - the actual"
+    " external-superiority claim - remains unevaluated (no ladder at 10x). In the warm ladder T6's"
+    " pre-registered comparison has no denominator at 400 rps (no baseline sustained that level),"
+    " and the sustained-vs-sustained reading is 0.50x for the declared arm and 1.00x for the"
+    " learned one against the 3x line, i.e. FAIL. No result here supports a claim that flashdb"
+    " beats postgres or sqlite at scale, a claim about the learned arm (in M1 it is the declared"
+    " wiring), or a claim about drift and reorg cost."
 )
 
 
 def read_json(path: Path):
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def load_average(path: Path) -> list[dict]:
+    """The runner's own `loadavg.jsonl` boundaries for a rung directory (empty when absent).
+
+    The schedule-lag rule is a scheduler-latency rule on a shared box, so the machine's load at every
+    prepare/arm/report boundary is part of the evidence, not a footnote: it is what separates a
+    quiet-box measurement from a contended one.
+    """
+    record = Path(path) / "loadavg.jsonl"
+    if not record.exists():
+        return []
+    return [json.loads(line) for line in record.read_text().splitlines() if line.strip()]
 
 
 def load_rungs(root: Path) -> list[dict]:
@@ -121,6 +142,8 @@ def load_rungs(root: Path) -> list[dict]:
             "window_ms": spec["window_ms"],
             "batch": spec["batch"],
             "on_hand": spec["on_hand"],
+            "runner": spec.get("runner"),
+            "load_average": load_average(path),
             "arms": arms,
         })
     return rungs
@@ -169,6 +192,7 @@ def t5(rung: dict) -> dict:
                       for a, v in baselines.items()},
         "arms": {},
     }
+    baselines_sustained = all(v["sustained"] for v in baselines.values())
     for arm, value in flashdb.items():
         d = deficit(value["achieved_rps"], slower_rps)
         out["arms"][arm] = {
@@ -180,6 +204,13 @@ def t5(rung: dict) -> dict:
             "design_failure": d > T5_FAIL_RATIO,
             "band": ("within-1.5x" if d <= T5_PASS_RATIO
                      else "between-1.5x-and-2x" if d <= T5_FAIL_RATIO else "beyond-2x"),
+            # What the pass rests on, so a reader can see whether it is the throughput reading or
+            # also the sustained one: the pre-registered metric is throughput, but a rung where the
+            # flashdb arm was rejected and the baselines were not is not a like-for-like comparison.
+            "sustained_reading": ("like-for-like (every arm sustained the rung)" if
+                                  value["sustained"] and baselines_sustained else
+                                  "not like-for-like (flashdb and the baselines did not all"
+                                  " sustain the rung)"),
         }
     return out
 
@@ -327,12 +358,18 @@ def main(argv: list[str]) -> int:
                       "run": run["root"],
                       "rungs": [rung["offered_rps"] for rung in run["rungs"]],
                       "t5": {arm: {"deficit_vs_slower_baseline": v["deficit_vs_slower_baseline"],
-                                   "pass": v["pass"]}
+                                   "pass": v["pass"],
+                                   "sustained": v["sustained"],
+                                   "sustained_reading": v.get("sustained_reading"),
+                                   "invalid_windows": v["invalid_windows"]}
                              for arm, v in run["t5"].get("arms", {}).items()},
                       "t6": t6_verdict_row(run["t6"]),
                       "t7": {"pass": run["t7"]["pass"],
                              "deficit_vs_slower_baseline":
-                                 run["t7"]["deficit_vs_slower_baseline"]},
+                                 run["t7"]["deficit_vs_slower_baseline"],
+                             "sustained": run["t5"].get("arms", {}).get(
+                                 "flashdb-declared", {}).get("sustained"),
+                             "note": run["t7"].get("note")},
                       "regime": {"floor_met_by": run["regime"]["floor_met_by"],
                                  "provisional": run["regime"]["provisional"],
                                  "data_to_cap": {arm: v["data_to_cap"]
@@ -373,6 +410,8 @@ def main(argv: list[str]) -> int:
         "t5": t5(next(r for r in rungs if r["offered_rps"] == min(x["offered_rps"] for x in rungs))),
         "t6": t6(rungs),
     }
+    report["t5"]["baselines_sustained"] = {
+        arm: value["sustained"] for arm, value in report["t5"].get("baselines", {}).items()}
     declared = report["t5"]["arms"].get("flashdb-declared", {})
     report["t7"] = {
         "condition": "the declared arm alone must already pass T5",

@@ -1,7 +1,8 @@
 {
   "arm": "postgres",
+  "arm_scope_peak_bytes": 80388096,
+  "arm_scope_peak_scope": "the postgres server scope's lifetime (bulk load + measured phase); the client runs outside it",
   "batch": 64,
-  "cgroup_peak_bytes": 80199680,
   "counters": {
     "backorder": 0,
     "errors": 0,
@@ -11,27 +12,27 @@
   },
   "curve": [
     {
-      "achieved_fraction": 0.977887709741023,
-      "achieved_rps": 391.1550838964092,
+      "achieved_fraction": 0.9980795950511622,
+      "achieved_rps": 399.23183802046486,
       "ceiling_rejected_windows": 21,
       "compact_bytes": 0,
       "early_dispatches": 0,
       "error_windows": 0,
       "group_elapsed_us": 0,
-      "groups": 742,
+      "groups": 715,
       "groups_over_service_ceiling": 0,
       "invalid_windows": 21,
       "lag_ceiling_rejected_windows": 21,
-      "lag_p50_us": 15401,
-      "lag_p95_us": 432156,
-      "lag_p99_us": 442749,
-      "max_group_size": 64,
-      "mean_group_size": 10.78167115902965,
+      "lag_p50_us": 18190,
+      "lag_p95_us": 67583,
+      "lag_p99_us": 78681,
+      "max_group_size": 34,
+      "mean_group_size": 11.188811188811188,
       "min_lag_us": 0,
       "offered_rps": 400.0,
-      "p50_us": 51419,
-      "p95_us": 588721,
-      "p99_us": 601221,
+      "p50_us": 53781,
+      "p95_us": 139708,
+      "p99_us": 157039,
       "rate_exceeded": false,
       "reject_reasons": {
         "lag_ceiling": 21
@@ -42,33 +43,40 @@
       "windows": 21
     }
   ],
-  "data_bytes": 22591167,
+  "data_bytes": 22730431,
   "durability": "postgres fsync=on + synchronous_commit=on (baseline-env.sh), one COMMIT per batch",
-  "elapsed_s": 20.452245754,
-  "engine_peak_source": "postgres server scope (patched by the runner payload)",
-  "groups": 742,
+  "elapsed_s": 20.038482241,
+  "engine_cap_mib": 128,
+  "engine_memory": {
+    "method": "sampled memory.current every 50 ms",
+    "peak_bytes": 80388096,
+    "samples": 394,
+    "scope": "measured phase",
+    "start_bytes": 66670592
+  },
+  "groups": 715,
   "lag_ceiling_us": 10000,
-  "max_group_size": 64,
-  "mean_group_size": 10.78167115902965,
+  "max_group_size": 34,
+  "mean_group_size": 11.188811188811188,
   "oracle": {
     "checks": [
       {
-        "check": "cell_count",
-        "detail": "120000 stock cells, expected 120000 (30000 sku x 4 loc)",
-        "ok": true,
-        "subjects": 1
-      },
-      {
         "check": "on_hand_matches_movements",
-        "detail": "stock(S000024,L000).on_hand=1000000, initial 1000000 + sum(delta) 0 = 1000000",
+        "detail": "stock(S022318,L000).on_hand=999995, initial 1000000 + sum(delta) -5 = 999995",
         "ok": true,
         "subjects": 120000
       },
       {
         "check": "on_hand_non_negative",
-        "detail": "stock(S000024,L000).on_hand=1000000",
+        "detail": "stock(S022318,L000).on_hand=999995",
         "ok": true,
         "subjects": 120000
+      },
+      {
+        "check": "cell_count",
+        "detail": "120000 stock cells, expected 120000 (30000 sku x 4 loc)",
+        "ok": true,
+        "subjects": 1
       },
       {
         "check": "no_duplicate_order_no",
@@ -135,7 +143,7 @@
     "synchronous_commit": "on"
   },
   "requests_run": 8000,
-  "seed_s": 6.826437188996351,
+  "seed_s": 9.466474407003261,
   "trace_sha256": "14e966c1c364fe4650e87c4e93ed6b0d81e74ccd14e62f75fbb107645e69490e",
   "verdict": {
     "highest_sustained_rps": 0.0,

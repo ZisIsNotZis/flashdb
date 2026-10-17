@@ -1,7 +1,8 @@
 {
   "arm": "postgres",
+  "arm_scope_peak_bytes": 77529088,
+  "arm_scope_peak_scope": "the postgres server scope's lifetime (bulk load + measured phase); the client runs outside it",
   "batch": 64,
-  "cgroup_peak_bytes": 77303808,
   "counters": {
     "backorder": 0,
     "errors": 0,
@@ -18,20 +19,20 @@
       "early_dispatches": 0,
       "error_windows": 0,
       "group_elapsed_us": 0,
-      "groups": 1994,
+      "groups": 1998,
       "groups_over_service_ceiling": 0,
       "invalid_windows": 1,
       "lag_ceiling_rejected_windows": 1,
-      "lag_p50_us": 106.5,
-      "lag_p95_us": 12205,
-      "lag_p99_us": 24426,
-      "max_group_size": 3,
-      "mean_group_size": 1.0030090270812437,
+      "lag_p50_us": 125.5,
+      "lag_p95_us": 5987,
+      "lag_p99_us": 12374,
+      "max_group_size": 2,
+      "mean_group_size": 1.001001001001001,
       "min_lag_us": 0,
       "offered_rps": 100.0,
-      "p50_us": 5175.5,
-      "p95_us": 33929,
-      "p99_us": 9996,
+      "p50_us": 5025.0,
+      "p95_us": 17667,
+      "p99_us": 15452,
       "rate_exceeded": false,
       "reject_reasons": {
         "lag_ceiling": 1
@@ -42,22 +43,23 @@
       "windows": 20
     }
   ],
-  "data_bytes": 21452479,
+  "data_bytes": 21509823,
   "durability": "postgres fsync=on + synchronous_commit=on (baseline-env.sh), one COMMIT per batch",
-  "elapsed_s": 19.995899480000002,
-  "engine_peak_source": "postgres server scope (patched by the runner payload)",
-  "groups": 1994,
+  "elapsed_s": 19.995721521,
+  "engine_cap_mib": 128,
+  "engine_memory": {
+    "method": "sampled memory.current every 50 ms",
+    "peak_bytes": 70017024,
+    "samples": 395,
+    "scope": "measured phase",
+    "start_bytes": 67264512
+  },
+  "groups": 1998,
   "lag_ceiling_us": 10000,
-  "max_group_size": 3,
-  "mean_group_size": 1.0030090270812437,
+  "max_group_size": 2,
+  "mean_group_size": 1.001001001001001,
   "oracle": {
     "checks": [
-      {
-        "check": "cell_count",
-        "detail": "120000 stock cells, expected 120000 (30000 sku x 4 loc)",
-        "ok": true,
-        "subjects": 1
-      },
       {
         "check": "on_hand_matches_movements",
         "detail": "stock(S000012,L003).on_hand=1000000, initial 1000000 + sum(delta) 0 = 1000000",
@@ -69,6 +71,12 @@
         "detail": "stock(S000012,L003).on_hand=1000000",
         "ok": true,
         "subjects": 120000
+      },
+      {
+        "check": "cell_count",
+        "detail": "120000 stock cells, expected 120000 (30000 sku x 4 loc)",
+        "ok": true,
+        "subjects": 1
       },
       {
         "check": "no_duplicate_order_no",
@@ -135,7 +143,7 @@
     "synchronous_commit": "on"
   },
   "requests_run": 2000,
-  "seed_s": 8.281013651998364,
+  "seed_s": 8.035097468004096,
   "trace_sha256": "dcbf758d98b0500d81a3694f67717accd8dc79997f786339b027d762d9b6e0f6",
   "verdict": {
     "highest_sustained_rps": 0.0,

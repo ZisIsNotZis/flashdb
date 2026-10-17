@@ -1543,13 +1543,17 @@ def _verify_flashdb(name: str, manifest: dict, workdir: Path, bins: Path, trace:
     """The post-hoc read-back of the measured instance: every cell, customer and order number."""
     trace_orders = sorted(set(iter_order_numbers(trace)))
     probe_t0 = time.perf_counter()
+    # `run_flashdb_probes` is a GENERATOR: calling it costs nothing and the replay happens as
+    # `oracle_flashdb` consumes it. The timer therefore wraps the consumption, not the call -- a
+    # timer around the call alone records 0.0 s and says nothing about the read-back's cost.
     replayed = run_flashdb_probes(name, manifest, workdir, bins, trace_orders)
-    record["oracle_s"] = time.perf_counter() - probe_t0
-    return oracle_flashdb(replayed, manifest, {
+    result = oracle_flashdb(replayed, manifest, {
         "take": record["counters"]["take"],
         "errors": record["counters"]["errors"],
         "first_error": record["counters"]["first_error"],
     }, spec["on_hand"])
+    record["oracle_s"] = time.perf_counter() - probe_t0
+    return result
 
 
 def cmd_verify(args: argparse.Namespace) -> int:

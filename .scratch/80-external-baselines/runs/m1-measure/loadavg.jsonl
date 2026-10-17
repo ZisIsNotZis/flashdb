@@ -1,7 +1,8 @@
-{"rung": 50, "phase": "before", "at": "2026-10-17T11:01:13+08:00", "loadavg": "2.40 3.27 3.76", "nproc": 8}
-{"rung": 50, "phase": "after", "at": "2026-10-17T11:04:17+08:00", "loadavg": "2.54 2.95 3.55", "nproc": 8}
-{"rung": 100, "phase": "before", "at": "2026-10-17T11:04:17+08:00", "loadavg": "2.54 2.95 3.55", "nproc": 8}
-{"rung": 100, "phase": "after", "at": "2026-10-17T11:08:04+08:00", "loadavg": "2.21 2.67 3.31", "nproc": 8}
-{"rung": 200, "phase": "before", "at": "2026-10-17T11:08:04+08:00", "loadavg": "2.21 2.67 3.31", "nproc": 8}
-{"rung": 200, "phase": "after", "at": "2026-10-17T11:13:18+08:00", "loadavg": "1.47 2.05 2.87", "nproc": 8}
-{"rung": 400, "phase": "before", "at": "2026-10-17T11:13:18+08:00", "loadavg": "1.47 2.05 2.87", "nproc": 8}
+{"rung": 50, "phase": "before", "at": "2026-10-17T13:47:32+08:00", "loadavg": "2.80 3.44 3.72", "nproc": 8}
+{"rung": 50, "phase": "after", "at": "2026-10-17T13:50:24+08:00", "loadavg": "2.19 3.06 3.54", "nproc": 8}
+{"rung": 100, "phase": "before", "at": "2026-10-17T13:50:24+08:00", "loadavg": "2.19 3.06 3.54", "nproc": 8}
+{"rung": 100, "phase": "after", "at": "2026-10-17T13:53:30+08:00", "loadavg": "3.74 3.35 3.56", "nproc": 8}
+{"rung": 200, "phase": "before", "at": "2026-10-17T13:53:30+08:00", "loadavg": "3.74 3.35 3.56", "nproc": 8}
+{"rung": 200, "phase": "after", "at": "2026-10-17T13:57:14+08:00", "loadavg": "4.08 3.57 3.59", "nproc": 8}
+{"rung": 400, "phase": "before", "at": "2026-10-17T13:57:14+08:00", "loadavg": "4.08 3.57 3.59", "nproc": 8}
+{"rung": 400, "phase": "after", "at": "2026-10-17T14:04:03+08:00", "loadavg": "3.68 3.84 3.70", "nproc": 8}

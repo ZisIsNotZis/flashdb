@@ -1,7 +1,11 @@
 {
   "arm": "flashdb-learned",
+  "arm_scope_peak_bytes": null,
   "batch": 64,
-  "cgroup_peak_bytes": 79220736,
+  "construction_memory": {
+    "cap_mib": 192,
+    "peak_bytes": 91279360
+  },
   "counters": {
     "backorder": 0,
     "errors": 0,
@@ -13,57 +17,56 @@
     {
       "achieved_fraction": 1.0,
       "achieved_rps": 200.0,
-      "ceiling_rejected_windows": 2,
+      "ceiling_rejected_windows": 0,
       "compact_bytes": 0,
       "early_dispatches": 0,
       "error_windows": 0,
-      "group_elapsed_us": 28864,
-      "groups": 3949,
+      "group_elapsed_us": 27962,
+      "groups": 3965,
       "groups_over_service_ceiling": 0,
-      "invalid_windows": 2,
-      "lag_ceiling_rejected_windows": 2,
-      "lag_p50_us": 175.0,
-      "lag_p95_us": 4852,
-      "lag_p99_us": 12745,
+      "invalid_windows": 0,
+      "lag_ceiling_rejected_windows": 0,
+      "lag_p50_us": 292.0,
+      "lag_p95_us": 5345,
+      "lag_p99_us": 7623,
       "max_group_size": 3,
-      "mean_group_size": 1.0129146619397316,
-      "min_lag_us": 1,
+      "mean_group_size": 1.008827238335435,
+      "min_lag_us": 3,
       "offered_rps": 200.0,
-      "p50_us": 3919.0,
-      "p95_us": 12838,
-      "p99_us": 19959,
+      "p50_us": 4528.5,
+      "p95_us": 10770,
+      "p99_us": 17962,
       "rate_exceeded": false,
-      "reject_reasons": {
-        "lag_ceiling": 2
-      },
+      "reject_reasons": {},
       "service_ceiling_rejected_windows": 0,
-      "sustained": false,
-      "valid_windows": 18,
+      "sustained": true,
+      "valid_windows": 20,
       "windows": 20
     }
   ],
   "durability": "flashdb --group-requests 64 (one WAL barrier per group)",
-  "elapsed_s": 20.003,
+  "elapsed_s": 20.002,
   "engine_cap_mib": 128,
-  "groups": 3949,
-  "instance_bytes": 21368415,
+  "engine_memory": {
+    "method": "exact memory.peak of the flashdb-load invocation's own scope, read inside it",
+    "peak_bytes": 15826944,
+    "samples": null,
+    "scope": "measured phase only: the instance is BUILT in a separate construction scope",
+    "start_bytes": 3813376
+  },
+  "groups": 3965,
+  "instance_bytes": 27224067,
+  "instance_files": {
+    "data-143.wal": 4419552,
+    "tile-143.tile": 10805133,
+    "tile-150.tile": 1084225,
+    "tile-73.tile": 10906965
+  },
   "lag_ceiling_us": 10000,
   "max_group_size": 3,
-  "mean_group_size": 1.0129146619397316,
+  "mean_group_size": 1.008827238335435,
   "oracle": {
     "checks": [
-      {
-        "check": "stock_cell_present",
-        "detail": "Stock(S000001,L000) is empty",
-        "ok": true,
-        "subjects": 120000
-      },
-      {
-        "check": "customer_present",
-        "detail": "probe-customer:c000000@example.com is empty",
-        "ok": true,
-        "subjects": 30000
-      },
       {
         "check": "one_movement_per_order",
         "detail": "O00000001 returned 1 movements, expected at most 1",
@@ -75,6 +78,30 @@
         "detail": "scan for O00000001 returned movement of O00000001",
         "ok": true,
         "subjects": 2785
+      },
+      {
+        "check": "customer_present",
+        "detail": "probe-customer:c000000@example.com is empty",
+        "ok": true,
+        "subjects": 30000
+      },
+      {
+        "check": "stock_cell_present",
+        "detail": "Stock(S000001,L000) is empty",
+        "ok": true,
+        "subjects": 120000
+      },
+      {
+        "check": "on_hand_matches_movements",
+        "detail": "stock(S000001,L000).on_hand=999815, initial 1000000 + sum(delta) -185 = 999815",
+        "ok": true,
+        "subjects": 120000
+      },
+      {
+        "check": "on_hand_non_negative",
+        "detail": "stock(S000001,L000).on_hand=999815",
+        "ok": true,
+        "subjects": 120000
       },
       {
         "check": "cell_count",
@@ -89,16 +116,10 @@
         "subjects": 1
       },
       {
-        "check": "on_hand_matches_movements",
-        "detail": "stock(S000001,L000).on_hand=999815, initial 1000000 + sum(delta) -185 = 999815",
+        "check": "every_movement_cell_probed",
+        "detail": "0 movement cells were never read back: []",
         "ok": true,
-        "subjects": 120000
-      },
-      {
-        "check": "on_hand_non_negative",
-        "detail": "stock(S000001,L000).on_hand=999815",
-        "ok": true,
-        "subjects": 120000
+        "subjects": 1
       },
       {
         "check": "movement_count_is_committed_takes",
@@ -122,32 +143,28 @@
     "order_no_uniqueness": "enforced at write time (no Order read shape); zero request errors required",
     "status": "PASS"
   },
-  "oracle_s": 36.22675921100017,
+  "oracle_s": 57.72718276300293,
   "policy": "declared default (no learner controller wired in M1)",
   "requests_run": 4000,
-  "seed_cap_mib": 192,
-  "seed_peak_bytes": 79720448,
-  "seed_s": 2.8002782109979307,
+  "seed_s": 4.142564046996995,
   "summary": {
     "completed": 4000,
     "early_dispatches": 0,
-    "elapsed_ms": 20003,
+    "elapsed_ms": 20002,
     "else_used": 0,
     "errors": 0,
     "first_error": null,
-    "invalid_windows": 2,
-    "lag_ceiling_rejected_windows": 2,
+    "invalid_windows": 0,
+    "lag_ceiling_rejected_windows": 0,
     "requests": 4000,
     "windows": 20
   },
   "trace_sha256": "30778694fbe326100f7942e0ae2d45897172392bf34fdc6d0734a82024bf8e3b",
   "verdict": {
-    "highest_sustained_rps": 0.0,
-    "reject_reasons": {
-      "lag_ceiling": 2
-    },
-    "rejected_windows": 2,
-    "sustained": false
+    "highest_sustained_rps": 200.0,
+    "reject_reasons": {},
+    "rejected_windows": 0,
+    "sustained": true
   },
   "window_ms": 1000,
   "windows_file": "windows-flashdb-learned.jsonl"

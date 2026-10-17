@@ -1,7 +1,8 @@
 {
   "arm": "sqlite",
+  "arm_scope_peak_bytes": 43204608,
+  "arm_scope_peak_scope": "this process's capped scope over the whole arm step (bulk load + measured phase)",
   "batch": 64,
-  "cgroup_peak_bytes": 42229760,
   "counters": {
     "backorder": 0,
     "errors": 0,
@@ -18,20 +19,20 @@
       "early_dispatches": 0,
       "error_windows": 0,
       "group_elapsed_us": 0,
-      "groups": 3994,
+      "groups": 3992,
       "groups_over_service_ceiling": 0,
       "invalid_windows": 0,
       "lag_ceiling_rejected_windows": 0,
-      "lag_p50_us": 142.5,
-      "lag_p95_us": 223,
-      "lag_p99_us": 3406,
-      "max_group_size": 3,
-      "mean_group_size": 1.0015022533800702,
+      "lag_p50_us": 113.0,
+      "lag_p95_us": 2464,
+      "lag_p99_us": 6564,
+      "max_group_size": 4,
+      "mean_group_size": 1.002004008016032,
       "min_lag_us": 0,
       "offered_rps": 200.0,
-      "p50_us": 1977.5,
-      "p95_us": 4680,
-      "p99_us": 12780,
+      "p50_us": 1711.5,
+      "p95_us": 7289,
+      "p99_us": 16944,
       "rate_exceeded": false,
       "reject_reasons": {},
       "service_ceiling_rejected_windows": 0,
@@ -40,21 +41,28 @@
       "windows": 20
     }
   ],
-  "data_bytes": 12152528,
+  "data_bytes": 12136048,
   "durability": "sqlite WAL + synchronous=FULL, one COMMIT per batch",
-  "elapsed_s": 19.995335511999997,
-  "groups": 3994,
+  "durability_observed": {
+    "journal_mode": "wal",
+    "synchronous": 2,
+    "synchronous_name": "FULL"
+  },
+  "elapsed_s": 19.99525901,
+  "engine_cap_mib": 128,
+  "engine_memory": {
+    "method": "sampled memory.current every 50 ms",
+    "peak_bytes": 43204608,
+    "samples": 396,
+    "scope": "measured phase",
+    "start_bytes": 36839424
+  },
+  "groups": 3992,
   "lag_ceiling_us": 10000,
-  "max_group_size": 3,
-  "mean_group_size": 1.0015022533800702,
+  "max_group_size": 4,
+  "mean_group_size": 1.002004008016032,
   "oracle": {
     "checks": [
-      {
-        "check": "cell_count",
-        "detail": "120000 stock cells, expected 120000 (30000 sku x 4 loc)",
-        "ok": true,
-        "subjects": 1
-      },
       {
         "check": "on_hand_matches_movements",
         "detail": "stock(S000001,L000).on_hand=999815, initial 1000000 + sum(delta) -185 = 999815",
@@ -66,6 +74,12 @@
         "detail": "stock(S000001,L000).on_hand=999815",
         "ok": true,
         "subjects": 120000
+      },
+      {
+        "check": "cell_count",
+        "detail": "120000 stock cells, expected 120000 (30000 sku x 4 loc)",
+        "ok": true,
+        "subjects": 1
       },
       {
         "check": "no_duplicate_order_no",
@@ -126,8 +140,13 @@
     "status": "PASS"
   },
   "requests_run": 4000,
-  "seed_s": 1.7363350359955803,
+  "seed_s": 1.943787896001595,
   "sqlite_cache_kib": 8192,
+  "sqlite_files": {
+    "db": 7958528,
+    "shm": 32768,
+    "wal": 4144752
+  },
   "trace_sha256": "30778694fbe326100f7942e0ae2d45897172392bf34fdc6d0734a82024bf8e3b",
   "verdict": {
     "highest_sustained_rps": 200.0,

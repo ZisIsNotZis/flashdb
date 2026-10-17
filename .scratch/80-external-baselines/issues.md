@@ -329,26 +329,32 @@ one process at a time, each engine in its own 128 MiB cgroup.
 
 | arm | achieved rps | lag p99 us | service p99 us | rejected windows | sustained | engine cgroup peak | data bytes (x cap) | oracle |
 |---|---|---|---|---|---|---|---|---|
-| flashdb-declared | 49.95 | 12,470 | 24,900 | 1 (lag_ceiling, window 8) | no | 128 MiB (at cap) | 1,683,903,919 (12.55x) | **DEFERRED** (see below) |
-| sqlite | 50.00 | 6,120 | 25,909 | 0 | yes | 128 MiB (at cap) | 546,160,216 (4.07x) | PASS (12 checks) |
-| postgres | 50.00 | 2,199 | 22,004 | 0 | yes | 128 MiB (at cap) | 1,103,779,519 (8.22x) | PASS (12 checks) |
+| flashdb-declared | 49.95 | 40,901 | 29,230 | 12 (lag_ceiling) | no | 128 MiB (at cap) | 1,683,903,919 (12.55x) | PASS (12 checks) |
+| sqlite | 50.00 | 1,969,377 | 2,006,844 | 1 (lag_ceiling) | no | 128 MiB (at cap) | 546,123,232 (4.07x) | PASS (12 checks) |
+| postgres | 50.00 | 41,827 | 27,705 | 3 (lag_ceiling) | no | 128 MiB (at cap) | 1,103,779,519 (8.22x) | PASS (12 checks) |
 
-- **T5 at the regime: PASS.** flashdb-declared 49.95 rps against the slower baseline's 50.00 → deficit
-  1.001 against the pre-registered 1.5x requirement (2x is the fail line). **T7: PASS** (the declared
-  arm is the one measured; `flashdb-learned` is the same wiring in M1 and was not run at 10x).
-- **The caveat the number does not carry on its own:** both baselines sustain the rung with zero
-  rejected windows while flashdb-declared fails the sustained rule on one window of twenty. Under the
-  validity rule ("throughput from invalid windows is not counted") the flashdb arm has no sustained
-  level at this rung; its *achieved* rate is identical. One seed, one rung: a second seed would decide
-  whether the miss is the engine or the machine.
+This is the re-run of 2026-10-17 12:30-13:47 through the locked runner (argv, caps and lock in
+`spec.json`; load average at every boundary in `loadavg.jsonl`); the numbers above replace the earlier
+run's. **The rung was contended: loadavg 6.14 at the flashdb arm's start, and no arm sustained it** —
+flashdb on 12 of 20 windows, sqlite on 1 (a 1.97 s host stall), postgres on 3. The earlier run of the
+same seed and trace (`8fcf807`, load average not recorded — the provenance defect this cycle fixed)
+had flashdb at 1 rejection and both baselines clean. `report.md` §3.1, §6 and §7 carry the comparison
+and what it does and does not decide.
+
+- **T5 at the regime: (a) PASS, (b) NOT ROBUSTLY DETERMINED.** flashdb-declared 49.95 rps against the
+  slower baseline's 50.00 → deficit 1.001 against the pre-registered 1.5x requirement (2x is the fail
+  line), and it reproduces in both runs; but no arm sustained this rung in the committed run while
+  both baselines sustained it in the earlier one, so the sustained half of the reading is undecided by
+  either run alone and needs a quiet-box repeat. **T7 inherits both halves** (the declared arm is the
+  one measured; `flashdb-learned` is the same wiring in M1 and was not run at 10x).
 - **T6 at the regime: UNVERIFIED.** It needs a ladder at 10x; measured costs make that impossible in
-  this package's 3 h cap — flashdb seeding 353.7 s per arm-run (the seed also reached its 512 MiB
-  construction cap), the read-back 16 min-1.6 h at 10.6M cells, and postgres seeding 650.1 s per
-  arm-run. Four rungs x four arms is ~8 h of measured cost, not an opinion.
-- **flashdb's read-back at 10x is DEFERRED and this is the one acceptance criterion the regime run
-  misses.** The arm is measured; its inventory verification was not run because at 10.6M cells it costs
-  16 min-1.6 h per arm even after the streaming rewrite. The same oracle passes on the same code at
-  0.15-0.19x (11 checks) and on the SQL arms at 10x (12 checks each).
+  this package's 4 h wall-clock cap — flashdb seeding 353.7-416.1 s per arm-run (the seed also
+  reached its 512 MiB construction cap), the read-back 38 min at 10.6M cells, and postgres seeding
+  650.1-686.9 s per arm-run. Four rungs x four arms is ~8 h of measured cost, not an opinion.
+- **flashdb's read-back at 10x is no longer deferred: it PASSED** in the re-run (12 checks;
+  10,600,000 cells read back with `on_hand == initial + sum(delta)` and `on_hand >= 0`, 200,000
+  customers, 694 order numbers, 0 request errors), which closes the one acceptance criterion the
+  earlier regime run missed. Cost, measured: 38 min of wall clock for 10.8M probes.
 
 ### Verification cost fixes made for this run
 
@@ -359,3 +365,35 @@ than `fetchall`, sqlite's bulk load uses `journal_mode=OFF` (a `MEMORY` journal 
 whole database in RAM: the first 10x sqlite attempt died with rc=137 at the 128 MiB cap), and flashdb's
 verification streams both the probe file and `flashdb-replay`'s stdout. The `(sku, loc)` verification
 index is created after the measured replay ends, so it cannot lengthen the measured path.
+
+## Fix record (independent review FAIL → this cycle)
+
+The independent review of the first M1 report (bound to `8fcf807`) returned **FAIL** on three
+acceptance claims and one measurement's provenance. This section is the current record of what was
+fixed; the report it applies to is `.scratch/80-external-baselines/report.md` and its `report.json`.
+
+### Defects and their fixes
+
+| # | defect | fix | evidence |
+|---|---|---|---|
+| P1.1 | the SQL window reducer rejected only on `lag_ceiling`/`errors`, while `flashdb-load` also rejects on 3 consecutive lag-growth windows — so the arms were not scored by the same rule, contrary to M1's acceptance | the growth clause (`LAG_GROWTH_WINDOWS`, `WindowSamples.advance_growth`, `saturated`, `lag_saturation` in `reject_reason`) is now part of the reducer, and the per-window `late_requests`/`late_growth_windows`/`saturated` inputs are recorded in `windows-<arm>.jsonl` | `harness/tests/test_baseline_0b.py::test_lag_growth_is_rejected_exactly_where_flashdb_load_rejects_it` binds the reducer to a transcription of the driver's rule window by window; the clause fired on real data (run A rung 200 flashdb-declared: 4 `lag_ceiling` + 2 `lag_saturation`) |
+| P1.2 | T6's multiple used flashdb's ACHIEVED rate at 400 rps (a level it did not sustain) against sqlite's sustained rate from a different rung; the dead `sustained_verdict()` was never called | T6 now reports the pre-registered comparison at the top rung (not evaluable there: no baseline sustained 400) AND the sustained-vs-sustained reading (declared 0.50x, learned 1.00x); `sustained_verdict()` is replaced by the used `sustained_level()` | `scripts/m1-ladder-score.py` `t6()`, `report.json` `verdicts[].t6`, report §6 |
+| P1.3 | sqlite's WAL/`synchronous=FULL` was asserted from the setter, never observed, although the seeding path runs journal-less and a failed `PRAGMA` is silent | `SqliteArm.observed_durability`/`require_measured_durability` read both pragmas back after the bulk load and fail loudly; run B records `{"journal_mode": "wal", "synchronous": 2}` | three tests (read-back, post-seed restore, failed-restore negative control); `runs/m1-10x/rung-50/run-sqlite.json` `durability_observed` |
+| P1.4 | run B's provenance was asserted: no `--seed-cap-mib` in the runner, no argv in `spec.json`, no lock evidence, no load average | the runner takes `--seed-cap-mib`, writes its argv/cwd/caps/lock into `spec.json`, and records the load average at every prepare/arm/report boundary; run B was re-run through it and the records regenerated, never hand-edited | `runs/m1-10x/rung-50/spec.json` `runner`, `loadavg.jsonl` |
+| P1.5 | the memory comparison mixed lifecycle points: flashdb's peak was measured-phase, sqlite's and postgres's were scope lifetimes including the bulk load, and `engine_cap_mib` was absent for the SQL arms | the serving peak is measured over the measured phase only — a per-invocation scope for flashdb, a 20 Hz `memory.current` sampler for sqlite and postgres — with the arm-scope lifetime peak and the construction peak recorded separately; `engine_cap_mib` on every arm | `report.md` §5, `run-<arm>.json` `engine_memory` / `arm_scope_peak_bytes` / `construction_memory` |
+| P2 | per-arm group size at 400 unattributed; four numbers with no source or a wrong value; `oracle_flashdb` had no test and no negative control; `issues.md` and the runner's header contradicted `report.md` about the postgres scope; the budget was quoted as 3 h here and 4 h there; the "synchronous SQL pacer is the main reason" claim was unsupported | per-arm group sizes tabled at 400 with the equal-durability statement (postgres 11.19 vs 1.04-1.37); every quoted number re-derived from the records; 8 parametrised negative controls for `oracle_flashdb` on a synthetic replay; both scope statements corrected (the cap covers the SERVER, the client is outside); the budget is 4 h everywhere; the causal claim softened to what the run shows | report §2, §4, §5; `tests/test_baseline_0b.py`; this file; `scripts/m1-baseline-run.sh` |
+
+The regime rung was re-measured under the locked runner (`report.md` §9 quotes the command) and the
+ladder was re-measured as well, because the pre-fix SQL windows cannot be re-scored: they carry no
+per-window late-request count, so whether the growth clause would have rejected them is not derivable
+from the committed bytes. In the re-measured windows the clause changed no SQL verdict (every SQL
+rejection is a `lag_ceiling` one).
+
+### Still open (named, not hidden)
+
+- **A quiet-box repeat of the regime rung.** The committed run was contended (§3.1 of the report) and
+  no arm sustained the rung there; the earlier run had both baselines clean. T5/T7's sustained reading
+  is not robustly determined until that repeat exists. The command is in `report.md` §9 and the seed
+  and trace are deterministic (sha256 `859b99a1…`).
+- **A ladder at 10x** for T6 — unchanged, and still the expensive one (~8 h of measured cost).
+- **The pre-registered 10-seed aggregation** — unchanged; both runs are one seed.

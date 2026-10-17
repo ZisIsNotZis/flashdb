@@ -1,7 +1,8 @@
 {
   "arm": "sqlite",
+  "arm_scope_peak_bytes": 43798528,
+  "arm_scope_peak_scope": "this process's capped scope over the whole arm step (bulk load + measured phase)",
   "batch": 64,
-  "cgroup_peak_bytes": 43225088,
   "counters": {
     "backorder": 0,
     "errors": 0,
@@ -18,20 +19,20 @@
       "early_dispatches": 0,
       "error_windows": 0,
       "group_elapsed_us": 0,
-      "groups": 7730,
+      "groups": 7696,
       "groups_over_service_ceiling": 0,
       "invalid_windows": 1,
       "lag_ceiling_rejected_windows": 1,
-      "lag_p50_us": 121.0,
-      "lag_p95_us": 4487,
-      "lag_p99_us": 14919,
-      "max_group_size": 9,
-      "mean_group_size": 1.034928848641656,
+      "lag_p50_us": 109.0,
+      "lag_p95_us": 4480,
+      "lag_p99_us": 15849,
+      "max_group_size": 10,
+      "mean_group_size": 1.0395010395010396,
       "min_lag_us": 0,
       "offered_rps": 400.0,
-      "p50_us": 1847.0,
-      "p95_us": 10356,
-      "p99_us": 10358,
+      "p50_us": 1732.0,
+      "p95_us": 10106,
+      "p99_us": 9688,
       "rate_exceeded": false,
       "reject_reasons": {
         "lag_ceiling": 1
@@ -44,19 +45,26 @@
   ],
   "data_bytes": 12598968,
   "durability": "sqlite WAL + synchronous=FULL, one COMMIT per batch",
-  "elapsed_s": 19.999728515,
-  "groups": 7730,
+  "durability_observed": {
+    "journal_mode": "wal",
+    "synchronous": 2,
+    "synchronous_name": "FULL"
+  },
+  "elapsed_s": 19.999428173000002,
+  "engine_cap_mib": 128,
+  "engine_memory": {
+    "method": "sampled memory.current every 50 ms",
+    "peak_bytes": 43794432,
+    "samples": 395,
+    "scope": "measured phase",
+    "start_bytes": 37109760
+  },
+  "groups": 7696,
   "lag_ceiling_us": 10000,
-  "max_group_size": 9,
-  "mean_group_size": 1.034928848641656,
+  "max_group_size": 10,
+  "mean_group_size": 1.0395010395010396,
   "oracle": {
     "checks": [
-      {
-        "check": "cell_count",
-        "detail": "120000 stock cells, expected 120000 (30000 sku x 4 loc)",
-        "ok": true,
-        "subjects": 1
-      },
       {
         "check": "on_hand_matches_movements",
         "detail": "stock(S000001,L000).on_hand=999638, initial 1000000 + sum(delta) -362 = 999638",
@@ -68,6 +76,12 @@
         "detail": "stock(S000001,L000).on_hand=999638",
         "ok": true,
         "subjects": 120000
+      },
+      {
+        "check": "cell_count",
+        "detail": "120000 stock cells, expected 120000 (30000 sku x 4 loc)",
+        "ok": true,
+        "subjects": 1
       },
       {
         "check": "no_duplicate_order_no",
@@ -128,8 +142,13 @@
     "status": "PASS"
   },
   "requests_run": 8000,
-  "seed_s": 1.5461748429952422,
+  "seed_s": 1.8338416009937646,
   "sqlite_cache_kib": 8192,
+  "sqlite_files": {
+    "db": 8409088,
+    "shm": 32768,
+    "wal": 4157112
+  },
   "trace_sha256": "14e966c1c364fe4650e87c4e93ed6b0d81e74ccd14e62f75fbb107645e69490e",
   "verdict": {
     "highest_sustained_rps": 0.0,

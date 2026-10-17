@@ -1,7 +1,11 @@
 {
   "arm": "flashdb-declared",
+  "arm_scope_peak_bytes": null,
   "batch": 64,
-  "cgroup_peak_bytes": 85434368,
+  "construction_memory": {
+    "cap_mib": 192,
+    "peak_bytes": 91111424
+  },
   "counters": {
     "backorder": 0,
     "errors": 0,
@@ -11,59 +15,60 @@
   },
   "curve": [
     {
-      "achieved_fraction": 0.999375,
-      "achieved_rps": 399.75,
-      "ceiling_rejected_windows": 11,
+      "achieved_fraction": 0.998,
+      "achieved_rps": 399.2,
+      "ceiling_rejected_windows": 14,
       "compact_bytes": 0,
       "early_dispatches": 0,
       "error_windows": 0,
-      "group_elapsed_us": 91400,
-      "groups": 6518,
+      "group_elapsed_us": 102141,
+      "groups": 5869,
       "groups_over_service_ceiling": 0,
-      "invalid_windows": 11,
-      "lag_ceiling_rejected_windows": 11,
-      "lag_p50_us": 279.5,
-      "lag_p95_us": 29533,
-      "lag_p99_us": 40307,
-      "max_group_size": 19,
-      "mean_group_size": 1.22737035900583,
-      "min_lag_us": 1,
+      "invalid_windows": 14,
+      "lag_ceiling_rejected_windows": 14,
+      "lag_p50_us": 243.5,
+      "lag_p95_us": 36123,
+      "lag_p99_us": 51201,
+      "max_group_size": 25,
+      "mean_group_size": 1.3630942238882262,
+      "min_lag_us": 2,
       "offered_rps": 400.0,
-      "p50_us": 11636.5,
-      "p95_us": 66926,
-      "p99_us": 52005,
+      "p50_us": 11392.0,
+      "p95_us": 81606,
+      "p99_us": 59982,
       "rate_exceeded": false,
       "reject_reasons": {
-        "lag_ceiling": 11
+        "lag_ceiling": 14
       },
       "service_ceiling_rejected_windows": 0,
       "sustained": false,
-      "valid_windows": 9,
+      "valid_windows": 6,
       "windows": 20
     }
   ],
   "durability": "flashdb --group-requests 64 (one WAL barrier per group)",
-  "elapsed_s": 20.017,
+  "elapsed_s": 20.024,
   "engine_cap_mib": 128,
-  "groups": 6518,
-  "instance_bytes": 24926514,
+  "engine_memory": {
+    "method": "exact memory.peak of the flashdb-load invocation's own scope, read inside it",
+    "peak_bytes": 28803072,
+    "samples": null,
+    "scope": "measured phase only: the instance is BUILT in a separate construction scope",
+    "start_bytes": 3518464
+  },
+  "groups": 5869,
+  "instance_bytes": 30782166,
+  "instance_files": {
+    "data-143.wal": 7977651,
+    "tile-143.tile": 10805133,
+    "tile-150.tile": 1084225,
+    "tile-73.tile": 10906965
+  },
   "lag_ceiling_us": 10000,
-  "max_group_size": 19,
-  "mean_group_size": 1.22737035900583,
+  "max_group_size": 25,
+  "mean_group_size": 1.3630942238882262,
   "oracle": {
     "checks": [
-      {
-        "check": "stock_cell_present",
-        "detail": "Stock(S000001,L000) is empty",
-        "ok": true,
-        "subjects": 120000
-      },
-      {
-        "check": "customer_present",
-        "detail": "probe-customer:c000000@example.com is empty",
-        "ok": true,
-        "subjects": 30000
-      },
       {
         "check": "one_movement_per_order",
         "detail": "O00000001 returned 1 movements, expected at most 1",
@@ -75,6 +80,30 @@
         "detail": "scan for O00000001 returned movement of O00000001",
         "ok": true,
         "subjects": 5559
+      },
+      {
+        "check": "customer_present",
+        "detail": "probe-customer:c000000@example.com is empty",
+        "ok": true,
+        "subjects": 30000
+      },
+      {
+        "check": "stock_cell_present",
+        "detail": "Stock(S000001,L000) is empty",
+        "ok": true,
+        "subjects": 120000
+      },
+      {
+        "check": "on_hand_matches_movements",
+        "detail": "stock(S000001,L000).on_hand=999638, initial 1000000 + sum(delta) -362 = 999638",
+        "ok": true,
+        "subjects": 120000
+      },
+      {
+        "check": "on_hand_non_negative",
+        "detail": "stock(S000001,L000).on_hand=999638",
+        "ok": true,
+        "subjects": 120000
       },
       {
         "check": "cell_count",
@@ -89,16 +118,10 @@
         "subjects": 1
       },
       {
-        "check": "on_hand_matches_movements",
-        "detail": "stock(S000001,L000).on_hand=999638, initial 1000000 + sum(delta) -362 = 999638",
+        "check": "every_movement_cell_probed",
+        "detail": "0 movement cells were never read back: []",
         "ok": true,
-        "subjects": 120000
-      },
-      {
-        "check": "on_hand_non_negative",
-        "detail": "stock(S000001,L000).on_hand=999638",
-        "ok": true,
-        "subjects": 120000
+        "subjects": 1
       },
       {
         "check": "movement_count_is_committed_takes",
@@ -122,21 +145,19 @@
     "order_no_uniqueness": "enforced at write time (no Order read shape); zero request errors required",
     "status": "PASS"
   },
-  "oracle_s": 106.47659307499998,
+  "oracle_s": 142.00708468799712,
   "policy": "declared default (no learner controller wired in M1)",
   "requests_run": 8000,
-  "seed_cap_mib": 192,
-  "seed_peak_bytes": 79294464,
-  "seed_s": 2.7259562149993144,
+  "seed_s": 3.9322430930042174,
   "summary": {
     "completed": 8000,
     "early_dispatches": 0,
-    "elapsed_ms": 20017,
+    "elapsed_ms": 20024,
     "else_used": 0,
     "errors": 0,
     "first_error": null,
-    "invalid_windows": 11,
-    "lag_ceiling_rejected_windows": 11,
+    "invalid_windows": 14,
+    "lag_ceiling_rejected_windows": 14,
     "requests": 8000,
     "windows": 20
   },
@@ -144,9 +165,9 @@
   "verdict": {
     "highest_sustained_rps": 0.0,
     "reject_reasons": {
-      "lag_ceiling": 11
+      "lag_ceiling": 14
     },
-    "rejected_windows": 11,
+    "rejected_windows": 14,
     "sustained": false
   },
   "window_ms": 1000,

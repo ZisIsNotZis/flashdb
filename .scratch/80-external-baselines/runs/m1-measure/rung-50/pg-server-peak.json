@@ -1,1 +1,1 @@
-{"arm": "postgres", "server_peak_bytes": 81813504, "cap_mib": 128}
+{"arm": "postgres", "server_lifetime_peak_bytes": 81682432, "cap_mib": 128}

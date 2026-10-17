@@ -13,7 +13,7 @@
       "regime_cap_bytes": 134217728
     },
     "sqlite": {
-      "data_bytes": 546160216,
+      "data_bytes": 546123232,
       "data_to_cap": 4.069,
       "meets_10x_floor": false,
       "regime_cap_bytes": 134217728
@@ -39,7 +39,7 @@
         "regime_cap_bytes": 134217728
       },
       "sqlite": {
-        "data_bytes": 546160216,
+        "data_bytes": 546123232,
         "data_to_cap": 4.069,
         "meets_10x_floor": false,
         "regime_cap_bytes": 134217728
@@ -54,25 +54,42 @@
         "flashdb-declared": {
           "achieved_fraction": 0.9990000000000001,
           "achieved_rps": 49.95,
-          "cgroup_peak_bytes": 134217728,
+          "arm_scope_peak_bytes": null,
+          "arm_scope_peak_scope": null,
+          "construction_memory": {
+            "cap_mib": 512,
+            "peak_bytes": 536870912
+          },
           "data_bytes": 1683903919,
           "durability": "flashdb --group-requests 64 (one WAL barrier per group)",
+          "durability_observed": null,
           "engine_cap_mib": 128,
-          "engine_peak_source": null,
+          "engine_memory": {
+            "method": "exact memory.peak of the flashdb-load invocation's own scope, read inside it",
+            "peak_bytes": 134217728,
+            "samples": null,
+            "scope": "measured phase only: the instance is BUILT in a separate construction scope",
+            "start_bytes": 3547136
+          },
           "errors": 0,
-          "invalid_windows": 1,
-          "lag_p99_us": 12470,
-          "mean_group_size": 1.0,
-          "oracle": "DEFERRED",
-          "oracle_checks": 0,
-          "oracle_s": null,
+          "footprint_files": {
+            "tile-154.tile": 10958445,
+            "tile-228.tile": 10868619,
+            "tile-4218.tile": 10842579,
+            "tile-77.tile": 10958445
+          },
+          "invalid_windows": 12,
+          "lag_p99_us": 40901,
+          "mean_group_size": 1.0121457489878543,
+          "oracle": "PASS",
+          "oracle_checks": 12,
+          "oracle_s": 6.526999641209841e-06,
           "postgres_settings": null,
           "reject_reasons": {
-            "lag_ceiling": 1
+            "lag_ceiling": 12
           },
-          "seed_peak_bytes": 536870912,
-          "seed_s": 353.7171269090031,
-          "service_p99_us": 24900,
+          "seed_s": 416.13310778100276,
+          "service_p99_us": 29230,
           "sqlite_cache_kib": null,
           "sustained": false,
           "windows": 20
@@ -80,15 +97,25 @@
         "postgres": {
           "achieved_fraction": 1.0,
           "achieved_rps": 50.0,
-          "cgroup_peak_bytes": 134221824,
+          "arm_scope_peak_bytes": 134221824,
+          "arm_scope_peak_scope": "the postgres server scope's lifetime (bulk load + measured phase); the client runs outside it",
+          "construction_memory": null,
           "data_bytes": 1103779519,
           "durability": "postgres fsync=on + synchronous_commit=on (baseline-env.sh), one COMMIT per batch",
-          "engine_cap_mib": null,
-          "engine_peak_source": "postgres server scope (patched by the runner payload)",
+          "durability_observed": null,
+          "engine_cap_mib": 128,
+          "engine_memory": {
+            "method": "sampled memory.current every 50 ms",
+            "peak_bytes": 134217728,
+            "samples": 396,
+            "scope": "measured phase",
+            "start_bytes": 134197248
+          },
           "errors": 0,
-          "invalid_windows": 0,
-          "lag_p99_us": 2199,
-          "mean_group_size": 1.0,
+          "footprint_files": null,
+          "invalid_windows": 3,
+          "lag_p99_us": 41827,
+          "mean_group_size": 1.015228426395939,
           "oracle": "PASS",
           "oracle_checks": 12,
           "oracle_s": null,
@@ -98,43 +125,127 @@
             "shared_buffers": "16MB",
             "synchronous_commit": "on"
           },
-          "reject_reasons": {},
-          "seed_peak_bytes": null,
-          "seed_s": 650.1156309740036,
-          "service_p99_us": 22004,
+          "reject_reasons": {
+            "lag_ceiling": 3
+          },
+          "seed_s": 686.8745566270081,
+          "service_p99_us": 27705,
           "sqlite_cache_kib": null,
-          "sustained": true,
+          "sustained": false,
           "windows": 20
         },
         "sqlite": {
           "achieved_fraction": 1.0,
           "achieved_rps": 50.0,
-          "cgroup_peak_bytes": 134217728,
-          "data_bytes": 546160216,
+          "arm_scope_peak_bytes": 134217728,
+          "arm_scope_peak_scope": "this process's capped scope over the whole arm step (bulk load + measured phase)",
+          "construction_memory": null,
+          "data_bytes": 546123232,
           "durability": "sqlite WAL + synchronous=FULL, one COMMIT per batch",
-          "engine_cap_mib": null,
-          "engine_peak_source": null,
+          "durability_observed": {
+            "journal_mode": "wal",
+            "synchronous": 2,
+            "synchronous_name": "FULL"
+          },
+          "engine_cap_mib": 128,
+          "engine_memory": {
+            "method": "sampled memory.current every 50 ms",
+            "peak_bytes": 134217728,
+            "samples": 395,
+            "scope": "measured phase",
+            "start_bytes": 134193152
+          },
           "errors": 0,
-          "invalid_windows": 0,
-          "lag_p99_us": 6120,
-          "mean_group_size": 1.0,
+          "footprint_files": {
+            "db": 541970432,
+            "shm": 32768,
+            "wal": 4120032
+          },
+          "invalid_windows": 1,
+          "lag_p99_us": 1969377,
+          "mean_group_size": 1.1111111111111112,
           "oracle": "PASS",
           "oracle_checks": 12,
           "oracle_s": null,
           "postgres_settings": null,
-          "reject_reasons": {},
-          "seed_peak_bytes": null,
-          "seed_s": 143.5930880740052,
-          "service_p99_us": 25909,
+          "reject_reasons": {
+            "lag_ceiling": 1
+          },
+          "seed_s": 183.8904047249962,
+          "service_p99_us": 2006844,
           "sqlite_cache_kib": 8192,
-          "sustained": true,
+          "sustained": false,
           "windows": 20
         }
       },
       "batch": 64,
+      "load_average": [
+        {
+          "at": "2026-10-17T12:30:54+08:00",
+          "loadavg": "2.98 4.73 4.99",
+          "nproc": 8,
+          "phase": "prepare-before"
+        },
+        {
+          "at": "2026-10-17T12:36:16+08:00",
+          "loadavg": "6.14 4.70 4.84",
+          "nproc": 8,
+          "phase": "prepare-after"
+        },
+        {
+          "at": "2026-10-17T12:36:16+08:00",
+          "loadavg": "6.14 4.70 4.84",
+          "nproc": 8,
+          "phase": "arm-flashdb-declared-before"
+        },
+        {
+          "at": "2026-10-17T13:27:31+08:00",
+          "loadavg": "3.39 3.61 3.51",
+          "nproc": 8,
+          "phase": "arm-flashdb-declared-after"
+        },
+        {
+          "at": "2026-10-17T13:27:31+08:00",
+          "loadavg": "3.39 3.61 3.51",
+          "nproc": 8,
+          "phase": "arm-sqlite-before"
+        },
+        {
+          "at": "2026-10-17T13:33:01+08:00",
+          "loadavg": "3.81 3.67 3.57",
+          "nproc": 8,
+          "phase": "arm-sqlite-after"
+        },
+        {
+          "at": "2026-10-17T13:33:01+08:00",
+          "loadavg": "3.81 3.67 3.57",
+          "nproc": 8,
+          "phase": "arm-postgres-before"
+        },
+        {
+          "at": "2026-10-17T13:47:00+08:00",
+          "loadavg": "2.69 3.47 3.74",
+          "nproc": 8,
+          "phase": "arm-postgres-after"
+        },
+        {
+          "at": "2026-10-17T13:47:00+08:00",
+          "loadavg": "2.69 3.47 3.74",
+          "nproc": 8,
+          "phase": "done"
+        }
+      ],
       "offered_rps": 50,
       "on_hand": 1000000,
       "requests": 1000,
+      "runner": {
+        "argv": "scripts/m1-baseline-run.sh --workdir .scratch/80-external-baselines/runs/m1-10x/rung-50 --requests 1000 --rate 50 --customers 200000 --skus 2650000 --locs 4 --seed-cap-mib 512 --arms flashdb-declared\\,sqlite\\,postgres --skip-build ",
+        "cwd": "/home/z/vibe/flashdb",
+        "engine_cap_mib": 128,
+        "lock": "/tmp/m1-measure.lock",
+        "postgres_root": "",
+        "seed_cap_mib": 512
+      },
       "trace_sha256": "859b99a1186ef6915d524d2fff339ed5eec88759468d7d942496f99f28faec65",
       "window_ms": 1000
     }
@@ -147,24 +258,33 @@
         "band": "within-1.5x",
         "deficit_vs_slower_baseline": 1.001,
         "design_failure": false,
-        "invalid_windows": 1,
+        "invalid_windows": 12,
         "pass": true,
-        "sustained": false
+        "sustained": false,
+        "sustained_reading": "not like-for-like (flashdb and the baselines did not all sustain the rung)"
       }
     },
     "baselines": {
       "postgres": {
         "achieved_rps": 50.0,
-        "invalid_windows": 0,
-        "reject_reasons": {},
-        "sustained": true
+        "invalid_windows": 3,
+        "reject_reasons": {
+          "lag_ceiling": 3
+        },
+        "sustained": false
       },
       "sqlite": {
         "achieved_rps": 50.0,
-        "invalid_windows": 0,
-        "reject_reasons": {},
-        "sustained": true
+        "invalid_windows": 1,
+        "reject_reasons": {
+          "lag_ceiling": 1
+        },
+        "sustained": false
       }
+    },
+    "baselines_sustained": {
+      "postgres": false,
+      "sqlite": false
     },
     "condition": "at 50 rps offered, flashdb must be within 1.5x of the slower of sqlite/postgres; 2.0x is the fail line",
     "evaluable": true,

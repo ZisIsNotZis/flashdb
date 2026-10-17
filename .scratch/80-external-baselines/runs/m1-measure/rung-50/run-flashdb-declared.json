@@ -1,7 +1,11 @@
 {
   "arm": "flashdb-declared",
+  "arm_scope_peak_bytes": null,
   "batch": 64,
-  "cgroup_peak_bytes": 77557760,
+  "construction_memory": {
+    "cap_mib": 192,
+    "peak_bytes": 91148288
+  },
   "counters": {
     "backorder": 0,
     "errors": 0,
@@ -17,21 +21,21 @@
       "compact_bytes": 0,
       "early_dispatches": 0,
       "error_windows": 0,
-      "group_elapsed_us": 12523,
+      "group_elapsed_us": 11572,
       "groups": 1000,
       "groups_over_service_ceiling": 0,
       "invalid_windows": 0,
       "lag_ceiling_rejected_windows": 0,
-      "lag_p50_us": 129.0,
-      "lag_p95_us": 155,
-      "lag_p99_us": 1350,
+      "lag_p50_us": 102.0,
+      "lag_p95_us": 1037,
+      "lag_p99_us": 4949,
       "max_group_size": 1,
       "mean_group_size": 1.0,
-      "min_lag_us": 1,
+      "min_lag_us": 0,
       "offered_rps": 50.0,
-      "p50_us": 3806.5,
-      "p95_us": 6723,
-      "p99_us": 12523,
+      "p50_us": 4492.0,
+      "p95_us": 7845,
+      "p99_us": 11572,
       "rate_exceeded": false,
       "reject_reasons": {},
       "service_ceiling_rejected_windows": 0,
@@ -43,25 +47,26 @@
   "durability": "flashdb --group-requests 64 (one WAL barrier per group)",
   "elapsed_s": 20.004,
   "engine_cap_mib": 128,
+  "engine_memory": {
+    "method": "exact memory.peak of the flashdb-load invocation's own scope, read inside it",
+    "peak_bytes": 11198464,
+    "samples": null,
+    "scope": "measured phase only: the instance is BUILT in a separate construction scope",
+    "start_bytes": 3268608
+  },
   "groups": 1000,
-  "instance_bytes": 18686326,
+  "instance_bytes": 24541978,
+  "instance_files": {
+    "data-143.wal": 1737463,
+    "tile-143.tile": 10805133,
+    "tile-150.tile": 1084225,
+    "tile-73.tile": 10906965
+  },
   "lag_ceiling_us": 10000,
   "max_group_size": 1,
   "mean_group_size": 1.0,
   "oracle": {
     "checks": [
-      {
-        "check": "stock_cell_present",
-        "detail": "Stock(S000001,L000) is empty",
-        "ok": true,
-        "subjects": 120000
-      },
-      {
-        "check": "customer_present",
-        "detail": "probe-customer:c000000@example.com is empty",
-        "ok": true,
-        "subjects": 30000
-      },
       {
         "check": "one_movement_per_order",
         "detail": "O00000001 returned 1 movements, expected at most 1",
@@ -73,6 +78,30 @@
         "detail": "scan for O00000001 returned movement of O00000001",
         "ok": true,
         "subjects": 694
+      },
+      {
+        "check": "customer_present",
+        "detail": "probe-customer:c000000@example.com is empty",
+        "ok": true,
+        "subjects": 30000
+      },
+      {
+        "check": "stock_cell_present",
+        "detail": "Stock(S000001,L000) is empty",
+        "ok": true,
+        "subjects": 120000
+      },
+      {
+        "check": "on_hand_matches_movements",
+        "detail": "stock(S000001,L000).on_hand=999940, initial 1000000 + sum(delta) -60 = 999940",
+        "ok": true,
+        "subjects": 120000
+      },
+      {
+        "check": "on_hand_non_negative",
+        "detail": "stock(S000001,L000).on_hand=999940",
+        "ok": true,
+        "subjects": 120000
       },
       {
         "check": "cell_count",
@@ -87,16 +116,10 @@
         "subjects": 1
       },
       {
-        "check": "on_hand_matches_movements",
-        "detail": "stock(S000001,L000).on_hand=999940, initial 1000000 + sum(delta) -60 = 999940",
+        "check": "every_movement_cell_probed",
+        "detail": "0 movement cells were never read back: []",
         "ok": true,
-        "subjects": 120000
-      },
-      {
-        "check": "on_hand_non_negative",
-        "detail": "stock(S000001,L000).on_hand=999940",
-        "ok": true,
-        "subjects": 120000
+        "subjects": 1
       },
       {
         "check": "movement_count_is_committed_takes",
@@ -120,12 +143,10 @@
     "order_no_uniqueness": "enforced at write time (no Order read shape); zero request errors required",
     "status": "PASS"
   },
-  "oracle_s": 14.064123710006243,
+  "oracle_s": 26.47324134099472,
   "policy": "declared default (no learner controller wired in M1)",
   "requests_run": 1000,
-  "seed_cap_mib": 192,
-  "seed_peak_bytes": 79343616,
-  "seed_s": 2.5366747380030574,
+  "seed_s": 5.227004891989054,
   "summary": {
     "completed": 1000,
     "early_dispatches": 0,
