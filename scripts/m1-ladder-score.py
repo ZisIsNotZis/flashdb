@@ -37,20 +37,33 @@ T6_MULTIPLE = 3.0
 REGIME_FLOOR = 10.0
 
 # The milestone's unverified list and its honest summary, kept beside the arithmetic so the JSON
-# carries them too (the long form with the numbers is `report.md` §7-§8; this is the same content, not
-# a second verdict). Anything listed here is NOT a pass.
+# carries them too. The eight entries are the same eight facts as `report.md` §7, in the same order;
+# anything listed here is NOT a pass.
 UNVERIFIED = (
-    "T6 at the pre-registered regime: it needs a ladder at >=10x, and one 10x flashdb arm-run costs"
-    " 416 s of seeding plus a 38 min read-back at 10.6M cells; run B measured the 1x rung only.",
-    "The sustained-rule outcome at the regime rung is not robustly determined: the committed run B"
-    " was measured at loadavg 6.1-8.3 on 8 cores and no arm sustained 50 rps (flashdb 12 of 20"
+    "T6 at the pre-registered regime: it needs a ladder at >=10x, and the committed arm-step"
+    " boundaries put a four-rung 10x ladder at ~8 h of measured cost (8 x 3,075 s flashdb + 4 x"
+    " 330 s sqlite + 4 x 839 s postgres = 29,276 s); run B measured the 1x rung only.",
+    "The sustained-rule outcome at the regime rung is not robustly determined: run B carried 6.14"
+    " on 8 cores at the flashdb arm step's start (before its 416 s seed) and 3.39 at its end, with"
+    " the measured phase's own load unrecorded, and no arm sustained 50 rps (flashdb 12 of 20"
     " windows rejected, sqlite 1 of 20 with a 1.97 s stall, postgres 3 of 20), while the earlier"
     " pre-fix run on the same seed and data (loadavg not recorded, its provenance defect) had"
     " sqlite and postgres clean and flashdb 1 of 20. A quiet-box repeat decides it.",
-    "The pre-registered 10-seed median/IQR aggregation: both runs are one seed.",
-    "Run A's rung-400 comparison: the SQL arms' windows were re-measured on 2026-10-17 at loadavg"
-    " 2.2-4.1 rather than the 1.5-2.5 of the first ladder, so its numbers are a second measurement"
-    " of the same traces, not the first one repaired.",
+    "The pre-registered 10-seed median/IQR aggregation: both runs are one seed, one rung, one repeat.",
+    "Run A is a second measurement of the same traces, not the first one repaired: its SQL windows"
+    " were re-measured on 2026-10-17 at loadavg 2.2-4.9 rather than the 1.5-2.5 of the first ladder,"
+    " so its numbers differ from the earlier report's in several cells; the traces are byte-identical.",
+    "The growth clause's effect on the previously committed SQL windows cannot be re-derived: those"
+    " windows carry no per-window late-request count, so they were re-measured rather than re-scored,"
+    " and in the re-measured windows the clause changed no SQL verdict.",
+    "The 12.546x footprint is re-derivable only by re-running the build (416 s): the instance files"
+    " are git-ignored, and the record carries the total and the four largest files, not the full"
+    " tiling.",
+    "The regime run exercised only the take branch (694 takes, 0 backorders), so at 12.546x the"
+    " backorder checks are vacuous; `runs/m1-build-else` exercises that branch at 0.02x, not at the"
+    " regime.",
+    "The shared box: run A saw 2.2-4.9 on 8 cores and run B 2.7-6.1 at the run boundaries; a quiet"
+    " box would move the rejection counts, not the mechanism.",
 )
 SUMMARY = (
     "The instrument works, and its two acceptance-shaped holes are closed or named. One harness"
@@ -61,7 +74,8 @@ SUMMARY = (
     " 10x read-back (12 checks over 10.6M cells). At the pre-registered regime (flashdb 1.68 GB ="
     " 12.546x of the cap, one seed, the 1x rung) all three arms hold 50 rps with zero errors and"
     " T5's throughput deficit is 1.001 against the 1.5x line, and T7 with it; but that run was"
-    " contended (loadavg 6.1-8.3): flashdb was rejected on 12 of 20 windows, sqlite on 1 (a 1.97 s"
+    " contended (6.14 at the flashdb arm step's start, its measured phase unrecorded): flashdb was"
+    " rejected on 12 of 20 windows, sqlite on 1 (a 1.97 s"
     " stall) and postgres on 3, so NO arm sustained the rung there, while the earlier pre-fix run"
     " on the same seed and data had both baselines clean. T5's throughput reading therefore"
     " reproduces across both runs and its sustained reading does not: the T5/T7 verdict is not"
@@ -171,6 +185,21 @@ def deficit(flashdb_rps: float, baseline_rps: float) -> float:
     return baseline_rps / flashdb_rps if flashdb_rps else float("inf")
 
 
+def t_state(passed, like_for_like: bool) -> str:
+    """The tri-state a JSON-only reader needs: `pass`, `fail` or `not-robustly-determined`.
+
+    The pre-registered metric is throughput, so `pass` records the throughput arithmetic. But a
+    throughput pass on a rung where the arm (or a baseline) was rejected is not a like-for-like
+    reading, and a consumer that reads only `pass: true` would report a PASS the report does not
+    claim. The tri-state makes the sustained half unmissable.
+    """
+    if passed is None:
+        return "not-evaluable"
+    if not passed:
+        return "fail"
+    return "pass" if like_for_like else "not-robustly-determined"
+
+
 def t5(rung: dict) -> dict:
     """The pre-registered low-load non-inferiority check, at the 1x rung."""
     baselines = {arm: rung["arms"][arm] for arm in BASELINES if arm in rung["arms"]}
@@ -211,6 +240,8 @@ def t5(rung: dict) -> dict:
                                   value["sustained"] and baselines_sustained else
                                   "not like-for-like (flashdb and the baselines did not all"
                                   " sustain the rung)"),
+            "verdict": t_state(d <= T5_PASS_RATIO,
+                               bool(value["sustained"] and baselines_sustained)),
         }
     return out
 
@@ -359,12 +390,14 @@ def main(argv: list[str]) -> int:
                       "rungs": [rung["offered_rps"] for rung in run["rungs"]],
                       "t5": {arm: {"deficit_vs_slower_baseline": v["deficit_vs_slower_baseline"],
                                    "pass": v["pass"],
+                                   "verdict": v.get("verdict"),
                                    "sustained": v["sustained"],
                                    "sustained_reading": v.get("sustained_reading"),
                                    "invalid_windows": v["invalid_windows"]}
                              for arm, v in run["t5"].get("arms", {}).items()},
                       "t6": t6_verdict_row(run["t6"]),
                       "t7": {"pass": run["t7"]["pass"],
+                             "verdict": run["t7"].get("verdict"),
                              "deficit_vs_slower_baseline":
                                  run["t7"]["deficit_vs_slower_baseline"],
                              "sustained": run["t5"].get("arms", {}).get(
@@ -413,9 +446,14 @@ def main(argv: list[str]) -> int:
     report["t5"]["baselines_sustained"] = {
         arm: value["sustained"] for arm, value in report["t5"].get("baselines", {}).items()}
     declared = report["t5"]["arms"].get("flashdb-declared", {})
+    declared_like_for_like = bool(
+        declared.get("sustained")
+        and all(report["t5"].get("baselines_sustained", {}).values()))
     report["t7"] = {
         "condition": "the declared arm alone must already pass T5",
         "pass": declared.get("pass"),
+        "verdict": t_state(declared.get("pass"), declared_like_for_like),
+        "sustained": declared.get("sustained"),
         "deficit_vs_slower_baseline": declared.get("deficit_vs_slower_baseline"),
         "note": ("flashdb-learned runs the same declared-default wiring in M1 (no learner"
                  " controller is wired), so T5's learned number and T7's declared number are the"

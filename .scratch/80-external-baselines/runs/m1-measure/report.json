@@ -1072,7 +1072,8 @@
         "invalid_windows": 0,
         "pass": true,
         "sustained": true,
-        "sustained_reading": "like-for-like (every arm sustained the rung)"
+        "sustained_reading": "like-for-like (every arm sustained the rung)",
+        "verdict": "pass"
       },
       "flashdb-learned": {
         "achieved_rps": 49.95,
@@ -1082,7 +1083,8 @@
         "invalid_windows": 0,
         "pass": true,
         "sustained": true,
-        "sustained_reading": "like-for-like (every arm sustained the rung)"
+        "sustained_reading": "like-for-like (every arm sustained the rung)",
+        "verdict": "pass"
       }
     },
     "baselines": {
@@ -1172,6 +1174,8 @@
     "condition": "the declared arm alone must already pass T5",
     "deficit_vs_slower_baseline": 1.001,
     "note": "flashdb-learned runs the same declared-default wiring in M1 (no learner controller is wired), so T5's learned number and T7's declared number are the same measurement twice rather than two independent arms",
-    "pass": true
+    "pass": true,
+    "sustained": true,
+    "verdict": "pass"
   }
 }

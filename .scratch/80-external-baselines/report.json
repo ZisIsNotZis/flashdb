@@ -1074,7 +1074,8 @@
             "invalid_windows": 0,
             "pass": true,
             "sustained": true,
-            "sustained_reading": "like-for-like (every arm sustained the rung)"
+            "sustained_reading": "like-for-like (every arm sustained the rung)",
+            "verdict": "pass"
           },
           "flashdb-learned": {
             "achieved_rps": 49.95,
@@ -1084,7 +1085,8 @@
             "invalid_windows": 0,
             "pass": true,
             "sustained": true,
-            "sustained_reading": "like-for-like (every arm sustained the rung)"
+            "sustained_reading": "like-for-like (every arm sustained the rung)",
+            "verdict": "pass"
           }
         },
         "baselines": {
@@ -1174,7 +1176,9 @@
         "condition": "the declared arm alone must already pass T5",
         "deficit_vs_slower_baseline": 1.001,
         "note": "flashdb-learned runs the same declared-default wiring in M1 (no learner controller is wired), so T5's learned number and T7's declared number are the same measurement twice rather than two independent arms",
-        "pass": true
+        "pass": true,
+        "sustained": true,
+        "verdict": "pass"
       }
     },
     {
@@ -1440,7 +1444,8 @@
             "invalid_windows": 12,
             "pass": true,
             "sustained": false,
-            "sustained_reading": "not like-for-like (flashdb and the baselines did not all sustain the rung)"
+            "sustained_reading": "not like-for-like (flashdb and the baselines did not all sustain the rung)",
+            "verdict": "not-robustly-determined"
           }
         },
         "baselines": {
@@ -1478,7 +1483,9 @@
         "condition": "the declared arm alone must already pass T5",
         "deficit_vs_slower_baseline": 1.001,
         "note": "flashdb-learned runs the same declared-default wiring in M1 (no learner controller is wired), so T5's learned number and T7's declared number are the same measurement twice rather than two independent arms",
-        "pass": true
+        "pass": true,
+        "sustained": false,
+        "verdict": "not-robustly-determined"
       }
     }
   ],
@@ -1487,12 +1494,16 @@
     "/home/z/vibe/flashdb/.scratch/80-external-baselines/runs/m1-measure/report.json",
     "/home/z/vibe/flashdb/.scratch/80-external-baselines/runs/m1-10x/report.json"
   ],
-  "summary": "The instrument works, and its two acceptance-shaped holes are closed or named. One harness drives four arms over one frozen trace (same sha256 per rung on every arm) at matched durability, each engine in its own 128 MiB scope, under one latency rule - the lag ceiling, the 3-consecutive-window growth clause and errors, bound by a test to flashdb-load's own verdicts - and every inventory oracle passes everywhere it was run, now including flashdb's 10x read-back (12 checks over 10.6M cells). At the pre-registered regime (flashdb 1.68 GB = 12.546x of the cap, one seed, the 1x rung) all three arms hold 50 rps with zero errors and T5's throughput deficit is 1.001 against the 1.5x line, and T7 with it; but that run was contended (loadavg 6.1-8.3): flashdb was rejected on 12 of 20 windows, sqlite on 1 (a 1.97 s stall) and postgres on 3, so NO arm sustained the rung there, while the earlier pre-fix run on the same seed and data had both baselines clean. T5's throughput reading therefore reproduces across both runs and its sustained reading does not: the T5/T7 verdict is not robustly determined and needs a quiet-box repeat. T6 at the regime - the actual external-superiority claim - remains unevaluated (no ladder at 10x). In the warm ladder T6's pre-registered comparison has no denominator at 400 rps (no baseline sustained that level), and the sustained-vs-sustained reading is 0.50x for the declared arm and 1.00x for the learned one against the 3x line, i.e. FAIL. No result here supports a claim that flashdb beats postgres or sqlite at scale, a claim about the learned arm (in M1 it is the declared wiring), or a claim about drift and reorg cost.",
+  "summary": "The instrument works, and its two acceptance-shaped holes are closed or named. One harness drives four arms over one frozen trace (same sha256 per rung on every arm) at matched durability, each engine in its own 128 MiB scope, under one latency rule - the lag ceiling, the 3-consecutive-window growth clause and errors, bound by a test to flashdb-load's own verdicts - and every inventory oracle passes everywhere it was run, now including flashdb's 10x read-back (12 checks over 10.6M cells). At the pre-registered regime (flashdb 1.68 GB = 12.546x of the cap, one seed, the 1x rung) all three arms hold 50 rps with zero errors and T5's throughput deficit is 1.001 against the 1.5x line, and T7 with it; but that run was contended (6.14 at the flashdb arm step's start, its measured phase unrecorded): flashdb was rejected on 12 of 20 windows, sqlite on 1 (a 1.97 s stall) and postgres on 3, so NO arm sustained the rung there, while the earlier pre-fix run on the same seed and data had both baselines clean. T5's throughput reading therefore reproduces across both runs and its sustained reading does not: the T5/T7 verdict is not robustly determined and needs a quiet-box repeat. T6 at the regime - the actual external-superiority claim - remains unevaluated (no ladder at 10x). In the warm ladder T6's pre-registered comparison has no denominator at 400 rps (no baseline sustained that level), and the sustained-vs-sustained reading is 0.50x for the declared arm and 1.00x for the learned one against the 3x line, i.e. FAIL. No result here supports a claim that flashdb beats postgres or sqlite at scale, a claim about the learned arm (in M1 it is the declared wiring), or a claim about drift and reorg cost.",
   "unverified": [
-    "T6 at the pre-registered regime: it needs a ladder at >=10x, and one 10x flashdb arm-run costs 416 s of seeding plus a 38 min read-back at 10.6M cells; run B measured the 1x rung only.",
-    "The sustained-rule outcome at the regime rung is not robustly determined: the committed run B was measured at loadavg 6.1-8.3 on 8 cores and no arm sustained 50 rps (flashdb 12 of 20 windows rejected, sqlite 1 of 20 with a 1.97 s stall, postgres 3 of 20), while the earlier pre-fix run on the same seed and data (loadavg not recorded, its provenance defect) had sqlite and postgres clean and flashdb 1 of 20. A quiet-box repeat decides it.",
-    "The pre-registered 10-seed median/IQR aggregation: both runs are one seed.",
-    "Run A's rung-400 comparison: the SQL arms' windows were re-measured on 2026-10-17 at loadavg 2.2-4.1 rather than the 1.5-2.5 of the first ladder, so its numbers are a second measurement of the same traces, not the first one repaired."
+    "T6 at the pre-registered regime: it needs a ladder at >=10x, and the committed arm-step boundaries put a four-rung 10x ladder at ~8 h of measured cost (8 x 3,075 s flashdb + 4 x 330 s sqlite + 4 x 839 s postgres = 29,276 s); run B measured the 1x rung only.",
+    "The sustained-rule outcome at the regime rung is not robustly determined: run B carried 6.14 on 8 cores at the flashdb arm step's start (before its 416 s seed) and 3.39 at its end, with the measured phase's own load unrecorded, and no arm sustained 50 rps (flashdb 12 of 20 windows rejected, sqlite 1 of 20 with a 1.97 s stall, postgres 3 of 20), while the earlier pre-fix run on the same seed and data (loadavg not recorded, its provenance defect) had sqlite and postgres clean and flashdb 1 of 20. A quiet-box repeat decides it.",
+    "The pre-registered 10-seed median/IQR aggregation: both runs are one seed, one rung, one repeat.",
+    "Run A is a second measurement of the same traces, not the first one repaired: its SQL windows were re-measured on 2026-10-17 at loadavg 2.2-4.9 rather than the 1.5-2.5 of the first ladder, so its numbers differ from the earlier report's in several cells; the traces are byte-identical.",
+    "The growth clause's effect on the previously committed SQL windows cannot be re-derived: those windows carry no per-window late-request count, so they were re-measured rather than re-scored, and in the re-measured windows the clause changed no SQL verdict.",
+    "The 12.546x footprint is re-derivable only by re-running the build (416 s): the instance files are git-ignored, and the record carries the total and the four largest files, not the full tiling.",
+    "The regime run exercised only the take branch (694 takes, 0 backorders), so at 12.546x the backorder checks are vacuous; `runs/m1-build-else` exercises that branch at 0.02x, not at the regime.",
+    "The shared box: run A saw 2.2-4.9 on 8 cores and run B 2.7-6.1 at the run boundaries; a quiet box would move the rejection counts, not the mechanism."
   ],
   "verdicts": [
     {
@@ -1519,14 +1530,16 @@
           "invalid_windows": 0,
           "pass": true,
           "sustained": true,
-          "sustained_reading": "like-for-like (every arm sustained the rung)"
+          "sustained_reading": "like-for-like (every arm sustained the rung)",
+          "verdict": "pass"
         },
         "flashdb-learned": {
           "deficit_vs_slower_baseline": 1.001,
           "invalid_windows": 0,
           "pass": true,
           "sustained": true,
-          "sustained_reading": "like-for-like (every arm sustained the rung)"
+          "sustained_reading": "like-for-like (every arm sustained the rung)",
+          "verdict": "pass"
         }
       },
       "t6": {
@@ -1594,7 +1607,8 @@
         "deficit_vs_slower_baseline": 1.001,
         "note": "flashdb-learned runs the same declared-default wiring in M1 (no learner controller is wired), so T5's learned number and T7's declared number are the same measurement twice rather than two independent arms",
         "pass": true,
-        "sustained": true
+        "sustained": true,
+        "verdict": "pass"
       }
     },
     {
@@ -1619,7 +1633,8 @@
           "invalid_windows": 12,
           "pass": true,
           "sustained": false,
-          "sustained_reading": "not like-for-like (flashdb and the baselines did not all sustain the rung)"
+          "sustained_reading": "not like-for-like (flashdb and the baselines did not all sustain the rung)",
+          "verdict": "not-robustly-determined"
         }
       },
       "t6": {
@@ -1640,7 +1655,8 @@
         "deficit_vs_slower_baseline": 1.001,
         "note": "flashdb-learned runs the same declared-default wiring in M1 (no learner controller is wired), so T5's learned number and T7's declared number are the same measurement twice rather than two independent arms",
         "pass": true,
-        "sustained": false
+        "sustained": false,
+        "verdict": "not-robustly-determined"
       }
     }
   ]

@@ -319,7 +319,8 @@ committed instrument could not reach it, and the reasons are measured, not argue
 | `harness/flashdb_harness/baseline_0b.py` | streamed dimension rows and seeding transaction; `scoped_command` (engine in its own cap); `verify` step; streamed trace and read-back; sqlite `cache_size`; per-arm `data_bytes`, `seed_s`, `seed_peak_bytes`, `engine_cap_mib` |
 | `scripts/m1-baseline-run.sh` | per-arm engine boundaries (flashdb engine scope, sqlite process scope, postgres server scope), `--skip-verify`, postgres peak patched from the server's own cgroup |
 | `scripts/m1-ladder-run.sh` | the ladder runner (rungs, per-rung trace, load-average boundaries) |
-| `scripts/m1-ladder-score.py` | T5/T6/T7, footprint and regime arithmetic from the raw run records |
+| `scripts/m1-ladder-score.py` | T5/T6/T7, footprint and regime arithmetic from the raw run records; a tri-state T5/T7 `verdict` so a JSON-only reader cannot take a contended rung's throughput pass as PASS |
+| `scripts/m1-latency-figure.py` | the M1 comparison figure (`figure.svg`): lag p99 vs offered rate with sustained markers, drawn directly from the per-rung `run-<arm>.json` records |
 
 ### The regime run (the pre-registered 1x rung at >=10x)
 
@@ -349,12 +350,17 @@ and what it does and does not decide.
   one measured; `flashdb-learned` is the same wiring in M1 and was not run at 10x).
 - **T6 at the regime: UNVERIFIED.** It needs a ladder at 10x; measured costs make that impossible in
   this package's 4 h wall-clock cap — flashdb seeding 353.7-416.1 s per arm-run (the seed also
-  reached its 512 MiB construction cap), the read-back 38 min at 10.6M cells, and postgres seeding
-  650.1-686.9 s per arm-run. Four rungs x four arms is ~8 h of measured cost, not an opinion.
+  reached its 512 MiB construction cap), a whole flashdb arm step 51 min 15 s on the committed
+  boundaries (12:36:16 → 13:27:31; seed + 20 s measured phase + probe write and read-back), and
+  postgres seeding 650.1-686.9 s per arm-run. Eight flashdb arm steps at 10x plus four of each SQL
+  arm is 29,276 s ≈ 8 h of measured cost by the committed boundaries, not an opinion.
 - **flashdb's read-back at 10x is no longer deferred: it PASSED** in the re-run (12 checks;
   10,600,000 cells read back with `on_hand == initial + sum(delta)` and `on_hand >= 0`, 200,000
   customers, 694 order numbers, 0 request errors), which closes the one acceptance criterion the
-  earlier regime run missed. Cost, measured: 38 min of wall clock for 10.8M probes.
+  earlier regime run missed. Cost: the flashdb arm step spans 51 min 15 s on the committed
+  `loadavg.jsonl` boundaries, of which the recorded seed is 416.133 s and the measured phase 20.007
+  s; the read-back's own time is the residue and is not separately recorded — the run record's
+  `oracle_s 6.53e-06` is a pre-fix timer artifact, not a measurement (`report.md` §4).
 
 ### Verification cost fixes made for this run
 
@@ -389,11 +395,27 @@ per-window late-request count, so whether the growth clause would have rejected 
 from the committed bytes. In the re-measured windows the clause changed no SQL verdict (every SQL
 rejection is a `lag_ceiling` one).
 
+### Second cycle (report correction after the re-review, no new measurement)
+
+| defect | fix | where |
+|---|---|---|
+| **P1:** §5 claimed the serving peak was "measured over the measured phase only — the bulk load is not charged to it", false for both SQL arms at the regime | `start_bytes` / `peak − start` table: both SQL arms entered the measured phase at 99.98% of the cap, so their serving peaks are carried-over bulk-load memory, not measured-phase growth, and sqlite's serving peak is numerically its arm-scope lifetime peak | `report.md` §5 |
+| T6's declared shortfall stated as "2x" | declared shortfall is 6x (3.0/0.5); the learned one is 3x (3.0/1.0) | `report.md` §6 T6 |
+| a 12:49:34 → 13:27:31 / 37 min 57 s timing no committed record contains | replaced with the committed arm-step boundaries (12:36:16 → 13:27:31 = 51 min 15 s), the recorded `seed_s 416.133` / `elapsed_s 20.007`, and the `oracle_s 6.53e-06` pre-fix timer artifact; the ~8 h ladder cost re-derived from the same boundaries | `report.md` §4, §6, §7; this file |
+| "this kernel ignores a write to `memory.peak` — verified" | withdrawn; no committed artefact records that probe | `report.md` §5 |
+| `report.json.unverified` carried 4 of §7's 8 items | all 8, mirroring §7 in the same order | `scripts/m1-ladder-score.py`, `report.json` |
+| run B's T5/T7 `pass: true` read as PASS in JSON | tri-state `verdict` (`pass` / `fail` / `not-robustly-determined`) per T5 arm and per T7, both runs | `scripts/m1-ladder-score.py`, `report.json` |
+| load-average claims beyond the readings ("other tenants throughout", 6.1-8.3, 2.7-8.3) | §3.1 and §7 state the bracketing readings (6.14 at the arm step's start, 3.39 at its end) and that the measured phase's own load is unrecorded; run B's span is 2.7-6.1, run A's 2.2-4.9 | `report.md` §3.1, §7; `report.json` |
+| "Durability, observed rather than asserted" overclaimed for flashdb | retitled to the per-arm truth; flashdb's `durability_observed` is `null` and its setting is the declared `--group-requests 64` argv | `report.md` §5 |
+| the M1 deliverable named "a comparison table + figure" had no figure | `figure.svg` and its generator, drawn from the committed per-rung records | `scripts/m1-latency-figure.py`, `figure.svg` |
+| the declared 100 rps / learned 200 rps pair read as two T6 readings | labelled run-to-run variance of the same declared wiring (2x on the sustained level on this shared box) | `report.md` §6 |
+
 ### Still open (named, not hidden)
 
 - **A quiet-box repeat of the regime rung.** The committed run was contended (§3.1 of the report) and
   no arm sustained the rung there; the earlier run had both baselines clean. T5/T7's sustained reading
   is not robustly determined until that repeat exists. The command is in `report.md` §9 and the seed
   and trace are deterministic (sha256 `859b99a1…`).
-- **A ladder at 10x** for T6 — unchanged, and still the expensive one (~8 h of measured cost).
+- **A ladder at 10x** for T6 — unchanged, and still the expensive one (~8 h of measured cost on the
+  committed arm-step boundaries).
 - **The pre-registered 10-seed aggregation** — unchanged; both runs are one seed.
