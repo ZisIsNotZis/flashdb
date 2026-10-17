@@ -1,5 +1,5 @@
 {
-  "argv": "scripts/m1-controlled-run.sh --phase measure ",
+  "argv": "scripts/m1-controlled-run.sh --phase blocks --since 2026-10-18T00:02:18 ",
   "arms": [
     "flashdb-declared",
     "sqlite",
@@ -27,5 +27,9 @@
   ],
   "schema": "flashdb.m1.controlled-run.v1",
   "seconds_per_arm_run": 20,
-  "seed_cap_mib": 512
+  "seed_cap_mib": 512,
+  "sqlite": {
+    "cache_kib": 8192,
+    "wal_autocheckpoint_pages": 0
+  }
 }

@@ -1,0 +1,4470 @@
+{
+  "aggregate": [
+    {
+      "achieved_rps": {
+        "iqr": 0.0,
+        "median": 49.95,
+        "q1": 49.95,
+        "q3": 49.95,
+        "values": [
+          49.95,
+          49.95,
+          49.95,
+          49.95,
+          49.95
+        ]
+      },
+      "arm": "flashdb-declared",
+      "blocks": 5,
+      "data_bytes": 1683903919,
+      "engine_cap_mib": 128,
+      "engine_peak_bytes": {
+        "iqr": 155648.0,
+        "median": 64331776.0,
+        "q1": 64303104.0,
+        "q3": 64458752.0,
+        "values": [
+          64458752.0,
+          64172032.0,
+          64331776.0,
+          64303104.0,
+          64512000.0
+        ]
+      },
+      "errors": {
+        "iqr": 0.0,
+        "median": 0.0,
+        "q1": 0.0,
+        "q3": 0.0,
+        "values": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      "floor_adjusted": {
+        "blocks_clean_below_ceiling_plus_floor": 5,
+        "device_floor_fsync_p99_us": 9821,
+        "device_floor_lag_p99_us": 197,
+        "lag_p99_minus_floor_us": 841.0,
+        "lag_p99_over_floor": 5.27,
+        "service_p99_over_fsync_floor": 11.18
+      },
+      "footprint_x_cap": 12.546,
+      "lag_p99_us": {
+        "iqr": 172.0,
+        "median": 1038.0,
+        "q1": 883.0,
+        "q3": 1055.0,
+        "values": [
+          1038.0,
+          3894.0,
+          1055.0,
+          846.0,
+          883.0
+        ]
+      },
+      "max_group_size": {
+        "iqr": 0.0,
+        "median": 1.0,
+        "q1": 1.0,
+        "q3": 1.0,
+        "values": [
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "mean_group_size": {
+        "iqr": 0.0,
+        "median": 1.0,
+        "q1": 1.0,
+        "q3": 1.0,
+        "values": [
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "oracle": [
+        "DEFERRED"
+      ],
+      "per_block": [
+        {
+          "achieved_rps": 49.95,
+          "block": 1,
+          "errors": 0,
+          "lag_p99_us": 1038,
+          "rejected_windows": 0,
+          "service_p99_us": 88006,
+          "sustained": true
+        },
+        {
+          "achieved_rps": 49.95,
+          "block": 2,
+          "errors": 0,
+          "lag_p99_us": 3894,
+          "rejected_windows": 0,
+          "service_p99_us": 127627,
+          "sustained": true
+        },
+        {
+          "achieved_rps": 49.95,
+          "block": 3,
+          "errors": 0,
+          "lag_p99_us": 1055,
+          "rejected_windows": 0,
+          "service_p99_us": 106744,
+          "sustained": true
+        },
+        {
+          "achieved_rps": 49.95,
+          "block": 4,
+          "errors": 0,
+          "lag_p99_us": 846,
+          "rejected_windows": 0,
+          "service_p99_us": 109766,
+          "sustained": true
+        },
+        {
+          "achieved_rps": 49.95,
+          "block": 5,
+          "errors": 0,
+          "lag_p99_us": 883,
+          "rejected_windows": 0,
+          "service_p99_us": 117454,
+          "sustained": true
+        }
+      ],
+      "reject_reasons": {},
+      "rejected_windows": {
+        "iqr": 0.0,
+        "median": 0.0,
+        "q1": 0.0,
+        "q3": 0.0,
+        "values": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      "restore_bytes": 1683012213,
+      "restore_sha256": [
+        "67b3d10c23bca301881278ab8bb739110c725d0bcd8e852124e2a2901acd37ac"
+      ],
+      "restore_verified_blocks": 5,
+      "rung": 50,
+      "service_p99_us": {
+        "iqr": 10710.0,
+        "median": 109766.0,
+        "q1": 106744.0,
+        "q3": 117454.0,
+        "values": [
+          88006.0,
+          127627.0,
+          106744.0,
+          109766.0,
+          117454.0
+        ]
+      },
+      "sustained_blocks": 5,
+      "trace_sha256": [
+        "859b99a1186ef6915d524d2fff339ed5eec88759468d7d942496f99f28faec65"
+      ]
+    },
+    {
+      "achieved_rps": {
+        "iqr": 0.0,
+        "median": 50.0,
+        "q1": 50.0,
+        "q3": 50.0,
+        "values": [
+          50.0,
+          50.0,
+          50.0,
+          50.0,
+          50.0
+        ]
+      },
+      "arm": "postgres",
+      "blocks": 5,
+      "data_bytes": 1103713983,
+      "engine_cap_mib": 128,
+      "engine_peak_bytes": {
+        "iqr": 458752.0,
+        "median": 35594240.0,
+        "q1": 35360768.0,
+        "q3": 35819520.0,
+        "values": [
+          35594240.0,
+          35360768.0,
+          35340288.0,
+          35819520.0,
+          52355072.0
+        ]
+      },
+      "errors": {
+        "iqr": 0.0,
+        "median": 0.0,
+        "q1": 0.0,
+        "q3": 0.0,
+        "values": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      "floor_adjusted": {
+        "blocks_clean_below_ceiling_plus_floor": 5,
+        "device_floor_fsync_p99_us": 9821,
+        "device_floor_lag_p99_us": 197,
+        "lag_p99_minus_floor_us": 188.0,
+        "lag_p99_over_floor": 1.95,
+        "service_p99_over_fsync_floor": 1.43
+      },
+      "footprint_x_cap": 8.223,
+      "lag_p99_us": {
+        "iqr": 876.0,
+        "median": 385.0,
+        "q1": 266.0,
+        "q3": 1142.0,
+        "values": [
+          1289.0,
+          1142.0,
+          385.0,
+          205.0,
+          266.0
+        ]
+      },
+      "max_group_size": {
+        "iqr": 0.0,
+        "median": 1.0,
+        "q1": 1.0,
+        "q3": 1.0,
+        "values": [
+          1.0,
+          1.0,
+          2.0,
+          1.0,
+          1.0
+        ]
+      },
+      "mean_group_size": {
+        "iqr": 0.0,
+        "median": 1.0,
+        "q1": 1.0,
+        "q3": 1.0,
+        "values": [
+          1.0,
+          1.0,
+          1.001,
+          1.0,
+          1.0
+        ]
+      },
+      "oracle": [
+        "DEFERRED",
+        "PASS"
+      ],
+      "per_block": [
+        {
+          "achieved_rps": 50.0,
+          "block": 1,
+          "errors": 0,
+          "lag_p99_us": 1289,
+          "rejected_windows": 0,
+          "service_p99_us": 13663,
+          "sustained": true
+        },
+        {
+          "achieved_rps": 50.0,
+          "block": 2,
+          "errors": 0,
+          "lag_p99_us": 1142,
+          "rejected_windows": 0,
+          "service_p99_us": 31536,
+          "sustained": true
+        },
+        {
+          "achieved_rps": 50.0,
+          "block": 3,
+          "errors": 0,
+          "lag_p99_us": 385,
+          "rejected_windows": 0,
+          "service_p99_us": 40158,
+          "sustained": true
+        },
+        {
+          "achieved_rps": 50.0,
+          "block": 4,
+          "errors": 0,
+          "lag_p99_us": 205,
+          "rejected_windows": 0,
+          "service_p99_us": 14034,
+          "sustained": true
+        },
+        {
+          "achieved_rps": 50.0,
+          "block": 5,
+          "errors": 0,
+          "lag_p99_us": 266,
+          "rejected_windows": 0,
+          "service_p99_us": 7870,
+          "sustained": true
+        }
+      ],
+      "reject_reasons": {},
+      "rejected_windows": {
+        "iqr": 0.0,
+        "median": 0.0,
+        "q1": 0.0,
+        "q3": 0.0,
+        "values": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      "restore_bytes": 2201362806,
+      "restore_sha256": [
+        "7f9a4ea8edb0c1a287a201389ab08aba61e82bd8cdd92f51fe64ddf48cad1b92"
+      ],
+      "restore_verified_blocks": 5,
+      "rung": 50,
+      "service_p99_us": {
+        "iqr": 17873.0,
+        "median": 14034.0,
+        "q1": 13663.0,
+        "q3": 31536.0,
+        "values": [
+          13663.0,
+          31536.0,
+          40158.0,
+          14034.0,
+          7870.0
+        ]
+      },
+      "sustained_blocks": 5,
+      "trace_sha256": [
+        "859b99a1186ef6915d524d2fff339ed5eec88759468d7d942496f99f28faec65"
+      ]
+    },
+    {
+      "achieved_rps": {
+        "iqr": 0.0,
+        "median": 50.0,
+        "q1": 50.0,
+        "q3": 50.0,
+        "values": [
+          50.0,
+          50.0,
+          50.0,
+          50.0,
+          50.0
+        ]
+      },
+      "arm": "sqlite",
+      "blocks": 5,
+      "data_bytes": 542052352,
+      "engine_cap_mib": 128,
+      "engine_peak_bytes": {
+        "iqr": 397312.0,
+        "median": 46006272.0,
+        "q1": 45932544.0,
+        "q3": 46329856.0,
+        "values": [
+          45903872.0,
+          46329856.0,
+          45932544.0,
+          46006272.0,
+          46489600.0
+        ]
+      },
+      "errors": {
+        "iqr": 0.0,
+        "median": 0.0,
+        "q1": 0.0,
+        "q3": 0.0,
+        "values": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      "floor_adjusted": {
+        "blocks_clean_below_ceiling_plus_floor": 5,
+        "device_floor_fsync_p99_us": 9821,
+        "device_floor_lag_p99_us": 197,
+        "lag_p99_minus_floor_us": 380.0,
+        "lag_p99_over_floor": 2.93,
+        "service_p99_over_fsync_floor": 2.22
+      },
+      "footprint_x_cap": 4.039,
+      "lag_p99_us": {
+        "iqr": 347.0,
+        "median": 577.0,
+        "q1": 515.0,
+        "q3": 862.0,
+        "values": [
+          375.0,
+          577.0,
+          2544.0,
+          862.0,
+          515.0
+        ]
+      },
+      "max_group_size": {
+        "iqr": 0.0,
+        "median": 1.0,
+        "q1": 1.0,
+        "q3": 1.0,
+        "values": [
+          2.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "mean_group_size": {
+        "iqr": 0.0,
+        "median": 1.0,
+        "q1": 1.0,
+        "q3": 1.0,
+        "values": [
+          1.004,
+          1.0,
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "oracle": [
+        "DEFERRED",
+        "PASS"
+      ],
+      "per_block": [
+        {
+          "achieved_rps": 50.0,
+          "block": 1,
+          "errors": 0,
+          "lag_p99_us": 375,
+          "rejected_windows": 0,
+          "service_p99_us": 64649,
+          "sustained": true
+        },
+        {
+          "achieved_rps": 50.0,
+          "block": 2,
+          "errors": 0,
+          "lag_p99_us": 577,
+          "rejected_windows": 0,
+          "service_p99_us": 14883,
+          "sustained": true
+        },
+        {
+          "achieved_rps": 50.0,
+          "block": 3,
+          "errors": 0,
+          "lag_p99_us": 2544,
+          "rejected_windows": 0,
+          "service_p99_us": 39190,
+          "sustained": true
+        },
+        {
+          "achieved_rps": 50.0,
+          "block": 4,
+          "errors": 0,
+          "lag_p99_us": 862,
+          "rejected_windows": 0,
+          "service_p99_us": 21768,
+          "sustained": true
+        },
+        {
+          "achieved_rps": 50.0,
+          "block": 5,
+          "errors": 0,
+          "lag_p99_us": 515,
+          "rejected_windows": 0,
+          "service_p99_us": 9378,
+          "sustained": true
+        }
+      ],
+      "reject_reasons": {},
+      "rejected_windows": {
+        "iqr": 0.0,
+        "median": 0.0,
+        "q1": 0.0,
+        "q3": 0.0,
+        "values": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      "restore_bytes": 541876224,
+      "restore_sha256": [
+        "46c6f1e1e2a149f8e55bb4f29a39b2ca57a53d1a50daa0ae5a3e30c2d4367130"
+      ],
+      "restore_verified_blocks": 5,
+      "rung": 50,
+      "service_p99_us": {
+        "iqr": 24307.0,
+        "median": 21768.0,
+        "q1": 14883.0,
+        "q3": 39190.0,
+        "values": [
+          64649.0,
+          14883.0,
+          39190.0,
+          21768.0,
+          9378.0
+        ]
+      },
+      "sustained_blocks": 5,
+      "trace_sha256": [
+        "859b99a1186ef6915d524d2fff339ed5eec88759468d7d942496f99f28faec65"
+      ]
+    },
+    {
+      "achieved_rps": {
+        "iqr": 0.0,
+        "median": 99.95,
+        "q1": 99.95,
+        "q3": 99.95,
+        "values": [
+          99.95,
+          99.95,
+          99.95,
+          99.95,
+          99.95
+        ]
+      },
+      "arm": "flashdb-declared",
+      "blocks": 5,
+      "data_bytes": 1684767398,
+      "engine_cap_mib": 128,
+      "engine_peak_bytes": {
+        "iqr": 69632.0,
+        "median": 64614400.0,
+        "q1": 64614400.0,
+        "q3": 64684032.0,
+        "values": [
+          64614400.0,
+          64561152.0,
+          64614400.0,
+          64684032.0,
+          64942080.0
+        ]
+      },
+      "errors": {
+        "iqr": 0.0,
+        "median": 0.0,
+        "q1": 0.0,
+        "q3": 0.0,
+        "values": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      "floor_adjusted": {
+        "blocks_clean_below_ceiling_plus_floor": 5,
+        "device_floor_fsync_p99_us": 9821,
+        "device_floor_lag_p99_us": 197,
+        "lag_p99_minus_floor_us": 660.0,
+        "lag_p99_over_floor": 4.35,
+        "service_p99_over_fsync_floor": 10.84
+      },
+      "footprint_x_cap": 12.552,
+      "lag_p99_us": {
+        "iqr": 950.0,
+        "median": 857.0,
+        "q1": 451.0,
+        "q3": 1401.0,
+        "values": [
+          857.0,
+          371.0,
+          2288.0,
+          1401.0,
+          451.0
+        ]
+      },
+      "max_group_size": {
+        "iqr": 0.0,
+        "median": 1.0,
+        "q1": 1.0,
+        "q3": 1.0,
+        "values": [
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "mean_group_size": {
+        "iqr": 0.0,
+        "median": 1.0,
+        "q1": 1.0,
+        "q3": 1.0,
+        "values": [
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "oracle": [
+        "DEFERRED"
+      ],
+      "per_block": [
+        {
+          "achieved_rps": 99.95,
+          "block": 1,
+          "errors": 0,
+          "lag_p99_us": 857,
+          "rejected_windows": 0,
+          "service_p99_us": 446565,
+          "sustained": true
+        },
+        {
+          "achieved_rps": 99.95,
+          "block": 2,
+          "errors": 0,
+          "lag_p99_us": 371,
+          "rejected_windows": 0,
+          "service_p99_us": 201985,
+          "sustained": true
+        },
+        {
+          "achieved_rps": 99.95,
+          "block": 3,
+          "errors": 0,
+          "lag_p99_us": 2288,
+          "rejected_windows": 0,
+          "service_p99_us": 106414,
+          "sustained": true
+        },
+        {
+          "achieved_rps": 99.95,
+          "block": 4,
+          "errors": 0,
+          "lag_p99_us": 1401,
+          "rejected_windows": 0,
+          "service_p99_us": 93214,
+          "sustained": true
+        },
+        {
+          "achieved_rps": 99.95,
+          "block": 5,
+          "errors": 0,
+          "lag_p99_us": 451,
+          "rejected_windows": 0,
+          "service_p99_us": 8753,
+          "sustained": true
+        }
+      ],
+      "reject_reasons": {},
+      "rejected_windows": {
+        "iqr": 0.0,
+        "median": 0.0,
+        "q1": 0.0,
+        "q3": 0.0,
+        "values": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      "restore_bytes": 1683012213,
+      "restore_sha256": [
+        "67b3d10c23bca301881278ab8bb739110c725d0bcd8e852124e2a2901acd37ac"
+      ],
+      "restore_verified_blocks": 5,
+      "rung": 100,
+      "service_p99_us": {
+        "iqr": 108771.0,
+        "median": 106414.0,
+        "q1": 93214.0,
+        "q3": 201985.0,
+        "values": [
+          446565.0,
+          201985.0,
+          106414.0,
+          93214.0,
+          8753.0
+        ]
+      },
+      "sustained_blocks": 5,
+      "trace_sha256": [
+        "583f9b4c3c5b3ebe4974822a3e26e1ed80e4f3ad0dc0a5c80153fbb390eb8443"
+      ]
+    },
+    {
+      "achieved_rps": {
+        "iqr": 0.0,
+        "median": 100.0,
+        "q1": 100.0,
+        "q3": 100.0,
+        "values": [
+          100.0,
+          100.0,
+          100.0,
+          100.0,
+          100.0
+        ]
+      },
+      "arm": "postgres",
+      "blocks": 5,
+      "data_bytes": 1103935167,
+      "engine_cap_mib": 128,
+      "engine_peak_bytes": {
+        "iqr": 978944.0,
+        "median": 35913728.0,
+        "q1": 35528704.0,
+        "q3": 36507648.0,
+        "values": [
+          35528704.0,
+          36507648.0,
+          35446784.0,
+          35913728.0,
+          69910528.0
+        ]
+      },
+      "errors": {
+        "iqr": 0.0,
+        "median": 0.0,
+        "q1": 0.0,
+        "q3": 0.0,
+        "values": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      "floor_adjusted": {
+        "blocks_clean_below_ceiling_plus_floor": 5,
+        "device_floor_fsync_p99_us": 9821,
+        "device_floor_lag_p99_us": 197,
+        "lag_p99_minus_floor_us": 67.0,
+        "lag_p99_over_floor": 1.34,
+        "service_p99_over_fsync_floor": 2.61
+      },
+      "footprint_x_cap": 8.225,
+      "lag_p99_us": {
+        "iqr": 33.0,
+        "median": 264.0,
+        "q1": 257.0,
+        "q3": 290.0,
+        "values": [
+          264.0,
+          290.0,
+          775.0,
+          171.0,
+          257.0
+        ]
+      },
+      "max_group_size": {
+        "iqr": 1.0,
+        "median": 2.0,
+        "q1": 2.0,
+        "q3": 3.0,
+        "values": [
+          3.0,
+          2.0,
+          2.0,
+          3.0,
+          1.0
+        ]
+      },
+      "mean_group_size": {
+        "iqr": 0.001,
+        "median": 1.001,
+        "q1": 1.001,
+        "q3": 1.002,
+        "values": [
+          1.002,
+          1.001,
+          1.001,
+          1.008,
+          1.0
+        ]
+      },
+      "oracle": [
+        "DEFERRED",
+        "PASS"
+      ],
+      "per_block": [
+        {
+          "achieved_rps": 100.0,
+          "block": 1,
+          "errors": 0,
+          "lag_p99_us": 264,
+          "rejected_windows": 0,
+          "service_p99_us": 32232,
+          "sustained": true
+        },
+        {
+          "achieved_rps": 100.0,
+          "block": 2,
+          "errors": 0,
+          "lag_p99_us": 290,
+          "rejected_windows": 0,
+          "service_p99_us": 21583,
+          "sustained": true
+        },
+        {
+          "achieved_rps": 100.0,
+          "block": 3,
+          "errors": 0,
+          "lag_p99_us": 775,
+          "rejected_windows": 0,
+          "service_p99_us": 25680,
+          "sustained": true
+        },
+        {
+          "achieved_rps": 100.0,
+          "block": 4,
+          "errors": 0,
+          "lag_p99_us": 171,
+          "rejected_windows": 0,
+          "service_p99_us": 51237,
+          "sustained": true
+        },
+        {
+          "achieved_rps": 100.0,
+          "block": 5,
+          "errors": 0,
+          "lag_p99_us": 257,
+          "rejected_windows": 0,
+          "service_p99_us": 6422,
+          "sustained": true
+        }
+      ],
+      "reject_reasons": {},
+      "rejected_windows": {
+        "iqr": 0.0,
+        "median": 0.0,
+        "q1": 0.0,
+        "q3": 0.0,
+        "values": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      "restore_bytes": 2201362806,
+      "restore_sha256": [
+        "7f9a4ea8edb0c1a287a201389ab08aba61e82bd8cdd92f51fe64ddf48cad1b92"
+      ],
+      "restore_verified_blocks": 5,
+      "rung": 100,
+      "service_p99_us": {
+        "iqr": 10649.0,
+        "median": 25680.0,
+        "q1": 21583.0,
+        "q3": 32232.0,
+        "values": [
+          32232.0,
+          21583.0,
+          25680.0,
+          51237.0,
+          6422.0
+        ]
+      },
+      "sustained_blocks": 5,
+      "trace_sha256": [
+        "583f9b4c3c5b3ebe4974822a3e26e1ed80e4f3ad0dc0a5c80153fbb390eb8443"
+      ]
+    },
+    {
+      "achieved_rps": {
+        "iqr": 0.0,
+        "median": 100.0,
+        "q1": 100.0,
+        "q3": 100.0,
+        "values": [
+          100.0,
+          100.0,
+          100.0,
+          100.0,
+          100.0
+        ]
+      },
+      "arm": "sqlite",
+      "blocks": 5,
+      "data_bytes": 542203904,
+      "engine_cap_mib": 128,
+      "engine_peak_bytes": {
+        "iqr": 507904.0,
+        "median": 65392640.0,
+        "q1": 65175552.0,
+        "q3": 65683456.0,
+        "values": [
+          65683456.0,
+          65736704.0,
+          65392640.0,
+          64798720.0,
+          65175552.0
+        ]
+      },
+      "errors": {
+        "iqr": 0.0,
+        "median": 0.0,
+        "q1": 0.0,
+        "q3": 0.0,
+        "values": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      "floor_adjusted": {
+        "blocks_clean_below_ceiling_plus_floor": 5,
+        "device_floor_fsync_p99_us": 9821,
+        "device_floor_lag_p99_us": 197,
+        "lag_p99_minus_floor_us": 54.0,
+        "lag_p99_over_floor": 1.27,
+        "service_p99_over_fsync_floor": 6.71
+      },
+      "footprint_x_cap": 4.04,
+      "lag_p99_us": {
+        "iqr": 77.0,
+        "median": 251.0,
+        "q1": 231.0,
+        "q3": 308.0,
+        "values": [
+          251.0,
+          308.0,
+          722.0,
+          231.0,
+          192.0
+        ]
+      },
+      "max_group_size": {
+        "iqr": 1.0,
+        "median": 4.0,
+        "q1": 3.0,
+        "q3": 4.0,
+        "values": [
+          1.0,
+          4.0,
+          3.0,
+          4.0,
+          4.0
+        ]
+      },
+      "mean_group_size": {
+        "iqr": 0.008,
+        "median": 1.008,
+        "q1": 1.004,
+        "q3": 1.012,
+        "values": [
+          1.0,
+          1.012,
+          1.004,
+          1.012,
+          1.008
+        ]
+      },
+      "oracle": [
+        "DEFERRED",
+        "PASS"
+      ],
+      "per_block": [
+        {
+          "achieved_rps": 100.0,
+          "block": 1,
+          "errors": 0,
+          "lag_p99_us": 251,
+          "rejected_windows": 0,
+          "service_p99_us": 9360,
+          "sustained": true
+        },
+        {
+          "achieved_rps": 100.0,
+          "block": 2,
+          "errors": 0,
+          "lag_p99_us": 308,
+          "rejected_windows": 0,
+          "service_p99_us": 65930,
+          "sustained": true
+        },
+        {
+          "achieved_rps": 100.0,
+          "block": 3,
+          "errors": 0,
+          "lag_p99_us": 722,
+          "rejected_windows": 0,
+          "service_p99_us": 45728,
+          "sustained": true
+        },
+        {
+          "achieved_rps": 100.0,
+          "block": 4,
+          "errors": 0,
+          "lag_p99_us": 231,
+          "rejected_windows": 0,
+          "service_p99_us": 75918,
+          "sustained": true
+        },
+        {
+          "achieved_rps": 100.0,
+          "block": 5,
+          "errors": 0,
+          "lag_p99_us": 192,
+          "rejected_windows": 0,
+          "service_p99_us": 66420,
+          "sustained": true
+        }
+      ],
+      "reject_reasons": {},
+      "rejected_windows": {
+        "iqr": 0.0,
+        "median": 0.0,
+        "q1": 0.0,
+        "q3": 0.0,
+        "values": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      "restore_bytes": 541876224,
+      "restore_sha256": [
+        "46c6f1e1e2a149f8e55bb4f29a39b2ca57a53d1a50daa0ae5a3e30c2d4367130"
+      ],
+      "restore_verified_blocks": 5,
+      "rung": 100,
+      "service_p99_us": {
+        "iqr": 20692.0,
+        "median": 65930.0,
+        "q1": 45728.0,
+        "q3": 66420.0,
+        "values": [
+          9360.0,
+          65930.0,
+          45728.0,
+          75918.0,
+          66420.0
+        ]
+      },
+      "sustained_blocks": 5,
+      "trace_sha256": [
+        "583f9b4c3c5b3ebe4974822a3e26e1ed80e4f3ad0dc0a5c80153fbb390eb8443"
+      ]
+    },
+    {
+      "achieved_rps": {
+        "iqr": 0.0,
+        "median": 200.0,
+        "q1": 200.0,
+        "q3": 200.0,
+        "values": [
+          200.0,
+          200.0,
+          200.0,
+          200.0,
+          200.0
+        ]
+      },
+      "arm": "flashdb-declared",
+      "blocks": 5,
+      "data_bytes": 1686590701,
+      "engine_cap_mib": 128,
+      "engine_peak_bytes": {
+        "iqr": 249856.0,
+        "median": 65990656.0,
+        "q1": 65880064.0,
+        "q3": 66129920.0,
+        "values": [
+          65990656.0,
+          65880064.0,
+          65830912.0,
+          66129920.0,
+          66170880.0
+        ]
+      },
+      "errors": {
+        "iqr": 0.0,
+        "median": 0.0,
+        "q1": 0.0,
+        "q3": 0.0,
+        "values": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      "floor_adjusted": {
+        "blocks_clean_below_ceiling_plus_floor": 3,
+        "device_floor_fsync_p99_us": 9821,
+        "device_floor_lag_p99_us": 197,
+        "lag_p99_minus_floor_us": 8192.0,
+        "lag_p99_over_floor": 42.58,
+        "service_p99_over_fsync_floor": 41.06
+      },
+      "footprint_x_cap": 12.566,
+      "lag_p99_us": {
+        "iqr": 23158.0,
+        "median": 8389.0,
+        "q1": 7272.0,
+        "q3": 30430.0,
+        "values": [
+          7272.0,
+          30430.0,
+          33747.0,
+          3088.0,
+          8389.0
+        ]
+      },
+      "max_group_size": {
+        "iqr": 5.0,
+        "median": 3.0,
+        "q1": 3.0,
+        "q3": 8.0,
+        "values": [
+          3.0,
+          8.0,
+          8.0,
+          2.0,
+          3.0
+        ]
+      },
+      "mean_group_size": {
+        "iqr": 0.001,
+        "median": 1.007,
+        "q1": 1.006,
+        "q3": 1.007,
+        "values": [
+          1.006,
+          1.011,
+          1.007,
+          1.0,
+          1.007
+        ]
+      },
+      "oracle": [
+        "DEFERRED"
+      ],
+      "per_block": [
+        {
+          "achieved_rps": 200.0,
+          "block": 1,
+          "errors": 0,
+          "lag_p99_us": 7272,
+          "rejected_windows": 0,
+          "service_p99_us": 469132,
+          "sustained": true
+        },
+        {
+          "achieved_rps": 200.0,
+          "block": 2,
+          "errors": 0,
+          "lag_p99_us": 30430,
+          "rejected_windows": 1,
+          "service_p99_us": 280654,
+          "sustained": false
+        },
+        {
+          "achieved_rps": 200.0,
+          "block": 3,
+          "errors": 0,
+          "lag_p99_us": 33747,
+          "rejected_windows": 1,
+          "service_p99_us": 129185,
+          "sustained": false
+        },
+        {
+          "achieved_rps": 200.0,
+          "block": 4,
+          "errors": 0,
+          "lag_p99_us": 3088,
+          "rejected_windows": 0,
+          "service_p99_us": 403213,
+          "sustained": true
+        },
+        {
+          "achieved_rps": 200.0,
+          "block": 5,
+          "errors": 0,
+          "lag_p99_us": 8389,
+          "rejected_windows": 0,
+          "service_p99_us": 423237,
+          "sustained": true
+        }
+      ],
+      "reject_reasons": {
+        "lag_ceiling": 2
+      },
+      "rejected_windows": {
+        "iqr": 1.0,
+        "median": 0.0,
+        "q1": 0.0,
+        "q3": 1.0,
+        "values": [
+          0.0,
+          1.0,
+          1.0,
+          0.0,
+          0.0
+        ]
+      },
+      "restore_bytes": 1683012213,
+      "restore_sha256": [
+        "67b3d10c23bca301881278ab8bb739110c725d0bcd8e852124e2a2901acd37ac"
+      ],
+      "restore_verified_blocks": 5,
+      "rung": 200,
+      "service_p99_us": {
+        "iqr": 142583.0,
+        "median": 403213.0,
+        "q1": 280654.0,
+        "q3": 423237.0,
+        "values": [
+          469132.0,
+          280654.0,
+          129185.0,
+          403213.0,
+          423237.0
+        ]
+      },
+      "sustained_blocks": 3,
+      "trace_sha256": [
+        "6472cf46477e037b67820a4fa5a7da9d46e1241e6d8d33f89e10f89b22b8f93f"
+      ]
+    },
+    {
+      "achieved_rps": {
+        "iqr": 0.0,
+        "median": 200.0,
+        "q1": 200.0,
+        "q3": 200.0,
+        "values": [
+          200.0,
+          200.0,
+          200.0,
+          200.0,
+          200.0
+        ]
+      },
+      "arm": "postgres",
+      "blocks": 5,
+      "data_bytes": 1104369343,
+      "engine_cap_mib": 128,
+      "engine_peak_bytes": {
+        "iqr": 24543232.0,
+        "median": 46026752.0,
+        "q1": 41926656.0,
+        "q3": 66469888.0,
+        "values": [
+          41926656.0,
+          46026752.0,
+          36990976.0,
+          81739776.0,
+          66469888.0
+        ]
+      },
+      "errors": {
+        "iqr": 0.0,
+        "median": 0.0,
+        "q1": 0.0,
+        "q3": 0.0,
+        "values": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      "floor_adjusted": {
+        "blocks_clean_below_ceiling_plus_floor": 5,
+        "device_floor_fsync_p99_us": 9821,
+        "device_floor_lag_p99_us": 197,
+        "lag_p99_minus_floor_us": 709.0,
+        "lag_p99_over_floor": 4.6,
+        "service_p99_over_fsync_floor": 4.09
+      },
+      "footprint_x_cap": 8.228,
+      "lag_p99_us": {
+        "iqr": 694.0,
+        "median": 906.0,
+        "q1": 274.0,
+        "q3": 968.0,
+        "values": [
+          968.0,
+          274.0,
+          162.0,
+          906.0,
+          1731.0
+        ]
+      },
+      "max_group_size": {
+        "iqr": 1.0,
+        "median": 6.0,
+        "q1": 5.0,
+        "q3": 6.0,
+        "values": [
+          6.0,
+          6.0,
+          6.0,
+          2.0,
+          5.0
+        ]
+      },
+      "mean_group_size": {
+        "iqr": 0.005,
+        "median": 1.006,
+        "q1": 1.003,
+        "q3": 1.008,
+        "values": [
+          1.008,
+          1.006,
+          1.013,
+          1.001,
+          1.003
+        ]
+      },
+      "oracle": [
+        "DEFERRED",
+        "PASS"
+      ],
+      "per_block": [
+        {
+          "achieved_rps": 200.0,
+          "block": 1,
+          "errors": 0,
+          "lag_p99_us": 968,
+          "rejected_windows": 0,
+          "service_p99_us": 51910,
+          "sustained": true
+        },
+        {
+          "achieved_rps": 200.0,
+          "block": 2,
+          "errors": 0,
+          "lag_p99_us": 274,
+          "rejected_windows": 0,
+          "service_p99_us": 40135,
+          "sustained": true
+        },
+        {
+          "achieved_rps": 200.0,
+          "block": 3,
+          "errors": 0,
+          "lag_p99_us": 162,
+          "rejected_windows": 0,
+          "service_p99_us": 50476,
+          "sustained": true
+        },
+        {
+          "achieved_rps": 200.0,
+          "block": 4,
+          "errors": 0,
+          "lag_p99_us": 906,
+          "rejected_windows": 0,
+          "service_p99_us": 11889,
+          "sustained": true
+        },
+        {
+          "achieved_rps": 200.0,
+          "block": 5,
+          "errors": 0,
+          "lag_p99_us": 1731,
+          "rejected_windows": 0,
+          "service_p99_us": 26228,
+          "sustained": true
+        }
+      ],
+      "reject_reasons": {},
+      "rejected_windows": {
+        "iqr": 0.0,
+        "median": 0.0,
+        "q1": 0.0,
+        "q3": 0.0,
+        "values": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      "restore_bytes": 2201362806,
+      "restore_sha256": [
+        "7f9a4ea8edb0c1a287a201389ab08aba61e82bd8cdd92f51fe64ddf48cad1b92"
+      ],
+      "restore_verified_blocks": 5,
+      "rung": 200,
+      "service_p99_us": {
+        "iqr": 24248.0,
+        "median": 40135.0,
+        "q1": 26228.0,
+        "q3": 50476.0,
+        "values": [
+          51910.0,
+          40135.0,
+          50476.0,
+          11889.0,
+          26228.0
+        ]
+      },
+      "sustained_blocks": 5,
+      "trace_sha256": [
+        "6472cf46477e037b67820a4fa5a7da9d46e1241e6d8d33f89e10f89b22b8f93f"
+      ]
+    },
+    {
+      "achieved_rps": {
+        "iqr": 0.0,
+        "median": 200.0,
+        "q1": 200.0,
+        "q3": 200.0,
+        "values": [
+          200.0,
+          200.0,
+          200.0,
+          200.0,
+          200.0
+        ]
+      },
+      "arm": "sqlite",
+      "blocks": 5,
+      "data_bytes": 542494720,
+      "engine_cap_mib": 128,
+      "engine_peak_bytes": {
+        "iqr": 806912.0,
+        "median": 103489536.0,
+        "q1": 103043072.0,
+        "q3": 103849984.0,
+        "values": [
+          104148992.0,
+          102510592.0,
+          103043072.0,
+          103849984.0,
+          103489536.0
+        ]
+      },
+      "errors": {
+        "iqr": 0.0,
+        "median": 0.0,
+        "q1": 0.0,
+        "q3": 0.0,
+        "values": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      "floor_adjusted": {
+        "blocks_clean_below_ceiling_plus_floor": 5,
+        "device_floor_fsync_p99_us": 9821,
+        "device_floor_lag_p99_us": 197,
+        "lag_p99_minus_floor_us": -46.0,
+        "lag_p99_over_floor": 0.77,
+        "service_p99_over_fsync_floor": 6.01
+      },
+      "footprint_x_cap": 4.042,
+      "lag_p99_us": {
+        "iqr": 85.0,
+        "median": 151.0,
+        "q1": 79.0,
+        "q3": 164.0,
+        "values": [
+          79.0,
+          33.0,
+          170.0,
+          164.0,
+          151.0
+        ]
+      },
+      "max_group_size": {
+        "iqr": 1.0,
+        "median": 8.0,
+        "q1": 8.0,
+        "q3": 9.0,
+        "values": [
+          9.0,
+          7.0,
+          8.0,
+          8.0,
+          9.0
+        ]
+      },
+      "mean_group_size": {
+        "iqr": 0.003,
+        "median": 1.008,
+        "q1": 1.007,
+        "q3": 1.01,
+        "values": [
+          1.008,
+          1.007,
+          1.017,
+          1.007,
+          1.01
+        ]
+      },
+      "oracle": [
+        "DEFERRED",
+        "PASS"
+      ],
+      "per_block": [
+        {
+          "achieved_rps": 200.0,
+          "block": 1,
+          "errors": 0,
+          "lag_p99_us": 79,
+          "rejected_windows": 0,
+          "service_p99_us": 59013,
+          "sustained": true
+        },
+        {
+          "achieved_rps": 200.0,
+          "block": 2,
+          "errors": 0,
+          "lag_p99_us": 33,
+          "rejected_windows": 0,
+          "service_p99_us": 51717,
+          "sustained": true
+        },
+        {
+          "achieved_rps": 200.0,
+          "block": 3,
+          "errors": 0,
+          "lag_p99_us": 170,
+          "rejected_windows": 0,
+          "service_p99_us": 70087,
+          "sustained": true
+        },
+        {
+          "achieved_rps": 200.0,
+          "block": 4,
+          "errors": 0,
+          "lag_p99_us": 164,
+          "rejected_windows": 0,
+          "service_p99_us": 55082,
+          "sustained": true
+        },
+        {
+          "achieved_rps": 200.0,
+          "block": 5,
+          "errors": 0,
+          "lag_p99_us": 151,
+          "rejected_windows": 0,
+          "service_p99_us": 66077,
+          "sustained": true
+        }
+      ],
+      "reject_reasons": {},
+      "rejected_windows": {
+        "iqr": 0.0,
+        "median": 0.0,
+        "q1": 0.0,
+        "q3": 0.0,
+        "values": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      "restore_bytes": 541876224,
+      "restore_sha256": [
+        "46c6f1e1e2a149f8e55bb4f29a39b2ca57a53d1a50daa0ae5a3e30c2d4367130"
+      ],
+      "restore_verified_blocks": 5,
+      "rung": 200,
+      "service_p99_us": {
+        "iqr": 10995.0,
+        "median": 59013.0,
+        "q1": 55082.0,
+        "q3": 66077.0,
+        "values": [
+          59013.0,
+          51717.0,
+          70087.0,
+          55082.0,
+          66077.0
+        ]
+      },
+      "sustained_blocks": 5,
+      "trace_sha256": [
+        "6472cf46477e037b67820a4fa5a7da9d46e1241e6d8d33f89e10f89b22b8f93f"
+      ]
+    }
+  ],
+  "arms": [
+    "flashdb-declared",
+    "postgres",
+    "sqlite"
+  ],
+  "blocks": 5,
+  "device_floor": {
+    "after": {
+      "at": "2026-10-17T23:29:33",
+      "benches": {
+        "fsync": {
+          "achieved_rps": 200.0,
+          "errors": 0,
+          "lag_p50_us": 5.0,
+          "lag_p99_us": 4096,
+          "offered_rps": 200.0,
+          "reject_reasons": {},
+          "rejected_windows": 0,
+          "service_p50_us": 3566.0,
+          "service_p99_us": 9905,
+          "sustained": true,
+          "windows": 20,
+          "windows_file": "windows-floor-fsync.jsonl"
+        },
+        "idle": {
+          "achieved_rps": 200.0,
+          "errors": 0,
+          "lag_p50_us": 37.0,
+          "lag_p99_us": 207,
+          "offered_rps": 200.0,
+          "reject_reasons": {},
+          "rejected_windows": 0,
+          "service_p50_us": 38.0,
+          "service_p99_us": 210,
+          "sustained": true,
+          "windows": 20,
+          "windows_file": "windows-floor-idle.jsonl"
+        }
+      },
+      "file": "floor/after/floor.json",
+      "label": "after",
+      "machine": {
+        "ac_online": [
+          "1"
+        ],
+        "at": "2026-10-17T23:29:33",
+        "concurrent_work": [],
+        "epp": [
+          "performance"
+        ],
+        "governor": "powersave",
+        "loadavg": "1.24 1.07 0.93 1/1433 1408174",
+        "nproc": 8,
+        "power_profile": "performance",
+        "scaling_cur_freq_khz": [
+          "3599566",
+          "3599998",
+          "3600000",
+          "3600019",
+          "3600046",
+          "3600305",
+          "3601934",
+          "400000"
+        ],
+        "scaling_max_freq_khz": "3600000",
+        "top_cpu": [
+          {
+            "args": "pi",
+            "comm": "pi",
+            "pcpu": 9.8
+          },
+          {
+            "args": "pi",
+            "comm": "pi",
+            "pcpu": 5.2
+          },
+          {
+            "args": "/home/z/vibe/flashdb/harness/.venv/bin/python -m flashdb_harness.baseline_0b floor --out /home/z/vibe/flashdb/.scratch/82-controlled-m1/runs/floor/after/floor.j",
+            "comm": "python",
+            "pcpu": 4.2
+          },
+          {
+            "args": "/usr/bin/ptyxis --gapplication-service",
+            "comm": "ptyxis",
+            "pcpu": 3.9
+          },
+          {
+            "args": "/usr/bin/gnome-shell --mode=ubuntu",
+            "comm": "gnome-shell",
+            "pcpu": 3.1
+          },
+          {
+            "args": "pi",
+            "comm": "pi",
+            "pcpu": 2.6
+          }
+        ]
+      },
+      "machine_state_file": "/home/z/vibe/flashdb/.scratch/82-controlled-m1/runs/floor/after/machine-state.jsonl",
+      "rate_rps": 200,
+      "requests": 4000,
+      "window_ms": 1000
+    },
+    "before": {
+      "at": "2026-10-17T20:56:52",
+      "benches": {
+        "fsync": {
+          "achieved_rps": 200.0,
+          "errors": 0,
+          "lag_p50_us": 9.0,
+          "lag_p99_us": 162595,
+          "offered_rps": 200.0,
+          "reject_reasons": {
+            "lag_ceiling": 3
+          },
+          "rejected_windows": 3,
+          "service_p50_us": 3105.5,
+          "service_p99_us": 9821,
+          "sustained": false,
+          "windows": 20,
+          "windows_file": "windows-floor-fsync.jsonl"
+        },
+        "idle": {
+          "achieved_rps": 200.0,
+          "errors": 0,
+          "lag_p50_us": 10.0,
+          "lag_p99_us": 197,
+          "offered_rps": 200.0,
+          "reject_reasons": {},
+          "rejected_windows": 0,
+          "service_p50_us": 12.0,
+          "service_p99_us": 199,
+          "sustained": true,
+          "windows": 20,
+          "windows_file": "windows-floor-idle.jsonl"
+        }
+      },
+      "file": "floor/before/floor.json",
+      "label": "before",
+      "machine": {
+        "ac_online": [
+          "1"
+        ],
+        "at": "2026-10-17T20:56:52",
+        "concurrent_work": [],
+        "epp": [
+          "performance"
+        ],
+        "governor": "powersave",
+        "loadavg": "2.76 3.81 3.13 3/1428 1311682",
+        "nproc": 8,
+        "power_profile": "performance",
+        "scaling_cur_freq_khz": [
+          "3597196",
+          "3599985",
+          "3599989",
+          "3599993",
+          "3600006",
+          "3600165",
+          "3601139",
+          "3603211"
+        ],
+        "scaling_max_freq_khz": "3600000",
+        "top_cpu": [
+          {
+            "args": "/home/z/.local/share/fnm/node-versions/v24.22.0/installation/bin/node --import file:///home/z/.pi/agent/npm/node_modules/pi-subagents/runner-peer-preload.mjs /h",
+            "comm": "MainThread",
+            "pcpu": 30.3
+          },
+          {
+            "args": "pi",
+            "comm": "pi",
+            "pcpu": 10.1
+          },
+          {
+            "args": "run anim ch npm run anim check episodes/showcase-props/episode.yml",
+            "comm": "npm",
+            "pcpu": 9.5
+          },
+          {
+            "args": "pi",
+            "comm": "pi",
+            "pcpu": 6.0
+          },
+          {
+            "args": "node /home/z/vibe/worktrees/agentic-animation/pi-worktree-9d18af44-e042-471a-88ca-c462812d0260-s0-0/node_modules/.bin/tsx packages/cli/src/index.ts check episod",
+            "comm": "MainThread",
+            "pcpu": 5.9
+          },
+          {
+            "args": "/home/z/vibe/flashdb/harness/.venv/bin/python -m flashdb_harness.baseline_0b floor --out /home/z/vibe/flashdb/.scratch/82-controlled-m1/runs/floor/before/floor.",
+            "comm": "python",
+            "pcpu": 5.3
+          }
+        ]
+      },
+      "machine_state_file": "/home/z/vibe/flashdb/.scratch/82-controlled-m1/runs/floor/before/machine-state.jsonl",
+      "rate_rps": 200,
+      "requests": 4000,
+      "window_ms": 1000
+    }
+  },
+  "device_floor_reference": {
+    "fsync_lag_p99_us": 4096,
+    "fsync_p50_us": 3105.5,
+    "fsync_p99_us": 9821,
+    "fsync_rejected_windows": {
+      "after": 0,
+      "before": 3
+    },
+    "idle_rejected_windows": {
+      "after": 0,
+      "before": 0
+    },
+    "labels": [
+      "after",
+      "before"
+    ],
+    "lag_p99_us": 197,
+    "rule": "the element-wise minimum across the floor phases, so no arm is flattered"
+  },
+  "footprint": [
+    {
+      "arm": "flashdb-declared",
+      "data_bytes": 1683903919,
+      "engine_cap_mib": 128,
+      "footprint_x_cap": 12.546,
+      "instrument": "directory bytes of the instance the arm served, live WAL included",
+      "meets_regime_floor": true
+    },
+    {
+      "arm": "postgres",
+      "data_bytes": 1103713983,
+      "data_dir_bytes": 2201362806,
+      "data_dir_instrument": "the cluster data directory the restore verified, WAL included (run record `restore.bytes`)",
+      "data_dir_x_cap": 16.401,
+      "engine_cap_mib": 128,
+      "footprint_x_cap": 8.223,
+      "instrument": "pg_database_size(current_database()): LOGICAL size, the WAL excluded",
+      "meets_regime_floor": false
+    },
+    {
+      "arm": "sqlite",
+      "data_bytes": 542052352,
+      "engine_cap_mib": 128,
+      "footprint_x_cap": 4.039,
+      "instrument": "database file plus its WAL and shared-memory sidecars, read after the post-run checkpoint",
+      "meets_regime_floor": false
+    }
+  ],
+  "machine_state": {
+    "ac_online": [
+      "1"
+    ],
+    "concurrent_work": [],
+    "concurrent_work_records": 0,
+    "epp": [
+      "performance"
+    ],
+    "governor": [
+      "powersave"
+    ],
+    "loadavg_1min": {
+      "max": 4.1,
+      "median": 1.95,
+      "min": 0.68
+    },
+    "nproc": [
+      8
+    ],
+    "power_profile": [
+      "performance"
+    ],
+    "records": 90,
+    "records_excluded_before_since": 111,
+    "scaling_cur_freq_khz": {
+      "per_core_max_khz": 3605132,
+      "per_core_median_khz": 3600006,
+      "per_core_min_khz": 400000,
+      "record_median_of_cores_khz": {
+        "max": 3601312,
+        "median": 3600010,
+        "min": 2899986
+      }
+    },
+    "scaling_max_freq_khz": [
+      "3600000"
+    ],
+    "since": "2026-10-18T00:02:18",
+    "top_cpu_observed": [
+      "35-vs2-bin",
+      "MainThread",
+      "chrome-headless",
+      "fwupdmgr",
+      "gnome-shell",
+      "localsearch-ext",
+      "pi",
+      "ps",
+      "ptyxis",
+      "python",
+      "python3"
+    ]
+  },
+  "metrics": [
+    {
+      "arm": "flashdb-declared",
+      "blocks": 5,
+      "defect": null,
+      "detail": "49.95 rps of 50 offered",
+      "fix": null,
+      "iqr": 0.0,
+      "median": 49.95,
+      "metric": "achieved_rps",
+      "q1": 49.95,
+      "q3": 49.95,
+      "rule": "the achieved rate is within 5% of the offered rate",
+      "rung": 50,
+      "verdict": "PASS"
+    },
+    {
+      "arm": "flashdb-declared",
+      "blocks": 5,
+      "defect": null,
+      "detail": "1038.0 us median, 172.0 us IQR",
+      "fix": null,
+      "iqr": 172.0,
+      "median": 1038.0,
+      "metric": "lag_p99_us",
+      "q1": 883.0,
+      "q3": 1055.0,
+      "rule": "the per-request schedule-lag p99 is at or below 10000 us",
+      "rung": 50,
+      "verdict": "PASS"
+    },
+    {
+      "arm": "flashdb-declared",
+      "blocks": 5,
+      "defect": "service_p99_us missed its rule at 50 rps: 109766.0 us median against a 9821 us device fsync p99",
+      "detail": "109766.0 us median against a 9821 us device fsync p99",
+      "fix": "instrument the commit path for the > 100 ms outliers (a per-window `group_elapsed_us` histogram) before tuning anything; no service ceiling is pre-registered, so this row is reported beside the rule, not enforced by it",
+      "iqr": 10710.0,
+      "median": 109766.0,
+      "metric": "service_p99_us",
+      "q1": 106744.0,
+      "q3": 117454.0,
+      "rule": "the per-request service p99 is within 10,000 us of the device's own fsync p99 (no service ceiling is pre-registered; secondary)",
+      "rung": 50,
+      "verdict": "FAIL"
+    },
+    {
+      "arm": "flashdb-declared",
+      "blocks": 5,
+      "defect": null,
+      "detail": "0 rejected over 5 blocks; reasons none",
+      "fix": null,
+      "iqr": 0.0,
+      "median": 0.0,
+      "metric": "rejected_windows",
+      "q1": 0.0,
+      "q3": 0.0,
+      "rule": "zero windows rejected by the unified rule in any block",
+      "rung": 50,
+      "verdict": "PASS"
+    },
+    {
+      "arm": "flashdb-declared",
+      "blocks": 5,
+      "defect": null,
+      "detail": "0 errors over 5 blocks",
+      "fix": null,
+      "iqr": 0.0,
+      "median": 0.0,
+      "metric": "errors",
+      "q1": 0.0,
+      "q3": 0.0,
+      "rule": "zero request errors in any block",
+      "rung": 50,
+      "verdict": "PASS"
+    },
+    {
+      "arm": "flashdb-declared",
+      "blocks": 5,
+      "defect": null,
+      "detail": "64331776.0 B median of 134217728 B cap",
+      "fix": null,
+      "iqr": 155648.0,
+      "median": 64331776.0,
+      "metric": "engine_peak_bytes",
+      "q1": 64303104.0,
+      "q3": 64458752.0,
+      "rule": "the engine's peak stays inside its 128 MiB cap",
+      "rung": 50,
+      "verdict": "PASS"
+    },
+    {
+      "arm": "postgres",
+      "blocks": 5,
+      "defect": null,
+      "detail": "50.0 rps of 50 offered",
+      "fix": null,
+      "iqr": 0.0,
+      "median": 50.0,
+      "metric": "achieved_rps",
+      "q1": 50.0,
+      "q3": 50.0,
+      "rule": "the achieved rate is within 5% of the offered rate",
+      "rung": 50,
+      "verdict": "PASS"
+    },
+    {
+      "arm": "postgres",
+      "blocks": 5,
+      "defect": null,
+      "detail": "385.0 us median, 876.0 us IQR",
+      "fix": null,
+      "iqr": 876.0,
+      "median": 385.0,
+      "metric": "lag_p99_us",
+      "q1": 266.0,
+      "q3": 1142.0,
+      "rule": "the per-request schedule-lag p99 is at or below 10000 us",
+      "rung": 50,
+      "verdict": "PASS"
+    },
+    {
+      "arm": "postgres",
+      "blocks": 5,
+      "defect": null,
+      "detail": "14034.0 us median against a 9821 us device fsync p99",
+      "fix": null,
+      "iqr": 17873.0,
+      "median": 14034.0,
+      "metric": "service_p99_us",
+      "q1": 13663.0,
+      "q3": 31536.0,
+      "rule": "the per-request service p99 is within 10,000 us of the device's own fsync p99 (no service ceiling is pre-registered; secondary)",
+      "rung": 50,
+      "verdict": "PASS"
+    },
+    {
+      "arm": "postgres",
+      "blocks": 5,
+      "defect": null,
+      "detail": "0 rejected over 5 blocks; reasons none",
+      "fix": null,
+      "iqr": 0.0,
+      "median": 0.0,
+      "metric": "rejected_windows",
+      "q1": 0.0,
+      "q3": 0.0,
+      "rule": "zero windows rejected by the unified rule in any block",
+      "rung": 50,
+      "verdict": "PASS"
+    },
+    {
+      "arm": "postgres",
+      "blocks": 5,
+      "defect": null,
+      "detail": "0 errors over 5 blocks",
+      "fix": null,
+      "iqr": 0.0,
+      "median": 0.0,
+      "metric": "errors",
+      "q1": 0.0,
+      "q3": 0.0,
+      "rule": "zero request errors in any block",
+      "rung": 50,
+      "verdict": "PASS"
+    },
+    {
+      "arm": "postgres",
+      "blocks": 5,
+      "defect": null,
+      "detail": "35594240.0 B median of 134217728 B cap",
+      "fix": null,
+      "iqr": 458752.0,
+      "median": 35594240.0,
+      "metric": "engine_peak_bytes",
+      "q1": 35360768.0,
+      "q3": 35819520.0,
+      "rule": "the engine's peak stays inside its 128 MiB cap",
+      "rung": 50,
+      "verdict": "PASS"
+    },
+    {
+      "arm": "sqlite",
+      "blocks": 5,
+      "defect": null,
+      "detail": "50.0 rps of 50 offered",
+      "fix": null,
+      "iqr": 0.0,
+      "median": 50.0,
+      "metric": "achieved_rps",
+      "q1": 50.0,
+      "q3": 50.0,
+      "rule": "the achieved rate is within 5% of the offered rate",
+      "rung": 50,
+      "verdict": "PASS"
+    },
+    {
+      "arm": "sqlite",
+      "blocks": 5,
+      "defect": null,
+      "detail": "577.0 us median, 347.0 us IQR",
+      "fix": null,
+      "iqr": 347.0,
+      "median": 577.0,
+      "metric": "lag_p99_us",
+      "q1": 515.0,
+      "q3": 862.0,
+      "rule": "the per-request schedule-lag p99 is at or below 10000 us",
+      "rung": 50,
+      "verdict": "PASS"
+    },
+    {
+      "arm": "sqlite",
+      "blocks": 5,
+      "defect": "service_p99_us missed its rule at 50 rps: 21768.0 us median against a 9821 us device fsync p99",
+      "detail": "21768.0 us median against a 9821 us device fsync p99",
+      "fix": "instrument the commit path for the > 100 ms outliers (a per-window `group_elapsed_us` histogram) before tuning anything; no service ceiling is pre-registered, so this row is reported beside the rule, not enforced by it",
+      "iqr": 24307.0,
+      "median": 21768.0,
+      "metric": "service_p99_us",
+      "q1": 14883.0,
+      "q3": 39190.0,
+      "rule": "the per-request service p99 is within 10,000 us of the device's own fsync p99 (no service ceiling is pre-registered; secondary)",
+      "rung": 50,
+      "verdict": "FAIL"
+    },
+    {
+      "arm": "sqlite",
+      "blocks": 5,
+      "defect": null,
+      "detail": "0 rejected over 5 blocks; reasons none",
+      "fix": null,
+      "iqr": 0.0,
+      "median": 0.0,
+      "metric": "rejected_windows",
+      "q1": 0.0,
+      "q3": 0.0,
+      "rule": "zero windows rejected by the unified rule in any block",
+      "rung": 50,
+      "verdict": "PASS"
+    },
+    {
+      "arm": "sqlite",
+      "blocks": 5,
+      "defect": null,
+      "detail": "0 errors over 5 blocks",
+      "fix": null,
+      "iqr": 0.0,
+      "median": 0.0,
+      "metric": "errors",
+      "q1": 0.0,
+      "q3": 0.0,
+      "rule": "zero request errors in any block",
+      "rung": 50,
+      "verdict": "PASS"
+    },
+    {
+      "arm": "sqlite",
+      "blocks": 5,
+      "defect": null,
+      "detail": "46006272.0 B median of 134217728 B cap",
+      "fix": null,
+      "iqr": 397312.0,
+      "median": 46006272.0,
+      "metric": "engine_peak_bytes",
+      "q1": 45932544.0,
+      "q3": 46329856.0,
+      "rule": "the engine's peak stays inside its 128 MiB cap",
+      "rung": 50,
+      "verdict": "PASS"
+    },
+    {
+      "arm": "flashdb-declared",
+      "blocks": 5,
+      "defect": null,
+      "detail": "99.95 rps of 100 offered",
+      "fix": null,
+      "iqr": 0.0,
+      "median": 99.95,
+      "metric": "achieved_rps",
+      "q1": 99.95,
+      "q3": 99.95,
+      "rule": "the achieved rate is within 5% of the offered rate",
+      "rung": 100,
+      "verdict": "PASS"
+    },
+    {
+      "arm": "flashdb-declared",
+      "blocks": 5,
+      "defect": null,
+      "detail": "857.0 us median, 950.0 us IQR",
+      "fix": null,
+      "iqr": 950.0,
+      "median": 857.0,
+      "metric": "lag_p99_us",
+      "q1": 451.0,
+      "q3": 1401.0,
+      "rule": "the per-request schedule-lag p99 is at or below 10000 us",
+      "rung": 100,
+      "verdict": "PASS"
+    },
+    {
+      "arm": "flashdb-declared",
+      "blocks": 5,
+      "defect": "service_p99_us missed its rule at 100 rps: 106414.0 us median against a 9821 us device fsync p99",
+      "detail": "106414.0 us median against a 9821 us device fsync p99",
+      "fix": "instrument the commit path for the > 100 ms outliers (a per-window `group_elapsed_us` histogram) before tuning anything; no service ceiling is pre-registered, so this row is reported beside the rule, not enforced by it",
+      "iqr": 108771.0,
+      "median": 106414.0,
+      "metric": "service_p99_us",
+      "q1": 93214.0,
+      "q3": 201985.0,
+      "rule": "the per-request service p99 is within 10,000 us of the device's own fsync p99 (no service ceiling is pre-registered; secondary)",
+      "rung": 100,
+      "verdict": "FAIL"
+    },
+    {
+      "arm": "flashdb-declared",
+      "blocks": 5,
+      "defect": null,
+      "detail": "0 rejected over 5 blocks; reasons none",
+      "fix": null,
+      "iqr": 0.0,
+      "median": 0.0,
+      "metric": "rejected_windows",
+      "q1": 0.0,
+      "q3": 0.0,
+      "rule": "zero windows rejected by the unified rule in any block",
+      "rung": 100,
+      "verdict": "PASS"
+    },
+    {
+      "arm": "flashdb-declared",
+      "blocks": 5,
+      "defect": null,
+      "detail": "0 errors over 5 blocks",
+      "fix": null,
+      "iqr": 0.0,
+      "median": 0.0,
+      "metric": "errors",
+      "q1": 0.0,
+      "q3": 0.0,
+      "rule": "zero request errors in any block",
+      "rung": 100,
+      "verdict": "PASS"
+    },
+    {
+      "arm": "flashdb-declared",
+      "blocks": 5,
+      "defect": null,
+      "detail": "64614400.0 B median of 134217728 B cap",
+      "fix": null,
+      "iqr": 69632.0,
+      "median": 64614400.0,
+      "metric": "engine_peak_bytes",
+      "q1": 64614400.0,
+      "q3": 64684032.0,
+      "rule": "the engine's peak stays inside its 128 MiB cap",
+      "rung": 100,
+      "verdict": "PASS"
+    },
+    {
+      "arm": "postgres",
+      "blocks": 5,
+      "defect": null,
+      "detail": "100.0 rps of 100 offered",
+      "fix": null,
+      "iqr": 0.0,
+      "median": 100.0,
+      "metric": "achieved_rps",
+      "q1": 100.0,
+      "q3": 100.0,
+      "rule": "the achieved rate is within 5% of the offered rate",
+      "rung": 100,
+      "verdict": "PASS"
+    },
+    {
+      "arm": "postgres",
+      "blocks": 5,
+      "defect": null,
+      "detail": "264.0 us median, 33.0 us IQR",
+      "fix": null,
+      "iqr": 33.0,
+      "median": 264.0,
+      "metric": "lag_p99_us",
+      "q1": 257.0,
+      "q3": 290.0,
+      "rule": "the per-request schedule-lag p99 is at or below 10000 us",
+      "rung": 100,
+      "verdict": "PASS"
+    },
+    {
+      "arm": "postgres",
+      "blocks": 5,
+      "defect": "service_p99_us missed its rule at 100 rps: 25680.0 us median against a 9821 us device fsync p99",
+      "detail": "25680.0 us median against a 9821 us device fsync p99",
+      "fix": "instrument the commit path for the > 100 ms outliers (a per-window `group_elapsed_us` histogram) before tuning anything; no service ceiling is pre-registered, so this row is reported beside the rule, not enforced by it",
+      "iqr": 10649.0,
+      "median": 25680.0,
+      "metric": "service_p99_us",
+      "q1": 21583.0,
+      "q3": 32232.0,
+      "rule": "the per-request service p99 is within 10,000 us of the device's own fsync p99 (no service ceiling is pre-registered; secondary)",
+      "rung": 100,
+      "verdict": "FAIL"
+    },
+    {
+      "arm": "postgres",
+      "blocks": 5,
+      "defect": null,
+      "detail": "0 rejected over 5 blocks; reasons none",
+      "fix": null,
+      "iqr": 0.0,
+      "median": 0.0,
+      "metric": "rejected_windows",
+      "q1": 0.0,
+      "q3": 0.0,
+      "rule": "zero windows rejected by the unified rule in any block",
+      "rung": 100,
+      "verdict": "PASS"
+    },
+    {
+      "arm": "postgres",
+      "blocks": 5,
+      "defect": null,
+      "detail": "0 errors over 5 blocks",
+      "fix": null,
+      "iqr": 0.0,
+      "median": 0.0,
+      "metric": "errors",
+      "q1": 0.0,
+      "q3": 0.0,
+      "rule": "zero request errors in any block",
+      "rung": 100,
+      "verdict": "PASS"
+    },
+    {
+      "arm": "postgres",
+      "blocks": 5,
+      "defect": null,
+      "detail": "35913728.0 B median of 134217728 B cap",
+      "fix": null,
+      "iqr": 978944.0,
+      "median": 35913728.0,
+      "metric": "engine_peak_bytes",
+      "q1": 35528704.0,
+      "q3": 36507648.0,
+      "rule": "the engine's peak stays inside its 128 MiB cap",
+      "rung": 100,
+      "verdict": "PASS"
+    },
+    {
+      "arm": "sqlite",
+      "blocks": 5,
+      "defect": null,
+      "detail": "100.0 rps of 100 offered",
+      "fix": null,
+      "iqr": 0.0,
+      "median": 100.0,
+      "metric": "achieved_rps",
+      "q1": 100.0,
+      "q3": 100.0,
+      "rule": "the achieved rate is within 5% of the offered rate",
+      "rung": 100,
+      "verdict": "PASS"
+    },
+    {
+      "arm": "sqlite",
+      "blocks": 5,
+      "defect": null,
+      "detail": "251.0 us median, 77.0 us IQR",
+      "fix": null,
+      "iqr": 77.0,
+      "median": 251.0,
+      "metric": "lag_p99_us",
+      "q1": 231.0,
+      "q3": 308.0,
+      "rule": "the per-request schedule-lag p99 is at or below 10000 us",
+      "rung": 100,
+      "verdict": "PASS"
+    },
+    {
+      "arm": "sqlite",
+      "blocks": 5,
+      "defect": "service_p99_us missed its rule at 100 rps: 65930.0 us median against a 9821 us device fsync p99",
+      "detail": "65930.0 us median against a 9821 us device fsync p99",
+      "fix": "instrument the commit path for the > 100 ms outliers (a per-window `group_elapsed_us` histogram) before tuning anything; no service ceiling is pre-registered, so this row is reported beside the rule, not enforced by it",
+      "iqr": 20692.0,
+      "median": 65930.0,
+      "metric": "service_p99_us",
+      "q1": 45728.0,
+      "q3": 66420.0,
+      "rule": "the per-request service p99 is within 10,000 us of the device's own fsync p99 (no service ceiling is pre-registered; secondary)",
+      "rung": 100,
+      "verdict": "FAIL"
+    },
+    {
+      "arm": "sqlite",
+      "blocks": 5,
+      "defect": null,
+      "detail": "0 rejected over 5 blocks; reasons none",
+      "fix": null,
+      "iqr": 0.0,
+      "median": 0.0,
+      "metric": "rejected_windows",
+      "q1": 0.0,
+      "q3": 0.0,
+      "rule": "zero windows rejected by the unified rule in any block",
+      "rung": 100,
+      "verdict": "PASS"
+    },
+    {
+      "arm": "sqlite",
+      "blocks": 5,
+      "defect": null,
+      "detail": "0 errors over 5 blocks",
+      "fix": null,
+      "iqr": 0.0,
+      "median": 0.0,
+      "metric": "errors",
+      "q1": 0.0,
+      "q3": 0.0,
+      "rule": "zero request errors in any block",
+      "rung": 100,
+      "verdict": "PASS"
+    },
+    {
+      "arm": "sqlite",
+      "blocks": 5,
+      "defect": null,
+      "detail": "65392640.0 B median of 134217728 B cap",
+      "fix": null,
+      "iqr": 507904.0,
+      "median": 65392640.0,
+      "metric": "engine_peak_bytes",
+      "q1": 65175552.0,
+      "q3": 65683456.0,
+      "rule": "the engine's peak stays inside its 128 MiB cap",
+      "rung": 100,
+      "verdict": "PASS"
+    },
+    {
+      "arm": "flashdb-declared",
+      "blocks": 5,
+      "defect": null,
+      "detail": "200.0 rps of 200 offered",
+      "fix": null,
+      "iqr": 0.0,
+      "median": 200.0,
+      "metric": "achieved_rps",
+      "q1": 200.0,
+      "q3": 200.0,
+      "rule": "the achieved rate is within 5% of the offered rate",
+      "rung": 200,
+      "verdict": "PASS"
+    },
+    {
+      "arm": "flashdb-declared",
+      "blocks": 5,
+      "defect": null,
+      "detail": "8389.0 us median, 23158.0 us IQR",
+      "fix": null,
+      "iqr": 23158.0,
+      "median": 8389.0,
+      "metric": "lag_p99_us",
+      "q1": 7272.0,
+      "q3": 30430.0,
+      "rule": "the per-request schedule-lag p99 is at or below 10000 us",
+      "rung": 200,
+      "verdict": "PASS"
+    },
+    {
+      "arm": "flashdb-declared",
+      "blocks": 5,
+      "defect": "service_p99_us missed its rule at 200 rps: 403213.0 us median against a 9821 us device fsync p99",
+      "detail": "403213.0 us median against a 9821 us device fsync p99",
+      "fix": "instrument the commit path for the > 100 ms outliers (a per-window `group_elapsed_us` histogram) before tuning anything; no service ceiling is pre-registered, so this row is reported beside the rule, not enforced by it",
+      "iqr": 142583.0,
+      "median": 403213.0,
+      "metric": "service_p99_us",
+      "q1": 280654.0,
+      "q3": 423237.0,
+      "rule": "the per-request service p99 is within 10,000 us of the device's own fsync p99 (no service ceiling is pre-registered; secondary)",
+      "rung": 200,
+      "verdict": "FAIL"
+    },
+    {
+      "arm": "flashdb-declared",
+      "blocks": 5,
+      "defect": "rejected_windows missed its rule at 200 rps: 2 rejected over 5 blocks; reasons {'lag_ceiling': 2}",
+      "detail": "2 rejected over 5 blocks; reasons {'lag_ceiling': 2}",
+      "fix": "re-run the rung with more blocks once the named rejection is understood; the unified rule rejects the WINDOW (schedule lag p99 > 10 ms), so the rung has no sustained level",
+      "iqr": 1.0,
+      "median": 0.0,
+      "metric": "rejected_windows",
+      "q1": 0.0,
+      "q3": 1.0,
+      "rule": "zero windows rejected by the unified rule in any block",
+      "rung": 200,
+      "verdict": "FAIL"
+    },
+    {
+      "arm": "flashdb-declared",
+      "blocks": 5,
+      "defect": null,
+      "detail": "0 errors over 5 blocks",
+      "fix": null,
+      "iqr": 0.0,
+      "median": 0.0,
+      "metric": "errors",
+      "q1": 0.0,
+      "q3": 0.0,
+      "rule": "zero request errors in any block",
+      "rung": 200,
+      "verdict": "PASS"
+    },
+    {
+      "arm": "flashdb-declared",
+      "blocks": 5,
+      "defect": null,
+      "detail": "65990656.0 B median of 134217728 B cap",
+      "fix": null,
+      "iqr": 249856.0,
+      "median": 65990656.0,
+      "metric": "engine_peak_bytes",
+      "q1": 65880064.0,
+      "q3": 66129920.0,
+      "rule": "the engine's peak stays inside its 128 MiB cap",
+      "rung": 200,
+      "verdict": "PASS"
+    },
+    {
+      "arm": "postgres",
+      "blocks": 5,
+      "defect": null,
+      "detail": "200.0 rps of 200 offered",
+      "fix": null,
+      "iqr": 0.0,
+      "median": 200.0,
+      "metric": "achieved_rps",
+      "q1": 200.0,
+      "q3": 200.0,
+      "rule": "the achieved rate is within 5% of the offered rate",
+      "rung": 200,
+      "verdict": "PASS"
+    },
+    {
+      "arm": "postgres",
+      "blocks": 5,
+      "defect": null,
+      "detail": "906.0 us median, 694.0 us IQR",
+      "fix": null,
+      "iqr": 694.0,
+      "median": 906.0,
+      "metric": "lag_p99_us",
+      "q1": 274.0,
+      "q3": 968.0,
+      "rule": "the per-request schedule-lag p99 is at or below 10000 us",
+      "rung": 200,
+      "verdict": "PASS"
+    },
+    {
+      "arm": "postgres",
+      "blocks": 5,
+      "defect": "service_p99_us missed its rule at 200 rps: 40135.0 us median against a 9821 us device fsync p99",
+      "detail": "40135.0 us median against a 9821 us device fsync p99",
+      "fix": "instrument the commit path for the > 100 ms outliers (a per-window `group_elapsed_us` histogram) before tuning anything; no service ceiling is pre-registered, so this row is reported beside the rule, not enforced by it",
+      "iqr": 24248.0,
+      "median": 40135.0,
+      "metric": "service_p99_us",
+      "q1": 26228.0,
+      "q3": 50476.0,
+      "rule": "the per-request service p99 is within 10,000 us of the device's own fsync p99 (no service ceiling is pre-registered; secondary)",
+      "rung": 200,
+      "verdict": "FAIL"
+    },
+    {
+      "arm": "postgres",
+      "blocks": 5,
+      "defect": null,
+      "detail": "0 rejected over 5 blocks; reasons none",
+      "fix": null,
+      "iqr": 0.0,
+      "median": 0.0,
+      "metric": "rejected_windows",
+      "q1": 0.0,
+      "q3": 0.0,
+      "rule": "zero windows rejected by the unified rule in any block",
+      "rung": 200,
+      "verdict": "PASS"
+    },
+    {
+      "arm": "postgres",
+      "blocks": 5,
+      "defect": null,
+      "detail": "0 errors over 5 blocks",
+      "fix": null,
+      "iqr": 0.0,
+      "median": 0.0,
+      "metric": "errors",
+      "q1": 0.0,
+      "q3": 0.0,
+      "rule": "zero request errors in any block",
+      "rung": 200,
+      "verdict": "PASS"
+    },
+    {
+      "arm": "postgres",
+      "blocks": 5,
+      "defect": null,
+      "detail": "46026752.0 B median of 134217728 B cap",
+      "fix": null,
+      "iqr": 24543232.0,
+      "median": 46026752.0,
+      "metric": "engine_peak_bytes",
+      "q1": 41926656.0,
+      "q3": 66469888.0,
+      "rule": "the engine's peak stays inside its 128 MiB cap",
+      "rung": 200,
+      "verdict": "PASS"
+    },
+    {
+      "arm": "sqlite",
+      "blocks": 5,
+      "defect": null,
+      "detail": "200.0 rps of 200 offered",
+      "fix": null,
+      "iqr": 0.0,
+      "median": 200.0,
+      "metric": "achieved_rps",
+      "q1": 200.0,
+      "q3": 200.0,
+      "rule": "the achieved rate is within 5% of the offered rate",
+      "rung": 200,
+      "verdict": "PASS"
+    },
+    {
+      "arm": "sqlite",
+      "blocks": 5,
+      "defect": null,
+      "detail": "151.0 us median, 85.0 us IQR",
+      "fix": null,
+      "iqr": 85.0,
+      "median": 151.0,
+      "metric": "lag_p99_us",
+      "q1": 79.0,
+      "q3": 164.0,
+      "rule": "the per-request schedule-lag p99 is at or below 10000 us",
+      "rung": 200,
+      "verdict": "PASS"
+    },
+    {
+      "arm": "sqlite",
+      "blocks": 5,
+      "defect": "service_p99_us missed its rule at 200 rps: 59013.0 us median against a 9821 us device fsync p99",
+      "detail": "59013.0 us median against a 9821 us device fsync p99",
+      "fix": "instrument the commit path for the > 100 ms outliers (a per-window `group_elapsed_us` histogram) before tuning anything; no service ceiling is pre-registered, so this row is reported beside the rule, not enforced by it",
+      "iqr": 10995.0,
+      "median": 59013.0,
+      "metric": "service_p99_us",
+      "q1": 55082.0,
+      "q3": 66077.0,
+      "rule": "the per-request service p99 is within 10,000 us of the device's own fsync p99 (no service ceiling is pre-registered; secondary)",
+      "rung": 200,
+      "verdict": "FAIL"
+    },
+    {
+      "arm": "sqlite",
+      "blocks": 5,
+      "defect": null,
+      "detail": "0 rejected over 5 blocks; reasons none",
+      "fix": null,
+      "iqr": 0.0,
+      "median": 0.0,
+      "metric": "rejected_windows",
+      "q1": 0.0,
+      "q3": 0.0,
+      "rule": "zero windows rejected by the unified rule in any block",
+      "rung": 200,
+      "verdict": "PASS"
+    },
+    {
+      "arm": "sqlite",
+      "blocks": 5,
+      "defect": null,
+      "detail": "0 errors over 5 blocks",
+      "fix": null,
+      "iqr": 0.0,
+      "median": 0.0,
+      "metric": "errors",
+      "q1": 0.0,
+      "q3": 0.0,
+      "rule": "zero request errors in any block",
+      "rung": 200,
+      "verdict": "PASS"
+    },
+    {
+      "arm": "sqlite",
+      "blocks": 5,
+      "defect": null,
+      "detail": "103489536.0 B median of 134217728 B cap",
+      "fix": null,
+      "iqr": 806912.0,
+      "median": 103489536.0,
+      "metric": "engine_peak_bytes",
+      "q1": 103043072.0,
+      "q3": 103849984.0,
+      "rule": "the engine's peak stays inside its 128 MiB cap",
+      "rung": 200,
+      "verdict": "PASS"
+    }
+  ],
+  "run_spec": {
+    "argv": "scripts/m1-controlled-run.sh --phase blocks --since 2026-10-18T00:02:18 ",
+    "arms": [
+      "flashdb-declared",
+      "sqlite",
+      "postgres"
+    ],
+    "blocks": 5,
+    "dataset": {
+      "batch": 64,
+      "customers": 200000,
+      "locs": 4,
+      "on_hand": 1000000,
+      "seed": 42,
+      "skus": 2650000
+    },
+    "engine_cap_mib": 128,
+    "frozen_source": "/home/z/vibe/flashdb/.scratch/80-external-baselines/runs/m1-10x/rung-50",
+    "lock": "/tmp/m1-measure.lock",
+    "postgres_database": "m1-controlled",
+    "postgres_root": "/home/z/vibe/flashdb/.scratch/82-controlled-m1/runs/pg",
+    "repo": "/home/z/vibe/flashdb",
+    "rungs": [
+      50,
+      100,
+      200
+    ],
+    "schema": "flashdb.m1.controlled-run.v1",
+    "seconds_per_arm_run": 20,
+    "seed_cap_mib": 512,
+    "sqlite": {
+      "cache_kib": 8192,
+      "wal_autocheckpoint_pages": 0
+    }
+  },
+  "rungs": [
+    50,
+    100,
+    200
+  ],
+  "schema": "flashdb.m1.controlled-report.v1",
+  "table": [
+    {
+      "achieved_rps": {
+        "iqr": 0.0,
+        "median": 49.95,
+        "q1": 49.95,
+        "q3": 49.95,
+        "values": [
+          49.95,
+          49.95,
+          49.95,
+          49.95,
+          49.95
+        ]
+      },
+      "arm": "flashdb-declared",
+      "blocks": 5,
+      "data_bytes": 1683903919,
+      "engine_cap_mib": 128,
+      "engine_peak_bytes": {
+        "iqr": 155648.0,
+        "median": 64331776.0,
+        "q1": 64303104.0,
+        "q3": 64458752.0,
+        "values": [
+          64458752.0,
+          64172032.0,
+          64331776.0,
+          64303104.0,
+          64512000.0
+        ]
+      },
+      "errors": {
+        "iqr": 0.0,
+        "median": 0.0,
+        "q1": 0.0,
+        "q3": 0.0,
+        "values": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      "footprint_x_cap": 12.546,
+      "lag_p99_us": {
+        "iqr": 172.0,
+        "median": 1038.0,
+        "q1": 883.0,
+        "q3": 1055.0,
+        "values": [
+          1038.0,
+          3894.0,
+          1055.0,
+          846.0,
+          883.0
+        ]
+      },
+      "max_group_size": {
+        "iqr": 0.0,
+        "median": 1.0,
+        "q1": 1.0,
+        "q3": 1.0,
+        "values": [
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "mean_group_size": {
+        "iqr": 0.0,
+        "median": 1.0,
+        "q1": 1.0,
+        "q3": 1.0,
+        "values": [
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "oracle": [
+        "DEFERRED"
+      ],
+      "per_block": [
+        {
+          "achieved_rps": 49.95,
+          "block": 1,
+          "errors": 0,
+          "lag_p99_us": 1038,
+          "rejected_windows": 0,
+          "service_p99_us": 88006,
+          "sustained": true
+        },
+        {
+          "achieved_rps": 49.95,
+          "block": 2,
+          "errors": 0,
+          "lag_p99_us": 3894,
+          "rejected_windows": 0,
+          "service_p99_us": 127627,
+          "sustained": true
+        },
+        {
+          "achieved_rps": 49.95,
+          "block": 3,
+          "errors": 0,
+          "lag_p99_us": 1055,
+          "rejected_windows": 0,
+          "service_p99_us": 106744,
+          "sustained": true
+        },
+        {
+          "achieved_rps": 49.95,
+          "block": 4,
+          "errors": 0,
+          "lag_p99_us": 846,
+          "rejected_windows": 0,
+          "service_p99_us": 109766,
+          "sustained": true
+        },
+        {
+          "achieved_rps": 49.95,
+          "block": 5,
+          "errors": 0,
+          "lag_p99_us": 883,
+          "rejected_windows": 0,
+          "service_p99_us": 117454,
+          "sustained": true
+        }
+      ],
+      "reject_reasons": {},
+      "rejected_windows": {
+        "iqr": 0.0,
+        "median": 0.0,
+        "q1": 0.0,
+        "q3": 0.0,
+        "values": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      "restore_bytes": 1683012213,
+      "restore_sha256": [
+        "67b3d10c23bca301881278ab8bb739110c725d0bcd8e852124e2a2901acd37ac"
+      ],
+      "restore_verified_blocks": 5,
+      "rung": 50,
+      "service_p99_us": {
+        "iqr": 10710.0,
+        "median": 109766.0,
+        "q1": 106744.0,
+        "q3": 117454.0,
+        "values": [
+          88006.0,
+          127627.0,
+          106744.0,
+          109766.0,
+          117454.0
+        ]
+      },
+      "sustained_blocks": 5,
+      "trace_sha256": [
+        "859b99a1186ef6915d524d2fff339ed5eec88759468d7d942496f99f28faec65"
+      ]
+    },
+    {
+      "achieved_rps": {
+        "iqr": 0.0,
+        "median": 50.0,
+        "q1": 50.0,
+        "q3": 50.0,
+        "values": [
+          50.0,
+          50.0,
+          50.0,
+          50.0,
+          50.0
+        ]
+      },
+      "arm": "postgres",
+      "blocks": 5,
+      "data_bytes": 1103713983,
+      "engine_cap_mib": 128,
+      "engine_peak_bytes": {
+        "iqr": 458752.0,
+        "median": 35594240.0,
+        "q1": 35360768.0,
+        "q3": 35819520.0,
+        "values": [
+          35594240.0,
+          35360768.0,
+          35340288.0,
+          35819520.0,
+          52355072.0
+        ]
+      },
+      "errors": {
+        "iqr": 0.0,
+        "median": 0.0,
+        "q1": 0.0,
+        "q3": 0.0,
+        "values": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      "footprint_x_cap": 8.223,
+      "lag_p99_us": {
+        "iqr": 876.0,
+        "median": 385.0,
+        "q1": 266.0,
+        "q3": 1142.0,
+        "values": [
+          1289.0,
+          1142.0,
+          385.0,
+          205.0,
+          266.0
+        ]
+      },
+      "max_group_size": {
+        "iqr": 0.0,
+        "median": 1.0,
+        "q1": 1.0,
+        "q3": 1.0,
+        "values": [
+          1.0,
+          1.0,
+          2.0,
+          1.0,
+          1.0
+        ]
+      },
+      "mean_group_size": {
+        "iqr": 0.0,
+        "median": 1.0,
+        "q1": 1.0,
+        "q3": 1.0,
+        "values": [
+          1.0,
+          1.0,
+          1.001,
+          1.0,
+          1.0
+        ]
+      },
+      "oracle": [
+        "DEFERRED",
+        "PASS"
+      ],
+      "per_block": [
+        {
+          "achieved_rps": 50.0,
+          "block": 1,
+          "errors": 0,
+          "lag_p99_us": 1289,
+          "rejected_windows": 0,
+          "service_p99_us": 13663,
+          "sustained": true
+        },
+        {
+          "achieved_rps": 50.0,
+          "block": 2,
+          "errors": 0,
+          "lag_p99_us": 1142,
+          "rejected_windows": 0,
+          "service_p99_us": 31536,
+          "sustained": true
+        },
+        {
+          "achieved_rps": 50.0,
+          "block": 3,
+          "errors": 0,
+          "lag_p99_us": 385,
+          "rejected_windows": 0,
+          "service_p99_us": 40158,
+          "sustained": true
+        },
+        {
+          "achieved_rps": 50.0,
+          "block": 4,
+          "errors": 0,
+          "lag_p99_us": 205,
+          "rejected_windows": 0,
+          "service_p99_us": 14034,
+          "sustained": true
+        },
+        {
+          "achieved_rps": 50.0,
+          "block": 5,
+          "errors": 0,
+          "lag_p99_us": 266,
+          "rejected_windows": 0,
+          "service_p99_us": 7870,
+          "sustained": true
+        }
+      ],
+      "reject_reasons": {},
+      "rejected_windows": {
+        "iqr": 0.0,
+        "median": 0.0,
+        "q1": 0.0,
+        "q3": 0.0,
+        "values": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      "restore_bytes": 2201362806,
+      "restore_sha256": [
+        "7f9a4ea8edb0c1a287a201389ab08aba61e82bd8cdd92f51fe64ddf48cad1b92"
+      ],
+      "restore_verified_blocks": 5,
+      "rung": 50,
+      "service_p99_us": {
+        "iqr": 17873.0,
+        "median": 14034.0,
+        "q1": 13663.0,
+        "q3": 31536.0,
+        "values": [
+          13663.0,
+          31536.0,
+          40158.0,
+          14034.0,
+          7870.0
+        ]
+      },
+      "sustained_blocks": 5,
+      "trace_sha256": [
+        "859b99a1186ef6915d524d2fff339ed5eec88759468d7d942496f99f28faec65"
+      ]
+    },
+    {
+      "achieved_rps": {
+        "iqr": 0.0,
+        "median": 50.0,
+        "q1": 50.0,
+        "q3": 50.0,
+        "values": [
+          50.0,
+          50.0,
+          50.0,
+          50.0,
+          50.0
+        ]
+      },
+      "arm": "sqlite",
+      "blocks": 5,
+      "data_bytes": 542052352,
+      "engine_cap_mib": 128,
+      "engine_peak_bytes": {
+        "iqr": 397312.0,
+        "median": 46006272.0,
+        "q1": 45932544.0,
+        "q3": 46329856.0,
+        "values": [
+          45903872.0,
+          46329856.0,
+          45932544.0,
+          46006272.0,
+          46489600.0
+        ]
+      },
+      "errors": {
+        "iqr": 0.0,
+        "median": 0.0,
+        "q1": 0.0,
+        "q3": 0.0,
+        "values": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      "footprint_x_cap": 4.039,
+      "lag_p99_us": {
+        "iqr": 347.0,
+        "median": 577.0,
+        "q1": 515.0,
+        "q3": 862.0,
+        "values": [
+          375.0,
+          577.0,
+          2544.0,
+          862.0,
+          515.0
+        ]
+      },
+      "max_group_size": {
+        "iqr": 0.0,
+        "median": 1.0,
+        "q1": 1.0,
+        "q3": 1.0,
+        "values": [
+          2.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "mean_group_size": {
+        "iqr": 0.0,
+        "median": 1.0,
+        "q1": 1.0,
+        "q3": 1.0,
+        "values": [
+          1.004,
+          1.0,
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "oracle": [
+        "DEFERRED",
+        "PASS"
+      ],
+      "per_block": [
+        {
+          "achieved_rps": 50.0,
+          "block": 1,
+          "errors": 0,
+          "lag_p99_us": 375,
+          "rejected_windows": 0,
+          "service_p99_us": 64649,
+          "sustained": true
+        },
+        {
+          "achieved_rps": 50.0,
+          "block": 2,
+          "errors": 0,
+          "lag_p99_us": 577,
+          "rejected_windows": 0,
+          "service_p99_us": 14883,
+          "sustained": true
+        },
+        {
+          "achieved_rps": 50.0,
+          "block": 3,
+          "errors": 0,
+          "lag_p99_us": 2544,
+          "rejected_windows": 0,
+          "service_p99_us": 39190,
+          "sustained": true
+        },
+        {
+          "achieved_rps": 50.0,
+          "block": 4,
+          "errors": 0,
+          "lag_p99_us": 862,
+          "rejected_windows": 0,
+          "service_p99_us": 21768,
+          "sustained": true
+        },
+        {
+          "achieved_rps": 50.0,
+          "block": 5,
+          "errors": 0,
+          "lag_p99_us": 515,
+          "rejected_windows": 0,
+          "service_p99_us": 9378,
+          "sustained": true
+        }
+      ],
+      "reject_reasons": {},
+      "rejected_windows": {
+        "iqr": 0.0,
+        "median": 0.0,
+        "q1": 0.0,
+        "q3": 0.0,
+        "values": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      "restore_bytes": 541876224,
+      "restore_sha256": [
+        "46c6f1e1e2a149f8e55bb4f29a39b2ca57a53d1a50daa0ae5a3e30c2d4367130"
+      ],
+      "restore_verified_blocks": 5,
+      "rung": 50,
+      "service_p99_us": {
+        "iqr": 24307.0,
+        "median": 21768.0,
+        "q1": 14883.0,
+        "q3": 39190.0,
+        "values": [
+          64649.0,
+          14883.0,
+          39190.0,
+          21768.0,
+          9378.0
+        ]
+      },
+      "sustained_blocks": 5,
+      "trace_sha256": [
+        "859b99a1186ef6915d524d2fff339ed5eec88759468d7d942496f99f28faec65"
+      ]
+    },
+    {
+      "achieved_rps": {
+        "iqr": 0.0,
+        "median": 99.95,
+        "q1": 99.95,
+        "q3": 99.95,
+        "values": [
+          99.95,
+          99.95,
+          99.95,
+          99.95,
+          99.95
+        ]
+      },
+      "arm": "flashdb-declared",
+      "blocks": 5,
+      "data_bytes": 1684767398,
+      "engine_cap_mib": 128,
+      "engine_peak_bytes": {
+        "iqr": 69632.0,
+        "median": 64614400.0,
+        "q1": 64614400.0,
+        "q3": 64684032.0,
+        "values": [
+          64614400.0,
+          64561152.0,
+          64614400.0,
+          64684032.0,
+          64942080.0
+        ]
+      },
+      "errors": {
+        "iqr": 0.0,
+        "median": 0.0,
+        "q1": 0.0,
+        "q3": 0.0,
+        "values": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      "footprint_x_cap": 12.552,
+      "lag_p99_us": {
+        "iqr": 950.0,
+        "median": 857.0,
+        "q1": 451.0,
+        "q3": 1401.0,
+        "values": [
+          857.0,
+          371.0,
+          2288.0,
+          1401.0,
+          451.0
+        ]
+      },
+      "max_group_size": {
+        "iqr": 0.0,
+        "median": 1.0,
+        "q1": 1.0,
+        "q3": 1.0,
+        "values": [
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "mean_group_size": {
+        "iqr": 0.0,
+        "median": 1.0,
+        "q1": 1.0,
+        "q3": 1.0,
+        "values": [
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "oracle": [
+        "DEFERRED"
+      ],
+      "per_block": [
+        {
+          "achieved_rps": 99.95,
+          "block": 1,
+          "errors": 0,
+          "lag_p99_us": 857,
+          "rejected_windows": 0,
+          "service_p99_us": 446565,
+          "sustained": true
+        },
+        {
+          "achieved_rps": 99.95,
+          "block": 2,
+          "errors": 0,
+          "lag_p99_us": 371,
+          "rejected_windows": 0,
+          "service_p99_us": 201985,
+          "sustained": true
+        },
+        {
+          "achieved_rps": 99.95,
+          "block": 3,
+          "errors": 0,
+          "lag_p99_us": 2288,
+          "rejected_windows": 0,
+          "service_p99_us": 106414,
+          "sustained": true
+        },
+        {
+          "achieved_rps": 99.95,
+          "block": 4,
+          "errors": 0,
+          "lag_p99_us": 1401,
+          "rejected_windows": 0,
+          "service_p99_us": 93214,
+          "sustained": true
+        },
+        {
+          "achieved_rps": 99.95,
+          "block": 5,
+          "errors": 0,
+          "lag_p99_us": 451,
+          "rejected_windows": 0,
+          "service_p99_us": 8753,
+          "sustained": true
+        }
+      ],
+      "reject_reasons": {},
+      "rejected_windows": {
+        "iqr": 0.0,
+        "median": 0.0,
+        "q1": 0.0,
+        "q3": 0.0,
+        "values": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      "restore_bytes": 1683012213,
+      "restore_sha256": [
+        "67b3d10c23bca301881278ab8bb739110c725d0bcd8e852124e2a2901acd37ac"
+      ],
+      "restore_verified_blocks": 5,
+      "rung": 100,
+      "service_p99_us": {
+        "iqr": 108771.0,
+        "median": 106414.0,
+        "q1": 93214.0,
+        "q3": 201985.0,
+        "values": [
+          446565.0,
+          201985.0,
+          106414.0,
+          93214.0,
+          8753.0
+        ]
+      },
+      "sustained_blocks": 5,
+      "trace_sha256": [
+        "583f9b4c3c5b3ebe4974822a3e26e1ed80e4f3ad0dc0a5c80153fbb390eb8443"
+      ]
+    },
+    {
+      "achieved_rps": {
+        "iqr": 0.0,
+        "median": 100.0,
+        "q1": 100.0,
+        "q3": 100.0,
+        "values": [
+          100.0,
+          100.0,
+          100.0,
+          100.0,
+          100.0
+        ]
+      },
+      "arm": "postgres",
+      "blocks": 5,
+      "data_bytes": 1103935167,
+      "engine_cap_mib": 128,
+      "engine_peak_bytes": {
+        "iqr": 978944.0,
+        "median": 35913728.0,
+        "q1": 35528704.0,
+        "q3": 36507648.0,
+        "values": [
+          35528704.0,
+          36507648.0,
+          35446784.0,
+          35913728.0,
+          69910528.0
+        ]
+      },
+      "errors": {
+        "iqr": 0.0,
+        "median": 0.0,
+        "q1": 0.0,
+        "q3": 0.0,
+        "values": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      "footprint_x_cap": 8.225,
+      "lag_p99_us": {
+        "iqr": 33.0,
+        "median": 264.0,
+        "q1": 257.0,
+        "q3": 290.0,
+        "values": [
+          264.0,
+          290.0,
+          775.0,
+          171.0,
+          257.0
+        ]
+      },
+      "max_group_size": {
+        "iqr": 1.0,
+        "median": 2.0,
+        "q1": 2.0,
+        "q3": 3.0,
+        "values": [
+          3.0,
+          2.0,
+          2.0,
+          3.0,
+          1.0
+        ]
+      },
+      "mean_group_size": {
+        "iqr": 0.001,
+        "median": 1.001,
+        "q1": 1.001,
+        "q3": 1.002,
+        "values": [
+          1.002,
+          1.001,
+          1.001,
+          1.008,
+          1.0
+        ]
+      },
+      "oracle": [
+        "DEFERRED",
+        "PASS"
+      ],
+      "per_block": [
+        {
+          "achieved_rps": 100.0,
+          "block": 1,
+          "errors": 0,
+          "lag_p99_us": 264,
+          "rejected_windows": 0,
+          "service_p99_us": 32232,
+          "sustained": true
+        },
+        {
+          "achieved_rps": 100.0,
+          "block": 2,
+          "errors": 0,
+          "lag_p99_us": 290,
+          "rejected_windows": 0,
+          "service_p99_us": 21583,
+          "sustained": true
+        },
+        {
+          "achieved_rps": 100.0,
+          "block": 3,
+          "errors": 0,
+          "lag_p99_us": 775,
+          "rejected_windows": 0,
+          "service_p99_us": 25680,
+          "sustained": true
+        },
+        {
+          "achieved_rps": 100.0,
+          "block": 4,
+          "errors": 0,
+          "lag_p99_us": 171,
+          "rejected_windows": 0,
+          "service_p99_us": 51237,
+          "sustained": true
+        },
+        {
+          "achieved_rps": 100.0,
+          "block": 5,
+          "errors": 0,
+          "lag_p99_us": 257,
+          "rejected_windows": 0,
+          "service_p99_us": 6422,
+          "sustained": true
+        }
+      ],
+      "reject_reasons": {},
+      "rejected_windows": {
+        "iqr": 0.0,
+        "median": 0.0,
+        "q1": 0.0,
+        "q3": 0.0,
+        "values": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      "restore_bytes": 2201362806,
+      "restore_sha256": [
+        "7f9a4ea8edb0c1a287a201389ab08aba61e82bd8cdd92f51fe64ddf48cad1b92"
+      ],
+      "restore_verified_blocks": 5,
+      "rung": 100,
+      "service_p99_us": {
+        "iqr": 10649.0,
+        "median": 25680.0,
+        "q1": 21583.0,
+        "q3": 32232.0,
+        "values": [
+          32232.0,
+          21583.0,
+          25680.0,
+          51237.0,
+          6422.0
+        ]
+      },
+      "sustained_blocks": 5,
+      "trace_sha256": [
+        "583f9b4c3c5b3ebe4974822a3e26e1ed80e4f3ad0dc0a5c80153fbb390eb8443"
+      ]
+    },
+    {
+      "achieved_rps": {
+        "iqr": 0.0,
+        "median": 100.0,
+        "q1": 100.0,
+        "q3": 100.0,
+        "values": [
+          100.0,
+          100.0,
+          100.0,
+          100.0,
+          100.0
+        ]
+      },
+      "arm": "sqlite",
+      "blocks": 5,
+      "data_bytes": 542203904,
+      "engine_cap_mib": 128,
+      "engine_peak_bytes": {
+        "iqr": 507904.0,
+        "median": 65392640.0,
+        "q1": 65175552.0,
+        "q3": 65683456.0,
+        "values": [
+          65683456.0,
+          65736704.0,
+          65392640.0,
+          64798720.0,
+          65175552.0
+        ]
+      },
+      "errors": {
+        "iqr": 0.0,
+        "median": 0.0,
+        "q1": 0.0,
+        "q3": 0.0,
+        "values": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      "footprint_x_cap": 4.04,
+      "lag_p99_us": {
+        "iqr": 77.0,
+        "median": 251.0,
+        "q1": 231.0,
+        "q3": 308.0,
+        "values": [
+          251.0,
+          308.0,
+          722.0,
+          231.0,
+          192.0
+        ]
+      },
+      "max_group_size": {
+        "iqr": 1.0,
+        "median": 4.0,
+        "q1": 3.0,
+        "q3": 4.0,
+        "values": [
+          1.0,
+          4.0,
+          3.0,
+          4.0,
+          4.0
+        ]
+      },
+      "mean_group_size": {
+        "iqr": 0.008,
+        "median": 1.008,
+        "q1": 1.004,
+        "q3": 1.012,
+        "values": [
+          1.0,
+          1.012,
+          1.004,
+          1.012,
+          1.008
+        ]
+      },
+      "oracle": [
+        "DEFERRED",
+        "PASS"
+      ],
+      "per_block": [
+        {
+          "achieved_rps": 100.0,
+          "block": 1,
+          "errors": 0,
+          "lag_p99_us": 251,
+          "rejected_windows": 0,
+          "service_p99_us": 9360,
+          "sustained": true
+        },
+        {
+          "achieved_rps": 100.0,
+          "block": 2,
+          "errors": 0,
+          "lag_p99_us": 308,
+          "rejected_windows": 0,
+          "service_p99_us": 65930,
+          "sustained": true
+        },
+        {
+          "achieved_rps": 100.0,
+          "block": 3,
+          "errors": 0,
+          "lag_p99_us": 722,
+          "rejected_windows": 0,
+          "service_p99_us": 45728,
+          "sustained": true
+        },
+        {
+          "achieved_rps": 100.0,
+          "block": 4,
+          "errors": 0,
+          "lag_p99_us": 231,
+          "rejected_windows": 0,
+          "service_p99_us": 75918,
+          "sustained": true
+        },
+        {
+          "achieved_rps": 100.0,
+          "block": 5,
+          "errors": 0,
+          "lag_p99_us": 192,
+          "rejected_windows": 0,
+          "service_p99_us": 66420,
+          "sustained": true
+        }
+      ],
+      "reject_reasons": {},
+      "rejected_windows": {
+        "iqr": 0.0,
+        "median": 0.0,
+        "q1": 0.0,
+        "q3": 0.0,
+        "values": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      "restore_bytes": 541876224,
+      "restore_sha256": [
+        "46c6f1e1e2a149f8e55bb4f29a39b2ca57a53d1a50daa0ae5a3e30c2d4367130"
+      ],
+      "restore_verified_blocks": 5,
+      "rung": 100,
+      "service_p99_us": {
+        "iqr": 20692.0,
+        "median": 65930.0,
+        "q1": 45728.0,
+        "q3": 66420.0,
+        "values": [
+          9360.0,
+          65930.0,
+          45728.0,
+          75918.0,
+          66420.0
+        ]
+      },
+      "sustained_blocks": 5,
+      "trace_sha256": [
+        "583f9b4c3c5b3ebe4974822a3e26e1ed80e4f3ad0dc0a5c80153fbb390eb8443"
+      ]
+    },
+    {
+      "achieved_rps": {
+        "iqr": 0.0,
+        "median": 200.0,
+        "q1": 200.0,
+        "q3": 200.0,
+        "values": [
+          200.0,
+          200.0,
+          200.0,
+          200.0,
+          200.0
+        ]
+      },
+      "arm": "flashdb-declared",
+      "blocks": 5,
+      "data_bytes": 1686590701,
+      "engine_cap_mib": 128,
+      "engine_peak_bytes": {
+        "iqr": 249856.0,
+        "median": 65990656.0,
+        "q1": 65880064.0,
+        "q3": 66129920.0,
+        "values": [
+          65990656.0,
+          65880064.0,
+          65830912.0,
+          66129920.0,
+          66170880.0
+        ]
+      },
+      "errors": {
+        "iqr": 0.0,
+        "median": 0.0,
+        "q1": 0.0,
+        "q3": 0.0,
+        "values": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      "footprint_x_cap": 12.566,
+      "lag_p99_us": {
+        "iqr": 23158.0,
+        "median": 8389.0,
+        "q1": 7272.0,
+        "q3": 30430.0,
+        "values": [
+          7272.0,
+          30430.0,
+          33747.0,
+          3088.0,
+          8389.0
+        ]
+      },
+      "max_group_size": {
+        "iqr": 5.0,
+        "median": 3.0,
+        "q1": 3.0,
+        "q3": 8.0,
+        "values": [
+          3.0,
+          8.0,
+          8.0,
+          2.0,
+          3.0
+        ]
+      },
+      "mean_group_size": {
+        "iqr": 0.001,
+        "median": 1.007,
+        "q1": 1.006,
+        "q3": 1.007,
+        "values": [
+          1.006,
+          1.011,
+          1.007,
+          1.0,
+          1.007
+        ]
+      },
+      "oracle": [
+        "DEFERRED"
+      ],
+      "per_block": [
+        {
+          "achieved_rps": 200.0,
+          "block": 1,
+          "errors": 0,
+          "lag_p99_us": 7272,
+          "rejected_windows": 0,
+          "service_p99_us": 469132,
+          "sustained": true
+        },
+        {
+          "achieved_rps": 200.0,
+          "block": 2,
+          "errors": 0,
+          "lag_p99_us": 30430,
+          "rejected_windows": 1,
+          "service_p99_us": 280654,
+          "sustained": false
+        },
+        {
+          "achieved_rps": 200.0,
+          "block": 3,
+          "errors": 0,
+          "lag_p99_us": 33747,
+          "rejected_windows": 1,
+          "service_p99_us": 129185,
+          "sustained": false
+        },
+        {
+          "achieved_rps": 200.0,
+          "block": 4,
+          "errors": 0,
+          "lag_p99_us": 3088,
+          "rejected_windows": 0,
+          "service_p99_us": 403213,
+          "sustained": true
+        },
+        {
+          "achieved_rps": 200.0,
+          "block": 5,
+          "errors": 0,
+          "lag_p99_us": 8389,
+          "rejected_windows": 0,
+          "service_p99_us": 423237,
+          "sustained": true
+        }
+      ],
+      "reject_reasons": {
+        "lag_ceiling": 2
+      },
+      "rejected_windows": {
+        "iqr": 1.0,
+        "median": 0.0,
+        "q1": 0.0,
+        "q3": 1.0,
+        "values": [
+          0.0,
+          1.0,
+          1.0,
+          0.0,
+          0.0
+        ]
+      },
+      "restore_bytes": 1683012213,
+      "restore_sha256": [
+        "67b3d10c23bca301881278ab8bb739110c725d0bcd8e852124e2a2901acd37ac"
+      ],
+      "restore_verified_blocks": 5,
+      "rung": 200,
+      "service_p99_us": {
+        "iqr": 142583.0,
+        "median": 403213.0,
+        "q1": 280654.0,
+        "q3": 423237.0,
+        "values": [
+          469132.0,
+          280654.0,
+          129185.0,
+          403213.0,
+          423237.0
+        ]
+      },
+      "sustained_blocks": 3,
+      "trace_sha256": [
+        "6472cf46477e037b67820a4fa5a7da9d46e1241e6d8d33f89e10f89b22b8f93f"
+      ]
+    },
+    {
+      "achieved_rps": {
+        "iqr": 0.0,
+        "median": 200.0,
+        "q1": 200.0,
+        "q3": 200.0,
+        "values": [
+          200.0,
+          200.0,
+          200.0,
+          200.0,
+          200.0
+        ]
+      },
+      "arm": "postgres",
+      "blocks": 5,
+      "data_bytes": 1104369343,
+      "engine_cap_mib": 128,
+      "engine_peak_bytes": {
+        "iqr": 24543232.0,
+        "median": 46026752.0,
+        "q1": 41926656.0,
+        "q3": 66469888.0,
+        "values": [
+          41926656.0,
+          46026752.0,
+          36990976.0,
+          81739776.0,
+          66469888.0
+        ]
+      },
+      "errors": {
+        "iqr": 0.0,
+        "median": 0.0,
+        "q1": 0.0,
+        "q3": 0.0,
+        "values": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      "footprint_x_cap": 8.228,
+      "lag_p99_us": {
+        "iqr": 694.0,
+        "median": 906.0,
+        "q1": 274.0,
+        "q3": 968.0,
+        "values": [
+          968.0,
+          274.0,
+          162.0,
+          906.0,
+          1731.0
+        ]
+      },
+      "max_group_size": {
+        "iqr": 1.0,
+        "median": 6.0,
+        "q1": 5.0,
+        "q3": 6.0,
+        "values": [
+          6.0,
+          6.0,
+          6.0,
+          2.0,
+          5.0
+        ]
+      },
+      "mean_group_size": {
+        "iqr": 0.005,
+        "median": 1.006,
+        "q1": 1.003,
+        "q3": 1.008,
+        "values": [
+          1.008,
+          1.006,
+          1.013,
+          1.001,
+          1.003
+        ]
+      },
+      "oracle": [
+        "DEFERRED",
+        "PASS"
+      ],
+      "per_block": [
+        {
+          "achieved_rps": 200.0,
+          "block": 1,
+          "errors": 0,
+          "lag_p99_us": 968,
+          "rejected_windows": 0,
+          "service_p99_us": 51910,
+          "sustained": true
+        },
+        {
+          "achieved_rps": 200.0,
+          "block": 2,
+          "errors": 0,
+          "lag_p99_us": 274,
+          "rejected_windows": 0,
+          "service_p99_us": 40135,
+          "sustained": true
+        },
+        {
+          "achieved_rps": 200.0,
+          "block": 3,
+          "errors": 0,
+          "lag_p99_us": 162,
+          "rejected_windows": 0,
+          "service_p99_us": 50476,
+          "sustained": true
+        },
+        {
+          "achieved_rps": 200.0,
+          "block": 4,
+          "errors": 0,
+          "lag_p99_us": 906,
+          "rejected_windows": 0,
+          "service_p99_us": 11889,
+          "sustained": true
+        },
+        {
+          "achieved_rps": 200.0,
+          "block": 5,
+          "errors": 0,
+          "lag_p99_us": 1731,
+          "rejected_windows": 0,
+          "service_p99_us": 26228,
+          "sustained": true
+        }
+      ],
+      "reject_reasons": {},
+      "rejected_windows": {
+        "iqr": 0.0,
+        "median": 0.0,
+        "q1": 0.0,
+        "q3": 0.0,
+        "values": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      "restore_bytes": 2201362806,
+      "restore_sha256": [
+        "7f9a4ea8edb0c1a287a201389ab08aba61e82bd8cdd92f51fe64ddf48cad1b92"
+      ],
+      "restore_verified_blocks": 5,
+      "rung": 200,
+      "service_p99_us": {
+        "iqr": 24248.0,
+        "median": 40135.0,
+        "q1": 26228.0,
+        "q3": 50476.0,
+        "values": [
+          51910.0,
+          40135.0,
+          50476.0,
+          11889.0,
+          26228.0
+        ]
+      },
+      "sustained_blocks": 5,
+      "trace_sha256": [
+        "6472cf46477e037b67820a4fa5a7da9d46e1241e6d8d33f89e10f89b22b8f93f"
+      ]
+    },
+    {
+      "achieved_rps": {
+        "iqr": 0.0,
+        "median": 200.0,
+        "q1": 200.0,
+        "q3": 200.0,
+        "values": [
+          200.0,
+          200.0,
+          200.0,
+          200.0,
+          200.0
+        ]
+      },
+      "arm": "sqlite",
+      "blocks": 5,
+      "data_bytes": 542494720,
+      "engine_cap_mib": 128,
+      "engine_peak_bytes": {
+        "iqr": 806912.0,
+        "median": 103489536.0,
+        "q1": 103043072.0,
+        "q3": 103849984.0,
+        "values": [
+          104148992.0,
+          102510592.0,
+          103043072.0,
+          103849984.0,
+          103489536.0
+        ]
+      },
+      "errors": {
+        "iqr": 0.0,
+        "median": 0.0,
+        "q1": 0.0,
+        "q3": 0.0,
+        "values": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      "footprint_x_cap": 4.042,
+      "lag_p99_us": {
+        "iqr": 85.0,
+        "median": 151.0,
+        "q1": 79.0,
+        "q3": 164.0,
+        "values": [
+          79.0,
+          33.0,
+          170.0,
+          164.0,
+          151.0
+        ]
+      },
+      "max_group_size": {
+        "iqr": 1.0,
+        "median": 8.0,
+        "q1": 8.0,
+        "q3": 9.0,
+        "values": [
+          9.0,
+          7.0,
+          8.0,
+          8.0,
+          9.0
+        ]
+      },
+      "mean_group_size": {
+        "iqr": 0.003,
+        "median": 1.008,
+        "q1": 1.007,
+        "q3": 1.01,
+        "values": [
+          1.008,
+          1.007,
+          1.017,
+          1.007,
+          1.01
+        ]
+      },
+      "oracle": [
+        "DEFERRED",
+        "PASS"
+      ],
+      "per_block": [
+        {
+          "achieved_rps": 200.0,
+          "block": 1,
+          "errors": 0,
+          "lag_p99_us": 79,
+          "rejected_windows": 0,
+          "service_p99_us": 59013,
+          "sustained": true
+        },
+        {
+          "achieved_rps": 200.0,
+          "block": 2,
+          "errors": 0,
+          "lag_p99_us": 33,
+          "rejected_windows": 0,
+          "service_p99_us": 51717,
+          "sustained": true
+        },
+        {
+          "achieved_rps": 200.0,
+          "block": 3,
+          "errors": 0,
+          "lag_p99_us": 170,
+          "rejected_windows": 0,
+          "service_p99_us": 70087,
+          "sustained": true
+        },
+        {
+          "achieved_rps": 200.0,
+          "block": 4,
+          "errors": 0,
+          "lag_p99_us": 164,
+          "rejected_windows": 0,
+          "service_p99_us": 55082,
+          "sustained": true
+        },
+        {
+          "achieved_rps": 200.0,
+          "block": 5,
+          "errors": 0,
+          "lag_p99_us": 151,
+          "rejected_windows": 0,
+          "service_p99_us": 66077,
+          "sustained": true
+        }
+      ],
+      "reject_reasons": {},
+      "rejected_windows": {
+        "iqr": 0.0,
+        "median": 0.0,
+        "q1": 0.0,
+        "q3": 0.0,
+        "values": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      "restore_bytes": 541876224,
+      "restore_sha256": [
+        "46c6f1e1e2a149f8e55bb4f29a39b2ca57a53d1a50daa0ae5a3e30c2d4367130"
+      ],
+      "restore_verified_blocks": 5,
+      "rung": 200,
+      "service_p99_us": {
+        "iqr": 10995.0,
+        "median": 59013.0,
+        "q1": 55082.0,
+        "q3": 66077.0,
+        "values": [
+          59013.0,
+          51717.0,
+          70087.0,
+          55082.0,
+          66077.0
+        ]
+      },
+      "sustained_blocks": 5,
+      "trace_sha256": [
+        "6472cf46477e037b67820a4fa5a7da9d46e1241e6d8d33f89e10f89b22b8f93f"
+      ]
+    }
+  ],
+  "verdicts": {
+    "t5": {
+      "arithmetic": {
+        "deficit_median": 1.001,
+        "deficit_required": 1.5,
+        "per_block": [
+          {
+            "block": 1,
+            "deficit": 1.001,
+            "flashdb_achieved_rps": 49.95,
+            "slower_baseline_achieved_rps": 50.0
+          },
+          {
+            "block": 2,
+            "deficit": 1.001,
+            "flashdb_achieved_rps": 49.95,
+            "slower_baseline_achieved_rps": 50.0
+          },
+          {
+            "block": 3,
+            "deficit": 1.001,
+            "flashdb_achieved_rps": 49.95,
+            "slower_baseline_achieved_rps": 50.0
+          },
+          {
+            "block": 4,
+            "deficit": 1.001,
+            "flashdb_achieved_rps": 49.95,
+            "slower_baseline_achieved_rps": 50.0
+          },
+          {
+            "block": 5,
+            "deficit": 1.001,
+            "flashdb_achieved_rps": 49.95,
+            "slower_baseline_achieved_rps": 50.0
+          }
+        ],
+        "sustained_blocks": {
+          "flashdb-declared": 5,
+          "postgres": 5,
+          "sqlite": 5
+        },
+        "sustained_blocks_required": 4
+      },
+      "condition": "prong A (pre-registered): median over 5 blocks of (slower baseline achieved / flashdb achieved) <= 1.5; prong B (ticket-80 cross-check): flashdb sustained the rung under the unified rule in at least 4 of 5 blocks",
+      "defect": null,
+      "fix": null,
+      "prong_a": "PASS",
+      "prong_b": "PASS",
+      "reading_limit": "with both arms paced at one offered rate, an achieved rate cannot exceed that rate, so a declared arm that holds the rung scores a deficit of at most 1.0526; read this PASS as non-inferiority at a paced rung, not as a throughput advantage",
+      "rung_rps": 50,
+      "threshold": "T5 low-load non-inferiority: at the 1x rung flashdb must be within 1.5x of the slower baseline (2x is the fail line, 10x a design failure)",
+      "verdict": "PASS"
+    },
+    "t6": {
+      "arithmetic": {
+        "achieved_vs_achieved_ratio": 1.0,
+        "best_baseline": {
+          "achieved_rps": 200.0,
+          "arm": "sqlite"
+        },
+        "flashdb_achieved_rps": 200.0,
+        "highest_common_offered_rung": 200,
+        "highest_sustained_rung_per_arm": {
+          "flashdb-declared": 100,
+          "postgres": 200,
+          "sqlite": 200
+        },
+        "ratio": 1.0,
+        "ratio_required": 3.0,
+        "ratio_upper_bound_for_any_pair_at_a_common_level": 1.0526,
+        "sustained_blocks_by_rung": {
+          "100": {
+            "flashdb-declared": 5,
+            "postgres": 5,
+            "sqlite": 5
+          },
+          "200": {
+            "flashdb-declared": 3,
+            "postgres": 5,
+            "sqlite": 5
+          },
+          "50": {
+            "flashdb-declared": 5,
+            "postgres": 5,
+            "sqlite": 5
+          }
+        },
+        "sustained_throughput_rps": {
+          "flashdb-declared": 200.0,
+          "postgres": 200.0,
+          "sqlite": 200.0
+        }
+      },
+      "condition": "a level is common when every arm was OFFERED it (the pre-registration's wording); at the highest such level, flashdb's median achieved rate over the blocks it sustained it is compared with the best baseline's same quantity (an arm sustaining the level in fewer than 4 of 5 blocks has none, reported as null)",
+      "defect": "at 200 rps flashdb sustained 200.0 rps and the best baseline (sqlite) sustained 200.0 rps: 1.0x against the required 3.0x -- and by construction: an achieved rate is bounded by the offered rate, so two arms that both sustain a common offered level differ by at most 0.0526 and the ratio cannot exceed 1.0526",
+      "fix": "add rungs BELOW the 50 rps floor so each baseline's sustained level exists, then read the ratio of the highest sustained LEVELS; the pre-registered throughput ratio at a common offered level is bounded by 1/SUSTAINED_TOLERANCE for any pair of arms and cannot reach 3x. Both are pre-registration changes and neither is made here",
+      "secondary_reading": {
+        "highest_sustained_rung_per_arm": {
+          "flashdb-declared": 100,
+          "postgres": 200,
+          "sqlite": 200
+        },
+        "is_lower_bound": false,
+        "metric": "the ratio of each arm's highest sustained offered LEVEL (NOT the pre-registered throughput ratio: reported so a FAIL is not read as a measured shortfall)",
+        "ratio": 0.5
+      },
+      "threshold": "T6 high-load superiority: at the highest common offered level flashdb must reach at least 3x the best baseline's sustained throughput under the same latency rule",
+      "verdict": "FAIL"
+    },
+    "t7": {
+      "arithmetic": {
+        "declared_sustained_blocks": 5,
+        "t5_deficit_median": 1.001,
+        "t5_verdict": "PASS"
+      },
+      "condition": "the declared arm's own T5 prongs at the 1x rung",
+      "defect": null,
+      "disclosure": "flashdb-learned was not run: M1 wires no learner controller, so a second flashdb arm would measure the same declared wiring twice",
+      "fix": null,
+      "threshold": "T7 initial-policy quality: the declared arm alone must pass T5",
+      "verdict": "PASS"
+    }
+  }
+}

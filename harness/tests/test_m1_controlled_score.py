@@ -120,7 +120,7 @@ def test_t5_reads_the_slower_baseline_and_prong_b_needs_a_sustained_rung(tmp_pat
     assert report["verdicts"]["t7"]["verdict"] == "FAIL"
 
 
-def test_t6_needs_a_level_every_arm_sustained_and_three_times_the_best_baseline(tmp_path):
+def test_t6_reads_the_highest_common_offered_level_and_its_own_ceiling(tmp_path):
     blocks = {
         1: {(50, "flashdb-declared"): _run_record("flashdb-declared", achieved=50.0, lag_p99=500),
             (50, "sqlite"): _run_record("sqlite", achieved=50.0, lag_p99=400),
@@ -133,22 +133,47 @@ def test_t6_needs_a_level_every_arm_sustained_and_three_times_the_best_baseline(
     _write_root(tmp_path, blocks)
     report = _score(tmp_path)
     t6 = report["verdicts"]["t6"]
-    # sqlite sustained the level in 1 of 2 blocks, and 2 - 1 == 1 is the required majority, so 50 is
-    # common; flashdb's 50 against the best baseline's 50 is 1.0x, far below the pre-registered 3x.
-    assert t6["arithmetic"]["highest_common_sustained_rung"] == 50
+    # "Common" is the pre-registration's: every arm was OFFERED the level, so 50 is common even
+    # though sqlite sustained it in only 1 of 2 blocks. flashdb's sustained 50 against the best
+    # baseline's sustained 50 is 1.0x, far below the pre-registered 3x -- and the arithmetic states
+    # that no pair of arms at a common level can exceed 1/SUSTAINED_TOLERANCE.
+    assert t6["arithmetic"]["highest_common_offered_rung"] == 50
+    assert t6["arithmetic"]["sustained_throughput_rps"] == {
+        "flashdb-declared": 50.0, "sqlite": 50.0, "postgres": 50.0}
     assert t6["arithmetic"]["ratio"] == 1.0
+    assert t6["arithmetic"]["ratio_upper_bound_for_any_pair_at_a_common_level"] == 1.0526
     assert t6["verdict"] == "FAIL"
+    assert "cannot exceed" in t6["defect"]
 
-    # A rung no arm sustained gives T6 no denominator at all: the verdict is still FAIL, and the
-    # arithmetic names each arm's highest sustained rung instead of leaving the cell undecided.
+    # A baseline that sustained no level at all gives the pre-registered ratio no denominator: the
+    # verdict is still FAIL, the denominator is null (never an invented number), and the secondary
+    # level reading is the one that still orders the arms.
     for block in (1, 2):
         blocks[block][(50, "sqlite")] = _run_record("sqlite", achieved=30.0, lag_p99=400,
                                                     rejected=20, reasons={"lag_ceiling": 20})
     _write_root(tmp_path, blocks)
     report = _score(tmp_path)
     t6 = report["verdicts"]["t6"]
-    assert t6["arithmetic"]["highest_common_sustained_rung"] is None
+    assert t6["arithmetic"]["highest_common_offered_rung"] == 50
+    assert t6["arithmetic"]["sustained_throughput_rps"]["sqlite"] is None
+    # postgres still sustained it, so the denominator exists and is postgres's own rate.
+    assert t6["arithmetic"]["best_baseline"] == {"arm": "postgres", "achieved_rps": 50.0}
     assert t6["arithmetic"]["highest_sustained_rung_per_arm"]["sqlite"] is None
+    assert t6["verdict"] == "FAIL"
+
+    # With NO baseline sustaining any level, the secondary level reading becomes a lower bound: the
+    # baseline sits below the lowest rung offered.
+    for block in (1, 2):
+        blocks[block][(50, "postgres")] = _run_record("postgres", achieved=30.0, lag_p99=400,
+                                                      rejected=20, reasons={"lag_ceiling": 20})
+    _write_root(tmp_path, blocks)
+    report = _score(tmp_path)
+    t6 = report["verdicts"]["t6"]
+    assert t6["arithmetic"]["best_baseline"] is None
+    assert t6["arithmetic"]["ratio"] is None
+    assert "no denominator" in t6["defect"]
+    assert t6["secondary_reading"]["ratio"] == 1.0
+    assert t6["secondary_reading"]["is_lower_bound"] is True
     assert t6["verdict"] == "FAIL"
 
 
@@ -166,6 +191,11 @@ def test_metric_rows_carry_a_verdict_and_the_rejected_window_reasons(tmp_path):
     assert rows[("flashdb-declared", "lag_p99_us")]["verdict"] == "FAIL"
     assert rows[("flashdb-declared", "rejected_windows")]["verdict"] == "FAIL"
     assert "lag_saturation" in rows[("flashdb-declared", "rejected_windows")]["detail"]
+    # The fix belongs to the metric that failed: the unified rule scores SCHEDULE LAG, so a
+    # service-p99 failure asks for instrumentation and a rejected-window failure names the rule.
+    assert "schedule lag" in rows[("flashdb-declared", "rejected_windows")]["fix"]
+    assert rows[("flashdb-declared", "service_p99_us")]["verdict"] == "FAIL"
+    assert "group_elapsed_us" in rows[("flashdb-declared", "service_p99_us")]["fix"]
     assert rows[("sqlite", "lag_p99_us")]["verdict"] == "PASS"
     assert rows[("sqlite", "engine_peak_bytes")]["verdict"] == "PASS"
     # The floor-adjusted reading is reported beside the absolute rule, never used by it.

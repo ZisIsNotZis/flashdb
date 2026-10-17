@@ -53,6 +53,10 @@ ON_HAND=1000000
 ARMS=flashdb-declared,sqlite,postgres
 # sqlite's page cache, stated to the arm exactly as `baseline_0b.SQLITE_CACHE_KIB` defaults it.
 SQLITE_CACHE_KIB=8192
+# sqlite's WAL auto-checkpoint, stated rather than left to sqlite's compiled default (1000 pages).
+# The measured default defers it to the post-run `wal_checkpoint(TRUNCATE)`; the checkpoint probe
+# passes 1000 to reproduce the stall the f70d91c arm-runs show.
+SQLITE_WAL_AUTOCHECKPOINT=0
 MODE=full
 SNAPSHOT_DIR=
 INSTANCE_ROOT=
@@ -87,6 +91,7 @@ while [ $# -gt 0 ]; do
         --instance-root) INSTANCE_ROOT=$2; shift 2 ;;
         --database) DATABASE=$2; shift 2 ;;
         --sqlite-cache-kib) SQLITE_CACHE_KIB=$2; shift 2 ;;
+        --sqlite-wal-autocheckpoint) SQLITE_WAL_AUTOCHECKPOINT=$2; shift 2 ;;
         --skip-build) SKIP_BUILD=1; shift ;;
         --skip-verify) SKIP_VERIFY=1; shift ;;
         *) die "unknown argument $1" ;;
@@ -205,6 +210,7 @@ export M1_CAP_MIB=$CAP_MIB M1_SEED_CAP_MIB=$SEED_CAP_MIB M1_WORKDIR=$WORKDIR
 export M1_HARNESS=$HARNESS M1_REPO=$REPO M1_SKIP_VERIFY=$SKIP_VERIFY
 export M1_INSTANCE_ROOT=$INSTANCE_ROOT M1_DATABASE=$DATABASE
 export M1_SQLITE_CACHE_KIB=$SQLITE_CACHE_KIB M1_SKIP_ORACLE=${M1_SKIP_ORACLE:-0}
+export M1_SQLITE_WAL_AUTOCHECKPOINT=$SQLITE_WAL_AUTOCHECKPOINT
 
 run_step() {
     local name=$1
@@ -245,6 +251,7 @@ cd "$M1_HARNESS"
 if [ "$M1_STEP" = instance ]; then
     exec uv run python -m flashdb_harness.baseline_0b build-instance --workdir "$M1_WORKDIR" \
         --arms sqlite --sqlite-cache-kib "$M1_SQLITE_CACHE_KIB" \
+        --sqlite-wal-autocheckpoint "$M1_SQLITE_WAL_AUTOCHECKPOINT" \
         --instance-root "$M1_INSTANCE_ROOT"
 fi
 oracle_args=()
@@ -252,10 +259,12 @@ if [ "$M1_SKIP_ORACLE" = 1 ]; then oracle_args=(--skip-oracle); fi
 if [ "$M1_RESTORED" = 1 ]; then
     exec uv run python -m flashdb_harness.baseline_0b arm --workdir "$M1_WORKDIR" --arm sqlite \
         --engine-cap-mib "$M1_CAP_MIB" --sqlite-cache-kib "$M1_SQLITE_CACHE_KIB" \
+        --sqlite-wal-autocheckpoint "$M1_SQLITE_WAL_AUTOCHECKPOINT" \
         --restored --instance-root "$M1_INSTANCE_ROOT" "${oracle_args[@]}"
 fi
 exec uv run python -m flashdb_harness.baseline_0b arm --workdir "$M1_WORKDIR" --arm sqlite \
-    --engine-cap-mib "$M1_CAP_MIB" --sqlite-cache-kib "$M1_SQLITE_CACHE_KIB" "${oracle_args[@]}"
+    --engine-cap-mib "$M1_CAP_MIB" --sqlite-cache-kib "$M1_SQLITE_CACHE_KIB" \
+    --sqlite-wal-autocheckpoint "$M1_SQLITE_WAL_AUTOCHECKPOINT" "${oracle_args[@]}"
 EOF
             chmod +x "$payload"
             systemd-run --user --scope -q \

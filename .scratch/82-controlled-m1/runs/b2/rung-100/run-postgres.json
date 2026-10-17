@@ -1,6 +1,6 @@
 {
   "arm": "postgres",
-  "arm_scope_peak_bytes": 37720064,
+  "arm_scope_peak_bytes": 36769792,
   "arm_scope_peak_scope": "the postgres server scope's lifetime (bulk load + measured phase); the client runs outside it",
   "batch": 64,
   "counters": {
@@ -14,57 +14,56 @@
     {
       "achieved_fraction": 1.0,
       "achieved_rps": 100.0,
-      "ceiling_rejected_windows": 1,
+      "ceiling_rejected_windows": 0,
       "compact_bytes": 0,
       "early_dispatches": 0,
       "error_windows": 0,
       "group_elapsed_us": 0,
-      "groups": 1996,
+      "groups": 1999,
       "groups_over_service_ceiling": 0,
-      "invalid_windows": 1,
-      "lag_ceiling_rejected_windows": 1,
-      "lag_p50_us": 78.5,
-      "lag_p95_us": 2840,
-      "lag_p99_us": 19138,
-      "max_group_size": 3,
-      "mean_group_size": 1.002004008016032,
+      "invalid_windows": 0,
+      "lag_ceiling_rejected_windows": 0,
+      "lag_p50_us": 7.0,
+      "lag_p95_us": 175,
+      "lag_p99_us": 290,
+      "max_group_size": 2,
+      "mean_group_size": 1.0005002501250626,
       "min_lag_us": 0,
       "offered_rps": 100.0,
-      "p50_us": 2651.5,
-      "p95_us": 15598,
-      "p99_us": 11660,
+      "p50_us": 2303.0,
+      "p95_us": 6718,
+      "p99_us": 21583,
       "rate_exceeded": false,
-      "reject_reasons": {
-        "lag_ceiling": 1
-      },
+      "reject_reasons": {},
       "service_ceiling_rejected_windows": 0,
-      "sustained": false,
-      "valid_windows": 19,
+      "sustained": true,
+      "valid_windows": 20,
       "windows": 20
     }
   ],
   "data_bytes": 1103853247,
   "database": "m1-controlled",
   "durability": "postgres fsync=on + synchronous_commit=on (baseline-env.sh), one COMMIT per batch",
-  "elapsed_s": 19.992645022999998,
+  "elapsed_s": 19.992399695,
   "engine_cap_mib": 128,
   "engine_memory": {
     "method": "sampled memory.current every 50 ms",
-    "peak_bytes": 35958784,
-    "samples": 397,
+    "peak_bytes": 36507648,
+    "samples": 398,
     "scope": "measured phase",
-    "start_bytes": 18616320
+    "start_bytes": 18153472
   },
-  "groups": 1996,
+  "groups": 1999,
   "instance_root": "/home/z/vibe/flashdb/.scratch/82-controlled-m1/runs/live",
   "lag_ceiling_us": 10000,
-  "max_group_size": 3,
-  "mean_group_size": 1.002004008016032,
+  "max_group_size": 2,
+  "mean_group_size": 1.0005002501250626,
   "oracle": {
     "checks": [],
     "reason": "--skip-oracle: the restored instance is byte-identical in every block, so the inventory is verified once per arm",
     "status": "DEFERRED"
   },
+  "pacing": "open loop: dispatch on the due schedule, one worker executes and commits each group and acks on completion (flashdb-load's shape)",
   "postgres_settings": {
     "data_directory": "/home/z/vibe/flashdb/.scratch/82-controlled-m1/runs/pg/data",
     "fsync": "on",
@@ -76,11 +75,11 @@
   "requests_run": 2000,
   "restore": {
     "arm": "postgres",
-    "at": "2026-10-17T23:14:45",
+    "at": "2026-10-18T00:10:35",
     "bytes": 2201362806,
     "files": 1361,
     "from": "/home/z/vibe/flashdb/.scratch/82-controlled-m1/runs/snapshot/postgres",
-    "restore_s": 6.767,
+    "restore_s": 6.658,
     "sha256": "7f9a4ea8edb0c1a287a201389ab08aba61e82bd8cdd92f51fe64ddf48cad1b92",
     "snapshot_sha256": "7f9a4ea8edb0c1a287a201389ab08aba61e82bd8cdd92f51fe64ddf48cad1b92",
     "to": "/home/z/vibe/flashdb/.scratch/82-controlled-m1/runs/pg/data",
@@ -90,12 +89,10 @@
   "seed_s": 0.0,
   "trace_sha256": "583f9b4c3c5b3ebe4974822a3e26e1ed80e4f3ad0dc0a5c80153fbb390eb8443",
   "verdict": {
-    "highest_sustained_rps": 0.0,
-    "reject_reasons": {
-      "lag_ceiling": 1
-    },
-    "rejected_windows": 1,
-    "sustained": false
+    "highest_sustained_rps": 100.0,
+    "reject_reasons": {},
+    "rejected_windows": 0,
+    "sustained": true
   },
   "window_ms": 1000,
   "windows_file": "windows-postgres.jsonl"

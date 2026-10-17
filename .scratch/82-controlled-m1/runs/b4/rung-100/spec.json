@@ -30,7 +30,7 @@
   "on_hand": 1000000,
   "order_flow_requests": 1366,
   "runner": {
-    "argv": "/home/z/vibe/flashdb/scripts/m1-baseline-run.sh --mode arm --workdir /home/z/vibe/flashdb/.scratch/82-controlled-m1/runs/b4/rung-100 --arms flashdb-declared --rate 100 --requests 2000 --snapshot-dir /home/z/vibe/flashdb/.scratch/82-controlled-m1/runs/snapshot --instance-root /home/z/vibe/flashdb/.scratch/82-controlled-m1/runs/live --cap-mib 128 --seed-cap-mib 512 --database m1-controlled --skip-verify --skip-build ",
+    "argv": "/home/z/vibe/flashdb/scripts/m1-baseline-run.sh --mode arm --workdir /home/z/vibe/flashdb/.scratch/82-controlled-m1/runs/b4/rung-100 --arms flashdb-declared --rate 100 --requests 2000 --snapshot-dir /home/z/vibe/flashdb/.scratch/82-controlled-m1/runs/snapshot --instance-root /home/z/vibe/flashdb/.scratch/82-controlled-m1/runs/live --cap-mib 128 --seed-cap-mib 512 --database m1-controlled --sqlite-wal-autocheckpoint 0 --skip-verify --skip-build ",
     "cwd": "/home/z/vibe/flashdb",
     "engine_cap_mib": 128,
     "instance_root": "/home/z/vibe/flashdb/.scratch/82-controlled-m1/runs/live",

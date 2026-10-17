@@ -123,10 +123,12 @@ def arm_run(row: dict) -> dict:
         "service_p50_us": curve["p50_us"],
         "errors": int((row.get("counters") or {}).get("errors", 0)),
         "mean_group_size": round(float(row.get("mean_group_size") or 0.0), 3),
+        "max_group_size": int(row.get("max_group_size") or 0),
         "elapsed_s": round(float(row.get("elapsed_s") or 0.0), 3),
         "engine_peak_bytes": memory.get("peak_bytes"),
         "engine_cap_mib": cap,
         "data_bytes": data_bytes,
+        "restore_bytes": (row.get("restore") or {}).get("bytes"),
         "footprint_x_cap": (round(data_bytes / (cap * (1 << 20)), 3)
                             if data_bytes and cap else None),
         "restore_sha256": (row.get("restore") or {}).get("sha256"),
@@ -155,7 +157,7 @@ def collect(root: Path) -> tuple[list[dict], dict[str, list[dict]]]:
 # Aggregation, the device floor and the readings built on it
 # ---------------------------------------------------------------------------
 AGGREGATED = ("achieved_rps", "lag_p99_us", "service_p99_us", "rejected_windows", "errors",
-              "engine_peak_bytes")
+              "engine_peak_bytes", "mean_group_size", "max_group_size")
 
 
 def aggregate(runs: list[dict]) -> list[dict]:
@@ -173,6 +175,7 @@ def aggregate(runs: list[dict]) -> list[dict]:
                  "footprint_x_cap": rows[0]["footprint_x_cap"],
                  "engine_cap_mib": rows[0]["engine_cap_mib"],
                  "data_bytes": rows[0]["data_bytes"],
+                 "restore_bytes": rows[0]["restore_bytes"],
                  "oracle": sorted({str(row["oracle"]) for row in rows}),
                  "reject_reasons": {},
                  "per_block": [{key: row[key] for key in
@@ -354,6 +357,14 @@ def t5(aggregated: list[dict], t5_rung: int, blocks: int) -> dict:
         "verdict": verdict,
         "prong_a": "PASS" if prong_a else "FAIL",
         "prong_b": "PASS" if prong_b else "FAIL",
+        # What the arithmetic can and cannot say. Both arms' achieved rate is bounded by the offered
+        # rate of the fixed rung, so a flashdb that HOLDS the rung can only show a deficit up to
+        # 1/SUSTAINED_TOLERANCE = 1.0526: prong A is a non-inferiority statement at a paced rung, and
+        # prong B (flashdb actually sustained it) carries the substance of the PASS.
+        "reading_limit": "with both arms paced at one offered rate, an achieved rate cannot exceed"
+                         " that rate, so a declared arm that holds the rung scores a deficit of at"
+                         f" most {1 / SUSTAINED_TOLERANCE:.4f}; read this PASS as non-inferiority at"
+                         " a paced rung, not as a throughput advantage",
         "defect": "; ".join(defects) if defects else None,
         "fix": (None if verdict == "PASS" else
                 "re-run the rung with more blocks so a single host stall cannot decide prong B, and"
@@ -362,57 +373,128 @@ def t5(aggregated: list[dict], t5_rung: int, blocks: int) -> dict:
 
 
 def t6(aggregated: list[dict], blocks: int) -> dict:
-    """High-load superiority at the highest offered level every arm sustained."""
+    """High-load superiority at the highest common OFFERED level (the pre-registration's wording).
+
+    The pre-registration reads "At the highest common offered level flashdb must reach at least 3x
+    the best baseline's sustained throughput under the same latency rule". A level is COMMON when
+    every arm was OFFERED it -- not "sustained by every arm in a majority of blocks", which is a rule
+    the pre-registration does not state and which the f70d91c scorer applied, leaving the arithmetic
+    with an empty denominator at a ladder whose floor none of the baselines sustained. The
+    numerator here is flashdb's achieved rate over the blocks in which IT sustained that level, and
+    the denominator is the same quantity for the best baseline; an arm that never sustained the
+    level contributes no number, which the arithmetic reports as null instead of inventing one.
+
+    The reading carries its own limit, because the limit is what decides the verdict:
+    `cold_0b.summarize_curve` bounds every arm's achieved rate by the OFFERED rate (its
+    `rate_exceeded` guard), so two arms that both sustain a common offered level are each within
+    `SUSTAINED_TOLERANCE` of that same rate and their ratio can only lie in
+    [0.95, 1/0.95 = 1.0526]. The pre-registered 3x is therefore unreachable at a common offered
+    level for ANY pair of arms, and a FAIL here means "the gate is not met / not demonstrated", not
+    "flashdb was measured to be slow". The smallest fix is a ladder with rungs BELOW the 50 rps
+    floor, so each baseline's sustained level exists and the ratio can be read as a level ratio;
+    that changes the pre-registered metric and is not done here.
+    """
     index = by_key(aggregated)
     rungs = sorted({entry["rung"] for entry in aggregated})
+    arms = (DECLARED_ARM, *BASELINES)
     required = max(1, blocks - 1)
     sustained_by_rung = {
-        rung: {arm: index[(arm, rung)]["sustained_blocks"]
-               for arm in (DECLARED_ARM, *BASELINES) if (arm, rung) in index}
+        rung: {arm: index[(arm, rung)]["sustained_blocks"] for arm in arms if (arm, rung) in index}
         for rung in rungs}
-    common = [rung for rung in rungs
-              if all(count >= required for count in sustained_by_rung[rung].values())]
+
+    def sustained_throughput(arm: str, rung: int | None) -> float | None:
+        """The arm's median achieved rate over the blocks it SUSTAINED that level (None: never)."""
+        if rung is None or (arm, rung) not in index:
+            return None
+        rates = [row["achieved_rps"] for row in index[(arm, rung)]["per_block"] if row["sustained"]]
+        return round(statistics.median(rates), 3) if rates else None
+
+    def highest_sustained(arm: str) -> int | None:
+        return max((rung for rung in rungs
+                    if sustained_by_rung[rung].get(arm, 0) >= required), default=None)
+
+    common = [rung for rung in rungs if all((arm, rung) in index for arm in arms)]
     highest = max(common) if common else None
-    best_baseline = None
-    ratio = None
-    if highest is not None:
-        candidates = [(arm, index[(arm, highest)]["achieved_rps"]["median"])
-                      for arm in BASELINES if (arm, highest) in index]
-        if candidates:
-            best_baseline = max(candidates, key=lambda pair: pair[1])
-            flash = index[(DECLARED_ARM, highest)]["achieved_rps"]["median"]
-            ratio = round(flash / best_baseline[1], 4) if best_baseline[1] else None
+    flash = sustained_throughput(DECLARED_ARM, highest)
+    baseline_rates = {arm: sustained_throughput(arm, highest) for arm in BASELINES}
+    measured = {arm: rate for arm, rate in baseline_rates.items() if rate is not None}
+    best = max(measured.items(), key=lambda pair: pair[1]) if measured else None
+    ratio = round(flash / best[1], 4) if flash and best and best[1] else None
+    achieved_baseline = (index[(best[0], highest)]["achieved_rps"]["median"]
+                         if best else None)
+    achieved_ratio = (round(index[(DECLARED_ARM, highest)]["achieved_rps"]["median"]
+                            / achieved_baseline, 4)
+                      if highest is not None and achieved_baseline else None)
+    per_arm = {arm: highest_sustained(arm) for arm in arms}
+    # The ratio of the highest SUSTAINED LEVELS: not the pre-registered metric, and reported so a
+    # FAIL is not read as a measured shortfall. A baseline that sustained nothing sits below the
+    # lowest rung offered, so its share is a lower bound rather than a value.
+    level_ratio = None
+    is_lower_bound = False
+    if per_arm[DECLARED_ARM] is not None:
+        levels = [per_arm[arm] for arm in BASELINES]
+        known = [level for level in levels if level is not None]
+        if known and len(known) == len(levels):
+            level_ratio = round(per_arm[DECLARED_ARM] / max(known), 3)
+        elif known:
+            level_ratio, is_lower_bound = round(per_arm[DECLARED_ARM] / max(known), 3), True
+        elif levels:
+            level_ratio, is_lower_bound = round(per_arm[DECLARED_ARM] / rungs[0], 3), True
     verdict = "PASS" if (ratio is not None and ratio >= T6_REQUIRED_RATIO) else "FAIL"
-    highest_sustained = {
-        arm: max((rung for rung in rungs
-                  if sustained_by_rung[rung].get(arm, 0) >= required), default=None)
-        for arm in (DECLARED_ARM, *BASELINES)}
+    if verdict == "PASS":
+        defect = None
+    elif flash is None:
+        defect = (f"flashdb did not sustain the highest common offered level ({highest} rps) in"
+                  f" {required} of {blocks} blocks, so it has no sustained throughput there")
+    elif best is None:
+        defect = (f"no baseline sustained the highest common offered level ({highest} rps) in"
+                  f" {required} of {blocks} blocks, so the pre-registered '3x the best baseline's"
+                  f" sustained throughput' has no denominator (null)")
+    else:
+        defect = (f"at {highest} rps flashdb sustained {flash} rps and the best baseline"
+                  f" ({best[0]}) sustained {best[1]} rps: {ratio}x against the required"
+                  f" {T6_REQUIRED_RATIO}x -- and by construction: an achieved rate is bounded by the"
+                  f" offered rate, so two arms that both sustain a common offered level differ by at"
+                  f" most {1 / SUSTAINED_TOLERANCE - 1:.4f} and the ratio cannot exceed"
+                  f" {1 / SUSTAINED_TOLERANCE:.4f}")
     return {
         "threshold": "T6 high-load superiority: at the highest common offered level flashdb must"
                      " reach at least 3x the best baseline's sustained throughput under the same"
                      " latency rule",
-        "condition": f"a level R is common when every arm sustained it in at least {required} of"
-                     f" {blocks} blocks; T6 reads flashdb's median achieved at the highest such R"
-                     " against the best baseline's median achieved at the same R",
+        "condition": f"a level is common when every arm was OFFERED it (the pre-registration's"
+                     f" wording); at the highest such level, flashdb's median achieved rate over the"
+                     f" blocks it sustained it is compared with the best baseline's same quantity"
+                     f" (an arm sustaining the level in fewer than {required} of {blocks} blocks has"
+                     f" none, reported as null)",
         "arithmetic": {
             "sustained_blocks_by_rung": {str(rung): counts
                                          for rung, counts in sustained_by_rung.items()},
-            "highest_common_sustained_rung": highest,
-            "highest_sustained_rung_per_arm": highest_sustained,
-            "flashdb_achieved_rps": (index[(DECLARED_ARM, highest)]["achieved_rps"]["median"]
-                                     if highest is not None else None),
-            "best_baseline": ({"arm": best_baseline[0], "achieved_rps": best_baseline[1]}
-                              if best_baseline else None),
+            "highest_common_offered_rung": highest,
+            "highest_sustained_rung_per_arm": per_arm,
+            "sustained_throughput_rps": {"flashdb-declared": flash, **baseline_rates},
+            "flashdb_achieved_rps": flash,
+            "best_baseline": ({"arm": best[0], "achieved_rps": best[1]} if best else None),
             "ratio": ratio,
             "ratio_required": T6_REQUIRED_RATIO,
+            "achieved_vs_achieved_ratio": achieved_ratio,
+            "ratio_upper_bound_for_any_pair_at_a_common_level": round(1 / SUSTAINED_TOLERANCE, 4),
+        },
+        "secondary_reading": {
+            "metric": "the ratio of each arm's highest sustained offered LEVEL (NOT the"
+                      " pre-registered throughput ratio: reported so a FAIL is not read as a measured"
+                      " shortfall)",
+            "highest_sustained_rung_per_arm": per_arm,
+            "ratio": level_ratio,
+            "is_lower_bound": is_lower_bound,
         },
         "verdict": verdict,
-        "defect": (None if verdict == "PASS" else
-                   "no offered level was sustained by every arm in enough blocks, or flashdb's"
-                   " sustained level there is below 3x the best baseline"),
+        "defect": defect,
         "fix": (None if verdict == "PASS" else
-                "extend the ladder above the highest common level and re-run the rungs where an arm"
-                " was rejected, so a common sustained level above it can exist"),
+                "add rungs BELOW the 50 rps floor so each baseline's sustained level exists, then"
+                " read the ratio of the highest sustained LEVELS; the pre-registered throughput"
+                " ratio at a common offered level is bounded by 1/SUSTAINED_TOLERANCE for any pair"
+                " of arms and cannot reach 3x. Both are pre-registration changes and neither is"
+                " made here"),
     }
 
 
@@ -436,6 +518,29 @@ def t7(t5_verdict: dict) -> dict:
 # ---------------------------------------------------------------------------
 # Per-metric verdicts
 # ---------------------------------------------------------------------------
+# What a failing metric actually needs, per metric: the earlier scorer emitted the rejected-window
+# sentence for every failure, which told a reader that the service-p99 row had been rejected by the
+# unified rule. That rule scores SCHEDULE LAG (`baseline_0b._reject_reason`), and every run record
+# carries `service_ceiling_rejected_windows` 0, so a service failure asks for instrumentation, not a
+# re-run of the rung.
+METRIC_FIXES = {
+    "achieved_rps": "re-run the rung and check the pacer kept its schedule: an achieved rate below"
+                    " the 5% tolerance is the rung's wall time exceeding its offered span",
+    "lag_p99_us": "attribute the lag to the engine before tuning: the device floor and the arm's own"
+                  " service tail say whether the dispatch or the engine's work is late",
+    "service_p99_us": "instrument the commit path for the > 100 ms outliers (a per-window"
+                      " `group_elapsed_us` histogram) before tuning anything; no service ceiling is"
+                      " pre-registered, so this row is reported beside the rule, not enforced by it",
+    "rejected_windows": "re-run the rung with more blocks once the named rejection is understood; the"
+                        " unified rule rejects the WINDOW (schedule lag p99 > 10 ms), so the rung has"
+                        " no sustained level",
+    "errors": "the failing request and its first error are in the run record; fix it and re-run the"
+              " rung, because an errored window can never be sustained",
+    "engine_peak_bytes": "the engine exceeded its memory cap: raise the cap only if the regime says"
+                         " so, otherwise find the allocation that grew",
+}
+
+
 def metric_rows(aggregated: list[dict], floor: dict | None) -> list[dict]:
     rows = []
     fsync_floor_us = (floor or {}).get("fsync_p99_us") or 0
@@ -485,9 +590,7 @@ def metric_rows(aggregated: list[dict], floor: dict | None) -> list[dict]:
                 "detail": detail,
                 "defect": None if ok else
                           f"{metric} missed its rule at {rung} rps: {detail}",
-                "fix": None if ok else
-                       ("re-run the rung once the named rejection is understood; the unified rule"
-                        " rejects the window, so the rung has no sustained level"),
+                "fix": None if ok else METRIC_FIXES[metric],
             })
     return rows
 
@@ -580,16 +683,37 @@ def machine_summary(states: dict[str, list[dict]], floors: dict, since: str | No
     }
 
 
+# The instrument behind each arm's numerator. They are NOT the same measurement, so a ratio between
+# two arms is not one dataset measured twice: flashdb's is its instance directory (live WAL included),
+# sqlite's is its database plus sidecars, and postgres's is `pg_database_size`, which the WAL is
+# outside of -- so postgres also carries the cluster data directory the restore verified.
+FOOTPRINT_INSTRUMENTS = {
+    DECLARED_ARM: "directory bytes of the instance the arm served, live WAL included",
+    "sqlite": "database file plus its WAL and shared-memory sidecars, read after the post-run"
+              " checkpoint",
+    "postgres": "pg_database_size(current_database()): LOGICAL size, the WAL excluded",
+}
+
+
 def footprint(aggregated: list[dict]) -> list[dict]:
     out = []
+    lowest = min(item["rung"] for item in aggregated)
     for entry in aggregated:
-        if entry["rung"] != min(item["rung"] for item in aggregated):
+        if entry["rung"] != lowest:
             continue
-        out.append({"arm": entry["arm"], "data_bytes": entry["data_bytes"],
-                    "engine_cap_mib": entry["engine_cap_mib"],
-                    "footprint_x_cap": entry["footprint_x_cap"],
-                    "meets_regime_floor": (entry["footprint_x_cap"] is not None
-                                           and entry["footprint_x_cap"] >= REGIME_FOOTPRINT_X)})
+        cap = entry["engine_cap_mib"] * (1 << 20) if entry["engine_cap_mib"] else None
+        row = {"arm": entry["arm"], "data_bytes": entry["data_bytes"],
+               "instrument": FOOTPRINT_INSTRUMENTS.get(entry["arm"]),
+               "engine_cap_mib": entry["engine_cap_mib"],
+               "footprint_x_cap": entry["footprint_x_cap"],
+               "meets_regime_floor": (entry["footprint_x_cap"] is not None
+                                      and entry["footprint_x_cap"] >= REGIME_FOOTPRINT_X)}
+        if entry["arm"] == "postgres" and entry["restore_bytes"] and cap:
+            row["data_dir_bytes"] = entry["restore_bytes"]
+            row["data_dir_instrument"] = ("the cluster data directory the restore verified, WAL"
+                                          " included (run record `restore.bytes`)")
+            row["data_dir_x_cap"] = round(entry["restore_bytes"] / cap, 3)
+        out.append(row)
     return out
 
 

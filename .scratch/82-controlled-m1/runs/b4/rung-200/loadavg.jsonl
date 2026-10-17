@@ -7,3 +7,12 @@
 {"phase": "arm-sqlite-before", "at": "2026-10-17T23:24:38+08:00", "loadavg": "1.00 0.82 0.83", "nproc": 8}
 {"phase": "arm-sqlite-after", "at": "2026-10-17T23:25:00+08:00", "loadavg": "0.99 0.83 0.83", "nproc": 8}
 {"phase": "done", "at": "2026-10-17T23:25:00+08:00", "loadavg": "0.99 0.83 0.83", "nproc": 8}
+{"phase": "arm-postgres-before", "at": "2026-10-18T00:19:38+08:00", "loadavg": "2.07 2.13 2.39", "nproc": 8}
+{"phase": "arm-postgres-after", "at": "2026-10-18T00:20:10+08:00", "loadavg": "2.48 2.24 2.42", "nproc": 8}
+{"phase": "done", "at": "2026-10-18T00:20:10+08:00", "loadavg": "2.48 2.24 2.42", "nproc": 8}
+{"phase": "arm-flashdb-declared-before", "at": "2026-10-18T00:20:10+08:00", "loadavg": "2.48 2.24 2.42", "nproc": 8}
+{"phase": "arm-flashdb-declared-after", "at": "2026-10-18T00:20:36+08:00", "loadavg": "1.93 2.14 2.38", "nproc": 8}
+{"phase": "done", "at": "2026-10-18T00:20:36+08:00", "loadavg": "1.93 2.14 2.38", "nproc": 8}
+{"phase": "arm-sqlite-before", "at": "2026-10-18T00:20:37+08:00", "loadavg": "1.93 2.14 2.38", "nproc": 8}
+{"phase": "arm-sqlite-after", "at": "2026-10-18T00:20:59+08:00", "loadavg": "1.90 2.12 2.37", "nproc": 8}
+{"phase": "done", "at": "2026-10-18T00:20:59+08:00", "loadavg": "1.90 2.12 2.37", "nproc": 8}

@@ -1,6 +1,6 @@
 {
   "arm": "sqlite",
-  "arm_scope_peak_bytes": 33406976,
+  "arm_scope_peak_bytes": 65208320,
   "arm_scope_peak_scope": "this process's capped scope over the whole arm step (bulk load + measured phase)",
   "batch": 64,
   "counters": {
@@ -14,69 +14,70 @@
     {
       "achieved_fraction": 1.0,
       "achieved_rps": 100.0,
-      "ceiling_rejected_windows": 1,
+      "ceiling_rejected_windows": 0,
       "compact_bytes": 0,
       "early_dispatches": 0,
       "error_windows": 0,
       "group_elapsed_us": 0,
-      "groups": 1974,
+      "groups": 1984,
       "groups_over_service_ceiling": 0,
-      "invalid_windows": 1,
-      "lag_ceiling_rejected_windows": 1,
-      "lag_p50_us": 54.5,
-      "lag_p95_us": 214315,
-      "lag_p99_us": 254315,
-      "max_group_size": 27,
-      "mean_group_size": 1.0131712259371835,
+      "invalid_windows": 0,
+      "lag_ceiling_rejected_windows": 0,
+      "lag_p50_us": 1.0,
+      "lag_p95_us": 70,
+      "lag_p99_us": 192,
+      "max_group_size": 4,
+      "mean_group_size": 1.0080645161290323,
       "min_lag_us": 0,
       "offered_rps": 100.0,
-      "p50_us": 1352.0,
-      "p95_us": 227758,
-      "p99_us": 5238,
+      "p50_us": 3435.0,
+      "p95_us": 58047,
+      "p99_us": 66420,
       "rate_exceeded": false,
-      "reject_reasons": {
-        "lag_ceiling": 1
-      },
+      "reject_reasons": {},
       "service_ceiling_rejected_windows": 0,
-      "sustained": false,
-      "valid_windows": 19,
+      "sustained": true,
+      "valid_windows": 20,
       "windows": 20
     }
   ],
-  "data_bytes": 546258496,
+  "data_bytes": 542203904,
   "durability": "sqlite WAL + synchronous=FULL, one COMMIT per batch",
   "durability_observed": {
     "journal_mode": "wal",
+    "journal_size_limit": -1,
     "synchronous": 2,
-    "synchronous_name": "FULL"
+    "synchronous_name": "FULL",
+    "wal_autocheckpoint_pages": 0
   },
-  "elapsed_s": 19.991297835,
+  "elapsed_s": 19.994263405999998,
   "engine_cap_mib": 128,
   "engine_memory": {
     "method": "sampled memory.current every 50 ms",
-    "peak_bytes": 33406976,
-    "samples": 398,
+    "peak_bytes": 65175552,
+    "samples": 399,
     "scope": "measured phase",
-    "start_bytes": 19275776
+    "start_bytes": 19066880
   },
-  "groups": 1974,
+  "groups": 1984,
   "instance_root": "/home/z/vibe/flashdb/.scratch/82-controlled-m1/runs/live",
   "lag_ceiling_us": 10000,
-  "max_group_size": 27,
-  "mean_group_size": 1.0131712259371835,
+  "max_group_size": 4,
+  "mean_group_size": 1.0080645161290323,
   "oracle": {
     "checks": [],
     "reason": "--skip-oracle: the restored instance is byte-identical in every block, so the inventory is verified once per arm",
     "status": "DEFERRED"
   },
+  "pacing": "open loop: dispatch on the due schedule, one worker executes and commits each group and acks on completion (flashdb-load's shape)",
   "requests_run": 2000,
   "restore": {
     "arm": "sqlite",
-    "at": "2026-10-17T23:27:14",
+    "at": "2026-10-18T00:23:14",
     "bytes": 541876224,
     "files": 1,
     "from": "/home/z/vibe/flashdb/.scratch/82-controlled-m1/runs/snapshot/sqlite.db",
-    "restore_s": 1.486,
+    "restore_s": 1.494,
     "sha256": "46c6f1e1e2a149f8e55bb4f29a39b2ca57a53d1a50daa0ae5a3e30c2d4367130",
     "snapshot_sha256": "46c6f1e1e2a149f8e55bb4f29a39b2ca57a53d1a50daa0ae5a3e30c2d4367130",
     "to": "/home/z/vibe/flashdb/.scratch/82-controlled-m1/runs/live/sqlite.db",
@@ -86,18 +87,36 @@
   "seed_s": 0.0,
   "sqlite_cache_kib": 8192,
   "sqlite_files": {
-    "db": 542089216,
-    "shm": 32768,
-    "wal": 4136512
+    "db": 542105600,
+    "shm": 98304,
+    "wal": 0
+  },
+  "sqlite_wal": {
+    "autocheckpoint_pages": 0,
+    "checkpoint": {
+      "at": "after the measured phase, before the oracle",
+      "pragma": "wal_checkpoint(TRUNCATE)",
+      "result": [
+        0,
+        0,
+        0
+      ]
+    },
+    "data_bytes_after_checkpoint": 542203904,
+    "files_after_checkpoint": {
+      "db": 542105600,
+      "shm": 98304,
+      "wal": 0
+    },
+    "journal_size_limit": -1,
+    "wal_bytes_after_run": 35390832
   },
   "trace_sha256": "583f9b4c3c5b3ebe4974822a3e26e1ed80e4f3ad0dc0a5c80153fbb390eb8443",
   "verdict": {
-    "highest_sustained_rps": 0.0,
-    "reject_reasons": {
-      "lag_ceiling": 1
-    },
-    "rejected_windows": 1,
-    "sustained": false
+    "highest_sustained_rps": 100.0,
+    "reject_reasons": {},
+    "rejected_windows": 0,
+    "sustained": true
   },
   "window_ms": 1000,
   "windows_file": "windows-sqlite.jsonl"

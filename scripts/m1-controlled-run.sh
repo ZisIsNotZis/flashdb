@@ -4,7 +4,8 @@
 #
 #   scripts/m1-controlled-run.sh [--root DIR] [--source DIR] [--blocks N] [--rungs 50,100,200]
 #                                [--seconds 20] [--arms a,b,c] [--cap-mib M] [--seed-cap-mib M]
-#                                [--phase all|setup|floor|measure|score] [--build]
+#                                [--sqlite-wal-autocheckpoint N] [--since ISO8601]
+#                                [--phase all|setup|floor|measure|blocks|score] [--build]
 #
 # What it fixes, and how
 # ----------------------
@@ -35,6 +36,12 @@ SECONDS_PER_RUNG=20
 ARMS=flashdb-declared,sqlite,postgres
 CAP_MIB=128
 SEED_CAP_MIB=512
+# sqlite's WAL auto-checkpoint in pages, handed to the runner instead of left to sqlite's default.
+SQLITE_WAL_AUTOCHECKPOINT=0
+# The ISO instant the score step keeps for the machine-state summary: a phase that re-runs the
+# blocks into the same work directories appends its boundaries to the same files, so the summary is
+# restricted to one attempt rather than mixing two machine states.
+SINCE=
 DATABASE=m1-controlled
 PHASE=all
 BUILD=0
@@ -55,6 +62,8 @@ while [ $# -gt 0 ]; do
         --cap-mib) CAP_MIB=$2; shift 2 ;;
         --seed-cap-mib) SEED_CAP_MIB=$2; shift 2 ;;
         --database) DATABASE=$2; shift 2 ;;
+        --sqlite-wal-autocheckpoint) SQLITE_WAL_AUTOCHECKPOINT=$2; shift 2 ;;
+        --since) SINCE=$2; shift 2 ;;
         --phase) PHASE=$2; shift 2 ;;
         --build) BUILD=1; shift ;;
         *) die "unknown argument $1" ;;
@@ -62,8 +71,8 @@ while [ $# -gt 0 ]; do
 done
 
 case "$PHASE" in
-    all|setup|floor|measure|score) ;;
-    *) die "unknown --phase $PHASE (expected all, setup, floor, measure or score)" ;;
+    all|setup|floor|measure|blocks|score) ;;
+    *) die "unknown --phase $PHASE (expected all, setup, floor, measure, blocks or score)" ;;
 esac
 
 mkdir -p "$ROOT"
@@ -101,16 +110,18 @@ IFS=, read -r -a RUNG_LIST <<< "$RUNGS"
 run_spec() {
     python3 - "$ROOT/run-spec.json" "$RUNNER_CMD" "$REPO" "$SOURCE" "$BLOCKS" "$RUNGS" \
         "$SECONDS_PER_RUNG" "$ARMS" "$CAP_MIB" "$SEED_CAP_MIB" "$DATABASE" \
-        "$SEED" "$CUSTOMERS" "$SKUS" "$LOCS" "$ON_HAND" "$BATCH" "$M1_PG_ROOT" "$LOCK" <<'PY'
+        "$SEED" "$CUSTOMERS" "$SKUS" "$LOCS" "$ON_HAND" "$BATCH" "$M1_PG_ROOT" "$LOCK" \
+        "$SQLITE_WAL_AUTOCHECKPOINT" <<'PY'
 import json, sys
 (path, argv, repo, source, blocks, rungs, seconds, arms, cap, seed_cap, database, seed,
- customers, skus, locs, on_hand, batch, pg_root, lock) = sys.argv[1:20]
+ customers, skus, locs, on_hand, batch, pg_root, lock, sqlite_wal) = sys.argv[1:21]
 json.dump({
     "schema": "flashdb.m1.controlled-run.v1",
     "argv": argv, "repo": repo, "frozen_source": source,
     "blocks": int(blocks), "rungs": [int(r) for r in rungs.split(",")],
     "seconds_per_arm_run": int(seconds), "arms": arms.split(","),
     "engine_cap_mib": int(cap), "seed_cap_mib": int(seed_cap), "postgres_database": database,
+    "sqlite": {"cache_kib": 8192, "wal_autocheckpoint_pages": int(sqlite_wal)},
     "dataset": {"seed": int(seed), "customers": int(customers), "skus": int(skus),
                 "locs": int(locs), "on_hand": int(on_hand), "batch": int(batch)},
     "postgres_root": pg_root, "lock": lock,
@@ -163,7 +174,7 @@ build_instances() {
     "$REPO/scripts/m1-baseline-run.sh" --mode instance --workdir "$workdir" --arms "$ARMS" \
         --rate "${RUNG_LIST[0]}" --snapshot-dir "$SNAPSHOT_DIR" --instance-root "$INSTANCE_ROOT" \
         --cap-mib "$CAP_MIB" --seed-cap-mib "$SEED_CAP_MIB" --database "$DATABASE" \
-        "${build_flag[@]}"
+        --sqlite-wal-autocheckpoint "$SQLITE_WAL_AUTOCHECKPOINT" "${build_flag[@]}"
 }
 
 run_floor() {
@@ -203,6 +214,7 @@ measure_blocks() {
                     --requests $((SECONDS_PER_RUNG * rung)) \
                     --snapshot-dir "$SNAPSHOT_DIR" --instance-root "$INSTANCE_ROOT" \
                     --cap-mib "$CAP_MIB" --seed-cap-mib "$SEED_CAP_MIB" --database "$DATABASE" \
+                    --sqlite-wal-autocheckpoint "$SQLITE_WAL_AUTOCHECKPOINT" \
                     --skip-verify --skip-build
             done
             rung_index=$((rung_index + 1))
@@ -211,8 +223,10 @@ measure_blocks() {
 }
 
 score() {
+    local since_args=()
+    [ -n "$SINCE" ] && since_args=(--since "$SINCE")
     python3 "$REPO/scripts/m1-controlled-score.py" --root "$ROOT" \
-        --out "$ROOT/report.json" --markdown "$ROOT/table.md"
+        --out "$ROOT/report.json" --markdown "$ROOT/table.md" "${since_args[@]}"
 }
 
 run_spec
@@ -228,6 +242,11 @@ fi
 if [ "$PHASE" = all ] || [ "$PHASE" = measure ]; then
     measure_blocks
     run_floor after
+fi
+# A re-measurement of the blocks alone, reusing the committed floor and snapshots: the two fairness
+# fixes change the arms, not the device, so the floor is not re-taken.
+if [ "$PHASE" = blocks ]; then
+    measure_blocks
 fi
 if [ "$PHASE" = all ] || [ "$PHASE" = score ]; then
     score

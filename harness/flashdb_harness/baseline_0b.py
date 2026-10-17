@@ -26,7 +26,10 @@ What is reused, and why nothing here re-spells it
 * The pacer contract: requests become READY at their cumulative scheduled due time; a batch is
   formed only from requests already ready, capped at `batch`, and is never held open to fill. That
   is `flashdb-load`'s arrivals model (`ready_group`), and it is why a rung's achieved rate is
-  bounded by its offered rate.
+  bounded by its offered rate. The SQL arms dispatch on that schedule and let a worker execute and
+  commit the group (`run_paced_loop(open_loop=True)`), exactly as `flashdb-load`'s dispatcher does
+  not wait for its barrier; only the device floor keeps the closed-loop shape, where the next
+  group waits for the previous commit.
 
 The rule a rung is scored by (the ticket's, applied identically to every arm)
 -----------------------------------------------------------------------------
@@ -131,6 +134,16 @@ SQLITE_CACHE_KIB = 8_192
 # The `PRAGMA synchronous` value the measured path requires. That pragma's scale is its own
 # (0 OFF, 1 NORMAL, 2 FULL, 3 EXTRA) and is NOT the C API's `SQLITE_SYNC_*` flag constants.
 SQLITE_SYNCHRONOUS_FULL = 2
+# sqlite's WAL auto-checkpoint, in pages, STATED and recorded per run instead of left to sqlite's
+# compiled default (1000 pages ~ 4 MiB). 0 defers the checkpoint out of the measured phase: the
+# automatic checkpoint runs on the committing thread, and against the 10x instance (542 MB) the
+# write-back blocks that thread for ~254 ms, which is what the f70d91c arm-runs show as a lag p99 of
+# 254 ms at every crossing with a 3 ms IQR. The deferred checkpoint is run once, after the measured
+# phase, by `sqlite_wal_record` (`PRAGMA wal_checkpoint(TRUNCATE)`), and the run record states the
+# policy, the WAL bytes it deferred and the checkpoint result. A probe with 1000 pages against 0 is
+# committed beside ticket 82's report (`runs/probe-checkpoint/`): the 254 ms stall follows the
+# setting, not the rung.
+SQLITE_WAL_AUTOCHECKPOINT_PAGES = 0
 # The line `scoped_command` prepends and appends: the engine cgroup's own `memory.current` at the
 # start of the invocation and its `memory.peak`, both read from inside it.
 SCOPE_START_PREFIX = "scope_memory_start_bytes="
@@ -603,11 +616,13 @@ class SqliteArm(SqlArm):
     int_type = "INTEGER"
     durability = "sqlite WAL + synchronous=FULL, one COMMIT per batch"
 
-    def __init__(self, conn: sqlite3.Connection) -> None:
+    def __init__(self, conn: sqlite3.Connection,
+                 wal_autocheckpoint: int = SQLITE_WAL_AUTOCHECKPOINT_PAGES) -> None:
         # Autocommit at the Python level: the transaction is explicit, so a batch's boundaries are
         # the pacer's and not sqlite3's implicit ones.
         conn.isolation_level = None
         super().__init__(conn)
+        self.wal_autocheckpoint = int(wal_autocheckpoint)
         self._set_measured_durability()
 
     def set_engine_memory(self, cache_kib: int) -> None:
@@ -621,25 +636,37 @@ class SqliteArm(SqlArm):
         self.cur.execute(f"PRAGMA cache_size = -{cache_kib}")
 
     def _set_measured_durability(self) -> None:
-        for pragma in ("journal_mode=WAL", "synchronous=FULL"):
+        for pragma in ("journal_mode=WAL", "synchronous=FULL",
+                       f"wal_autocheckpoint={self.wal_autocheckpoint}"):
             self.cur.execute(f"PRAGMA {pragma}")
 
     def observed_durability(self) -> dict:
-        """The connection's durability, read BACK from sqlite rather than assumed from the setter.
+        """The connection's durability and WAL policy, read BACK from sqlite rather than assumed.
 
         `PRAGMA journal_mode=WAL` that cannot be applied returns the old mode and raises nothing,
         and the seeding path deliberately runs with `journal_mode=OFF, synchronous=OFF`, so the
-        measured path depends on this restore actually having taken effect.
+        measured path depends on this restore actually having taken effect. The WAL
+        auto-checkpoint is read back for the same reason: it decides whether the measured phase
+        pays sqlite's checkpoint stall, so leaving it an unstated default would hide a parameter
+        from the record. `journal_size_limit` is sqlite's own cap (or -1) and is recorded so the
+        WAL cannot grow past a bound no reader was told about.
         """
         self.cur.execute("PRAGMA journal_mode")
         mode = str(self.cur.fetchone()[0]).lower()
         self.cur.execute("PRAGMA synchronous")
         sync = int(self.cur.fetchone()[0])
+        self.cur.execute("PRAGMA wal_autocheckpoint")
+        autocheckpoint = int(self.cur.fetchone()[0])
+        self.cur.execute("PRAGMA journal_size_limit")
+        journal_size_limit = int(self.cur.fetchone()[0])
         return {"journal_mode": mode, "synchronous": sync,
-                "synchronous_name": "FULL" if sync == SQLITE_SYNCHRONOUS_FULL else str(sync)}
+                "synchronous_name": "FULL" if sync == SQLITE_SYNCHRONOUS_FULL else str(sync),
+                "wal_autocheckpoint_pages": autocheckpoint,
+                "journal_size_limit": journal_size_limit}
 
     def require_measured_durability(self) -> dict:
-        """Fail loudly unless the measured path ran under WAL + `synchronous=FULL`."""
+        """Fail loudly unless the measured path ran under WAL + `synchronous=FULL` + the stated
+        auto-checkpoint, so a parameter the report cites is the one the engine held."""
         observed = self.observed_durability()
         if (observed["journal_mode"], observed["synchronous"]) != ("wal",
                                                                   SQLITE_SYNCHRONOUS_FULL):
@@ -647,6 +674,11 @@ class SqliteArm(SqlArm):
                 f"sqlite measured path is not WAL + synchronous=FULL: observed"
                 f" journal_mode={observed['journal_mode']}"
                 f" synchronous={observed['synchronous']}")
+        if observed["wal_autocheckpoint_pages"] != self.wal_autocheckpoint:
+            raise SqlArmError(
+                f"sqlite measured path is not on the stated wal_autocheckpoint="
+                f"{self.wal_autocheckpoint}: observed"
+                f" {observed['wal_autocheckpoint_pages']}")
         return observed
 
     def begin_bulk_load(self) -> None:
@@ -711,18 +743,50 @@ def add_verify_index(arm: SqlArm) -> None:
 
 
 def sqlite_arm(path: str | Path = ":memory:", cache_kib: int = SQLITE_CACHE_KIB,
-               create_schema: bool = True) -> SqliteArm:
+               create_schema: bool = True,
+               wal_autocheckpoint: int = SQLITE_WAL_AUTOCHECKPOINT_PAGES) -> SqliteArm:
     """A sqlite arm on `path` (`:memory:` by default), page cache stated, schema created.
 
     `create_schema=False` opens an instance that ALREADY has the schema: a restored snapshot. The
     schema belongs to the pre-load state, so re-creating it there would be a setup step inside the
     measurement loop (and would fail loudly, which is how this was found).
+
+    The connection accepts the arm's commit worker on another thread (`check_same_thread=False`):
+    the open-loop pacer executes and commits one group at a time from ONE worker thread, and the
+    read-back, the oracle and the checkpoint run on this thread after that worker has joined.
     """
-    arm = SqliteArm(sqlite3.connect(str(path)))
+    arm = SqliteArm(sqlite3.connect(str(path), check_same_thread=False), wal_autocheckpoint)
     arm.set_engine_memory(cache_kib)
     if create_schema:
         arm.create_schema()
     return arm
+
+
+def sqlite_wal_record(arm: SqliteArm, db: Path) -> dict:
+    """Record the WAL policy and, when the automatic checkpoint is deferred, run it here.
+
+    Called after the measured phase and before the oracle: with `wal_autocheckpoint=0` the WAL keeps
+    every frame the run wrote, so the state the run measured is exactly the state the checkpoint
+    then writes back. The checkpoint is the maintenance sqlite would otherwise have paid on its
+    committing thread, so it is recorded (WAL bytes, result, files) rather than done silently.
+    """
+    observed = arm.observed_durability()
+    before = _sqlite_files(db)
+    checkpoint = None
+    if observed["wal_autocheckpoint_pages"] == 0:
+        arm.cur.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        row = arm.cur.fetchone() or ()
+        # sqlite returns (busy, log_frames_checkpointed, checkpointed_frames).
+        checkpoint = {"pragma": "wal_checkpoint(TRUNCATE)",
+                      "result": [int(value) for value in row] if row else None,
+                      "at": "after the measured phase, before the oracle"}
+    after = _sqlite_files(db)
+    return {"autocheckpoint_pages": observed["wal_autocheckpoint_pages"],
+            "journal_size_limit": observed["journal_size_limit"],
+            "wal_bytes_after_run": before.get("wal", 0),
+            "checkpoint": checkpoint,
+            "files_after_checkpoint": after,
+            "data_bytes_after_checkpoint": _db_bytes(db)}
 
 
 # ---------------------------------------------------------------------------
@@ -1030,16 +1094,52 @@ def run_paced_loop(
     batch: int,
     window_ms: int,
     execute_batch,
+    open_loop: bool = False,
 ) -> dict:
     """The ONE pacer: replay `due`/`rates` through `execute_batch`, one window sample per second.
 
     `due[i]` is request `i`'s ready instant (microseconds from the start), `requests` yields the
     payloads in the same order, and `execute_batch(list_of_payloads)` returns the per-batch counters
-    (`take`/`backorder`/`miss`/`errors`/`first_error`). A batch is executed and committed before the
-    next one is dispatched, so a slow commit shows up as schedule lag on the next request rather than
-    as hidden queueing. `run_sql_arm` and the device floor both call this, so the machine's floor and
-    the arms are measured by ONE pacer instead of two implementations that could drift apart.
+    (`take`/`backorder`/`miss`/`errors`/`first_error`).
+
+    `open_loop` selects which side of the commit the DISPATCH waits on, and nothing else:
+
+    * `False` (closed loop, the device floor's shape): a group is executed and committed before the
+      next one is dispatched, so a slow commit shows up as schedule lag on the next request.
+    * `True` (open loop, `flashdb-load`'s shape and the SQL arms'): the pacer dispatches a request
+      at its due instant into a ready queue and a worker executes and commits the group, acking on
+      completion. The durable commit no longer holds the next dispatch back, so the schedule-lag
+      rule scores the pacer's own wakeup for both engines and an engine's stall is scored where
+      `flashdb-load` puts it, in the per-request service latency. A group is formed from the
+      requests already ready when the worker picks them up, capped at `batch` and never held open
+      to fill; one durable commit per group and the same `batch` cap in both shapes.
+
+    `run_sql_arm` and the device floor both call this, so the machine's floor and the arms are
+    measured by ONE pacer instead of two implementations that could drift apart.
     """
+    if open_loop:
+        counters, windows, groups, max_group, end_us = _open_loop_replay(
+            due, rates, requests, batch, window_ms, execute_batch)
+    else:
+        counters, windows, groups, max_group, end_us = _closed_loop_replay(
+            due, rates, requests, batch, window_ms, execute_batch)
+    lines = [json.dumps(r, sort_keys=True) for r in windows.records]
+    parsed = window_records(lines, window_ms)
+    return {
+        "requests_run": len(due),
+        "groups": groups,
+        "mean_group_size": len(due) / groups if groups else 0.0,
+        "max_group_size": max_group,
+        "elapsed_s": (end_us - due[0]) / 1e6,
+        "counters": counters,
+        "windows": parsed,
+        "curve": summarize_curve(parsed, None),
+        "windows_jsonl": lines,
+    }
+
+
+def _closed_loop_replay(due, rates, requests, batch, window_ms, execute_batch):
+    """Dispatch the next group only after the previous one's commit returned (the floor's shape)."""
     total = len(due)
     stream = iter(requests)
     windows = WindowSamples(window_ms)
@@ -1074,19 +1174,74 @@ def run_paced_loop(
         i = j
     end_us = now_us()
     windows.finish(end_us, rates[-1])
-    lines = [json.dumps(r, sort_keys=True) for r in windows.records]
-    parsed = window_records(lines, window_ms)
-    return {
-        "requests_run": total,
-        "groups": groups,
-        "mean_group_size": total / groups if groups else 0.0,
-        "max_group_size": max_group,
-        "elapsed_s": (end_us - due[0]) / 1e6,
-        "counters": counters,
-        "windows": parsed,
-        "curve": summarize_curve(parsed, None),
-        "windows_jsonl": lines,
-    }
+    return counters, windows, groups, max_group, end_us
+
+
+def _open_loop_replay(due, rates, requests, batch, window_ms, execute_batch):
+    """Dispatch on the due schedule, execute and commit in a worker, ack on completion.
+
+    The pacer thread does only what `flashdb-load`'s dispatcher does: wait for the due instant and
+    hand the request over. The worker owns the connection, takes the requests already ready (at
+    most `batch`), executes and commits them as ONE durable group, and stamps their completion. The
+    lock covers bookkeeping only, never `execute_batch`, so a running commit cannot delay dispatch.
+    """
+    total = len(due)
+    stream = iter(requests)
+    windows = WindowSamples(window_ms)
+    counters = {TAKE: 0, BACKORDER: 0, MISS: 0, "errors": 0, "first_error": None}
+    stats = {"groups": 0, "max_group": 0}
+    t0 = time.perf_counter_ns()
+
+    def now_us() -> float:
+        return (time.perf_counter_ns() - t0) / 1000.0
+
+    condition = threading.Condition()
+    ready: list[tuple[int, float, dict]] = []  # (request index, dispatch us, payload)
+    dispatched_all = False
+
+    def worker() -> None:
+        while True:
+            with condition:
+                while not ready and not dispatched_all:
+                    condition.wait(0.05)
+                if not ready:
+                    return  # every request dispatched and every group acked
+                pending = ready[:batch]
+                del ready[:len(pending)]
+            start = now_us()
+            outcome = execute_batch([payload for _, _, payload in pending])
+            done = now_us()
+            with condition:
+                windows.flush_through(done, rates[pending[0][0]])
+                windows.batch([dispatched - due[index] for index, dispatched, _ in pending],
+                              [done - due[index] for index, _, _ in pending],
+                              done - start, rates[pending[0][0]], outcome["errors"])
+                for key in (TAKE, BACKORDER, MISS, "errors"):
+                    counters[key] += outcome[key]
+                if counters["first_error"] is None:
+                    counters["first_error"] = outcome["first_error"]
+                stats["groups"] += 1
+                stats["max_group"] = max(stats["max_group"], len(pending))
+
+    thread = threading.Thread(target=worker, name="m1-commit-worker", daemon=True)
+    thread.start()
+    try:
+        for index in range(total):
+            _wait_until(t0, due[index])
+            now = now_us()
+            payload = next(stream)
+            with condition:
+                windows.flush_through(now, rates[index])
+                ready.append((index, now, payload))
+                condition.notify()
+    finally:
+        with condition:
+            dispatched_all = True
+            condition.notify_all()
+        thread.join()
+    end_us = now_us()
+    windows.finish(end_us, rates[-1])
+    return counters, windows, stats["groups"], stats["max_group"], end_us
 
 
 def run_sql_arm(
@@ -1096,6 +1251,7 @@ def run_sql_arm(
     batch: int = DEFAULT_BATCH,
     window_ms: int = DEFAULT_WINDOW_MS,
     engine_cgroup: Path | None = None,
+    open_loop: bool = True,
 ) -> dict:
     """Replay the trace against one SQL arm and return its run record.
 
@@ -1105,14 +1261,24 @@ def run_sql_arm(
     `engine_cgroup` is the cgroup the ENGINE ran in: this process's own for sqlite (embedded), the
     server's scope for postgres. Its `memory.current` is sampled across this measured phase only, so
     the reported peak is serving pressure and never the bulk load that preceded it.
+
+    `open_loop` is the fairness fix the f70d91c report named (§9.3) and it defaults ON: flashdb's
+    driver submits its durable barrier to a background worker and keeps dispatching, so scoring a
+    SQL arm whose dispatch waits for its own commit against the same schedule-lag rule charges the
+    synchronous arm for a difference in client shape, not in engine behaviour. Both shapes run one
+    durable commit per group with the same `batch` cap; `pacing` in the record states which ran.
     """
     sampler = MemoryPeakSampler(engine_cgroup).start()
     due, rates = build_schedule(manifest)
-    paced = run_paced_loop(due, rates, requests, batch, window_ms, arm.execute_batch)
+    paced = run_paced_loop(due, rates, requests, batch, window_ms, arm.execute_batch,
+                           open_loop=open_loop)
     engine_memory = sampler.stop()
     return {
         "arm": arm.name,
         "durability": arm.durability,
+        "pacing": ("open loop: dispatch on the due schedule, one worker executes and commits each"
+                   " group and acks on completion (flashdb-load's shape)" if open_loop else
+                   "closed loop: the group's commit is acked before the next dispatch"),
         "batch": batch,
         "window_ms": window_ms,
         "lag_ceiling_us": LAG_CEILING_US,
@@ -1659,7 +1825,8 @@ def postgres_connect(dbname: str):
 
 
 def seed_sqlite_instance(workdir: Path, manifest: dict, spec: dict, cache_kib: int,
-                         instance_root: Path | None = None) -> dict:
+                         instance_root: Path | None = None,
+                         wal_autocheckpoint: int = SQLITE_WAL_AUTOCHECKPOINT_PAGES) -> dict:
     """Build sqlite's pre-load instance: schema + dimension rows, ONE bulk transaction.
 
     Seeding is setup, so it runs journal-less (`SqliteArm.begin_bulk_load`) and the measured
@@ -1670,7 +1837,7 @@ def seed_sqlite_instance(workdir: Path, manifest: dict, spec: dict, cache_kib: i
     for stale in (db, Path(f"{db}-wal"), Path(f"{db}-shm")):
         stale.unlink(missing_ok=True)
     db.parent.mkdir(parents=True, exist_ok=True)
-    arm = sqlite_arm(db, cache_kib)
+    arm = sqlite_arm(db, cache_kib, wal_autocheckpoint=wal_autocheckpoint)
     customers, stock = seed_docs(manifest, spec["on_hand"])
     seed_t0 = time.perf_counter()
     arm.seed(customers, stock)
@@ -1731,7 +1898,8 @@ def seed_postgres_instance(manifest: dict, spec: dict, database: str = POSTGRES_
 
 def build_instance(name: str, manifest: dict, spec: dict, workdir: Path, bins: Path,
                    instance_root: Path | None, seed_cap_mib: int, engine_cap_mib: int,
-                   sqlite_cache_kib: int, database: str) -> dict:
+                   sqlite_cache_kib: int, database: str,
+                   wal_autocheckpoint: int = SQLITE_WAL_AUTOCHECKPOINT_PAGES) -> dict:
     """Build one arm's pre-load instance and CHECK it holds the dataset the manifest describes.
 
     The check is what ties the two seeding paths together: flashdb is seeded from the frozen
@@ -1741,7 +1909,8 @@ def build_instance(name: str, manifest: dict, spec: dict, workdir: Path, bins: P
     if name in FLASHDB_ARMS:
         record = seed_flashdb_instance(name, workdir, bins, seed_cap_mib, instance_root)
     elif name == "sqlite":
-        record = seed_sqlite_instance(workdir, manifest, spec, sqlite_cache_kib, instance_root)
+        record = seed_sqlite_instance(workdir, manifest, spec, sqlite_cache_kib, instance_root,
+                                      wal_autocheckpoint)
     elif name == "postgres":
         record = seed_postgres_instance(manifest, spec, database, engine_cap_mib)
     else:
@@ -1766,7 +1935,8 @@ def cmd_build_instance(args: argparse.Namespace) -> int:
     for name in args.arms:
         records[name] = build_instance(name, manifest, spec, workdir, Path(args.bins),
                                        instance_root, args.seed_cap_mib, args.engine_cap_mib,
-                                       args.sqlite_cache_kib, args.database)
+                                       args.sqlite_cache_kib, args.database,
+                                       args.sqlite_wal_autocheckpoint)
         print(f"build-instance {name}: seed_s={records[name]['seed_s']:.1f}"
               f" bytes={records[name].get('instance_bytes') or records[name].get('data_bytes')}")
     path = Path(args.out) if args.out else workdir / "instance-build.json"
@@ -2129,12 +2299,14 @@ def cmd_arm(args: argparse.Namespace) -> int:
             # controlled pre-load state with a construction step again.
             if not db.exists():
                 raise SystemExit(f"no restored sqlite instance at {db}")
-            arm = sqlite_arm(db, args.sqlite_cache_kib, create_schema=False)
+            arm = sqlite_arm(db, args.sqlite_cache_kib, create_schema=False,
+                             wal_autocheckpoint=args.sqlite_wal_autocheckpoint)
             seed_s = 0.0
         else:
             for stale in (db, Path(f"{db}-wal"), Path(f"{db}-shm")):
                 stale.unlink(missing_ok=True)
-            arm = sqlite_arm(db, args.sqlite_cache_kib)
+            arm = sqlite_arm(db, args.sqlite_cache_kib,
+                             wal_autocheckpoint=args.sqlite_wal_autocheckpoint)
             customers, stock = seed_docs(manifest, spec["on_hand"])
             seed_t0 = time.perf_counter()
             arm.seed(customers, stock)
@@ -2151,6 +2323,9 @@ def cmd_arm(args: argparse.Namespace) -> int:
         record["arm_scope_peak_bytes"] = cgroup_peak_bytes()
         record["arm_scope_peak_scope"] = ("this process's capped scope over the whole arm step"
                                           " (bulk load + measured phase)")
+        # The WAL policy is a measured-phase parameter, and with the automatic checkpoint deferred
+        # the checkpoint itself runs here: after the run, before the oracle, and recorded.
+        record["sqlite_wal"] = sqlite_wal_record(arm, db)
         record["sqlite_files"] = _sqlite_files(db)
         record["data_bytes"] = _db_bytes(db)
         if args.skip_oracle:
@@ -2371,6 +2546,10 @@ def main(argv: list[str]) -> int:
                      help="transient budget for `seed-inventory` (construction, not serving)")
     arm.add_argument("--sqlite-cache-kib", type=int, default=SQLITE_CACHE_KIB,
                      help="sqlite `PRAGMA cache_size` in KiB (its engine is embedded)")
+    arm.add_argument("--sqlite-wal-autocheckpoint", type=int,
+                     default=SQLITE_WAL_AUTOCHECKPOINT_PAGES,
+                     help="sqlite `PRAGMA wal_autocheckpoint` in pages, stated and recorded per run"
+                          " (0 defers the checkpoint to the post-run `wal_checkpoint(TRUNCATE)`)")
     arm.add_argument("--skip-verify", action="store_true",
                      help="defer the flashdb read-back to the `verify` step (outside the engine cap)")
     arm.add_argument("--restored", action="store_true",
@@ -2397,6 +2576,8 @@ def main(argv: list[str]) -> int:
     build.add_argument("--engine-cap-mib", type=int, default=ENGINE_CAP_MIB)
     build.add_argument("--seed-cap-mib", type=int, default=SEED_CAP_MIB)
     build.add_argument("--sqlite-cache-kib", type=int, default=SQLITE_CACHE_KIB)
+    build.add_argument("--sqlite-wal-autocheckpoint", type=int,
+                       default=SQLITE_WAL_AUTOCHECKPOINT_PAGES)
     build.add_argument("--database", default=POSTGRES_DATABASE)
     build.add_argument("--out", default=None)
     build.set_defaults(func=cmd_build_instance)

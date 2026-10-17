@@ -15,6 +15,7 @@ flashdb arm's own run (needs the Rust binaries). Both are exercised by
 import hashlib
 import json
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -242,13 +243,121 @@ def test_a_clean_window_series_is_not_saturated():
 
 
 # ---------------------------------------------------------------------------
+# The pacer's two shapes: closed loop (the device floor) and open loop (the SQL arms, flashdb-load's)
+# ---------------------------------------------------------------------------
+OPEN_LOOP_RATE = 100          # 10 ms between requests
+OPEN_LOOP_COMMIT_S = 0.03     # three times the inter-arrival time: the commit cannot keep up
+
+
+def _slow_executor(commit_s, calls):
+    """An `execute_batch` that records the group it was handed and then pays a slow commit."""
+    def execute_batch(payloads):
+        calls.append([payload["id"] for payload in payloads])
+        time.sleep(commit_s)
+        return {"take": len(payloads), "backorder": 0, "miss": 0, "errors": 0, "first_error": None}
+    return execute_batch
+
+
+def _paced(count: int):
+    return ({"id": index} for index in range(count))
+
+
+def test_open_loop_pacer_does_not_charge_dispatch_for_the_commit():
+    """The fairness fix: an open-loop client is scored on its SCHEDULE, not on its own commit.
+
+    A 30 ms commit carrying a 10 ms schedule cannot keep up either way -- `batch=2` caps the batch
+    at two requests per commit while three arrive -- and the difference is where the cost lands.
+    Closed loop (the floor's shape) it lands in schedule lag; open loop (the SQL arms', and
+    flashdb-load's) the dispatch keeps to the schedule and the cost lands in the per-request
+    service latency the report reads beside the rule.
+    """
+    manifest = {"segments": [{"offered_rate": OPEN_LOOP_RATE, "count": 40}], "total_requests": 40}
+    due, rates = b0.build_schedule(manifest)
+    closed_calls, open_calls = [], []
+    closed = b0.run_paced_loop(due, rates, _paced(40), 2, 200,
+                               _slow_executor(OPEN_LOOP_COMMIT_S, closed_calls))
+    opened = b0.run_paced_loop(due, rates, _paced(40), 2, 200,
+                               _slow_executor(OPEN_LOOP_COMMIT_S, open_calls), open_loop=True)
+
+    assert closed["curve"][0]["lag_p99_us"] > 100_000   # dispatch queued behind the commit
+    assert opened["curve"][0]["lag_p99_us"] < 50_000    # dispatch stayed on the schedule
+    assert opened["curve"][0]["p99_us"] >= 25_000       # the commit's cost did not vanish, it moved
+    assert opened["max_group_size"] <= 2
+    for paced in (closed, opened):
+        assert paced["requests_run"] == 40
+        assert paced["counters"] == {b0.TAKE: 40, b0.BACKORDER: 0, b0.MISS: 0, "errors": 0,
+                                     "first_error": None}
+    assert [i for call in open_calls for i in call] == list(range(40))
+
+
+def test_open_loop_pacer_commits_one_group_of_the_requests_already_ready():
+    """One durable commit per group, the same `batch` cap, and no group held open to fill."""
+    manifest = {"segments": [{"offered_rate": 50, "count": 60}], "total_requests": 60}
+    due, rates = b0.build_schedule(manifest)
+    calls = []
+    paced = b0.run_paced_loop(due, rates, _paced(60), 8, 200, _slow_executor(0.05, calls),
+                              open_loop=True)
+    # Every request executed exactly once, in schedule order: a group is a prefix of the ready queue.
+    assert [i for call in calls for i in call] == list(range(60))
+    assert paced["groups"] == len(calls)          # one durable commit per group
+    assert paced["requests_run"] == sum(len(call) for call in calls)
+    assert 1 < paced["max_group_size"] <= 8        # ready requests batched, never past the cap
+    assert paced["mean_group_size"] == paced["requests_run"] / paced["groups"]
+
+
+def test_run_sql_arm_records_the_pacing_it_ran(tmp_path):
+    """The run record must state the client shape, because the lag rule reads differently in each."""
+    _emitted, manifest, requests, _order_flows = tiny_trace()
+    open_arm = b0.sqlite_arm(tmp_path / "open.db")
+    open_arm.seed(*b0.seed_docs(manifest, TINY_ON_HAND))
+    opened = b0.run_sql_arm(open_arm, manifest, iter(requests), open_loop=True)
+    assert opened["pacing"].startswith("open loop")
+    assert opened["counters"]["errors"] == 0
+    assert opened["requests_run"] == len(requests)
+
+    closed_arm = b0.sqlite_arm(tmp_path / "closed.db")
+    closed_arm.seed(*b0.seed_docs(manifest, TINY_ON_HAND))
+    closed = b0.run_sql_arm(closed_arm, manifest, iter(requests), open_loop=False)
+    assert closed["pacing"].startswith("closed loop")
+    assert closed["requests_run"] == len(requests)
+
+
+# ---------------------------------------------------------------------------
 # sqlite's durability is OBSERVED before the measured phase, not assumed from the setter
 # ---------------------------------------------------------------------------
 def test_sqlite_measured_durability_is_read_back(tmp_path):
     arm = b0.sqlite_arm(tmp_path / "observed.db")
     assert arm.require_measured_durability() == {
         "journal_mode": "wal", "synchronous": b0.SQLITE_SYNCHRONOUS_FULL,
-        "synchronous_name": "FULL"}
+        "synchronous_name": "FULL", "wal_autocheckpoint_pages": 0, "journal_size_limit": -1}
+
+
+def test_sqlite_wal_autocheckpoint_is_stated_read_back_and_checked(tmp_path):
+    """The WAL policy is a statement the run makes, so the read-back must hold it, not sqlite's."""
+    stated = b0.sqlite_arm(tmp_path / "stated.db", wal_autocheckpoint=4000)
+    assert stated.require_measured_durability()["wal_autocheckpoint_pages"] == 4000
+    # A connection whose policy drifted from the stated one must stop the run, not pass silently.
+    stated.wal_autocheckpoint = 1000
+    with pytest.raises(b0.SqlArmError, match="wal_autocheckpoint"):
+        stated.require_measured_durability()
+
+
+def test_the_deferred_checkpoint_is_recorded_and_truncates_the_wal(tmp_path):
+    """`wal_autocheckpoint=0` defers sqlite's checkpoint out of the measured phase, and it is run
+    and recorded after it, so the WAL bytes the run deferred and the write-back are both visible."""
+    db = tmp_path / "deferred.db"
+    arm = b0.sqlite_arm(db, wal_autocheckpoint=0)
+    arm.cur.execute("CREATE TABLE probe (value INTEGER)")
+    for value in range(200):
+        arm.cur.execute("BEGIN IMMEDIATE")
+        arm.cur.execute("INSERT INTO probe (value) VALUES (?)", (value,))
+        arm.cur.execute("COMMIT")
+    record = b0.sqlite_wal_record(arm, db)
+    assert record["autocheckpoint_pages"] == 0
+    assert record["wal_bytes_after_run"] > 0
+    assert record["checkpoint"]["pragma"] == "wal_checkpoint(TRUNCATE)"
+    assert record["files_after_checkpoint"].get("wal", 0) == 0
+    assert record["data_bytes_after_checkpoint"] >= 200 * 8
 
 
 def test_sqlite_seed_restores_measured_durability(tmp_path):
