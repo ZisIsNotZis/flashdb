@@ -191,6 +191,11 @@ What the table says, read straight off it (no layout claim yet — that is WP 2.
 - `dependent-read share` is 0.5-0.8333 everywhere, i.e. most of every one of these requests is a read
   that cannot be issued until an earlier read returns.
 
+**WP 2.3/2.4:** the layout-space analysis and the per-shape recommendation are in
+[report.md](report.md). Verified before writing it: the corpus regenerates to the committed sha256
+`ecc271e4...`, the descriptor JSON reproduces byte-identically, and `tests/test_join_shapes.py` is
+8 passed.
+
 ### Unmeasured, and why
 
 1. **No latency, bytes, block-read or dependent-read *cost* is measured for any shape.** Nothing here
