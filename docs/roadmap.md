@@ -61,21 +61,12 @@ generator shapes + headroom harness).
 
 ## Milestone status (current)
 
-- **M1 — external baseline scoreboard: delivered artefact, gate CANNOT-VERIFY.** The harness
-  (`baseline_0b.py`) and the corrected scoreboard (`report.md`/`report.json`, commit `43b1297`) passed
-  a fresh narrow review (PASS for the correction). The milestone gate is not met: **T6 has no
-  measurement at >=10x** (the only evaluable reading is 0.50x declared / 1.00x learned against 3x,
-  a FAIL), and **T5/T7 pass on throughput (deficit 1.001 at 12.546x) but the sustained half is
-  not-robustly-determined** (one contended run: no arm sustained). Open items: a quiet-box repeat of
-  run B, a >=10x ladder for T6 (~8 h per single seed; the pre-registration asks for 10 seeds), and
-  the 10-seed aggregation. Mechanical facts: oracle PASS for all arms including the 10x flashdb
-  read-back; one latency rule including the growth clause; sqlite durability observed; run B
-  provenance recorded. Environment: the literal `cargo build/test --workspace --offline` fails at
-  resolution on this box (lock pins crates.io, cache is mirrors.aliyun.com); the pinned-aliyun
-  `--config` command builds and passes 308 tests / 168 pytest.
+- **M1 — external baseline scoreboard: controlled verdict delivered, T5/T7 PASS, T6 FAIR FAIL.** Ticket 82 (`51c69f3`, 5 paired blocks, 12.546x, AC + EPP performance at 3.6 GHz, snapshot restore, device floor): **T5 PASS** (deficit 1.001; non-inferiority, bounded at 1.0526 at one offered rate), **T7 PASS**, **T6 FAIL** — at 200 rps flashdb-declared sustained 3/5 blocks while sqlite and postgres each sustained 5/5; achieved ratio 1.00x vs 3x, highest-sustained-level ratio 0.5x. The **external-superiority claim is not supported**; the internal learned-vs-declared gain (T1 +41-51%) stands separately. Two method defects were removed and measured: sqlite's default WAL autocheckpoint caused a 272 ms stall (0 -> 20.5 ms) and the SQL pacers were closed-loop (now open-loop like flashdb); both had manufactured the opposite reading. **T6's pre-registered wording is structurally unpassable** (any pair at one offered level is capped at 1.0526), so the metric definition needs an author decision; the level-ratio reading also fails. Footprint: postgres 16.40x by data directory (no footprint excuse on that leg), sqlite 4.04x (below the 10x floor).
 - **M2 — join-heavy workload descriptors: descriptors + recommendation delivered; gate UNMET (2/4), now with a recorded proposal.** Ticket 81's `report.md` delivers the four descriptors (§2, `descriptors.json`, corpus `ecc271e4…`) and the per-shape recommendation (§0, §4): L2 co-location is required for `star_fanout` (page size alone helps only its 5-row tail, and is a net loss on the median), `multi_hop` is fan-out-volume-dominated (1,216 read groups / 1,583 child rows per request) so neither axis alone is sufficient, `as_of` is not layout-bound, and `anti_join` points against L2. Two of the four M2 acceptance items are met (descriptors measured, explicit recommendation); two are **unmet** — a headroom measurement at ≥10x and learned-vs-declared headroom with the latency rule — because the engine cannot execute the shapes. **Proposal (simplest-reasonable principle, author may veto):** accept the structural decision — do not invest in L2 now; keep the narrow `star_fanout` case as a conditional future item; defer both the simulator (S) and the engine work (E), because S cannot close the gate (the pre-registration needs a real run) and would need E for calibration anyway, and E is not needed for the primary thesis. Revisit E only if a real star-schema workload makes the narrow case worth the engine contract change.
 
 ## Current milestone
 
-M1 — controlled T5/T6/T7 verdict on the low-spec laptop (ticket 82), now that the machine runs on AC at
-full clock. M2's structural decision is recorded above as a proposal.
+M1's controlled verdict is delivered; the remaining decision is the **T6 metric definition** (fix the
+pre-registered ratio to compare highest sustained levels, or accept the negative external result).
+M2's structural decision is recorded as a proposal. The primary thesis's final proof is **M3**
+(10-seed T1-T4).

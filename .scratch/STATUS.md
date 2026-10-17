@@ -4,11 +4,26 @@ Current single source of truth for project state. Facts only: every number names
 History and process live in the tickets, not here.
 
 The remaining work is sequenced as milestones in [`docs/roadmap.md`](../docs/roadmap.md).
-M1 is delivered but its gate is CANNOT-VERIFY (T6 at >=10x unmeasured). M2's analysis slice is
-delivered and merged, but its gate is UNMET (2/4): the >=10x and learned-vs-declared headroom
-measurements need three engine capabilities that do not exist (multi-row `$block.field` binding, a
-validator wider than `cust -> take`, aggregate-to-write). The author decision is M-B engine work vs
-an explicit waiver of the >=10x item. No later milestone is authorised until that is decided.
+
+**M1 controlled verdict (ticket 82, commit `51c69f3`, 2026-10-18):** at 12.546x, on AC + EPP
+`performance` at 3.6 GHz, 5 paired blocks with snapshot restore and the device floor calibrated,
+**T5 PASS** (deficit 1.001; non-inferiority, bounded at 1.0526 at one offered rate), **T7 PASS**, and
+**T6 FAIR FAIL**: at 200 rps flashdb-declared sustained 3/5 blocks while sqlite and postgres each
+sustained 5/5; the achieved ratio is 1.00x vs 3x, and the highest-sustained-level ratio is 0.5x. The
+external-superiority claim is therefore **not supported**; the internal learned-vs-declared gain
+(T1 +41-51%) stands separately. Two method defects were removed and measured: sqlite's default WAL
+autocheckpoint caused a 272 ms stall (0 -> 20.5 ms), and the SQL pacers were closed-loop
+(now open-loop like flashdb); both had previously manufactured the opposite reading. **T6's
+pre-registered wording is structurally unpassable** (any pair at one offered level is capped at
+1.0526), so the metric definition needs an author decision; the level-ratio reading also fails.
+Footprint: postgres is 16.40x by data directory, so no footprint excuse on that leg; sqlite is 4.04x,
+below the 10x floor.
+
+M2's analysis slice is delivered and merged; its gate is UNMET (2/4) because the >=10x and
+learned-vs-declared join measurements need three engine capabilities that do not exist (multi-row
+`$block.field` binding, a validator wider than `cust -> take`, aggregate-to-write). The recorded
+proposal is to accept the structural decision (no general L2; narrow `star_fanout` case conditional)
+and defer the engine work; the author may veto.
 
 ## 1. Bound revision and instance
 
