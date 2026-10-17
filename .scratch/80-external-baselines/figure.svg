@@ -1,0 +1,84 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1040" height="660" viewBox="0 0 1040 660" font-family="DejaVu Sans, Helvetica, Arial, sans-serif">
+<rect x="0" y="0" width="1040" height="660" fill="#ffffff"/>
+<text x="28.0" y="34.0" font-size="20" font-weight="bold" fill="#111111">M1 - external baseline scoreboard: schedule-lag p99 vs offered rate</text>
+<text x="28.0" y="56.0" font-size="11" fill="#333333">One point per arm per rung, read from the committed run-&lt;arm&gt;.json records. Filled marker = sustained under the pre-registered rule</text>
+<text x="28.0" y="72.0" font-size="11" fill="#333333">(lag p99 &lt;= 10,000 us, the 3-window growth streak, zero errors); hollow marker = at least one rejected window (counts in report.md Table A).</text>
+<text x="28.0" y="88.0" font-size="11" fill="#333333">Dashed line = the 10,000 us lag ceiling. Markers at one offered level are spread horizontally so they do not overprint; the tick marks the level.</text>
+<line x1="96" y1="500.0" x2="1000" y2="500.0" stroke="#e3e3e3" stroke-width="1"/>
+<text x="84.0" y="504.0" font-size="11" fill="#444444" text-anchor="end">1e3</text>
+<line x1="96" y1="400.6" x2="1000" y2="400.6" stroke="#e3e3e3" stroke-width="1"/>
+<text x="84.0" y="404.6" font-size="11" fill="#444444" text-anchor="end">1e4</text>
+<line x1="96" y1="301.1" x2="1000" y2="301.1" stroke="#e3e3e3" stroke-width="1"/>
+<text x="84.0" y="305.1" font-size="11" fill="#444444" text-anchor="end">1e5</text>
+<line x1="96" y1="201.7" x2="1000" y2="201.7" stroke="#e3e3e3" stroke-width="1"/>
+<text x="84.0" y="205.7" font-size="11" fill="#444444" text-anchor="end">1e6</text>
+<line x1="96" y1="400.6" x2="1000" y2="400.6" stroke="#777777" stroke-width="1.5" stroke-dasharray="7 5"/>
+<text x="996.0" y="394.6" font-size="10" fill="#555555" text-anchor="end">10,000 us ceiling</text>
+<text x="24.0" y="326.0" font-size="12" fill="#222222" text-anchor="middle" transform="rotate(-90 24 326.0)">lag p99 (us, log scale)</text>
+<line x1="96" y1="120" x2="112" y2="120" stroke="#1f5fa8" stroke-width="2.5"/>
+<circle cx="104.0" cy="120.0" r="7" fill="#1f5fa8"/>
+<text x="118.0" y="124.0" font-size="11" fill="#222222">flashdb-declared</text>
+<line x1="244" y1="120" x2="260" y2="120" stroke="#2a9d4a" stroke-width="2.5"/>
+<circle cx="252.0" cy="120.0" r="7" fill="#2a9d4a"/>
+<text x="266.0" y="124.0" font-size="11" fill="#222222">flashdb-learned</text>
+<line x1="392" y1="120" x2="408" y2="120" stroke="#d1701a" stroke-width="2.5"/>
+<circle cx="400.0" cy="120.0" r="7" fill="#d1701a"/>
+<text x="414.0" y="124.0" font-size="11" fill="#222222">sqlite</text>
+<line x1="540" y1="120" x2="556" y2="120" stroke="#b02418" stroke-width="2.5"/>
+<circle cx="548.0" cy="120.0" r="7" fill="#b02418"/>
+<text x="562.0" y="124.0" font-size="11" fill="#222222">postgres</text>
+<circle cx="696.0" cy="120.0" r="7" fill="#444444"/>
+<text x="708.0" y="124.0" font-size="11" fill="#222222">sustained</text>
+<circle cx="776.0" cy="120.0" r="7" fill="#ffffff" stroke="#444444" stroke-width="2.5"/>
+<text x="788.0" y="124.0" font-size="11" fill="#222222">rejected</text>
+<text x="96.0" y="142.0" font-size="12" font-weight="bold" fill="#111111">A. Ladder - run A (flashdb data 0.183x of the cap, PROVISIONAL)</text>
+<line x1="126.0" y1="148" x2="126.0" y2="506" stroke="#f0f0f0" stroke-width="1"/>
+<text x="126.0" y="526.0" font-size="11" fill="#222222" text-anchor="middle">50</text>
+<line x1="270.7" y1="148" x2="270.7" y2="506" stroke="#f0f0f0" stroke-width="1"/>
+<text x="270.7" y="526.0" font-size="11" fill="#222222" text-anchor="middle">100</text>
+<line x1="415.3" y1="148" x2="415.3" y2="506" stroke="#f0f0f0" stroke-width="1"/>
+<text x="415.3" y="526.0" font-size="11" fill="#222222" text-anchor="middle">200</text>
+<line x1="560.0" y1="148" x2="560.0" y2="506" stroke="#f0f0f0" stroke-width="1"/>
+<text x="560.0" y="526.0" font-size="11" fill="#222222" text-anchor="middle">400</text>
+<text x="343.0" y="548.0" font-size="12" fill="#222222" text-anchor="middle">offered rate (rps) - one rung per column, 20 windows each</text>
+<polyline points="102.0,430.9 246.7,481.4 391.3,372.7 536.0,330.0" fill="none" stroke="#1f5fa8" stroke-width="2" stroke-opacity="0.75"/>
+<circle cx="102.0" cy="430.9" r="7" fill="#1f5fa8"/>
+<circle cx="246.7" cy="481.4" r="7" fill="#1f5fa8"/>
+<circle cx="391.3" cy="372.7" r="7" fill="#ffffff" stroke="#1f5fa8" stroke-width="2.5"/>
+<circle cx="536.0" cy="330.0" r="7" fill="#ffffff" stroke="#1f5fa8" stroke-width="2.5"/>
+<polyline points="118.0,474.9 262.7,449.0 407.3,412.3 552.0,302.5" fill="none" stroke="#2a9d4a" stroke-width="2" stroke-opacity="0.75"/>
+<circle cx="118.0" cy="474.9" r="7" fill="#2a9d4a"/>
+<circle cx="262.7" cy="449.0" r="7" fill="#2a9d4a"/>
+<circle cx="407.3" cy="412.3" r="7" fill="#2a9d4a"/>
+<circle cx="552.0" cy="302.5" r="7" fill="#ffffff" stroke="#2a9d4a" stroke-width="2.5"/>
+<polyline points="134.0,422.9 278.7,462.6 423.3,418.8 568.0,380.7" fill="none" stroke="#d1701a" stroke-width="2" stroke-opacity="0.75"/>
+<circle cx="134.0" cy="422.9" r="7" fill="#d1701a"/>
+<circle cx="278.7" cy="462.6" r="7" fill="#d1701a"/>
+<circle cx="423.3" cy="418.8" r="7" fill="#d1701a"/>
+<circle cx="568.0" cy="380.7" r="7" fill="#ffffff" stroke="#d1701a" stroke-width="2.5"/>
+<polyline points="150.0,459.2 294.7,391.4 439.3,407.7 584.0,311.5" fill="none" stroke="#b02418" stroke-width="2" stroke-opacity="0.75"/>
+<circle cx="150.0" cy="459.2" r="7" fill="#b02418"/>
+<circle cx="294.7" cy="391.4" r="7" fill="#ffffff" stroke="#b02418" stroke-width="2.5"/>
+<circle cx="439.3" cy="407.7" r="7" fill="#b02418"/>
+<circle cx="584.0" cy="311.5" r="7" fill="#ffffff" stroke="#b02418" stroke-width="2.5"/>
+<text x="650.0" y="142.0" font-size="12" font-weight="bold" fill="#111111">B. Regime rung - run B (flashdb data 12.546x of the cap)</text>
+<line x1="700.0" y1="148" x2="700.0" y2="506" stroke="#f0f0f0" stroke-width="1"/>
+<circle cx="700.0" cy="339.7" r="7" fill="#ffffff" stroke="#1f5fa8" stroke-width="2.5"/>
+<text x="700.0" y="325.7" font-size="10" fill="#333333" text-anchor="middle">40,901 us</text>
+<text x="700.0" y="361.7" font-size="10" fill="#666666" text-anchor="middle">12 rej.</text>
+<text x="700.0" y="526.0" font-size="11" fill="#222222" text-anchor="middle">fdb-declared</text>
+<line x1="840.0" y1="148" x2="840.0" y2="506" stroke="#f0f0f0" stroke-width="1"/>
+<circle cx="840.0" cy="172.4" r="7" fill="#ffffff" stroke="#d1701a" stroke-width="2.5"/>
+<text x="840.0" y="158.4" font-size="10" fill="#333333" text-anchor="middle">1,969,377 us</text>
+<text x="840.0" y="194.4" font-size="10" fill="#666666" text-anchor="middle">1 rej.</text>
+<text x="840.0" y="526.0" font-size="11" fill="#222222" text-anchor="middle">sqlite</text>
+<line x1="980.0" y1="148" x2="980.0" y2="506" stroke="#f0f0f0" stroke-width="1"/>
+<circle cx="980.0" cy="338.8" r="7" fill="#ffffff" stroke="#b02418" stroke-width="2.5"/>
+<text x="980.0" y="324.8" font-size="10" fill="#333333" text-anchor="middle">41,827 us</text>
+<text x="980.0" y="360.8" font-size="10" fill="#666666" text-anchor="middle">3 rej.</text>
+<text x="980.0" y="526.0" font-size="11" fill="#222222" text-anchor="middle">postgres</text>
+<text x="840.0" y="548.0" font-size="12" fill="#222222" text-anchor="middle">arm (one offered level: 50 rps, 20 windows)</text>
+<text x="28.0" y="588.0" font-size="10" fill="#555555">Source: .scratch/80-external-baselines/runs/m1-measure/rung-*/run-&lt;arm&gt;.json and .scratch/80-external-baselines/runs/m1-10x/rung-*/run-&lt;arm&gt;.json (curve[0]).</text>
+<text x="28.0" y="602.0" font-size="10" fill="#555555">Marker fill is each record's own sustained verdict; the rule is the pre-registered one (10,000 us lag p99, the 3-window growth streak, zero errors), scored per arm by cold_0b.summarize_curve.</text>
+<text x="28.0" y="616.0" font-size="10" fill="#555555">Regenerate: uv run python scripts/m1-latency-figure.py</text>
+</svg>

@@ -1,0 +1,145 @@
+{
+  "arm": "flashdb-declared",
+  "batch": 64,
+  "cgroup_peak_bytes": 41988096,
+  "counters": {
+    "backorder": 0,
+    "errors": 0,
+    "first_error": null,
+    "miss": 0,
+    "take": 1366
+  },
+  "curve": [
+    {
+      "achieved_fraction": 0.9995,
+      "achieved_rps": 49.975,
+      "ceiling_rejected_windows": 0,
+      "compact_bytes": 0,
+      "early_dispatches": 0,
+      "error_windows": 0,
+      "group_elapsed_us": 11752,
+      "groups": 2000,
+      "groups_over_service_ceiling": 0,
+      "invalid_windows": 0,
+      "lag_ceiling_rejected_windows": 0,
+      "lag_p50_us": 83.0,
+      "lag_p95_us": 153,
+      "lag_p99_us": 1766,
+      "max_group_size": 1,
+      "mean_group_size": 1.0,
+      "min_lag_us": 3,
+      "offered_rps": 50.0,
+      "p50_us": 3828.5,
+      "p95_us": 6884,
+      "p99_us": 11752,
+      "rate_exceeded": false,
+      "reject_reasons": {},
+      "service_ceiling_rejected_windows": 0,
+      "sustained": true,
+      "valid_windows": 40,
+      "windows": 40
+    }
+  ],
+  "durability": "flashdb --group-requests 64 (one WAL barrier per group)",
+  "elapsed_s": 40.005,
+  "groups": 2000,
+  "instance_bytes": 2010491,
+  "lag_ceiling_us": 10000,
+  "max_group_size": 1,
+  "mean_group_size": 1.0,
+  "oracle": {
+    "checks": [
+      {
+        "check": "stock_cell_present",
+        "detail": "Stock(S000001,L000) is empty",
+        "ok": true,
+        "subjects": 2000
+      },
+      {
+        "check": "customer_present",
+        "detail": "probe-customer:c000000@example.com is empty",
+        "ok": true,
+        "subjects": 200
+      },
+      {
+        "check": "one_movement_per_order",
+        "detail": "O00000001 returned 1 movements, expected at most 1",
+        "ok": true,
+        "subjects": 1366
+      },
+      {
+        "check": "movement_order_no_matches",
+        "detail": "scan for O00000001 returned movement of O00000001",
+        "ok": true,
+        "subjects": 1366
+      },
+      {
+        "check": "cell_count",
+        "detail": "2000 cells read back, expected 2000",
+        "ok": true,
+        "subjects": 1
+      },
+      {
+        "check": "no_skipped_take",
+        "detail": "200 customers read back, expected 200",
+        "ok": true,
+        "subjects": 1
+      },
+      {
+        "check": "on_hand_matches_movements",
+        "detail": "stock(S000001,L000).on_hand=999865, initial 1000000 + sum(delta) -135 = 999865",
+        "ok": true,
+        "subjects": 2000
+      },
+      {
+        "check": "on_hand_non_negative",
+        "detail": "stock(S000001,L000).on_hand=999865",
+        "ok": true,
+        "subjects": 2000
+      },
+      {
+        "check": "movement_count_is_committed_takes",
+        "detail": "1366 movements read back, 1366 committed take blocks",
+        "ok": true,
+        "subjects": 1
+      },
+      {
+        "check": "order_count_is_committed_takes",
+        "detail": "1366 orders carry a movement, 1366 takes committed",
+        "ok": true,
+        "subjects": 1
+      },
+      {
+        "check": "no_request_errors",
+        "detail": "0 request errors (first: None)",
+        "ok": true,
+        "subjects": 1
+      }
+    ],
+    "order_no_uniqueness": "enforced at write time (no Order read shape); zero request errors required",
+    "status": "PASS"
+  },
+  "policy": "declared default (no learner controller wired in M1)",
+  "requests_run": 2000,
+  "summary": {
+    "completed": 2000,
+    "early_dispatches": 0,
+    "elapsed_ms": 40005,
+    "else_used": 0,
+    "errors": 0,
+    "first_error": null,
+    "invalid_windows": 0,
+    "lag_ceiling_rejected_windows": 0,
+    "requests": 2000,
+    "windows": 40
+  },
+  "trace_sha256": "7a56a3d6a19b7396ea60a91b669a32349b3d57f8defd96222e6db3151accf3e2",
+  "verdict": {
+    "highest_sustained_rps": 50.0,
+    "reject_reasons": {},
+    "rejected_windows": 0,
+    "sustained": true
+  },
+  "window_ms": 1000,
+  "windows_file": "windows-flashdb-declared.jsonl"
+}

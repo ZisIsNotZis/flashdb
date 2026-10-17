@@ -1,0 +1,159 @@
+{
+  "arm": "sqlite",
+  "arm_scope_peak_bytes": 42434560,
+  "arm_scope_peak_scope": "this process's capped scope over the whole arm step (bulk load + measured phase)",
+  "batch": 64,
+  "counters": {
+    "backorder": 0,
+    "errors": 0,
+    "first_error": null,
+    "miss": 0,
+    "take": 694
+  },
+  "curve": [
+    {
+      "achieved_fraction": 1.0,
+      "achieved_rps": 50.0,
+      "ceiling_rejected_windows": 0,
+      "compact_bytes": 0,
+      "early_dispatches": 0,
+      "error_windows": 0,
+      "group_elapsed_us": 0,
+      "groups": 1000,
+      "groups_over_service_ceiling": 0,
+      "invalid_windows": 0,
+      "lag_ceiling_rejected_windows": 0,
+      "lag_p50_us": 132.0,
+      "lag_p95_us": 989,
+      "lag_p99_us": 5960,
+      "max_group_size": 1,
+      "mean_group_size": 1.0,
+      "min_lag_us": 0,
+      "offered_rps": 50.0,
+      "p50_us": 1844.0,
+      "p95_us": 7260,
+      "p99_us": 20772,
+      "rate_exceeded": false,
+      "reject_reasons": {},
+      "service_ceiling_rejected_windows": 0,
+      "sustained": true,
+      "valid_windows": 20,
+      "windows": 20
+    }
+  ],
+  "data_bytes": 11800152,
+  "durability": "sqlite WAL + synchronous=FULL, one COMMIT per batch",
+  "durability_observed": {
+    "journal_mode": "wal",
+    "synchronous": 2,
+    "synchronous_name": "FULL"
+  },
+  "elapsed_s": 19.981905055,
+  "engine_cap_mib": 128,
+  "engine_memory": {
+    "method": "sampled memory.current every 50 ms",
+    "peak_bytes": 42434560,
+    "samples": 395,
+    "scope": "measured phase",
+    "start_bytes": 36892672
+  },
+  "groups": 1000,
+  "lag_ceiling_us": 10000,
+  "max_group_size": 1,
+  "mean_group_size": 1.0,
+  "oracle": {
+    "checks": [
+      {
+        "check": "on_hand_matches_movements",
+        "detail": "stock(S000001,L000).on_hand=999940, initial 1000000 + sum(delta) -60 = 999940",
+        "ok": true,
+        "subjects": 120000
+      },
+      {
+        "check": "on_hand_non_negative",
+        "detail": "stock(S000001,L000).on_hand=999940",
+        "ok": true,
+        "subjects": 120000
+      },
+      {
+        "check": "cell_count",
+        "detail": "120000 stock cells, expected 120000 (30000 sku x 4 loc)",
+        "ok": true,
+        "subjects": 1
+      },
+      {
+        "check": "no_duplicate_order_no",
+        "detail": "0 order numbers appear in both/again: []",
+        "ok": true,
+        "subjects": 1
+      },
+      {
+        "check": "movement_count_is_committed_takes",
+        "detail": "694 movements, 694 committed take blocks",
+        "ok": true,
+        "subjects": 1
+      },
+      {
+        "check": "order_count_is_committed_takes",
+        "detail": "694 orders, 694 committed take blocks",
+        "ok": true,
+        "subjects": 1
+      },
+      {
+        "check": "backorder_count_is_committed_fallbacks",
+        "detail": "0 backorders, 0 committed fallbacks",
+        "ok": true,
+        "subjects": 1
+      },
+      {
+        "check": "every_order_flow_accounted",
+        "detail": "694 take + 0 backorder + 0 miss against 694 order_flow requests",
+        "ok": true,
+        "subjects": 1
+      },
+      {
+        "check": "no_skipped_take",
+        "detail": "0 order_flow requests found no customer (every seeded email exists)",
+        "ok": true,
+        "subjects": 1
+      },
+      {
+        "check": "movement_deltas_match_order_lines",
+        "detail": "every movement has its order, with delta == -qty and the same sku",
+        "ok": true,
+        "subjects": 1
+      },
+      {
+        "check": "movement_delta_sum",
+        "detail": "sum(delta) over movements == -sum(qty) over fulfilled orders",
+        "ok": true,
+        "subjects": 1
+      },
+      {
+        "check": "stock_decrements_match_orders",
+        "detail": "sum(on_hand) == 120000 cells x 1000000 - taken qty",
+        "ok": true,
+        "subjects": 1
+      }
+    ],
+    "order_no_uniqueness": "queried",
+    "status": "PASS"
+  },
+  "requests_run": 1000,
+  "seed_s": 2.0103452949988423,
+  "sqlite_cache_kib": 8192,
+  "sqlite_files": {
+    "db": 7626752,
+    "shm": 32768,
+    "wal": 4140632
+  },
+  "trace_sha256": "9a7b06a4fc670cdc8e5acebb36a941d316b286887f28ef0ce0f9ef1dc916dca5",
+  "verdict": {
+    "highest_sustained_rps": 50.0,
+    "reject_reasons": {},
+    "rejected_windows": 0,
+    "sustained": true
+  },
+  "window_ms": 1000,
+  "windows_file": "windows-sqlite.jsonl"
+}

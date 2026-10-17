@@ -1,0 +1,158 @@
+{
+  "arm": "postgres",
+  "arm_scope_peak_bytes": 80388096,
+  "arm_scope_peak_scope": "the postgres server scope's lifetime (bulk load + measured phase); the client runs outside it",
+  "batch": 64,
+  "counters": {
+    "backorder": 0,
+    "errors": 0,
+    "first_error": null,
+    "miss": 0,
+    "take": 5559
+  },
+  "curve": [
+    {
+      "achieved_fraction": 0.9980795950511622,
+      "achieved_rps": 399.23183802046486,
+      "ceiling_rejected_windows": 21,
+      "compact_bytes": 0,
+      "early_dispatches": 0,
+      "error_windows": 0,
+      "group_elapsed_us": 0,
+      "groups": 715,
+      "groups_over_service_ceiling": 0,
+      "invalid_windows": 21,
+      "lag_ceiling_rejected_windows": 21,
+      "lag_p50_us": 18190,
+      "lag_p95_us": 67583,
+      "lag_p99_us": 78681,
+      "max_group_size": 34,
+      "mean_group_size": 11.188811188811188,
+      "min_lag_us": 0,
+      "offered_rps": 400.0,
+      "p50_us": 53781,
+      "p95_us": 139708,
+      "p99_us": 157039,
+      "rate_exceeded": false,
+      "reject_reasons": {
+        "lag_ceiling": 21
+      },
+      "service_ceiling_rejected_windows": 0,
+      "sustained": false,
+      "valid_windows": 0,
+      "windows": 21
+    }
+  ],
+  "data_bytes": 22730431,
+  "durability": "postgres fsync=on + synchronous_commit=on (baseline-env.sh), one COMMIT per batch",
+  "elapsed_s": 20.038482241,
+  "engine_cap_mib": 128,
+  "engine_memory": {
+    "method": "sampled memory.current every 50 ms",
+    "peak_bytes": 80388096,
+    "samples": 394,
+    "scope": "measured phase",
+    "start_bytes": 66670592
+  },
+  "groups": 715,
+  "lag_ceiling_us": 10000,
+  "max_group_size": 34,
+  "mean_group_size": 11.188811188811188,
+  "oracle": {
+    "checks": [
+      {
+        "check": "on_hand_matches_movements",
+        "detail": "stock(S022318,L000).on_hand=999995, initial 1000000 + sum(delta) -5 = 999995",
+        "ok": true,
+        "subjects": 120000
+      },
+      {
+        "check": "on_hand_non_negative",
+        "detail": "stock(S022318,L000).on_hand=999995",
+        "ok": true,
+        "subjects": 120000
+      },
+      {
+        "check": "cell_count",
+        "detail": "120000 stock cells, expected 120000 (30000 sku x 4 loc)",
+        "ok": true,
+        "subjects": 1
+      },
+      {
+        "check": "no_duplicate_order_no",
+        "detail": "0 order numbers appear in both/again: []",
+        "ok": true,
+        "subjects": 1
+      },
+      {
+        "check": "movement_count_is_committed_takes",
+        "detail": "5559 movements, 5559 committed take blocks",
+        "ok": true,
+        "subjects": 1
+      },
+      {
+        "check": "order_count_is_committed_takes",
+        "detail": "5559 orders, 5559 committed take blocks",
+        "ok": true,
+        "subjects": 1
+      },
+      {
+        "check": "backorder_count_is_committed_fallbacks",
+        "detail": "0 backorders, 0 committed fallbacks",
+        "ok": true,
+        "subjects": 1
+      },
+      {
+        "check": "every_order_flow_accounted",
+        "detail": "5559 take + 0 backorder + 0 miss against 5559 order_flow requests",
+        "ok": true,
+        "subjects": 1
+      },
+      {
+        "check": "no_skipped_take",
+        "detail": "0 order_flow requests found no customer (every seeded email exists)",
+        "ok": true,
+        "subjects": 1
+      },
+      {
+        "check": "movement_deltas_match_order_lines",
+        "detail": "every movement has its order, with delta == -qty and the same sku",
+        "ok": true,
+        "subjects": 1
+      },
+      {
+        "check": "movement_delta_sum",
+        "detail": "sum(delta) over movements == -sum(qty) over fulfilled orders",
+        "ok": true,
+        "subjects": 1
+      },
+      {
+        "check": "stock_decrements_match_orders",
+        "detail": "sum(on_hand) == 120000 cells x 1000000 - taken qty",
+        "ok": true,
+        "subjects": 1
+      }
+    ],
+    "order_no_uniqueness": "queried",
+    "status": "PASS"
+  },
+  "postgres_settings": {
+    "fsync": "on",
+    "server_version": "18.6 (Ubuntu 18.6-3build2)",
+    "shared_buffers": "16MB",
+    "synchronous_commit": "on"
+  },
+  "requests_run": 8000,
+  "seed_s": 9.466474407003261,
+  "trace_sha256": "14e966c1c364fe4650e87c4e93ed6b0d81e74ccd14e62f75fbb107645e69490e",
+  "verdict": {
+    "highest_sustained_rps": 0.0,
+    "reject_reasons": {
+      "lag_ceiling": 21
+    },
+    "rejected_windows": 21,
+    "sustained": false
+  },
+  "window_ms": 1000,
+  "windows_file": "windows-postgres.jsonl"
+}

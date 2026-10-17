@@ -1,0 +1,25 @@
+{
+  "n_customers": 30000,
+  "n_loc": 4,
+  "n_sku": 30000,
+  "schema": "flashdb.load-profile.manifest.v1",
+  "seed": 42,
+  "segments": [
+    {
+      "count": 4000,
+      "drift": null,
+      "index": 0,
+      "mix": {
+        "customer_lookup": 10,
+        "movements_scan": 5,
+        "order_flow": 70,
+        "stock_lookup": 15
+      },
+      "offered_rate": 200,
+      "start_request": 0
+    }
+  ],
+  "theta": 1.0,
+  "total_requests": 4000,
+  "trace_sha256": "30778694fbe326100f7942e0ae2d45897172392bf34fdc6d0734a82024bf8e3b"
+}

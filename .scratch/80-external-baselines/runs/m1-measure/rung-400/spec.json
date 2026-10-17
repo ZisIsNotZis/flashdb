@@ -1,0 +1,39 @@
+{
+  "argv": [
+    "baseline_0b.py",
+    "prepare",
+    "--workdir",
+    "/home/z/vibe/flashdb/.scratch/80-external-baselines/runs/m1-measure/rung-400",
+    "--seed",
+    "42",
+    "--requests",
+    "8000",
+    "--rate",
+    "400",
+    "--customers",
+    "30000",
+    "--skus",
+    "30000",
+    "--locs",
+    "4",
+    "--batch",
+    "64",
+    "--on-hand",
+    "1000000"
+  ],
+  "batch": 64,
+  "lag_ceiling_us": 10000,
+  "on_hand": 1000000,
+  "order_flow_requests": 5559,
+  "runner": {
+    "argv": "/home/z/vibe/flashdb/scripts/m1-baseline-run.sh --workdir /home/z/vibe/flashdb/.scratch/80-external-baselines/runs/m1-measure/rung-400 --requests 8000 --rate 400 --customers 30000 --skus 30000 --locs 4 --batch 64 --cap-mib 128 --arms flashdb-declared\\,flashdb-learned\\,sqlite\\,postgres --skip-build ",
+    "cwd": "/home/z/vibe/flashdb",
+    "engine_cap_mib": 128,
+    "lock": "/tmp/m1-measure.lock",
+    "postgres_root": "/var/tmp/m1-pg",
+    "seed_cap_mib": 192
+  },
+  "schema": "flashdb.baseline.run-spec.v1",
+  "trace_sha256": "14e966c1c364fe4650e87c4e93ed6b0d81e74ccd14e62f75fbb107645e69490e",
+  "window_ms": 1000
+}

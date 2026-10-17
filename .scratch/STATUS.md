@@ -3,6 +3,10 @@
 Current single source of truth for project state. Facts only: every number names its conditions.
 History and process live in the tickets, not here.
 
+The remaining work is sequenced as milestones in [`docs/roadmap.md`](../docs/roadmap.md).
+M1 is delivered but its gate is CANNOT-VERIFY (T6 at >=10x unmeasured); the current milestone is M2
+(join-heavy workload descriptors, ticket 81).
+
 ## 1. Bound revision and instance
 
 - **Bound revision (final integrated master, WP-79):** `482e3a1bd2a0c12dff4e0f3f758cd8a29556fed2`.
@@ -99,9 +103,14 @@ tail at seed 42 window 43) with NO build concurrent. The build's own durable flu
 
 ## 6. Evidence quality and accounting
 
-- **Gates (current):** `cargo build --workspace --offline` 0 warnings; `cargo test --workspace
-  --offline` **308 passed / 0 failed / 0 ignored**; `cd harness && uv run --with pytest pytest -q`
-  **146 passed**; `git diff --check` silent.
+- **Gates (current):** crates.io is unreachable from this box and the local cache is the aliyun
+  mirror, so the bare `--offline` form fails at resolution (`no matching package named serde`). The
+  command that works — the one the repo runners use, pinned by flags so it touches no host config —
+  is `cargo --config 'source.crates-io.replace-with="aliyun"' --config
+  'source.aliyun.registry="sparse+https://mirrors.aliyun.com/crates.io-index/"' build --workspace
+  --offline` → **0 warnings**; the same invocation with `test --workspace --offline` → **308 passed /
+  0 failed / 0 ignored** in 27 test binaries; `cd harness && uv run --with pytest pytest -q` → **168
+  passed**; `git diff --check` silent.
 - **Cold measurement discipline:** every run uses a fresh `cp -a` instance copy, one flashdb
   process at a time under `systemd-run --user --scope -p MemoryMax=...`, `flock`-serialized.
   `cgroup_peak` = the 128 MiB cap on every arm-run.

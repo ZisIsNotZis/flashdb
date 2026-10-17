@@ -1,0 +1,171 @@
+{
+  "arm": "flashdb-declared",
+  "arm_scope_peak_bytes": null,
+  "batch": 64,
+  "construction_memory": {
+    "cap_mib": 192,
+    "peak_bytes": 91086848
+  },
+  "counters": {
+    "backorder": 0,
+    "errors": 0,
+    "first_error": null,
+    "miss": 0,
+    "take": 1366
+  },
+  "curve": [
+    {
+      "achieved_fraction": 0.9995,
+      "achieved_rps": 99.95,
+      "ceiling_rejected_windows": 0,
+      "compact_bytes": 0,
+      "early_dispatches": 0,
+      "error_windows": 0,
+      "group_elapsed_us": 13225,
+      "groups": 2000,
+      "groups_over_service_ceiling": 0,
+      "invalid_windows": 0,
+      "lag_ceiling_rejected_windows": 0,
+      "lag_p50_us": 125.0,
+      "lag_p95_us": 216,
+      "lag_p99_us": 1540,
+      "max_group_size": 1,
+      "mean_group_size": 1.0,
+      "min_lag_us": 1,
+      "offered_rps": 100.0,
+      "p50_us": 4158.5,
+      "p95_us": 7145,
+      "p99_us": 13225,
+      "rate_exceeded": false,
+      "reject_reasons": {},
+      "service_ceiling_rejected_windows": 0,
+      "sustained": true,
+      "valid_windows": 20,
+      "windows": 20
+    }
+  ],
+  "durability": "flashdb --group-requests 64 (one WAL barrier per group)",
+  "elapsed_s": 20.004,
+  "engine_cap_mib": 128,
+  "engine_memory": {
+    "method": "exact memory.peak of the flashdb-load invocation's own scope, read inside it",
+    "peak_bytes": 12345344,
+    "samples": null,
+    "scope": "measured phase only: the instance is BUILT in a separate construction scope",
+    "start_bytes": 4169728
+  },
+  "groups": 2000,
+  "instance_bytes": 25403943,
+  "instance_files": {
+    "data-143.wal": 2599428,
+    "tile-143.tile": 10805133,
+    "tile-150.tile": 1084225,
+    "tile-73.tile": 10906965
+  },
+  "lag_ceiling_us": 10000,
+  "max_group_size": 1,
+  "mean_group_size": 1.0,
+  "oracle": {
+    "checks": [
+      {
+        "check": "one_movement_per_order",
+        "detail": "O00000001 returned 1 movements, expected at most 1",
+        "ok": true,
+        "subjects": 1366
+      },
+      {
+        "check": "movement_order_no_matches",
+        "detail": "scan for O00000001 returned movement of O00000001",
+        "ok": true,
+        "subjects": 1366
+      },
+      {
+        "check": "customer_present",
+        "detail": "probe-customer:c000000@example.com is empty",
+        "ok": true,
+        "subjects": 30000
+      },
+      {
+        "check": "stock_cell_present",
+        "detail": "Stock(S000001,L000) is empty",
+        "ok": true,
+        "subjects": 120000
+      },
+      {
+        "check": "on_hand_matches_movements",
+        "detail": "stock(S000001,L000).on_hand=999906, initial 1000000 + sum(delta) -94 = 999906",
+        "ok": true,
+        "subjects": 120000
+      },
+      {
+        "check": "on_hand_non_negative",
+        "detail": "stock(S000001,L000).on_hand=999906",
+        "ok": true,
+        "subjects": 120000
+      },
+      {
+        "check": "cell_count",
+        "detail": "120000 cells read back, expected 120000",
+        "ok": true,
+        "subjects": 1
+      },
+      {
+        "check": "no_skipped_take",
+        "detail": "30000 customers read back, expected 30000",
+        "ok": true,
+        "subjects": 1
+      },
+      {
+        "check": "every_movement_cell_probed",
+        "detail": "0 movement cells were never read back: []",
+        "ok": true,
+        "subjects": 1
+      },
+      {
+        "check": "movement_count_is_committed_takes",
+        "detail": "1366 movements read back, 1366 committed take blocks",
+        "ok": true,
+        "subjects": 1
+      },
+      {
+        "check": "order_count_is_committed_takes",
+        "detail": "1366 orders carry a movement, 1366 takes committed",
+        "ok": true,
+        "subjects": 1
+      },
+      {
+        "check": "no_request_errors",
+        "detail": "0 request errors (first: None)",
+        "ok": true,
+        "subjects": 1
+      }
+    ],
+    "order_no_uniqueness": "enforced at write time (no Order read shape); zero request errors required",
+    "status": "PASS"
+  },
+  "oracle_s": 37.07982009400439,
+  "policy": "declared default (no learner controller wired in M1)",
+  "requests_run": 2000,
+  "seed_s": 4.214779713001917,
+  "summary": {
+    "completed": 2000,
+    "early_dispatches": 0,
+    "elapsed_ms": 20004,
+    "else_used": 0,
+    "errors": 0,
+    "first_error": null,
+    "invalid_windows": 0,
+    "lag_ceiling_rejected_windows": 0,
+    "requests": 2000,
+    "windows": 20
+  },
+  "trace_sha256": "dcbf758d98b0500d81a3694f67717accd8dc79997f786339b027d762d9b6e0f6",
+  "verdict": {
+    "highest_sustained_rps": 100.0,
+    "reject_reasons": {},
+    "rejected_windows": 0,
+    "sustained": true
+  },
+  "window_ms": 1000,
+  "windows_file": "windows-flashdb-declared.jsonl"
+}
