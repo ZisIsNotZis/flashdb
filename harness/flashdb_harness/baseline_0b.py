@@ -139,8 +139,9 @@ SQLITE_SYNCHRONOUS_FULL = 2
 # automatic checkpoint runs on the committing thread, and against the 10x instance (542 MB) the
 # write-back blocks that thread for ~254 ms, which is what the f70d91c arm-runs show as a lag p99 of
 # 254 ms at every crossing with a 3 ms IQR. The deferred checkpoint is run once, after the measured
-# phase, by `sqlite_wal_record` (`PRAGMA wal_checkpoint(TRUNCATE)`), and the run record states the
-# policy, the WAL bytes it deferred and the checkpoint result. A probe with 1000 pages against 0 is
+# phase, by `sqlite_wal_record` (`PRAGMA wal_checkpoint(TRUNCATE)`, whose result is recorded beside
+# the `PASSIVE` row that names the frames it moved), and the run record states the policy, the WAL
+# bytes it deferred and both checkpoint rows. A probe with 1000 pages against 0 is
 # committed beside ticket 82's report (`runs/probe-checkpoint/`): the 254 ms stall follows the
 # setting, not the rung.
 SQLITE_WAL_AUTOCHECKPOINT_PAGES = 0
@@ -769,24 +770,61 @@ def sqlite_wal_record(arm: SqliteArm, db: Path) -> dict:
     every frame the run wrote, so the state the run measured is exactly the state the checkpoint
     then writes back. The checkpoint is the maintenance sqlite would otherwise have paid on its
     committing thread, so it is recorded (WAL bytes, result, files) rather than done silently.
+
+    The `TRUNCATE` row alone cannot evidence the move: on this build a successful truncating
+    checkpoint reports `(0, 0, 0)` because it reads the state AFTER the truncation, and an
+    already-empty WAL reports the same tuple. The deferred frames are therefore named first by a
+    `PASSIVE` checkpoint, whose `(busy, frames_in_wal, frames_moved)` is recorded beside the
+    `TRUNCATE` row, and the run stops unless that row shows every frame moved and the `TRUNCATE`
+    left no WAL behind.
     """
     observed = arm.observed_durability()
     before = _sqlite_files(db)
+    passive = None
     checkpoint = None
     if observed["wal_autocheckpoint_pages"] == 0:
+        arm.cur.execute("PRAGMA wal_checkpoint(PASSIVE)")
+        row = arm.cur.fetchone() or ()
+        passive = {"pragma": "wal_checkpoint(PASSIVE)",
+                   "result": [int(value) for value in row] if row else None,
+                   "at": "after the measured phase, before the TRUNCATE checkpoint"}
         arm.cur.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         row = arm.cur.fetchone() or ()
-        # sqlite returns (busy, log_frames_checkpointed, checkpointed_frames).
         checkpoint = {"pragma": "wal_checkpoint(TRUNCATE)",
                       "result": [int(value) for value in row] if row else None,
                       "at": "after the measured phase, before the oracle"}
     after = _sqlite_files(db)
+    if checkpoint is not None:
+        _require_deferred_write_back(before.get("wal", 0), passive, after)
     return {"autocheckpoint_pages": observed["wal_autocheckpoint_pages"],
             "journal_size_limit": observed["journal_size_limit"],
             "wal_bytes_after_run": before.get("wal", 0),
+            "passive_checkpoint": passive,
             "checkpoint": checkpoint,
             "files_after_checkpoint": after,
             "data_bytes_after_checkpoint": _db_bytes(db)}
+
+
+def _require_deferred_write_back(wal_bytes_after_run: int, passive: dict,
+                                files_after: dict) -> None:
+    """Stop unless the deferred frames provably moved from the WAL into the database.
+
+    `wal_bytes_after_run` says the WAL still held those bytes at the end of the measured phase. The
+    `PASSIVE` row must then name those frames and move all of them into the database with `busy = 0`
+    (this process is the only connection, so no reader can block a checkpoint), and the `TRUNCATE`
+    must leave no WAL file. Anything else is a state the record cannot describe, and a record that
+    cannot describe the write-back must not be written.
+    """
+    busy, frames_in_wal, frames_moved = (list(passive["result"] or ()) + [0, 0, 0])[:3]
+    if wal_bytes_after_run > 0 and (busy or frames_in_wal == 0 or frames_moved != frames_in_wal):
+        raise SqlArmError(
+            f"the deferred checkpoint did not move every WAL frame: wal_bytes_after_run="
+            f"{wal_bytes_after_run} but wal_checkpoint(PASSIVE) reported (busy, frames_in_wal,"
+            f" frames_moved) = ({busy}, {frames_in_wal}, {frames_moved})")
+    if files_after.get("wal", 0):
+        raise SqlArmError(
+            f"wal_checkpoint(TRUNCATE) left a WAL of {files_after['wal']} bytes; the record cannot"
+            f" claim the deferred write-back happened")
 
 
 # ---------------------------------------------------------------------------

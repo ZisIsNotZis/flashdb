@@ -144,6 +144,13 @@ def test_t6_reads_the_highest_common_offered_level_and_its_own_ceiling(tmp_path)
     assert t6["arithmetic"]["ratio_upper_bound_for_any_pair_at_a_common_level"] == 1.0526
     assert t6["verdict"] == "FAIL"
     assert "cannot exceed" in t6["defect"]
+    # The stated condition must SEPARATE the two quantities, because this run exercises the gap: the
+    # numerator is a median over whichever blocks sustained the level, while the "sustained in >= N of
+    # M blocks" rule governs `secondary_reading` only. A condition that gave the numerator that rule
+    # would make a reader recompute null where the code computes 1.0x.
+    assert "NUMERATOR" in t6["condition"] and "DENOMINATOR" in t6["condition"]
+    assert "`secondary_reading`" in t6["condition"]
+    assert "sustained in >= 1 of 2 blocks" in t6["condition"]
 
     # A baseline that sustained no level at all gives the pre-registered ratio no denominator: the
     # verdict is still FAIL, the denominator is null (never an invented number), and the secondary

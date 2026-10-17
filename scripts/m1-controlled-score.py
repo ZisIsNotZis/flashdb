@@ -462,10 +462,13 @@ def t6(aggregated: list[dict], blocks: int) -> dict:
                      " reach at least 3x the best baseline's sustained throughput under the same"
                      " latency rule",
         "condition": f"a level is common when every arm was OFFERED it (the pre-registration's"
-                     f" wording); at the highest such level, flashdb's median achieved rate over the"
-                     f" blocks it sustained it is compared with the best baseline's same quantity"
-                     f" (an arm sustaining the level in fewer than {required} of {blocks} blocks has"
-                     f" none, reported as null)",
+                     f" wording); at the highest such level the NUMERATOR is flashdb's median"
+                     f" achieved rate over the blocks it sustained that level in (null only when it"
+                     f" sustained none) and the DENOMINATOR is the best baseline's same quantity."
+                     f" Two quantities, two rules: this numerator asks only whether any block"
+                     f" sustained the level, while the stricter 'sustained in >= {required} of"
+                     f" {blocks} blocks' rule governs `secondary_reading` -- the ratio of each arm's"
+                     f" highest sustained LEVEL -- and never this ratio",
         "arithmetic": {
             "sustained_blocks_by_rung": {str(rung): counts
                                          for rung, counts in sustained_by_rung.items()},

@@ -358,6 +358,33 @@ def test_the_deferred_checkpoint_is_recorded_and_truncates_the_wal(tmp_path):
     assert record["checkpoint"]["pragma"] == "wal_checkpoint(TRUNCATE)"
     assert record["files_after_checkpoint"].get("wal", 0) == 0
     assert record["data_bytes_after_checkpoint"] >= 200 * 8
+    # A successful truncating checkpoint reports (0, 0, 0) on this build, so the frames it moved are
+    # named by the PASSIVE row recorded beside it -- the TRUNCATE row alone evidences nothing.
+    busy, frames_in_wal, frames_moved = record["passive_checkpoint"]["result"]
+    assert busy == 0
+    assert frames_in_wal > 0
+    assert frames_moved == frames_in_wal
+
+
+def test_the_deferred_write_back_is_refused_when_the_frames_were_not_moved():
+    """Negative control: a deferred write-back the record cannot evidence must stop the run.
+
+    The committed ticket-82 records show `wal_bytes_after_run` in the tens of MB beside a
+    `wal_checkpoint(TRUNCATE)` row of `(0, 0, 0)`, which on this sqlite build is exactly what a
+    SUCCESSFUL truncating checkpoint returns -- and also what an already-empty WAL returns. The
+    verdict on the write-back therefore rests on the PASSIVE row, and these cases are the ones it
+    must refuse.
+    """
+    unmoved = {"pragma": "wal_checkpoint(PASSIVE)", "result": [0, 0, 0]}
+    with pytest.raises(b0.SqlArmError, match="did not move every WAL frame"):
+        b0._require_deferred_write_back(17_703_672, unmoved, {"db": 1, "wal": 0})
+    partially = {"pragma": "wal_checkpoint(PASSIVE)", "result": [0, 4_321, 4_000]}
+    with pytest.raises(b0.SqlArmError, match="did not move every WAL frame"):
+        b0._require_deferred_write_back(17_703_672, partially, {"db": 1, "wal": 0})
+    with pytest.raises(b0.SqlArmError, match="left a WAL"):
+        b0._require_deferred_write_back(0, unmoved, {"db": 1, "wal": 512})
+    # An empty WAL is a state the record CAN describe: nothing was deferred, nothing had to move.
+    b0._require_deferred_write_back(0, unmoved, {"db": 1})
 
 
 def test_sqlite_seed_restores_measured_durability(tmp_path):

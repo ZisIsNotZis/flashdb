@@ -85,7 +85,9 @@ The f70d91c report's §9.2 named the 254 ms stall as a **checkpoint inference, n
 * **The deferred work is done and recorded, not dropped**: after the measured phase and before the
   oracle the arm runs `PRAGMA wal_checkpoint(TRUNCATE)`, and `sqlite_wal` records the WAL bytes it
   deferred (17.7 MB at 50 rps, 72.5 MB at 200 rps), the checkpoint's own result, and the footprint
-  after it. What moved is *when* the write-back happens (off the durable-commit path), not whether it
+  after it. That result tuple is `[0, 0, 0]`, which by itself cannot evidence the write-back on this
+  sqlite build — §9.11 names the limit and the code that fixes it for future runs. What moved is
+  *when* the write-back happens (off the durable-commit path), not whether it
   happens; a SQL arm's durability is unchanged, and the cost of the choice is the WAL and the memory it
   retains inside the 128 MiB cap (sqlite's serving peak rises to 98.7 MiB at 200 rps, §6).
 
@@ -98,7 +100,7 @@ The f70d91c report's §9.2 named the 254 ms stall as a **checkpoint inference, n
 | EPP (`energy_performance_preference`, all 8 CPUs) | `performance` at every boundary |
 | `scaling_cur_freq` | per-record median of the 8 cores **2,899,986-3,601,312 kHz** (median 3,600,010 kHz); per-core readings 0.4-3.6 GHz (an idle core drops even under EPP, which is why the record keeps all eight) |
 | `scaling_max_freq` | 3,600,000 kHz |
-| **governor name** | **`powersave`** — recorded and *not* trusted: on this intel_pstate platform the frequency is driven by EPP, so the governor's name contradicts the 3.6 GHz the cores actually ran at |
+| **governor name** | **`powersave`** — recorded and *not* trusted: on this intel_pstate platform the frequency is driven by EPP, so the governor's name contradicts the clock the boundaries did record (per-record median 2.90-3.60 GHz, this row above) |
 | load average (1 min, 8 cores) | **min 0.68, median 1.95, max 4.10** over 90 boundaries (ticket-80 run B's measured phase sat at 2.7-6.1; **f70d91c's measured phase was 0.32 / 0.80 / 2.02**) |
 | busiest processes seen | `python` (the arm), `MainThread`/`pi` (the agent runtime), `gnome-shell`, `ptyxis`, and **foreign work**: `35-vs2-bin`, `chrome-headless` (×2), `fwupdmgr`, `localsearch-ext`, `ps` |
 | `concurrent_work` records | **0** — but the detector's patterns (`cargo`, `rustc`, `flashdb-scale`, `seed-inventory`, `baseline_0b`) cannot see the foreign processes above, so this is *not* a claim that the box was idle (§9.6) |
@@ -107,8 +109,10 @@ The f70d91c report's §9.2 named the 254 ms stall as a **checkpoint inference, n
 **Read this beside the results.** This measured phase ran at **2.4x f70d91c's median load** (1.95 vs
 0.80) because other work streams were active on the same box: `35-vs2-bin` at 64-73% CPU and two
 `chrome-headless` processes at 26-55% appear in the boundaries around 00:10:01-00:12:36 (block 2's
-rung-50 and rung-200 crossings). The cores still ran at 3.6 GHz, the pairing is within-window, and no
-arm produced a request error — but the two `lag_ceiling` rejections flashdb took at 200 rps are one
+rung-50 and rung-200 crossings). The per-record median of the 8 cores was still 3.60 GHz (range
+2.90-3.60 GHz across the 90 boundaries; **in-run frequency was not sampled**, since machine state is
+read only at arm boundaries), the pairing is within-window, and no arm produced a request error — but
+the two `lag_ceiling` rejections flashdb took at 200 rps are one
 ~575 ms engine stall each (§9.5), and the same stall appears in the *quieter* f70d91c run, so the load
 is not what causes them.
 
@@ -153,7 +157,12 @@ service p99 as a multiple of the 9,821 us fsync floor):
 The absolute 10 ms ceiling stays the primary rule (§4-§6). The floor-adjusted column is what keeps a
 reading honest about *whose* latency it is: after the fixes, **no baseline's lag is anywhere near the
 device's own floor multiple** — sqlite sits at 0.8-2.9x the machine's scheduling floor and postgres at
-1.3-4.6x, while flashdb sits at 4.4-42.6x.
+1.3-4.6x, while flashdb sits at 4.4-42.6x. **Part of flashdb's multiple is its own client shape, and it
+changes no verdict:** `flashdb-load` executes each group **inline on the dispatching thread** and defers
+only the durable barrier, so group N's execution delays group N+1's dispatch and is scored as flashdb's
+schedule lag, while the SQL arms' commit worker never delays dispatch (§9.3). The largest group in this
+data was 8-9 requests (mean 1.000-1.017, §9.9), so the effect is bounded and no floor multiple above
+moves a verdict.
 
 ## 4. The decisive table — median and IQR across the 5 paired blocks
 
@@ -212,9 +221,11 @@ rejection: the window that carries a ~575 ms group (§9.5). Everything else sits
   **prong B carries the substance of this PASS**: flashdb held the 1x rung under the unified rule in
   every block, which is exactly what f70d91c's and ticket 80's runs failed to show.
 * **Not a latency claim.** At 50 rps flashdb's schedule lag p99 (1,038 us) and service p99 (109.8 ms)
-  are the **worst of the three arms** (sqlite 577 us / 21.8 ms; postgres 385 us / 14.0 ms). T5's
-  pre-registered metric is achieved throughput, so this is not a T5 failure — but no reading of this
-  run supports calling flashdb faster than either baseline at 50 rps.
+  are the **worst of the three arms** (sqlite 577 us / 21.8 ms; postgres 385 us / 14.0 ms) — and
+  flashdb's lag also carries its own inline group execution, which the SQL arms' dispatch does not
+  (§3, §9.3; the largest group was 8-9 requests, so no verdict changes). T5's pre-registered metric is
+  achieved throughput, so this is not a T5 failure — but no reading of this run supports calling flashdb
+  faster than either baseline at 50 rps.
 
 ### T6 — high-load superiority: **FAIL**
 
@@ -227,7 +238,10 @@ rejection: the window that carries a ~575 ms group (§9.5). Everything else sits
 * **Sustained blocks at 200 rps:** flashdb **3 of 5**, sqlite **5 of 5**, postgres **5 of 5**.
 * **Arithmetic:** flashdb's sustained throughput at 200 rps = **200.00 rps** (median over the 3 blocks
   it sustained); the best baseline's = **200.00 rps** (sqlite, 5/5). Ratio **1.00x** against the
-  required 3x. **FAIL.**
+  required 3x. **FAIL.** These two numerators are *medians over whatever blocks each arm sustained*;
+  the stricter "sustained in ≥4 of 5 blocks" rule governs the **secondary level reading** below, not
+  this numerator (flashdb's 200 rps median therefore exists at 3/5 while its sustained *level* is
+  100 rps). `report.json` states the same separation.
 * **The gate cannot be passed by measurement, for any engine.** `summarize_curve` bounds every arm's
   achieved rate by the offered rate, and an arm that sustains a level is within 5% of it, so two arms
   that both sustain a common offered level differ by at most 5% and the ratio is confined to
@@ -242,8 +256,13 @@ rejection: the window that carries a ~575 ms group (§9.5). Everything else sits
 * **Smallest fix (named, not applied — it changes the pre-registration):** add rungs **below** the
   50 rps floor (10 and 25 rps) so each baseline's sustained level exists, then read the ratio of the
   highest sustained *levels* rather than of achieved throughput at a common offered level. Cost: 2
-  rungs x 3 arms x ~40 s. The other named limit is the footprint regime (§7): only flashdb ran inside
-  the pre-registered ≥10x floor.
+  rungs x 3 arms x ~40 s. The other named limit is the footprint regime (§7), and it is **sqlite's
+  alone**: sqlite ran at **4.04x**, below the pre-registered ≥10x floor, while postgres's data
+  directory is **16.40x** (§7) and postgres sustained 200 rps **5 of 5**. So footprint cannot excuse
+  this FAIL for the postgres leg: a baseline serving an instance inside the pre-registered regime held
+  the same rate as flashdb. What the regime does limit is the **sqlite** leg, whose 5/5 is a reading at
+  a less demanding physical size — that cuts against reading sqlite's sustainment as impressive, and it
+  changes no verdict.
 
 ### T7 — initial-policy quality: **PASS**
 
@@ -330,7 +349,9 @@ directory already clears it) and re-run the three arms — a change of dataset s
    exceed 1.0526 for any pair of arms at one scored level.
 2. **Any claim that flashdb is faster than the baselines at any rung of this ladder.** After the fixes,
    its schedule-lag p99 is the **worst** of the three at every rung, its service p99 is the worst at
-   every rung, and it is the only arm that fails to sustain a rung. What the run supports is
+   every rung, and it is the only arm that fails to sustain a rung (flashdb's lag also carries its own
+   inline group execution, which the SQL arms' dispatch does not — §3, §9.3; at most 8-9 requests per
+   group in this data, so the comparison stands and no verdict changes). What the run supports is
    non-inferiority at the declared 1x rung in achieved throughput (T5), and that flashdb serves a
    12.5x instance from half of its memory budget.
 3. **Any claim that flashdb meets a per-request latency SLO.** Its schedule lag is inside the
@@ -363,8 +384,14 @@ directory already clears it) and re-run the three arms — a change of dataset s
    both variants, which is what the A/B needs; its absolute numbers are therefore a *heavier* state than
    the measured phase's.
 3. **The pacer asymmetry is fixed** (§1.1), not just disclosed: the SQL arms now dispatch on the
-   schedule and let a worker commit, exactly as `flashdb-load` does, with the same one-commit-per-group
-   durability and the same batch cap. Its effect is the whole of this report's difference from f70d91c:
+   schedule and let a worker commit, in `flashdb-load`'s open-loop shape, with the same
+   one-commit-per-group durability and the same batch cap. Two residual client differences survive, and
+   both count *against* flashdb rather than for it: group execution stays **inline on flashdb's
+   dispatching thread** (so group N's execution delays group N+1's dispatch and is scored as flashdb's
+   schedule lag, §3), and `flashdb-load` bounds in-flight barriers at 64 (`engine/src/engine.rs`)
+   while the SQL ready queue is unbounded. Neither is exercised in this data — the largest group was
+   8-9 requests (§9.9), far below the 64 cap — so no verdict reads on them. Its effect is the whole of
+   this report's difference from f70d91c:
    the SQL arms' lag p99 fell from ~254 ms / 13-22 ms to 0.03-2.5 ms, and the baselines now sustain
    every rung.
 4. **The floors differ by load state** (loadavg 2.76 before, 1.22 after) and the `before` floor's fsync
@@ -389,8 +416,9 @@ directory already clears it) and re-run the three arms — a change of dataset s
    boundaries list foreign processes — `35-vs2-bin` at 64-73% CPU and two `chrome-headless` at 26-55%
    — around 00:10-00:12:36. `CONCURRENT_WORK_PATTERNS` does not include them, so `concurrent_work`
    stayed empty; the detector is a build/seed/second-harness check, **not** a claim of an idle box, and
-   this report does not make that claim. The cores ran at 3.6 GHz throughout, the pairing is
-   within-window, and the arms' ordering was rotated; **smallest fix:** add the process names of the
+   this report does not make that claim. The cores' per-record median at the 90 boundaries was 3.60 GHz
+   (range 2.90-3.60 GHz) and **in-run frequency was not sampled**, the pairing is within-window, and the
+   arms' ordering was rotated; **smallest fix:** add the process names of the
    other work streams (`*-bin`, `chrome-headless`, the agent runner) to `CONCURRENT_WORK_PATTERNS`, so a
    future phase stops instead of recording them.
 7. **The aborted first attempt, and what it cost.** The first launch (20:46, superseded) ran the setup
@@ -415,6 +443,32 @@ directory already clears it) and re-run the three arms — a change of dataset s
     level"; that rule produced the empty denominator and the "extend the ladder above" fix. Both are
     corrected in `scripts/m1-controlled-score.py`: the check is the registered one, and the named
     smallest fix is now rungs **below** the floor (§5, T6).
+11. **The sqlite checkpoint tuple in this run's records is reachable but uninformative.** Every sqlite
+    record states `wal_bytes_after_run` (17.7 MB at 50 rps, 72.5 MB at 200 rps) and then
+    `checkpoint.result = [0, 0, 0]` with the WAL at 0 bytes afterwards. `[0, 0, 0]` is not an
+    unreachable state: on this build (sqlite 3.53.4, the harness' own) a **fully successful**
+    `wal_checkpoint(TRUNCATE)` returns exactly that tuple, because it reports the post-truncation
+    state. That is bound by a committed test rather than by this paragraph:
+    `test_the_deferred_checkpoint_is_recorded_and_truncates_the_wal` runs the two pragmas on a real
+    WAL of deferred commits and asserts that the `PASSIVE` row reports the frames it moves
+    (`frames_in_wal > 0`, `frames_moved == frames_in_wal`, `busy = 0`) while the `TRUNCATE` row that
+    follows is `(0, 0, 0)` with no WAL left.
+    The limitation is the converse: a WAL that was already empty returns the same tuple, so the record
+    alone does not prove that 17.7-72.5 MB of deferred frames moved into the database. What does
+    evidence it is on the record: the WAL is **0 bytes after** the checkpoint, the data file is
+    541,986,816 B at 50 rps (restored 541,876,224 B, +27 pages) and 542,330,880 B at 200 rps, so the
+    `4.039x` footprint is the post-checkpoint size and not an uncheckpointed WAL, and block 1's
+    sqlite oracle passed **12 checks on that same post-checkpoint database**, which reads the run's
+    own writes back (blocks 2-5 DEFERRED, §9.1). Durability is unaffected under either reading (the
+    frames are fsynced in the WAL before the checkpoint and in the database after it) and no verdict
+    depends on it. **Fixed in the code, not in this run's records:** `sqlite_wal_record` now runs
+    `PRAGMA wal_checkpoint(PASSIVE)` first and records its `(busy, frames_in_wal, frames_moved)`
+    beside the `TRUNCATE` result, and stops the run unless the `PASSIVE` checkpoint moved every frame
+    with `busy = 0` and the `TRUNCATE` left no WAL — bound by
+    `test_the_deferred_checkpoint_is_recorded_and_truncates_the_wal` and, for the refusal path,
+    `test_the_deferred_write_back_is_refused_when_the_frames_were_not_moved`.
+    The 15 sqlite records committed here predate that, so they keep the uninformative tuple: no record
+    was edited and no tuple was invented.
 
 ## 10. Reproduce
 

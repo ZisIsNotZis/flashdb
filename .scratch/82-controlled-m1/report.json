@@ -4437,7 +4437,7 @@
           "sqlite": 200.0
         }
       },
-      "condition": "a level is common when every arm was OFFERED it (the pre-registration's wording); at the highest such level, flashdb's median achieved rate over the blocks it sustained it is compared with the best baseline's same quantity (an arm sustaining the level in fewer than 4 of 5 blocks has none, reported as null)",
+      "condition": "a level is common when every arm was OFFERED it (the pre-registration's wording); at the highest such level the NUMERATOR is flashdb's median achieved rate over the blocks it sustained that level in (null only when it sustained none) and the DENOMINATOR is the best baseline's same quantity. Two quantities, two rules: this numerator asks only whether any block sustained the level, while the stricter 'sustained in >= 4 of 5 blocks' rule governs `secondary_reading` -- the ratio of each arm's highest sustained LEVEL -- and never this ratio",
       "defect": "at 200 rps flashdb sustained 200.0 rps and the best baseline (sqlite) sustained 200.0 rps: 1.0x against the required 3.0x -- and by construction: an achieved rate is bounded by the offered rate, so two arms that both sustain a common offered level differ by at most 0.0526 and the ratio cannot exceed 1.0526",
       "fix": "add rungs BELOW the 50 rps floor so each baseline's sustained level exists, then read the ratio of the highest sustained LEVELS; the pre-registered throughput ratio at a common offered level is bounded by 1/SUSTAINED_TOLERANCE for any pair of arms and cannot reach 3x. Both are pre-registration changes and neither is made here",
       "secondary_reading": {
