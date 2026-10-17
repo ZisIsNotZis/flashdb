@@ -1,0 +1,104 @@
+{
+  "arm": "sqlite",
+  "arm_scope_peak_bytes": 36196352,
+  "arm_scope_peak_scope": "this process's capped scope over the whole arm step (bulk load + measured phase)",
+  "batch": 64,
+  "counters": {
+    "backorder": 0,
+    "errors": 0,
+    "first_error": null,
+    "miss": 0,
+    "take": 2785
+  },
+  "curve": [
+    {
+      "achieved_fraction": 1.0,
+      "achieved_rps": 200.0,
+      "ceiling_rejected_windows": 2,
+      "compact_bytes": 0,
+      "early_dispatches": 0,
+      "error_windows": 0,
+      "group_elapsed_us": 0,
+      "groups": 3909,
+      "groups_over_service_ceiling": 0,
+      "invalid_windows": 2,
+      "lag_ceiling_rejected_windows": 2,
+      "lag_p50_us": 45.0,
+      "lag_p95_us": 220811,
+      "lag_p99_us": 260811,
+      "max_group_size": 54,
+      "mean_group_size": 1.0232796111537477,
+      "min_lag_us": 0,
+      "offered_rps": 200.0,
+      "p50_us": 1607.5,
+      "p95_us": 229237,
+      "p99_us": 11136,
+      "rate_exceeded": false,
+      "reject_reasons": {
+        "lag_ceiling": 2
+      },
+      "service_ceiling_rejected_windows": 0,
+      "sustained": false,
+      "valid_windows": 18,
+      "windows": 20
+    }
+  ],
+  "data_bytes": 546512568,
+  "durability": "sqlite WAL + synchronous=FULL, one COMMIT per batch",
+  "durability_observed": {
+    "journal_mode": "wal",
+    "synchronous": 2,
+    "synchronous_name": "FULL"
+  },
+  "elapsed_s": 19.995080010000002,
+  "engine_cap_mib": 128,
+  "engine_memory": {
+    "method": "sampled memory.current every 50 ms",
+    "peak_bytes": 36089856,
+    "samples": 397,
+    "scope": "measured phase",
+    "start_bytes": 21692416
+  },
+  "groups": 3909,
+  "instance_root": "/home/z/vibe/flashdb/.scratch/82-controlled-m1/runs/live",
+  "lag_ceiling_us": 10000,
+  "max_group_size": 54,
+  "mean_group_size": 1.0232796111537477,
+  "oracle": {
+    "checks": [],
+    "reason": "--skip-oracle: the restored instance is byte-identical in every block, so the inventory is verified once per arm",
+    "status": "DEFERRED"
+  },
+  "requests_run": 4000,
+  "restore": {
+    "arm": "sqlite",
+    "at": "2026-10-17T23:19:51",
+    "bytes": 541876224,
+    "files": 1,
+    "from": "/home/z/vibe/flashdb/.scratch/82-controlled-m1/runs/snapshot/sqlite.db",
+    "restore_s": 1.494,
+    "sha256": "46c6f1e1e2a149f8e55bb4f29a39b2ca57a53d1a50daa0ae5a3e30c2d4367130",
+    "snapshot_sha256": "46c6f1e1e2a149f8e55bb4f29a39b2ca57a53d1a50daa0ae5a3e30c2d4367130",
+    "to": "/home/z/vibe/flashdb/.scratch/82-controlled-m1/runs/live/sqlite.db",
+    "verified": true
+  },
+  "restored": true,
+  "seed_s": 0.0,
+  "sqlite_cache_kib": 8192,
+  "sqlite_files": {
+    "db": 542322688,
+    "shm": 32768,
+    "wal": 4157112
+  },
+  "trace_sha256": "6472cf46477e037b67820a4fa5a7da9d46e1241e6d8d33f89e10f89b22b8f93f",
+  "verdict": {
+    "highest_sustained_rps": 0.0,
+    "reject_reasons": {
+      "lag_ceiling": 2
+    },
+    "rejected_windows": 2,
+    "sustained": false
+  },
+  "window_ms": 1000,
+  "windows_file": "windows-sqlite.jsonl"
+}

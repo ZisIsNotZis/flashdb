@@ -341,3 +341,126 @@ def test_flashdb_oracle_negative_controls_on_the_committed_counters(overrides, e
     with pytest.raises(b0.OracleViolation, match=expected):
         b0.oracle_flashdb(_replayed(), FLASHDB_ORACLE_MANIFEST,
                           _flashdb_oracle_counters(**overrides), FLASHDB_ORACLE_INITIAL)
+
+
+# ---------------------------------------------------------------------------
+# Ticket 82's controlled protocol: the pre-load snapshot, the device floor, the machine state and
+# the scorer's arithmetic. Each test binds one thing the controlled run's evidence depends on.
+# ---------------------------------------------------------------------------
+def test_instance_snapshot_round_trip_is_byte_identical_and_detects_a_changed_snapshot(tmp_path):
+    """A restore succeeds only on the bytes the snapshot recorded (ticket 82's stop condition)."""
+    live_root = tmp_path / "live"
+    instance = live_root / "instance-flashdb-declared"
+    instance.mkdir(parents=True)
+    (instance / "manifest").write_bytes(b"manifest-bytes")
+    (instance / "tile-1.tile").write_bytes(b"tile-bytes")
+    snapshot_dir = tmp_path / "snapshot"
+    snap = b0.snapshot_instance("flashdb-declared", tmp_path, snapshot_dir, live_root)
+    digest, total, files = b0.tree_sha256(instance)
+    assert (snap["sha256"], snap["bytes"], snap["files"]) == (digest, total, files)
+
+    # Serving the trace mutates the live instance; a restore has to put the seeded bytes back.
+    (instance / "tile-1.tile").write_bytes(b"changed by the measured load")
+    (instance / "wal").write_bytes(b"new file")
+    state = b0.restore_instance("flashdb-declared", tmp_path, snapshot_dir, live_root)
+    assert state["verified"] is True
+    assert b0.tree_sha256(instance)[0] == digest
+    assert not (instance / "wal").exists()
+
+    # The snapshot is the reference, so a snapshot whose bytes changed must stop the run instead of
+    # quietly measuring a different state.
+    (snapshot_dir / "flashdb-declared" / "tile-1.tile").write_bytes(b"tampered")
+    with pytest.raises(SystemExit, match="does NOT reproduce the seeded state"):
+        b0.restore_instance("flashdb-declared", tmp_path, snapshot_dir, live_root)
+
+
+def test_sqlite_snapshot_is_a_single_file_and_restores(tmp_path):
+    """sqlite's instance is one file; its `-wal`/`-shm` sidecars are not part of the snapshot."""
+    db = b0.instance_path("sqlite", tmp_path, tmp_path / "live")
+    db.parent.mkdir(parents=True)
+    db.write_bytes(b"SQLite format 3\x00" + b"x" * 100)
+    (Path(f"{db}-wal")).write_bytes(b"wal")
+    snap = b0.snapshot_instance("sqlite", tmp_path, tmp_path / "snapshot", tmp_path / "live")
+    assert snap["files"] == 1
+    b0.restore_instance("sqlite", tmp_path, tmp_path / "snapshot", tmp_path / "live")
+    assert db.read_bytes().startswith(b"SQLite format 3")
+    assert not Path(f"{db}-wal").exists()
+
+
+def test_instance_path_names_the_instance_of_each_arm(tmp_path):
+    live = tmp_path / "live"
+    assert b0.instance_path("flashdb-declared", tmp_path, live) == live / "instance-flashdb-declared"
+    assert b0.instance_path("sqlite", tmp_path, live) == live / "sqlite.db"
+    assert b0.instance_path("sqlite", tmp_path) == tmp_path / "sqlite.db"
+    assert b0.instance_path("postgres", tmp_path, live).name == "data"
+
+
+def test_prepare_reuses_the_frozen_seed_trace_by_link_and_records_its_digest(tmp_path):
+    """Every rung and block of a controlled run must be seeded from one frozen dataset."""
+    frozen = tmp_path / "frozen-seed.jsonl"
+    frozen.write_text('{"block":"seed-00000000","docs":[]}\n', encoding="utf-8")
+    manifest = {"n_customers": 1, "n_sku": 1, "n_loc": 1, "seed": 1}
+    record = b0.prepare_seed_trace(tmp_path / "seed.jsonl", manifest, str(frozen))
+    assert record["method"] == "hard link"
+    assert record["sha256"] == b0.file_sha256(frozen)
+    assert b0.file_sha256(tmp_path / "seed.jsonl") == record["sha256"]
+    assert (tmp_path / "seed.jsonl").read_text() == frozen.read_text()
+
+    regenerated = b0.prepare_seed_trace(tmp_path / "seed.jsonl", manifest, None)
+    assert regenerated["method"] == "generate"
+    assert regenerated["bytes"] > 0
+
+
+def test_device_floor_runs_the_arms_pacer_with_no_engine(tmp_path):
+    """The floor is measured by the same pacer and window rule as the arms, with no engine."""
+    manifest = {"segments": [{"offered_rate": 100, "count": 40}], "total_requests": 40}
+    due, rates = b0.build_schedule(manifest)
+    for bench in ("idle", "fsync"):
+        paced = b0.run_floor_bench(bench, due, rates, b0.DEFAULT_BATCH, 200, tmp_path / f"{bench}.dat")
+        assert paced["requests_run"] == 40
+        assert paced["counters"]["errors"] == 0
+        row = paced["curve"][0]
+        assert row["offered_rps"] == 100
+        assert row["windows"] >= 1
+        # The fsync bench pays a durable commit per request, so its service latency is the device's.
+        if bench == "fsync":
+            assert row["p99_us"] >= row["lag_p99_us"] >= 0
+            assert (tmp_path / "fsync.dat").stat().st_size == 40 * len(
+                json.dumps({"bench": "fsync", "record": "x" * 256}).encode())
+        else:
+            assert row["p99_us"] >= 0
+
+
+def test_machine_state_records_the_fields_the_lag_rule_depends_on():
+    state = b0.machine_state()
+    for key in ("ac_online", "power_profile", "governor", "epp", "scaling_cur_freq_khz",
+                "loadavg", "nproc", "top_cpu", "concurrent_work"):
+        assert key in state
+    # The governor NAME is not the frequency state on this platform, so the state carries the EPP
+    # hint and the effective frequency beside it rather than relying on that one word.
+    assert isinstance(state["epp"], list) and state["epp"]
+    assert isinstance(state["scaling_cur_freq_khz"], list) and state["scaling_cur_freq_khz"]
+    assert state["governor"] is not None
+    assert not state["concurrent_work"], state["concurrent_work"]
+
+
+def test_the_arm_step_passes_every_keyword_its_arm_builders_accept():
+    """`cmd_arm`'s calls and the arm builders' signatures must agree.
+
+    This is a structural check because the failure it catches is structural: the postgres arm step
+    was written to pass `verify`/`restored`/`database` while `run_postgres_arm` accepted neither
+    some of them, and the TypeError surfaced only after a 7-minute seed and a 2.2 GB restore, halfway
+    through the first measured block. The keyword sets are asserted here instead.
+    """
+    import inspect
+
+    for function, required in (
+        (b0.run_postgres_arm, {"restored", "database", "verify", "engine_cap_mib"}),
+        (b0.run_flashdb_load, {"engine_cap_mib", "instance_root", "batch", "window_ms"}),
+        (b0.run_flashdb_arm, {"engine_cap_mib", "seed_cap_mib"}),
+        (b0.seed_flashdb_instance, {"seed_cap_mib", "instance_root"}),
+        (b0.seed_sqlite_instance, {"instance_root", "cache_kib"}),
+    ):
+        params = set(inspect.signature(function).parameters)
+        missing = required - params
+        assert not missing, f"{function.__name__} does not accept {sorted(missing)}"

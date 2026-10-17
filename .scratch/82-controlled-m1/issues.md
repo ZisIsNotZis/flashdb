@@ -1,5 +1,15 @@
 # 82 - controlled T5/T6/T7 verdict on the low-spec laptop (M1, decidable)
 
+## Status: measured, decidable
+
+5 paired blocks x rungs 50/100/200 x 3 arms at 12.546x of the 128 MiB cap, on AC / power profile
+`performance` / EPP `performance` / 3.6 GHz, with a 0.2 ms machine lag floor and a 9.8 ms device
+fsync floor. **T5 PASS** (deficit 1.001 against 1.5x; flashdb sustained 50 rps in 5/5 blocks),
+**T7 PASS**, **T6 FAIL** (no baseline sustained any rung, so the pre-registered 3x has no
+denominator). flashdb-declared also held 100 rps in 5/5 and 200 rps in 4/5. The verdicts, the
+per-metric defects and their smallest fixes are in `report.md`; the machine-readable document is
+`report.json`; the raw evidence is `runs/`.
+
 ## Objective
 
 Make T5/T6/T7 decidable at the pre-registered >=10x regime on the available machine (Intel i5-8350U,
