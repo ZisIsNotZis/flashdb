@@ -231,3 +231,128 @@ engines, sqlite file, driver logs) out of git.
   (service p99 9-26 ms across runs), so postgres is likely to be the first arm rejected by the 10 ms
   lag rule at a higher rung. That is a property of the disclosed minimal config, not a defect in the
   harness, and it must be reported rather than tuned away.
+
+## Measurement record (WP1.4): the ladder, the memory boundary, and the regime gap
+
+Authored by the measurement worker on `wave/m1-baselines`. No pre-registered threshold was changed,
+no engine code was touched, nothing was pushed. The report and its raw JSON are
+`.scratch/80-external-baselines/report.md` and `report.json`; the raw run evidence is under
+`runs/m1-measure/` (the ladder) and `runs/m1-10x/` (the regime run).
+
+### The measured memory boundary (a method change, recorded here)
+
+The first ladder attempt put the harness AND the engine inside one 128 MiB scope per arm and
+OOM-killed the flashdb arms at the pre-registered rung sizes: the instrument (the parsed trace, the
+read-back verification) was spending the engine's budget. The boundary is now stated explicitly, in
+the shape the published T1-T4 runs already used (`cold_0b` ran `flashdb-load` under the cap and the
+Python harness outside it):
+
+| arm | what the 128 MiB cap covers | engine-side memory control |
+|---|---|---|
+| flashdb-declared / flashdb-learned | `flashdb-load` only, in its own `systemd-run --scope` cgroup; the harness, the pacer and the read-back are outside it | the cgroup cap; the instance is built under a separate 192 MiB construction cap (slice 51's measured convention: seeding peaks ~500 B/doc, serving ~75 MiB) |
+| sqlite | the whole arm process, because sqlite's engine is EMBEDDED in it (driver + pacer + engine share the cgroup) | `PRAGMA cache_size = -8192` (8 MiB) states the engine's own page cache; both the pragma and the process cap are recorded per run |
+| postgres | the server process tree only, in its own named scope (`m1-pg-postgres-<pid>.scope`); the client stays outside | the cgroup cap plus the disclosed minimal config (`shared_buffers=16MB`, `fsync=on`, `synchronous_commit=on`), echoed from the server's own `SHOW` in every run record |
+
+A consequence worth stating: postgres's data directory moved from `/tmp` (tmpfs, where `fsync` is a
+no-op, and where its pages were charged to the client's cgroup) to `/var/tmp/m1-pg` (ext4), so its
+durability setting is real and its memory is its own.
+
+### Seeding is setup, not workload
+
+Seeding was rewritten so that it cannot be mistaken for the measured path: dimension rows are
+STREAMED (they were materialised as Python lists, which is why a 10^5-row instance could not fit the
+cgroup), loaded in ONE transaction per arm, and sqlite's seed runs with
+`journal_mode=MEMORY`/`synchronous=OFF` before the arm restores `journal_mode=WAL`/`synchronous=FULL`
+for every request it measures. Measured effect: the 220k-row sqlite seed went from >4m30s (one
+durable commit per row) to 5.2 s. Postgres seeds in one transaction, which psycopg 3 pipelines.
+`seed_s` and the construction scope's own peak are recorded on every arm.
+
+### Verification is verification, not workload
+
+The flashdb read-back (`build_probe_trace` + `flashdb-replay` + `oracle_flashdb`) is now a separate
+`verify` step that runs after the measured arm and outside the engine's cgroup, with the same checks
+and the same fail-loud behaviour. It was also made streaming on both sides (the probe file is written
+as it is generated; the replay's stdout is consumed line by line), and its probes are ordered
+movements -> customers -> cells so a per-cell check can be folded and released as its cell arrives.
+Memory is now proportional to the trace, not to the dataset. For sqlite/postgres the oracle stays in
+the arm (it is a handful of SQL statements) but gains a `(sku, loc)` index on `stock_movement`
+created AFTER the replay ends, so the verification's cost is not the product of cells and movements
+and cannot lengthen the measured path.
+
+Evidence for the moment this was needed: an in-scope read-back peaked at ~1.4 KB of cgroup memory
+per verified cell (45k probes reached 127 MiB of 128 MiB), and the replay runs at 1.7k-10.7k
+probes/s, so a 10^7-cell read-back is 16 min-1.6 h of verification per flashdb arm.
+
+### The ladder (harness check) — PROVISIONAL regime
+
+`scripts/m1-ladder-run.sh` runs `50 x [1,2,4,8]` rps, 20 s of offered load per rung, all four arms,
+one process at a time under `flock /tmp/m1-measure.lock`, each engine in its own capped scope, with
+the machine's load average recorded before and after every rung. The instance is
+`customers=30000, skus=30000, locs=4` (120k cells + 30k customers = 150k docs; flashdb 18.7 MB,
+sqlite 11.8 MB, postgres 21.2 MB). That is 0.09-0.16x of the 128 MiB cap, i.e. NOT the
+pre-registered >=10x regime; every number from it is PROVISIONAL and is reported as a harness check,
+never as the T5/T6/T7 verdict.
+
+### The regime gap, with the numbers that establish it
+
+The pre-registered floor is data >= 10x the memory budget = 1.28 GiB at the 128 MiB cap. The
+committed instrument could not reach it, and the reasons are measured, not argued:
+
+1. In-scope verification cost: ~1.4 KB of cgroup memory per verified cell and 1.7k-10.7k probes/s.
+   At 10.8M cells that is 16 min-1.6 h per flashdb arm-run and 2.4 GB of Python dicts if the oracle
+   keeps per-cell state (both addressed by the streaming read-back above, the time is not).
+2. In-scope trace parse: ~7 KB of Python objects per request, so a long trace is a memory decision
+   about the harness (fixed by streaming the trace).
+3. Construction memory: `flashdb-scale seed-inventory` peaks ~500 B/doc in the memtable, so the
+   dataset must be BUILT under a larger transient cap (192 MiB) than the one it is served under
+   (128 MiB) — the same two-cap convention slice 51 published.
+4. SQL oracle complexity: the per-cell arithmetic is O(cells x movements) without a `(sku, loc)`
+   index (fixed above by the post-hoc verification index).
+
+### Files changed by this work package
+
+| file | change |
+|---|---|
+| `harness/flashdb_harness/baseline_0b.py` | streamed dimension rows and seeding transaction; `scoped_command` (engine in its own cap); `verify` step; streamed trace and read-back; sqlite `cache_size`; per-arm `data_bytes`, `seed_s`, `seed_peak_bytes`, `engine_cap_mib` |
+| `scripts/m1-baseline-run.sh` | per-arm engine boundaries (flashdb engine scope, sqlite process scope, postgres server scope), `--skip-verify`, postgres peak patched from the server's own cgroup |
+| `scripts/m1-ladder-run.sh` | the ladder runner (rungs, per-rung trace, load-average boundaries) |
+| `scripts/m1-ladder-score.py` | T5/T6/T7, footprint and regime arithmetic from the raw run records |
+
+### The regime run (the pre-registered 1x rung at >=10x)
+
+`runs/m1-10x/rung-50/`: 200,000 customers, 2.65M skus x 4 locs = 10.6M stock cells (10.8M docs),
+one frozen trace of 1,000 requests offered at 50 rps (`sha256 859b99a1…`), seed 42, theta 1.0, B=64,
+one process at a time, each engine in its own 128 MiB cgroup.
+
+| arm | achieved rps | lag p99 us | service p99 us | rejected windows | sustained | engine cgroup peak | data bytes (x cap) | oracle |
+|---|---|---|---|---|---|---|---|---|
+| flashdb-declared | 49.95 | 12,470 | 24,900 | 1 (lag_ceiling, window 8) | no | 128 MiB (at cap) | 1,683,903,919 (12.55x) | **DEFERRED** (see below) |
+| sqlite | 50.00 | 6,120 | 25,909 | 0 | yes | 128 MiB (at cap) | 546,160,216 (4.07x) | PASS (12 checks) |
+| postgres | 50.00 | 2,199 | 22,004 | 0 | yes | 128 MiB (at cap) | 1,103,779,519 (8.22x) | PASS (12 checks) |
+
+- **T5 at the regime: PASS.** flashdb-declared 49.95 rps against the slower baseline's 50.00 → deficit
+  1.001 against the pre-registered 1.5x requirement (2x is the fail line). **T7: PASS** (the declared
+  arm is the one measured; `flashdb-learned` is the same wiring in M1 and was not run at 10x).
+- **The caveat the number does not carry on its own:** both baselines sustain the rung with zero
+  rejected windows while flashdb-declared fails the sustained rule on one window of twenty. Under the
+  validity rule ("throughput from invalid windows is not counted") the flashdb arm has no sustained
+  level at this rung; its *achieved* rate is identical. One seed, one rung: a second seed would decide
+  whether the miss is the engine or the machine.
+- **T6 at the regime: UNVERIFIED.** It needs a ladder at 10x; measured costs make that impossible in
+  this package's 3 h cap — flashdb seeding 353.7 s per arm-run (the seed also reached its 512 MiB
+  construction cap), the read-back 16 min-1.6 h at 10.6M cells, and postgres seeding 650.1 s per
+  arm-run. Four rungs x four arms is ~8 h of measured cost, not an opinion.
+- **flashdb's read-back at 10x is DEFERRED and this is the one acceptance criterion the regime run
+  misses.** The arm is measured; its inventory verification was not run because at 10.6M cells it costs
+  16 min-1.6 h per arm even after the streaming rewrite. The same oracle passes on the same code at
+  0.14x (11 checks) and on the SQL arms at 10x (12 checks each).
+
+### Verification cost fixes made for this run
+
+The read-back was the run's dominant cost and is now bounded: the SQL oracle's per-cell arithmetic is
+one `GROUP BY` aggregate joined to `stock` (a correlated subquery per stock row took tens of minutes at
+10.6M cells and was observed live in `pg_stat_activity`), the cell scan is a streamed cursor rather
+than `fetchall`, sqlite's bulk load uses `journal_mode=OFF` (a `MEMORY` journal at 10^7 rows is the
+whole database in RAM: the first 10x sqlite attempt died with rc=137 at the 128 MiB cap), and flashdb's
+verification streams both the probe file and `flashdb-replay`'s stdout. The `(sku, loc)` verification
+index is created after the measured replay ends, so it cannot lengthen the measured path.

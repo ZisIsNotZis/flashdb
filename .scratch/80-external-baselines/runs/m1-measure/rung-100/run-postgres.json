@@ -1,0 +1,150 @@
+{
+  "arm": "postgres",
+  "batch": 64,
+  "cgroup_peak_bytes": 77303808,
+  "counters": {
+    "backorder": 0,
+    "errors": 0,
+    "first_error": null,
+    "miss": 0,
+    "take": 1366
+  },
+  "curve": [
+    {
+      "achieved_fraction": 1.0,
+      "achieved_rps": 100.0,
+      "ceiling_rejected_windows": 1,
+      "compact_bytes": 0,
+      "early_dispatches": 0,
+      "error_windows": 0,
+      "group_elapsed_us": 0,
+      "groups": 1994,
+      "groups_over_service_ceiling": 0,
+      "invalid_windows": 1,
+      "lag_ceiling_rejected_windows": 1,
+      "lag_p50_us": 106.5,
+      "lag_p95_us": 12205,
+      "lag_p99_us": 24426,
+      "max_group_size": 3,
+      "mean_group_size": 1.0030090270812437,
+      "min_lag_us": 0,
+      "offered_rps": 100.0,
+      "p50_us": 5175.5,
+      "p95_us": 33929,
+      "p99_us": 9996,
+      "rate_exceeded": false,
+      "reject_reasons": {
+        "lag_ceiling": 1
+      },
+      "service_ceiling_rejected_windows": 0,
+      "sustained": false,
+      "valid_windows": 19,
+      "windows": 20
+    }
+  ],
+  "data_bytes": 21452479,
+  "durability": "postgres fsync=on + synchronous_commit=on (baseline-env.sh), one COMMIT per batch",
+  "elapsed_s": 19.995899480000002,
+  "engine_peak_source": "postgres server scope (patched by the runner payload)",
+  "groups": 1994,
+  "lag_ceiling_us": 10000,
+  "max_group_size": 3,
+  "mean_group_size": 1.0030090270812437,
+  "oracle": {
+    "checks": [
+      {
+        "check": "cell_count",
+        "detail": "120000 stock cells, expected 120000 (30000 sku x 4 loc)",
+        "ok": true,
+        "subjects": 1
+      },
+      {
+        "check": "on_hand_matches_movements",
+        "detail": "stock(S000012,L003).on_hand=1000000, initial 1000000 + sum(delta) 0 = 1000000",
+        "ok": true,
+        "subjects": 120000
+      },
+      {
+        "check": "on_hand_non_negative",
+        "detail": "stock(S000012,L003).on_hand=1000000",
+        "ok": true,
+        "subjects": 120000
+      },
+      {
+        "check": "no_duplicate_order_no",
+        "detail": "0 order numbers appear in both/again: []",
+        "ok": true,
+        "subjects": 1
+      },
+      {
+        "check": "movement_count_is_committed_takes",
+        "detail": "1366 movements, 1366 committed take blocks",
+        "ok": true,
+        "subjects": 1
+      },
+      {
+        "check": "order_count_is_committed_takes",
+        "detail": "1366 orders, 1366 committed take blocks",
+        "ok": true,
+        "subjects": 1
+      },
+      {
+        "check": "backorder_count_is_committed_fallbacks",
+        "detail": "0 backorders, 0 committed fallbacks",
+        "ok": true,
+        "subjects": 1
+      },
+      {
+        "check": "every_order_flow_accounted",
+        "detail": "1366 take + 0 backorder + 0 miss against 1366 order_flow requests",
+        "ok": true,
+        "subjects": 1
+      },
+      {
+        "check": "no_skipped_take",
+        "detail": "0 order_flow requests found no customer (every seeded email exists)",
+        "ok": true,
+        "subjects": 1
+      },
+      {
+        "check": "movement_deltas_match_order_lines",
+        "detail": "every movement has its order, with delta == -qty and the same sku",
+        "ok": true,
+        "subjects": 1
+      },
+      {
+        "check": "movement_delta_sum",
+        "detail": "sum(delta) over movements == -sum(qty) over fulfilled orders",
+        "ok": true,
+        "subjects": 1
+      },
+      {
+        "check": "stock_decrements_match_orders",
+        "detail": "sum(on_hand) == 120000 cells x 1000000 - taken qty",
+        "ok": true,
+        "subjects": 1
+      }
+    ],
+    "order_no_uniqueness": "queried",
+    "status": "PASS"
+  },
+  "postgres_settings": {
+    "fsync": "on",
+    "server_version": "18.6 (Ubuntu 18.6-3build2)",
+    "shared_buffers": "16MB",
+    "synchronous_commit": "on"
+  },
+  "requests_run": 2000,
+  "seed_s": 8.281013651998364,
+  "trace_sha256": "dcbf758d98b0500d81a3694f67717accd8dc79997f786339b027d762d9b6e0f6",
+  "verdict": {
+    "highest_sustained_rps": 0.0,
+    "reject_reasons": {
+      "lag_ceiling": 1
+    },
+    "rejected_windows": 1,
+    "sustained": false
+  },
+  "window_ms": 1000,
+  "windows_file": "windows-postgres.jsonl"
+}

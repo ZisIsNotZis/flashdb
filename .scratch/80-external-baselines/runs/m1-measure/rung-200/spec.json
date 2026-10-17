@@ -1,0 +1,9 @@
+{
+  "batch": 64,
+  "lag_ceiling_us": 10000,
+  "on_hand": 1000000,
+  "order_flow_requests": 2785,
+  "schema": "flashdb.baseline.run-spec.v1",
+  "trace_sha256": "30778694fbe326100f7942e0ae2d45897172392bf34fdc6d0734a82024bf8e3b",
+  "window_ms": 1000
+}

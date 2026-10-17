@@ -72,6 +72,7 @@ import json
 import math
 import os
 import re
+import shlex
 import shutil
 import sqlite3
 import subprocess
@@ -93,6 +94,26 @@ DEFAULT_WINDOW_MS = 1_000
 # `cold_0b`'s shipped `--group-requests` cadence. Named once here so every arm states the batch it
 # actually ran with.
 DEFAULT_BATCH = 64
+# Rows per bulk-load statement during seeding (setup only; not the measured path).
+SEED_CHUNK = 5_000
+# The memory budget the MEASURED phase runs under, and the construction budget `seed-inventory`
+# gets. They differ for the reason slice 51 states: construction is heavier than serving (the seed
+# scope holds the whole dimension set in its memtable, ~500 B/doc), so the regime cap judges
+# serving while the dataset is BUILT under a larger transient cap. Both are recorded per run.
+ENGINE_CAP_MIB = 128
+SEED_CAP_MIB = 192
+# The construction cadence the published 10x build uses (slice 51): the shipped 16 KiB default
+# exhausts the 1024-tile publish cap (slice 46), and with no cadence at all the seed memtable holds
+# the whole dimension set (~500 B/doc measured here), which is what makes a 10^7-doc seed exceed any
+# reasonable construction cap. These are construction settings only; the measured load is untouched.
+SEED_ENV = {"FLASHDB_SEED_CHECKPOINT_BYTES": str(8 << 20),
+            "FLASHDB_SEED_ROTATE_BYTES": str(8 << 20)}
+# sqlite's page cache in KiB (`PRAGMA cache_size`, negative = KiB). sqlite's engine runs inside the
+# arm's own process, so the engine's cache is stated here and the process is capped in the runner.
+SQLITE_CACHE_KIB = 8_192
+# The line `scoped_command` appends: the engine cgroup's own `memory.peak`, read from inside it.
+ENGINE_PEAK_PREFIX = "engine_memory_peak_bytes="
+SEED_PEAK_PREFIX = "seed_memory_peak_bytes="
 # The seeded `Stock.on_hand` every cell starts at (uniform: `on_hand_jitter=0`), which is what makes
 # the oracle's `on_hand == initial - sum(delta)` check checkable without a second table.
 DEFAULT_ON_HAND = 1_000_000
@@ -146,11 +167,14 @@ def build_trace_baseline(
     return load_profile.generate(profile)
 
 
-def seed_docs(manifest: dict, on_hand: int = DEFAULT_ON_HAND) -> tuple[list[tuple], list[tuple]]:
+def seed_docs(manifest: dict, on_hand: int = DEFAULT_ON_HAND):
     """The dimension rows every arm is seeded from: `(customers, stock)` in insert order.
 
     Both come from one `SeedGenerator` built from the manifest, so the external arms and
-    `flashdb-scale seed-inventory` are seeded from the same rows.
+    `flashdb-scale seed-inventory` are seeded from the same rows. They are generators, not lists:
+    a dimension set of 10^6-10^7 rows materialised here would be a memory decision about the
+    instrument rather than about the engine, and it is the arm's own process (sqlite's, or the
+    flashdb read-back) that pays for it.
     """
     gen = SeedGenerator(
         seed=manifest["seed"],
@@ -160,8 +184,8 @@ def seed_docs(manifest: dict, on_hand: int = DEFAULT_ON_HAND) -> tuple[list[tupl
         on_hand=on_hand,
         on_hand_jitter=0,
     )
-    customers = [(d["doc"]["email"],) for d in gen.customer_docs()]
-    stock = [(d["doc"]["sku"], d["doc"]["loc"], d["doc"]["on_hand"]) for d in gen.stock_docs()]
+    customers = ((d["doc"]["email"],) for d in gen.customer_docs())
+    stock = ((d["doc"]["sku"], d["doc"]["loc"], d["doc"]["on_hand"]) for d in gen.stock_docs())
     return customers, stock
 
 
@@ -178,6 +202,26 @@ def write_seed_trace(path: Path, manifest: dict, on_hand: int = DEFAULT_ON_HAND)
     lines = [next(render([block])) for block in gen.blocks()]
     path.write_text("\n".join(lines) + "\n", encoding="utf-8", newline="\n")
     return len(lines)
+
+
+def iter_requests(trace: Path):
+    """Stream one frozen trace request at a time.
+
+    The parsed form of a request is ~7 KB of Python objects (nested blocks and strings), so
+    materialising a 10^5-request trace is a decision about the harness's memory, not about the
+    engine's. The pacer only ever needs the batch in front of it, so it streams.
+    """
+    with open(trace, encoding="utf-8") as fh:
+        for line in fh:
+            if line.strip():
+                yield json.loads(line)
+
+
+def iter_order_numbers(trace: Path):
+    """The trace's `order_flow` order numbers, in trace order (the movement-scan probe targets)."""
+    for req in iter_requests(trace):
+        if "take" in req["blocks"]:
+            yield req["params"]["order_no"]
 
 
 def file_sha256(path: Path) -> str:
@@ -224,6 +268,14 @@ class SqlArm:
         self.cur = conn.cursor()
 
     # -- dialect hooks ------------------------------------------------------
+    def begin_bulk_load(self) -> None:
+        """Open the seeding transaction under the arm's fastest SAFE-for-setup settings."""
+        raise NotImplementedError
+
+    def end_bulk_load(self) -> None:
+        """Restore the measured-path durability settings (the ticket's per-arm statement)."""
+        raise NotImplementedError
+
     def begin_write(self) -> None:
         raise NotImplementedError
 
@@ -239,12 +291,28 @@ class SqlArm:
             self.cur.execute(statement.replace("{int}", self.int_type))
         self.commit()
 
-    def seed(self, customers: list[tuple], stock: list[tuple]) -> None:
-        ph = self.placeholder
-        self.cur.executemany(f"INSERT INTO customer (email) VALUES ({ph})", customers)
-        self.cur.executemany(
-            f"INSERT INTO stock (sku, loc, on_hand) VALUES ({ph}, {ph}, {ph})", stock)
-        self.commit()
+    def seed(self, customers, stock) -> None:
+        """Bulk-load the dimension rows: this is SETUP, not the measured request path.
+
+        The streams are consumed in chunks and loaded in ONE transaction through the arm's bulk
+        path (`begin_bulk_load`/`end_bulk_load`), so the row count never has to fit in the capped
+        scope and the load does not pay one durable commit per row. The durability settings the
+        measured replay runs under are restored by `end_bulk_load` before any request is issued.
+        """
+        self.begin_bulk_load()
+        try:
+            for chunk in _chunks(customers, SEED_CHUNK):
+                self.cur.executemany(
+                    f"INSERT INTO customer (email) VALUES ({self.placeholder})", chunk)
+            for chunk in _chunks(stock, SEED_CHUNK):
+                ph = self.placeholder
+                self.cur.executemany(
+                    f"INSERT INTO stock (sku, loc, on_hand) VALUES ({ph}, {ph}, {ph})", chunk)
+            self.commit()
+        except BaseException:
+            self.rollback()
+            raise
+        self.end_bulk_load()
 
     # -- the four shapes ----------------------------------------------------
     def execute_one(self, req: dict) -> str:
@@ -346,6 +414,18 @@ class SqlArmError(RuntimeError):
     """A request the arm must refuse (the adapter refuses it too)."""
 
 
+def _chunks(rows, size: int):
+    """Consume a row stream `size` at a time, so a bulk load runs in bounded memory."""
+    chunk = []
+    for row in rows:
+        chunk.append(row)
+        if len(chunk) == size:
+            yield chunk
+            chunk = []
+    if chunk:
+        yield chunk
+
+
 class SqliteArm(SqlArm):
     name = "sqlite"
     placeholder = "?"
@@ -357,8 +437,32 @@ class SqliteArm(SqlArm):
         # the pacer's and not sqlite3's implicit ones.
         conn.isolation_level = None
         super().__init__(conn)
+        self._set_measured_durability()
+
+    def set_engine_memory(self, cache_kib: int) -> None:
+        """State sqlite's page-cache budget explicitly (`cache_size` in KiB, negative = KiB).
+
+        sqlite runs INSIDE the arm's process, so unlike flashdb (a separate `flashdb-load`) and
+        postgres (a separate server) its engine memory is not separated by a cgroup: this pragma is
+        the engine's own cache bound, and the process cap in `scripts/m1-baseline-run.sh` bounds
+        driver + engine together. Both are reported.
+        """
+        self.cur.execute(f"PRAGMA cache_size = -{cache_kib}")
+
+    def _set_measured_durability(self) -> None:
         for pragma in ("journal_mode=WAL", "synchronous=FULL"):
             self.cur.execute(f"PRAGMA {pragma}")
+
+    def begin_bulk_load(self) -> None:
+        # Setup only (no request is issued while these settings are in force): no rollback journal
+        # and no fsync turn a 10^7-row load from one fsync per row into one write. The file is
+        # disposable (each arm run deletes and recreates it), so there is nothing to roll back.
+        for pragma in ("journal_mode=OFF", "synchronous=OFF"):
+            self.cur.execute(f"PRAGMA {pragma}")
+        self.cur.execute("BEGIN IMMEDIATE")
+
+    def end_bulk_load(self) -> None:
+        self._set_measured_durability()
 
     def begin_write(self) -> None:
         self.cur.execute("BEGIN IMMEDIATE")
@@ -378,6 +482,15 @@ class PostgresArm(SqlArm):
     int_type = "BIGINT"
     durability = "postgres fsync=on + synchronous_commit=on (baseline-env.sh), one COMMIT per batch"
 
+    def begin_bulk_load(self) -> None:
+        # psycopg opens a transaction on the first statement and psycopg 3 pipelines executemany,
+        # so one transaction is already the bulk path; the server's durability settings are the
+        # ones the measured replay runs under.
+        pass
+
+    def end_bulk_load(self) -> None:
+        pass
+
     def begin_write(self) -> None:
         # psycopg opens a transaction on the first statement of the batch.
         pass
@@ -389,9 +502,22 @@ class PostgresArm(SqlArm):
         self.conn.rollback()
 
 
-def sqlite_arm(path: str | Path = ":memory:") -> SqliteArm:
-    """A sqlite arm on `path` (`:memory:` by default) with its schema created."""
+# Created AFTER the measured replay and only for verification: the oracle's per-cell arithmetic
+# needs `stock_movement` by (sku, loc), and without this index its cost is the product of the cells
+# and the movements (hours at 10^7 cells). It cannot lengthen the measured path, because nothing
+# writes after the replay ends.
+VERIFY_INDEX = "CREATE INDEX stock_movement_sku_loc ON stock_movement (sku, loc)"
+
+
+def add_verify_index(arm: SqlArm) -> None:
+    arm.cur.execute(VERIFY_INDEX)
+    arm.commit()
+
+
+def sqlite_arm(path: str | Path = ":memory:", cache_kib: int = SQLITE_CACHE_KIB) -> SqliteArm:
+    """A sqlite arm on `path` (`:memory:` by default), schema created, page cache stated."""
     arm = SqliteArm(sqlite3.connect(str(path)))
+    arm.set_engine_memory(cache_kib)
     arm.create_schema()
     return arm
 
@@ -551,6 +677,34 @@ def _wait_until(t0_ns: int, due_us: float) -> None:
             time.sleep((remaining - 300_000) / 1e9)
 
 
+def scoped_command(cmd: list[str], cap_mib: int, peak_prefix: str) -> list[str]:
+    """Run ONE engine invocation in its own memory-capped cgroup and report that cgroup's peak.
+
+    The measured memory budget is the STORAGE ENGINE's. `flashdb-load` is the engine's own driver,
+    so it runs here, in its own scope, exactly as the published T1-T4 runs put `flashdb-load` under
+    the cap (`cold_0b`) while the Python harness that scores the windows stayed outside it. The
+    child appends the scope's `memory.peak` as its last line, read from inside the cgroup before it
+    exits, so the peak belongs to this invocation and to nothing else.
+    """
+    inner = " ".join(shlex.quote(part) for part in cmd)
+    script = (
+        f"{inner}; rc=$?; "
+        'peak=$(cat /sys/fs/cgroup$(grep "^0::" /proc/self/cgroup | cut -d: -f3)/memory.peak'
+        ' 2>/dev/null || echo 0); '
+        f'echo "{peak_prefix}$peak"; exit $rc'
+    )
+    return ["systemd-run", "--user", "--scope", "-q",
+            "-p", f"MemoryMax={cap_mib}M", "-p", "MemorySwapMax=0", "bash", "-c", script]
+
+
+def _peak_from_log(lines: list[str], prefix: str) -> int | None:
+    for line in reversed(lines):
+        if line.startswith(prefix):
+            value = line[len(prefix):].strip()
+            return int(value) if value.isdigit() else None
+    return None
+
+
 def cgroup_peak_bytes() -> int | None:
     """The scope's `memory.peak`, read from inside the cgroup (None outside a scope)."""
     try:
@@ -567,17 +721,20 @@ def cgroup_peak_bytes() -> int | None:
 def run_sql_arm(
     arm: SqlArm,
     manifest: dict,
-    requests: list[dict],
+    requests,
     batch: int = DEFAULT_BATCH,
     window_ms: int = DEFAULT_WINDOW_MS,
 ) -> dict:
     """Replay the trace against one SQL arm and return its run record.
 
-    The loop is closed: a batch is executed and committed before the next one is dispatched, so a
-    slow commit shows up as schedule lag on the next request rather than as hidden queueing.
+    `requests` is an ITERABLE of parsed requests, not a list: the pacer pulls only the batch in
+    front of it, so a long trace costs no more memory than its batch. The loop is closed: a batch is
+    executed and committed before the next one is dispatched, so a slow commit shows up as schedule
+    lag on the next request rather than as hidden queueing.
     """
     due, rates = build_schedule(manifest)
     total = len(due)
+    stream = iter(requests)
     windows = WindowSamples(window_ms)
     counters = {TAKE: 0, BACKORDER: 0, MISS: 0, "errors": 0, "first_error": None}
     groups = 0
@@ -592,11 +749,12 @@ def run_sql_arm(
         _wait_until(t0, due[i])
         now = now_us()
         windows.flush_through(now, rates[i])
-        j = i
-        while j < total and j - i < batch and due[j] <= now:
-            j += 1
+        pending = [next(stream)]
+        while len(pending) < batch and i + len(pending) < total and due[i + len(pending)] <= now:
+            pending.append(next(stream))
+        j = i + len(pending)
         start = now_us()
-        state = arm.execute_batch(requests[i:j])
+        state = arm.execute_batch(pending)
         done = now_us()
         groups += 1
         max_group = max(max_group, j - i)
@@ -659,27 +817,43 @@ def run_flashdb_arm(
     order_flow_requests: int,
     batch: int = DEFAULT_BATCH,
     window_ms: int = DEFAULT_WINDOW_MS,
+    engine_cap_mib: int = ENGINE_CAP_MIB,
+    seed_cap_mib: int = SEED_CAP_MIB,
 ) -> dict:
-    """Seed a fresh instance from the same dimensions, run the trace, parse the driver's windows."""
+    """Seed a fresh instance, run the trace in the engine's own capped scope, parse its windows.
+
+    Two scopes, two budgets, both recorded: the dataset is BUILT under `seed_cap_mib` (construction
+    is heavier than serving, slice 51's measured convention) and the measured load runs under
+    `engine_cap_mib`. The harness itself is the instrument and stays outside both.
+    """
     instance = workdir / f"instance-{name}"
     if instance.exists():
         shutil.rmtree(instance)
     seed_path = workdir / "seed.jsonl"
     trace = workdir / "trace.jsonl"
+    seed_t0 = time.perf_counter()
     seeded = subprocess.run(
-        [str(bins / "flashdb-scale"), "seed-inventory", str(instance), str(seed_path)],
-        capture_output=True, text=True)
+        scoped_command([str(bins / "flashdb-scale"), "seed-inventory", str(instance),
+                        str(seed_path)], seed_cap_mib, SEED_PEAK_PREFIX),
+        capture_output=True, text=True, env={**os.environ, **SEED_ENV})
+    seed_s = time.perf_counter() - seed_t0
     if seeded.returncode != 0:
         raise RuntimeError(f"seed-inventory failed (rc={seeded.returncode}): {seeded.stderr[-2000:]}")
+    seed_peak = _peak_from_log(seeded.stdout.splitlines(), SEED_PEAK_PREFIX)
     cmd = flashdb_load_command(bins, instance, trace, manifest, batch, window_ms)
+    driver_log = workdir / f"driver-{name}.log"
     t0 = time.perf_counter()
-    proc = subprocess.run(cmd, capture_output=True, text=True)
+    # The driver's dump is written straight to its log: the measured process must not hold a whole
+    # run's window samples in the instrument's memory.
+    with open(driver_log, "w", encoding="utf-8") as log:
+        proc = subprocess.run(scoped_command(cmd, engine_cap_mib, ENGINE_PEAK_PREFIX),
+                              stdout=log, stderr=subprocess.STDOUT, text=True)
     elapsed = time.perf_counter() - t0
-    lines = proc.stdout.splitlines()
-    (workdir / f"driver-{name}.log").write_text(
-        "\n".join([proc.stdout, proc.stderr]) + "\n", encoding="utf-8")
+    lines = driver_log.read_text(encoding="utf-8").splitlines()
+    engine_peak = _peak_from_log(lines, ENGINE_PEAK_PREFIX)
     if proc.returncode != 0:
-        raise RuntimeError(f"flashdb-load failed (rc={proc.returncode}): {proc.stderr[-2000:]}")
+        raise RuntimeError(f"flashdb-load failed (rc={proc.returncode}): {driver_log}"
+                           f" tail={lines[-5:]}")
     windows = window_records(lines, window_ms)
     summary = _parse_flashdb_summary(lines)
     groups = sum(w["groups"] for w in windows)
@@ -692,6 +866,7 @@ def run_flashdb_arm(
         "window_ms": window_ms,
         "lag_ceiling_us": LAG_CEILING_US,
         "requests_run": requests_run,
+        "seed_s": seed_s,
         "groups": groups,
         "mean_group_size": requests_run / groups if groups else 0.0,
         "max_group_size": max((w["max_group_size"] for w in windows), default=0),
@@ -703,7 +878,10 @@ def run_flashdb_arm(
                      "first_error": summary.get("first_error")},
         "summary": summary,
         "instance_bytes": _dir_bytes(instance),
-        "cgroup_peak_bytes": cgroup_peak_bytes(),
+        "engine_cap_mib": engine_cap_mib,
+        "seed_cap_mib": seed_cap_mib,
+        "seed_peak_bytes": seed_peak,
+        "cgroup_peak_bytes": engine_peak,
         "windows": windows,
         "curve": summarize_curve(windows, None),
         "windows_jsonl": [json.dumps(w, sort_keys=True) for w in windows],
@@ -736,6 +914,13 @@ def _dir_bytes(path: Path) -> int:
     return sum(p.stat().st_size for p in path.rglob("*") if p.is_file())
 
 
+def _db_bytes(path: Path) -> int:
+    """sqlite's on-disk footprint: the database file plus its WAL and shared-memory sidecars."""
+    return sum(p.stat().st_size for p in
+               (path, path.with_suffix(path.suffix + "-wal"),
+                path.with_suffix(path.suffix + "-shm")) if p.exists())
+
+
 # ---------------------------------------------------------------------------
 # The inventory oracle
 # ---------------------------------------------------------------------------
@@ -764,15 +949,20 @@ def oracle_sql(arm: SqlArm, manifest: dict, counters: dict, order_flow_requests:
     checks: dict[str, dict] = {}
     n_cells = int(manifest["n_sku"]) * int(manifest["n_loc"])
 
+    cells_seen = 0
+    on_hand_sum = 0
+    # The scan is STREAMED (a cursor, not `fetchall`): at 10^7 cells a materialised result set is a
+    # memory decision about the verification, not about the data.
+    # One aggregate over the movements, then a join: the per-cell arithmetic is the same check, but
+    # its cost is the dataset rather than the product of the cells and the movements (a correlated
+    # subquery per stock row is what made a 10^7-cell verification take tens of minutes).
     arm.cur.execute(
-        "SELECT s.sku, s.loc, s.on_hand,"
-        " (SELECT COALESCE(SUM(m.delta), 0) FROM stock_movement m"
-        "   WHERE m.sku = s.sku AND m.loc = s.loc) FROM stock s")
-    cells = arm.cur.fetchall()
-    _check(checks, "cell_count", len(cells) == n_cells,
-           f"{len(cells)} stock cells, expected {n_cells} ({manifest['n_sku']} sku x"
-           f" {manifest['n_loc']} loc)")
-    for sku, loc, on_hand, delta in cells:
+        "SELECT s.sku, s.loc, s.on_hand, COALESCE(g.sum_delta, 0) FROM stock s"
+        " LEFT JOIN (SELECT sku, loc, SUM(delta) AS sum_delta FROM stock_movement"
+        "            GROUP BY sku, loc) g ON g.sku = s.sku AND g.loc = s.loc")
+    for sku, loc, on_hand, delta in arm.cur:
+        cells_seen += 1
+        on_hand_sum += int(on_hand)
         # `delta` is the signed movement (-qty), so the cell's arithmetic is initial + sum(delta) --
         # the ticket's "on_hand_initial - sum(delta)" with a decrement counted as its magnitude.
         expected = on_hand_initial + int(delta)
@@ -781,6 +971,9 @@ def oracle_sql(arm: SqlArm, manifest: dict, counters: dict, order_flow_requests:
                f" {delta} = {expected}")
         _check(checks, "on_hand_non_negative", int(on_hand) >= 0,
                f"stock({sku},{loc}).on_hand={on_hand}")
+    _check(checks, "cell_count", cells_seen == n_cells,
+           f"{cells_seen} stock cells, expected {n_cells} ({manifest['n_sku']} sku x"
+           f" {manifest['n_loc']} loc)")
 
     arm.cur.execute(
         'SELECT order_no, COUNT(*) FROM (SELECT order_no FROM "order"'
@@ -816,7 +1009,7 @@ def oracle_sql(arm: SqlArm, manifest: dict, counters: dict, order_flow_requests:
            == -_scalar(arm, 'SELECT COALESCE(SUM(qty), 0) FROM "order"'),
            "sum(delta) over movements == -sum(qty) over fulfilled orders")
     _check(checks, "stock_decrements_match_orders",
-           sum(int(c[2]) for c in cells) == on_hand_initial * n_cells
+           on_hand_sum == on_hand_initial * n_cells
            - _scalar(arm, 'SELECT COALESCE(SUM(qty), 0) FROM "order"'),
            f"sum(on_hand) == {n_cells} cells x {on_hand_initial} - taken qty")
     return {"status": "PASS", "checks": list(checks.values()),
@@ -828,7 +1021,7 @@ def _scalar(arm: SqlArm, sql: str) -> int:
     return int(arm.cur.fetchone()[0])
 
 
-def build_probe_trace(manifest: dict, order_nos: list[str], customers: list[str]) -> list[dict]:
+def iter_probe_trace(manifest: dict, order_nos, customers):
     """The read-only probe trace the flashdb oracle reads the instance back with.
 
     The adapter has no Order/Backorder read shape, so the state is read through the shapes it does
@@ -836,34 +1029,47 @@ def build_probe_trace(manifest: dict, order_nos: list[str], customers: list[str]
     proves no order_flow took the skipped path), and every order number in the trace via
     `movements_scan` (which yields that order's movement rows). The probe target is encoded in the
     request id so a replay line can be attributed without a second mapping.
+
+    The probes are STREAMED, and ordered movements -> customers -> cells so the oracle can fold each
+    movement's delta into its cell and then check that cell as it arrives, which is what keeps a
+    10^7-cell verification's memory proportional to the trace rather than to the dataset. The
+    cells still cover every (sku, loc), so the arithmetic is unchanged.
     """
-    probes: list[dict] = []
-    for rank in range(1, int(manifest["n_sku"]) + 1):
-        sku = sku_name(rank)
-        for j in range(int(manifest["n_loc"])):
-            loc = loc_name(j)
-            probes.append({
-                "id": f"probe-stock:{sku}:{loc}",
-                "class": {"durability": "batched", "max_staleness": 2},
-                "blocks": {"q": {"get": {"Stock": {"where": {"sku": sku, "loc": loc}}}}},
-            })
-    for email in customers:
-        probes.append({
-            "id": f"probe-customer:{email}",
-            "class": {"durability": "batched"},
-            "blocks": {"q": {"find": {"Customer": {"email": email}}}},
-        })
     for order_no in order_nos:
-        probes.append({
+        yield {
             "id": f"probe-movements:{order_no}",
             "class": {"durability": "batched", "max_staleness": 5},
             "blocks": {"q": {"find": {"StockMovement": {"where": {"order_no": order_no}},
                                       "order": ["movement_no"], "limit": 100}}},
-        })
-    return probes
+        }
+    for email in customers:
+        yield {
+            "id": f"probe-customer:{email}",
+            "class": {"durability": "batched"},
+            "blocks": {"q": {"find": {"Customer": {"email": email}}}},
+        }
+    for rank in range(1, int(manifest["n_sku"]) + 1):
+        sku = sku_name(rank)
+        for j in range(int(manifest["n_loc"])):
+            loc = loc_name(j)
+            yield {
+                "id": f"probe-stock:{sku}:{loc}",
+                "class": {"durability": "batched", "max_staleness": 2},
+                "blocks": {"q": {"get": {"Stock": {"where": {"sku": sku, "loc": loc}}}}},
+            }
 
 
-def oracle_flashdb(replayed: list[dict], manifest: dict, counters: dict,
+def write_probe_trace(path: Path, manifest: dict, order_nos, customers) -> int:
+    """Write the streamed probe trace; returns the probe count."""
+    count = 0
+    with open(path, "w", encoding="utf-8") as fh:
+        for probe in iter_probe_trace(manifest, order_nos, customers):
+            fh.write(json.dumps(probe, sort_keys=True) + "\n")
+            count += 1
+    return count
+
+
+def oracle_flashdb(replayed, manifest: dict, counters: dict,
                    on_hand_initial: int = DEFAULT_ON_HAND) -> dict:
     """The same inventory arithmetic as `oracle_sql`, read back through the request interface.
 
@@ -874,8 +1080,8 @@ def oracle_flashdb(replayed: list[dict], manifest: dict, counters: dict,
     is an error in the window record, which `oracle_flashdb` requires to be zero.
     """
     checks: dict[str, dict] = {}
-    on_hand: dict[tuple[str, str], int] = {}
     deltas: dict[tuple[str, str], int] = {}
+    cells_seen = 0
     movements = 0
     orders_with_movements = 0
     customers_seen = 0
@@ -886,7 +1092,13 @@ def oracle_flashdb(replayed: list[dict], manifest: dict, counters: dict,
         if target.startswith("probe-stock:"):
             _, sku, loc = target.split(":")
             _check(checks, "stock_cell_present", row is not None, f"Stock({sku},{loc}) is empty")
-            on_hand[(sku, loc)] = int(row["on_hand"])
+            cells_seen += 1
+            value = int(row["on_hand"])
+            expected = on_hand_initial + deltas.pop((sku, loc), 0)
+            _check(checks, "on_hand_matches_movements", value == expected,
+                   f"stock({sku},{loc}).on_hand={value}, initial {on_hand_initial} + sum(delta)"
+                   f" {expected - on_hand_initial} = {expected}")
+            _check(checks, "on_hand_non_negative", value >= 0, f"stock({sku},{loc}).on_hand={value}")
         elif target.startswith("probe-customer:"):
             _check(checks, "customer_present", row is not None, f"{target} is empty")
             customers_seen += 1
@@ -905,16 +1117,13 @@ def oracle_flashdb(replayed: list[dict], manifest: dict, counters: dict,
             orders_with_movements += 1 if rows else 0
 
     n_cells = int(manifest["n_sku"]) * int(manifest["n_loc"])
-    _check(checks, "cell_count", len(on_hand) == n_cells,
-           f"{len(on_hand)} cells read back, expected {n_cells}")
+    _check(checks, "cell_count", cells_seen == n_cells,
+           f"{cells_seen} cells read back, expected {n_cells}")
     _check(checks, "no_skipped_take", customers_seen == int(manifest["n_customers"]),
            f"{customers_seen} customers read back, expected {manifest['n_customers']}")
-    for (sku, loc), value in on_hand.items():
-        expected = on_hand_initial + deltas.get((sku, loc), 0)
-        _check(checks, "on_hand_matches_movements", value == expected,
-               f"stock({sku},{loc}).on_hand={value}, initial {on_hand_initial} + sum(delta)"
-               f" {deltas.get((sku, loc), 0)} = {expected}")
-        _check(checks, "on_hand_non_negative", value >= 0, f"stock({sku},{loc}).on_hand={value}")
+    # Every movement's cell is probed, so an empty fold means every delta was accounted for.
+    _check(checks, "every_movement_cell_probed", not deltas,
+           f"{len(deltas)} movement cells were never read back: {list(deltas)[:5]}")
     _check(checks, "movement_count_is_committed_takes", movements == counters["take"],
            f"{movements} movements read back, {counters['take']} committed take blocks")
     _check(checks, "order_count_is_committed_takes", orders_with_movements == counters["take"],
@@ -926,21 +1135,28 @@ def oracle_flashdb(replayed: list[dict], manifest: dict, counters: dict,
                                    " errors required"}
 
 
-def run_flashdb_probes(name: str, manifest: dict, workdir: Path, bins: Path,
-                       trace_orders: list[str]) -> list[dict]:
-    """Replay the probe trace read-only and parse `flashdb-replay`'s one-JSON-line-per-probe output."""
+def run_flashdb_probes(name: str, manifest: dict, workdir: Path, bins: Path, trace_orders):
+    """Replay the probe trace read-only, streaming `flashdb-replay`'s one-JSON-line-per-probe output.
+
+    Both sides are streamed: the probe file is written as it is generated and the replay's stdout is
+    consumed line by line, so a 10^7-cell verification costs the size of one record rather than the
+    size of the whole dump in the instrument's memory.
+    """
     instance = workdir / f"instance-{name}"
     customers, _stock = seed_docs(manifest)
-    probes = build_probe_trace(manifest, trace_orders, [c[0] for c in customers])
     probe_path = workdir / f"probe-{name}.jsonl"
-    probe_path.write_text("\n".join(json.dumps(p, sort_keys=True) for p in probes) + "\n",
-                          encoding="utf-8")
-    proc = subprocess.run([str(bins / "flashdb-replay"), str(instance), str(probe_path)],
-                          capture_output=True, text=True)
-    (workdir / f"probe-{name}.log").write_text(proc.stdout + proc.stderr, encoding="utf-8")
-    if proc.returncode != 0:
-        raise RuntimeError(f"flashdb-replay failed (rc={proc.returncode}): {proc.stderr[-2000:]}")
-    return [json.loads(line) for line in proc.stdout.splitlines() if line.startswith("{")]
+    write_probe_trace(probe_path, manifest, trace_orders, (c[0] for c in customers))
+    log_path = workdir / f"probe-{name}.log"
+    with open(log_path, "w", encoding="utf-8") as log:
+        proc = subprocess.Popen([str(bins / "flashdb-replay"), str(instance), str(probe_path)],
+                                stdout=subprocess.PIPE, stderr=log, text=True, bufsize=1 << 20)
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            if line.startswith("{"):
+                yield json.loads(line)
+        rc = proc.wait()
+    if rc != 0:
+        raise RuntimeError(f"flashdb-replay failed (rc={rc}): {log_path}")
 
 
 # ---------------------------------------------------------------------------
@@ -1048,44 +1264,53 @@ def cmd_prepare(args: argparse.Namespace) -> int:
     return 0
 
 
-def _load_workdir(workdir: Path) -> tuple[dict, dict, list[dict]]:
+def _load_workdir(workdir: Path) -> tuple[dict, dict, Path]:
+    """`(manifest, spec, trace_path)`; the trace is hashed against the manifest and streamed later."""
     manifest = _read_json(workdir / "manifest.json")
     spec = _read_json(workdir / "spec.json")
-    trace_sha = file_sha256(workdir / "trace.jsonl")
+    trace = workdir / "trace.jsonl"
+    trace_sha = file_sha256(trace)
     if trace_sha != manifest["trace_sha256"]:
-        raise SystemExit(f"trace {workdir / 'trace.jsonl'} hashes to {trace_sha} but the manifest"
+        raise SystemExit(f"trace {trace} hashes to {trace_sha} but the manifest"
                          f" says {manifest['trace_sha256']}; rerun prepare")
-    requests = [json.loads(line) for line in
-                (workdir / "trace.jsonl").read_text(encoding="utf-8").splitlines()]
-    return manifest, spec, requests
+    return manifest, spec, trace
 
 
 def cmd_arm(args: argparse.Namespace) -> int:
     workdir = Path(args.workdir).resolve()
-    manifest, spec, requests = _load_workdir(workdir)
+    manifest, spec, trace = _load_workdir(workdir)
     name = args.arm
     if name in FLASHDB_ARMS:
         record = run_flashdb_arm(name, manifest, workdir, Path(args.bins),
-                                 spec["order_flow_requests"], spec["batch"], spec["window_ms"])
-        trace_orders = sorted({r["params"]["order_no"] for r in requests if "take" in r["blocks"]})
-        replayed = run_flashdb_probes(name, manifest, workdir, Path(args.bins), trace_orders)
-        record["oracle"] = oracle_flashdb(replayed, manifest, {
-            "take": record["counters"]["take"],
-            "errors": record["counters"]["errors"],
-            "first_error": record["counters"]["first_error"],
-        }, spec["on_hand"])
+                                 spec["order_flow_requests"], spec["batch"], spec["window_ms"],
+                                 args.engine_cap_mib, args.seed_cap_mib)
+        if args.skip_verify:
+            # The read-back is verification, not workload: it is the `verify` step's job and it runs
+            # outside the engine's memory budget (see `run_flashdb_probes`).
+            record["oracle"] = {"status": "DEFERRED", "checks": [],
+                                "order_no_uniqueness": "deferred to the verify step"}
+        else:
+            record["oracle"] = _verify_flashdb(name, manifest, workdir, Path(args.bins), trace,
+                                               spec, record)
     elif name == "sqlite":
         db = workdir / f"{name}.db"
         for stale in (db, db.with_suffix(".db-wal"), db.with_suffix(".db-shm")):
             stale.unlink(missing_ok=True)
-        arm = sqlite_arm(db)
+        arm = sqlite_arm(db, args.sqlite_cache_kib)
         customers, stock = seed_docs(manifest, spec["on_hand"])
+        seed_t0 = time.perf_counter()
         arm.seed(customers, stock)
-        record = run_sql_arm(arm, manifest, requests, spec["batch"], spec["window_ms"])
+        seed_s = time.perf_counter() - seed_t0
+        record = run_sql_arm(arm, manifest, iter_requests(trace), spec["batch"],
+                             spec["window_ms"])
+        record["seed_s"] = seed_s
+        record["sqlite_cache_kib"] = args.sqlite_cache_kib
+        record["data_bytes"] = _db_bytes(db)
+        add_verify_index(arm)
         record["oracle"] = oracle_sql(arm, manifest, record["counters"],
                                       spec["order_flow_requests"], spec["on_hand"])
     elif name == "postgres":
-        record = run_postgres_arm(name, manifest, spec, requests)
+        record = run_postgres_arm(name, manifest, spec, iter_requests(trace))
     else:
         raise SystemExit(f"unknown arm {name!r}; expected one of {FLASHDB_ARMS + SQL_ARMS}")
     record["trace_sha256"] = manifest["trace_sha256"]
@@ -1106,7 +1331,41 @@ def cmd_arm(args: argparse.Namespace) -> int:
     return 0
 
 
-def run_postgres_arm(name: str, manifest: dict, spec: dict, requests: list[dict]) -> dict:
+def _verify_flashdb(name: str, manifest: dict, workdir: Path, bins: Path, trace: Path,
+                    spec: dict, record: dict) -> dict:
+    """The post-hoc read-back of the measured instance: every cell, customer and order number."""
+    trace_orders = sorted(set(iter_order_numbers(trace)))
+    probe_t0 = time.perf_counter()
+    replayed = run_flashdb_probes(name, manifest, workdir, bins, trace_orders)
+    record["oracle_s"] = time.perf_counter() - probe_t0
+    return oracle_flashdb(replayed, manifest, {
+        "take": record["counters"]["take"],
+        "errors": record["counters"]["errors"],
+        "first_error": record["counters"]["first_error"],
+    }, spec["on_hand"])
+
+
+def cmd_verify(args: argparse.Namespace) -> int:
+    """Run the deferred inventory read-back for a flashdb arm and merge it into its run record.
+
+    Separate from `arm` on purpose: the read-back is verification (`iter_probe_trace` +
+    `flashdb-replay` + `oracle_flashdb`), it touches the instance only through read requests, and
+    its own memory therefore must not be charged to the engine's measured budget.
+    """
+    workdir = Path(args.workdir).resolve()
+    manifest, spec, trace = _load_workdir(workdir)
+    path = workdir / f"run-{args.arm}.json"
+    record = _read_json(path)
+    if record["trace_sha256"] != manifest["trace_sha256"]:
+        raise SystemExit(f"{path} measured a different trace than {workdir / 'trace.jsonl'}")
+    record["oracle"] = _verify_flashdb(args.arm, manifest, workdir, Path(args.bins), trace, spec,
+                                       record)
+    _write_json(path, record)
+    print(f"{args.arm}: oracle {record['oracle']['status']} (verify_s={record['oracle_s']:.1f})")
+    return 0
+
+
+def run_postgres_arm(name: str, manifest: dict, spec: dict, requests) -> dict:
     """The postgres arm against the user-space cluster `scripts/baseline-env.sh` provides."""
     import psycopg  # imported here: only this arm needs it, and only inside its capped scope
 
@@ -1124,9 +1383,18 @@ def run_postgres_arm(name: str, manifest: dict, spec: dict, requests: list[dict]
         arm = PostgresArm(conn)
         arm.create_schema()
         customers, stock = seed_docs(manifest, spec["on_hand"])
+        seed_t0 = time.perf_counter()
         arm.seed(customers, stock)
+        seed_s = time.perf_counter() - seed_t0
         record = run_sql_arm(arm, manifest, requests, spec["batch"], spec["window_ms"])
+        record["seed_s"] = seed_s
         record["durability"] = PostgresArm.durability
+        # The engine here is the SERVER, which runs in its own cgroup; this client cannot read that
+        # cgroup's peak, so the runner's payload patches this field from the server scope's own
+        # `memory.peak` after the arm -- and it stays null rather than publishing the instrument's.
+        record["cgroup_peak_bytes"] = None
+        record["engine_peak_source"] = "postgres server scope (patched by the runner payload)"
+        add_verify_index(arm)
         record["oracle"] = oracle_sql(arm, manifest, record["counters"],
                                       spec["order_flow_requests"], spec["on_hand"])
         record["postgres_settings"] = {
@@ -1135,6 +1403,8 @@ def run_postgres_arm(name: str, manifest: dict, spec: dict, requests: list[dict]
             "shared_buffers": _setting(conn, "shared_buffers"),
             "server_version": _setting(conn, "server_version"),
         }
+        # The arm's data:memory ratio is reported from the server's own catalog, not from a guess.
+        record["data_bytes"] = _scalar(arm, "SELECT pg_database_size(current_database())")
         conn.close()
     finally:
         with connect("postgres") as admin:
@@ -1195,7 +1465,21 @@ def main(argv: list[str]) -> int:
     arm.add_argument("--arm", required=True)
     arm.add_argument("--bins", default=str(REPO_ROOT / "target" / "release"),
                      help="directory holding flashdb-load / flashdb-scale / flashdb-replay")
+    arm.add_argument("--engine-cap-mib", type=int, default=ENGINE_CAP_MIB,
+                     help="memory budget of the engine's own cgroup for the measured load")
+    arm.add_argument("--seed-cap-mib", type=int, default=SEED_CAP_MIB,
+                     help="transient budget for `seed-inventory` (construction, not serving)")
+    arm.add_argument("--sqlite-cache-kib", type=int, default=SQLITE_CACHE_KIB,
+                     help="sqlite `PRAGMA cache_size` in KiB (its engine is embedded)")
+    arm.add_argument("--skip-verify", action="store_true",
+                     help="defer the flashdb read-back to the `verify` step (outside the engine cap)")
     arm.set_defaults(func=cmd_arm)
+
+    verify = sub.add_parser("verify", help="run a flashdb arm's deferred inventory read-back")
+    verify.add_argument("--workdir", required=True)
+    verify.add_argument("--arm", required=True)
+    verify.add_argument("--bins", default=str(REPO_ROOT / "target" / "release"))
+    verify.set_defaults(func=cmd_verify)
 
     report = sub.add_parser("report", help="write the scoreboard from the arm records")
     report.add_argument("--workdir", required=True)

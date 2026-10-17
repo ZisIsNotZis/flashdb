@@ -1,0 +1,140 @@
+{
+  "arm": "sqlite",
+  "batch": 64,
+  "cgroup_peak_bytes": 41869312,
+  "counters": {
+    "backorder": 0,
+    "errors": 0,
+    "first_error": null,
+    "miss": 0,
+    "take": 1366
+  },
+  "curve": [
+    {
+      "achieved_fraction": 1.0,
+      "achieved_rps": 100.0,
+      "ceiling_rejected_windows": 0,
+      "compact_bytes": 0,
+      "early_dispatches": 0,
+      "error_windows": 0,
+      "group_elapsed_us": 0,
+      "groups": 1999,
+      "groups_over_service_ceiling": 0,
+      "invalid_windows": 0,
+      "lag_ceiling_rejected_windows": 0,
+      "lag_p50_us": 129.5,
+      "lag_p95_us": 269,
+      "lag_p99_us": 1654,
+      "max_group_size": 2,
+      "mean_group_size": 1.0005002501250626,
+      "min_lag_us": 0,
+      "offered_rps": 100.0,
+      "p50_us": 1815.5,
+      "p95_us": 7153,
+      "p99_us": 15070,
+      "rate_exceeded": false,
+      "reject_reasons": {},
+      "service_ceiling_rejected_windows": 0,
+      "sustained": true,
+      "valid_windows": 20,
+      "windows": 20
+    }
+  ],
+  "data_bytes": 11902576,
+  "durability": "sqlite WAL + synchronous=FULL, one COMMIT per batch",
+  "elapsed_s": 19.994833407,
+  "groups": 1999,
+  "lag_ceiling_us": 10000,
+  "max_group_size": 2,
+  "mean_group_size": 1.0005002501250626,
+  "oracle": {
+    "checks": [
+      {
+        "check": "cell_count",
+        "detail": "120000 stock cells, expected 120000 (30000 sku x 4 loc)",
+        "ok": true,
+        "subjects": 1
+      },
+      {
+        "check": "on_hand_matches_movements",
+        "detail": "stock(S000001,L000).on_hand=999906, initial 1000000 + sum(delta) -94 = 999906",
+        "ok": true,
+        "subjects": 120000
+      },
+      {
+        "check": "on_hand_non_negative",
+        "detail": "stock(S000001,L000).on_hand=999906",
+        "ok": true,
+        "subjects": 120000
+      },
+      {
+        "check": "no_duplicate_order_no",
+        "detail": "0 order numbers appear in both/again: []",
+        "ok": true,
+        "subjects": 1
+      },
+      {
+        "check": "movement_count_is_committed_takes",
+        "detail": "1366 movements, 1366 committed take blocks",
+        "ok": true,
+        "subjects": 1
+      },
+      {
+        "check": "order_count_is_committed_takes",
+        "detail": "1366 orders, 1366 committed take blocks",
+        "ok": true,
+        "subjects": 1
+      },
+      {
+        "check": "backorder_count_is_committed_fallbacks",
+        "detail": "0 backorders, 0 committed fallbacks",
+        "ok": true,
+        "subjects": 1
+      },
+      {
+        "check": "every_order_flow_accounted",
+        "detail": "1366 take + 0 backorder + 0 miss against 1366 order_flow requests",
+        "ok": true,
+        "subjects": 1
+      },
+      {
+        "check": "no_skipped_take",
+        "detail": "0 order_flow requests found no customer (every seeded email exists)",
+        "ok": true,
+        "subjects": 1
+      },
+      {
+        "check": "movement_deltas_match_order_lines",
+        "detail": "every movement has its order, with delta == -qty and the same sku",
+        "ok": true,
+        "subjects": 1
+      },
+      {
+        "check": "movement_delta_sum",
+        "detail": "sum(delta) over movements == -sum(qty) over fulfilled orders",
+        "ok": true,
+        "subjects": 1
+      },
+      {
+        "check": "stock_decrements_match_orders",
+        "detail": "sum(on_hand) == 120000 cells x 1000000 - taken qty",
+        "ok": true,
+        "subjects": 1
+      }
+    ],
+    "order_no_uniqueness": "queried",
+    "status": "PASS"
+  },
+  "requests_run": 2000,
+  "seed_s": 1.7331830360053573,
+  "sqlite_cache_kib": 8192,
+  "trace_sha256": "dcbf758d98b0500d81a3694f67717accd8dc79997f786339b027d762d9b6e0f6",
+  "verdict": {
+    "highest_sustained_rps": 100.0,
+    "reject_reasons": {},
+    "rejected_windows": 0,
+    "sustained": true
+  },
+  "window_ms": 1000,
+  "windows_file": "windows-sqlite.jsonl"
+}

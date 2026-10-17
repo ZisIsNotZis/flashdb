@@ -37,6 +37,7 @@ BATCH=64
 ON_HAND=1000000
 ARMS=flashdb-declared,sqlite,postgres
 SKIP_BUILD=0
+SKIP_VERIFY=0
 PAYLOADS=$REPO/.tmp/m1-run
 
 die() { printf 'm1-baseline-run: %s\n' "$*" >&2; exit 1; }
@@ -55,6 +56,7 @@ while [ $# -gt 0 ]; do
         --cap-mib) CAP_MIB=$2; shift 2 ;;
         --arms) ARMS=$2; shift 2 ;;
         --skip-build) SKIP_BUILD=1; shift ;;
+        --skip-verify) SKIP_VERIFY=1; shift ;;
         *) die "unknown argument $1" ;;
     esac
 done
@@ -95,45 +97,91 @@ prepare() {
         --on-hand "$ON_HAND" )
 }
 
-# Every arm runs inside its own capped scope. The payload is a file, not a quoted `bash -c`
-# string, so the scope's command line stays inspectable in the artefacts.
-run_in_scope() {
-    local name=$1
-    local payload=$PAYLOADS/$name.sh
-    systemd-run --user --scope -q \
-        -p "MemoryMax=${CAP_MIB}M" -p MemorySwapMax=0 bash "$payload" \
-        || die "arm $name failed inside the ${CAP_MIB} MiB scope (see $WORKDIR)"
-}
+# The measured memory budget is the STORAGE ENGINE's, so each arm bounds its engine and nothing
+# else (the ticket's "memory boundary" note):
+#   * flashdb: the harness wraps `flashdb-load` in its own `MemoryMax` scope, and the post-hoc
+#     inventory read-back runs after it as a separate `verify` step, outside that budget;
+#   * sqlite: the engine is EMBEDDED in the arm's process, so this one arm's process (driver +
+#     pacer + engine) is what the scope caps, with `PRAGMA cache_size` stating the engine's cache;
+#   * postgres: the server runs in its own named scope and only the client stays outside it.
+# The payloads are written with a QUOTED heredoc: they expand their own variables at run time, and
+# the parameters reach them through the environment (`M1_*`), never through shell interpolation.
+export M1_CAP_MIB=$CAP_MIB M1_WORKDIR=$WORKDIR M1_HARNESS=$HARNESS M1_REPO=$REPO
+export M1_SKIP_VERIFY=$SKIP_VERIFY
 
 run_arm() {
     local name=$1
     local payload=$PAYLOADS/$name.sh
     case "$name" in
-        sqlite|flashdb-declared|flashdb-learned)
-            cat > "$payload" <<EOF
+        flashdb-declared|flashdb-learned)
+            cat > "$payload" <<'EOF'
 set -euo pipefail
-cd "$HARNESS"
-exec uv run python -m flashdb_harness.baseline_0b arm --workdir "$WORKDIR" --arm "$name"
+cd "$M1_HARNESS"
+uv run python -m flashdb_harness.baseline_0b arm --workdir "$M1_WORKDIR" --arm ARG_ARM \
+    --engine-cap-mib "$M1_CAP_MIB" --skip-verify
+if [ "$M1_SKIP_VERIFY" = 1 ]; then
+    echo "flashdb read-back DEFERRED (--skip-verify): see the run record" >&2
+else
+    uv run python -m flashdb_harness.baseline_0b verify --workdir "$M1_WORKDIR" --arm ARG_ARM
+fi
 EOF
+            sed -i "s/ARG_ARM/$name/" "$payload"
+            chmod +x "$payload"
+            bash "$payload" || die "arm $name failed (see $WORKDIR)"
+            ;;
+        sqlite)
+            cat > "$payload" <<'EOF'
+set -euo pipefail
+cd "$M1_HARNESS"
+exec uv run python -m flashdb_harness.baseline_0b arm --workdir "$M1_WORKDIR" --arm sqlite \
+    --engine-cap-mib "$M1_CAP_MIB"
+EOF
+            chmod +x "$payload"
+            systemd-run --user --scope -q \
+                -p "MemoryMax=${CAP_MIB}M" -p MemorySwapMax=0 bash "$payload" \
+                || die "arm $name failed inside the ${CAP_MIB} MiB scope (see $WORKDIR)"
             ;;
         postgres)
-            cat > "$payload" <<EOF
+            cat > "$payload" <<'EOF'
 set -euo pipefail
-export M1_PG_ROOT=$(printf %q "${M1_PG_ROOT:-/tmp/m1-pg}")
-eval "\$("$REPO/scripts/baseline-env.sh" env)"
-"$REPO/scripts/baseline-env.sh" start
+export M1_PG_ROOT=${M1_PG_ROOT:-/var/tmp/m1-pg}
+eval "$("$M1_REPO/scripts/baseline-env.sh" env)"
+unit="m1-pg-postgres-$$"
+# The server IS the engine here: its own capped cgroup, client outside it.
+systemd-run --user --scope -q --unit="$unit" -p "MemoryMax=${M1_CAP_MIB}M" -p MemorySwapMax=0 \
+    bash -c "pg_ctl start -w -D '$M1_PG_ROOT/data' -l '$M1_PG_ROOT/pg.log' && exec sleep 7200" &
+scope_pid=$!
+ready=0
+for _ in $(seq 1 600); do
+    if [ -S "$M1_PGHOST/.s.PGSQL.$M1_PGPORT" ]; then ready=1; break; fi
+    sleep 0.1
+done
+[ "$ready" = 1 ] || { echo "postgres did not start" >&2; exit 1; }
 rc=0
-cd "$HARNESS"
+cd "$M1_HARNESS"
 uv run --with 'psycopg[binary]==3.3.6' python -m flashdb_harness.baseline_0b \
-    arm --workdir "$WORKDIR" --arm postgres || rc=\$?
-"$REPO/scripts/baseline-env.sh" stop
-exit \$rc
+    arm --workdir "$M1_WORKDIR" --arm postgres || rc=$?
+cg=$(systemctl --user show --property=ControlGroup --value "$unit.scope")
+peak=$(cat "/sys/fs/cgroup$cg/memory.peak" 2>/dev/null || echo 0)
+printf '{"arm": "postgres", "server_peak_bytes": %s, "cap_mib": %s}\n' "$peak" "${M1_CAP_MIB}" \
+    > "$M1_WORKDIR/pg-server-peak.json"
+python3 - "$M1_WORKDIR/run-postgres.json" "$peak" <<'PY'
+import json, sys
+path, peak = sys.argv[1], int(sys.argv[2])
+record = json.load(open(path))
+record["cgroup_peak_bytes"] = peak
+json.dump(record, open(path, "w"), sort_keys=True, indent=2)
+PY
+pg_ctl stop -w -D "$M1_PG_ROOT/data" >/dev/null 2>&1 || true
+systemctl --user stop "$unit.scope" >/dev/null 2>&1 || true
+wait "$scope_pid" 2>/dev/null || true
+exit $rc
 EOF
+            chmod +x "$payload"
+            bash "$payload" || die "arm $name failed (see $WORKDIR)"
             ;;
         *) die "unknown arm $name" ;;
     esac
-    chmod +x "$payload"
-    run_in_scope "$name"
 }
 
 build_binaries
