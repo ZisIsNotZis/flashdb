@@ -27,6 +27,11 @@ In scope (this slice, no engine execution, no L2 implementation):
 Out of scope: implementing L2, changing the engine, any claim about L2 before it is measured on a
 real run, changing the pre-registration.
 
+This slice's scope is not the M2 gate. `docs/roadmap.md` M2 also asks for a ≥10x headroom measurement
+and learned-vs-declared headroom with the latency rule; the engine cannot execute these shapes, so this
+ticket cannot deliver them. The gate is **UNMET (2 of 4)** — item-by-item status, the missing engine
+capabilities and the closing routes are in [report.md §8](report.md#8-m2-acceptance-status).
+
 ## Authoritative inputs
 
 - `docs/dev-loop.md` (the four shapes and their hypotheses).
@@ -92,18 +97,18 @@ What exists now, and what it is evidence for:
   cd harness && uv run --offline python -m flashdb_harness.join_descriptors --seed 42 --per-shape 25 \
       --out ../.scratch/81-join-heavy-workloads/descriptors.json
   ```
-- **Tests**: `harness/tests/test_join_shapes.py` (8 new). Every command below was run with
-  `uv run --offline` (the box resolves packages from the local uv cache; without `--offline` uv
-  attempts a network resolve).
+- **Tests**: `harness/tests/test_join_shapes.py` (11 new). The commands and results below are as run
+  on this branch; `uv run --offline` resolves packages from the local uv cache, and the bare
+  `uv run --with pytest pytest -q` also passed.
 
 ### Commands and results
 
 ```
-cd harness && uv run --offline --with pytest python -m pytest -q
-176 passed in 18.83s                     # 168 pre-existing + 8 new; the 168 are unchanged
+cd harness && uv run --with pytest pytest -q
+179 passed in 27.60s                     # 168 pre-existing + 11 new; the 168 are unchanged
 
 uv run --offline --with pytest python -m pytest -q tests/test_join_shapes.py
-8 passed in 5.53s
+11 passed in 11.80s
 
 uv run --offline python -m flashdb_harness.generator --seed 42 --requests 20 | sha256sum
 929822594483301f5951e98746c60932d7bfd82408780555a231e9d0a28c5264
@@ -169,7 +174,7 @@ counts requests whose hop matched nothing):
 | `as_of` | `facts` | StockMovement | 1 | - | 64 | 1 / 5 | 47 | 0 | 0.0 | - |
 | `as_of` | `versions` | ProductVersion | 2 | facts | - | 1 / 1 | 47 | 0 | 0.0 | 1.0 |
 | `anti_join` | `demand` | OrderLine | 1 | - | 512 | 153 / 165 | 3782 | 0 | 0.0 | - |
-| `anti_join` | `supply` | StockMovement | 2 | demand | 1 | 1.0 / 1 | 3311 | 0 | 0.1245 | 1.0 |
+| `anti_join` | `supply` | StockMovement | 2 | demand | 1 | 1 / 1 | 3311 | 0 | 0.1245 | 1.0 |
 
 What the table says, read straight off it (no layout claim yet — that is WP 2.3):
 
@@ -186,15 +191,15 @@ What the table says, read straight off it (no layout claim yet — that is WP 2.
 - `as_of` and `anti_join` reach 1.0 co-location on `sku` for the rows that exist, and they are
   different cases rather than the same number: the as-of join is region-local (1 region/request) and
   its open question is time tiling, while the anti-join touches 106.64 sku regions per request and
-  12.45% of its probes come back **empty** — there is no row to co-locate for those, so placement
-  cannot make them cheaper; their cost can only be set by what a region costs to consult.
+  12.45% of its **parent rows** come back **empty** — there is no row to co-locate for those, so
+  placement cannot make them cheaper; their cost can only be set by what a region costs to consult.
 - `dependent-read share` is 0.5-0.8333 everywhere, i.e. most of every one of these requests is a read
   that cannot be issued until an earlier read returns.
 
 **WP 2.3/2.4:** the layout-space analysis and the per-shape recommendation are in
 [report.md](report.md). Verified before writing it: the corpus regenerates to the committed sha256
 `ecc271e4...`, the descriptor JSON reproduces byte-identically, and `tests/test_join_shapes.py` is
-8 passed.
+11 passed.
 
 ### Unmeasured, and why
 

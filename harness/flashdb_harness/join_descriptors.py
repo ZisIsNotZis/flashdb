@@ -6,7 +6,7 @@ Ticket 29 found that the flat inventory flow produces four roughly independent
 access shapes, so every learnable *per-region* axis measured neutral or harmful
 on it — but the workloads the design actually motivates (star-schema fan-out,
 multi-hop traceability, as-of join, anti-join) were never generated. Ticket 81
-adds them (`generator.JOIN_MIX`) and this module measures what the emitted
+adds them (`generator.JOIN_NAMES`) and this module measures what the emitted
 requests structurally ask for, before any engine run:
 
 - **fan-out width** — how many child rows one parent row's hop reaches;
@@ -313,6 +313,12 @@ def _share(numerator: int, denominator: int) -> float:
     return numerator / denominator if denominator else 0.0
 
 
+def _median(values: list[int]) -> int | float:
+    """Median that stays an int when it is whole (`1.0` and `1` are one value)."""
+    value = median(values)
+    return int(value) if float(value).is_integer() else value
+
+
 def _hop_rows(hops: list[Hop], key: str) -> list[dict]:
     """Aggregate the hops by block name over the whole corpus (one row per block)."""
     order: list[str] = []
@@ -333,7 +339,7 @@ def _hop_rows(hops: list[Hop], key: str) -> list[dict]:
             "depth": own[0].depth,
             "parents": list(own[0].parents),
             "limit": own[0].limit,
-            "fanout_median": median(fanouts) if fanouts else 0,
+            "fanout_median": _median(fanouts) if fanouts else 0,
             "fanout_max": max(fanouts) if fanouts else 0,
             "rows_total": sum(len(hop.matched) for hop in own),
             "requests_with_no_match": sum(1 for hop in own if not hop.matched),
@@ -375,7 +381,7 @@ def measure(seed: int, per_shape: int) -> dict:
         shapes[name] = {
             "colocation_key": key,
             "fanout_width": {
-                "value": {"median": median(fanout_max), "max": max(fanout_max)},
+                "value": {"median": _median(fanout_max), "max": max(fanout_max)},
                 "method": (
                     "per dependent hop, the number of child rows one parent row reaches "
                     "after the block's declared `limit`, selected against "
@@ -437,11 +443,13 @@ def measure(seed: int, per_shape: int) -> dict:
                     f"distinct `{key}` values carried by the request's parent and child rows, "
                     "averaged over the corpus: the number of regions a region keyed on that "
                     "field makes the request touch (a per-region-parameter cost driver, not a "
-                    "co-location one)."
+                    "co-location one). A lower bound: only rows carrying the key are counted, "
+                    "so a row without it (every `Supplier` row carries no `sku`) adds no region "
+                    "although the request still has to visit it."
                 ),
             },
             "root_rows": {
-                "value": {"median": median(d["root_rows"] for d in described),
+                "value": {"median": _median([d["root_rows"] for d in described]),
                           "max": max(d["root_rows"] for d in described)},
                 "method": (
                     "rows the request's root read returns (the independent hop), median and "
@@ -463,6 +471,52 @@ def measure(seed: int, per_shape: int) -> dict:
                   "notes": MODEL_NOTES},
         "shapes": shapes,
     }
+
+
+def read_groups(seed: int, per_shape: int) -> dict[str, dict]:
+    """Read groups, child rows and root rows per request (the report's §2.3 bridge).
+
+    The descriptors count per *hop*; a set-binding hop (`$lines.order_no`,
+    `$demand.sku`) becomes one dependent read per distinct parent predicate, so the
+    read count exceeds the hop count by the parent fan-out. This resolves each
+    request's blocks against `JoinWorld` and deduplicates identical child
+    predicates (identical predicates are one read). It is the only place those
+    cost-model numbers come from, so the report quotes this function, not a shell
+    heredoc.
+    """
+    gen = Generator(seed, 4 * per_shape)
+    pairs = list(zip([n for _ in range(per_shape) for n in JOIN_NAMES],
+                     gen.join_requests(per_shape)))
+    world = gen.world
+    report: dict[str, dict] = {}
+    for name in JOIN_NAMES:
+        groups = dependent_groups = rows = root_rows = 0
+        per_hop: dict[str, int] = {}
+        for request_name, request in pairs:
+            if request_name != name:
+                continue
+            for hop in interpret(request, world):
+                per_hop.setdefault(hop.block, 0)
+                if not hop.dependent:
+                    groups += 1
+                    per_hop[hop.block] += 1
+                    root_rows += len(hop.matched)
+                    continue
+                predicates = {tuple(sorted((key, repr(value)) for key, value in group.where.items()))
+                              for group in hop.groups}
+                groups += len(predicates)
+                dependent_groups += len(predicates)
+                per_hop[hop.block] += len(predicates)
+                rows += len(hop.matched)
+        report[name] = {
+            "read_groups_per_request": round(groups / per_shape, 2),
+            "dependent_read_groups_per_request": round(dependent_groups / per_shape, 2),
+            "child_rows_per_request": round(rows / per_shape, 2),
+            "root_rows_per_request": round(root_rows / per_shape, 2),
+            "read_groups_by_hop": {block: round(count / per_shape, 2)
+                                   for block, count in per_hop.items()},
+        }
+    return report
 
 
 def print_table(report: dict, out=sys.stdout) -> None:
@@ -496,12 +550,32 @@ def print_table(report: dict, out=sys.stdout) -> None:
                   f"{'-' if not hop['dependent'] else hop['key_colocated_share']} |", file=out)
 
 
+def print_read_groups(report: dict, out=sys.stdout) -> None:
+    """The read-group derivation as committed Markdown (the report's §2.3 table)."""
+    print("| shape | read groups / request | dependent read groups / request "
+          "| child rows / request | root rows / request | read groups per hop / request |",
+          file=out)
+    print("|---|---|---|---|---|---|", file=out)
+    for name, row in report.items():
+        hops = ", ".join(f"{block} {count:.2f}"
+                         for block, count in row["read_groups_by_hop"].items())
+        print(f"| `{name}` | {row['read_groups_per_request']:.2f} "
+              f"| {row['dependent_read_groups_per_request']:.2f} "
+              f"| {row['child_rows_per_request']:.2f} "
+              f"| {row['root_rows_per_request']:.2f} | {hops} |", file=out)
+
+
 def main(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(description="measure the join-heavy shapes' descriptors")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--per-shape", type=int, default=25)
     ap.add_argument("--out", type=Path, default=None, help="write the JSON report here")
+    ap.add_argument("--groups", action="store_true",
+                    help="print the read-group cost derivation instead of the descriptor table")
     a = ap.parse_args(argv)
+    if a.groups:
+        print_read_groups(read_groups(a.seed, a.per_shape))
+        return 0
     report = measure(a.seed, a.per_shape)
     print_table(report)
     print(f"corpus: {report['corpus']['requests']} requests, "

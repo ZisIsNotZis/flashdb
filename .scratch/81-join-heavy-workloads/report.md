@@ -1,7 +1,8 @@
 # 81 — join-heavy workloads: per-region layout space vs L2 co-location (M2 WP 2.3 / 2.4)
 
-Status: 2026-10-17, branch `wave/m2-join-heavy`. Authority: the M2 acceptance in
-`.scratch/81-join-heavy-workloads/issues.md` and the workload hypotheses in `docs/dev-loop.md`. The
+Status: 2026-10-17, branch `wave/m2-join-heavy`. Authority: the M2 acceptance in `docs/roadmap.md`
+(item-by-item status in §8) and the workload hypotheses in `docs/dev-loop.md`; this report's own work
+packages are scoped by `.scratch/81-join-heavy-workloads/issues.md`. The
 pre-registered contract (`.scratch/15-objective-v0/pre-registration.md`) is **not changed**, no engine
 code is touched, L2 is not implemented, and no claim is made that an L2 implementation delivers any
 number below. The L2 go/no-go is an author-reserved decision (`docs/roadmap.md`, "Decisions reserved to
@@ -17,10 +18,10 @@ layout at all:
 
 | shape | verdict | decisive number |
 |---|---|---|
-| `star_fanout` | **L2 required for a structural read-count win.** Per-region parameters cannot remove a dependent hop; 64.79% of dependent parent groups are co-locatable on `sku`; the one non-co-locatable hop is a shared 64-row dimension. Per-region ceiling ≈1.1-1.2x (the 2-5-row movement fan-out), L2 ceiling ≈2x on the whole shape. | 4 read groups/request (root + 3 dependent); 1.84 co-locatable groups/request; `supplier` hop co-located share 0.0 |
-| `multi_hop` | **Not determinable between the two spaces, and the dominant term is neither: it is fan-out volume.** ≥1,216 dependent read groups and 1,583 child rows per request, 5 hops, no single key co-locates the chain (best 0.5487). Page size can compress the per-row read cost by at most ≈8.2x and only if the fan-out rows are contiguous under the access path (unmeasured); L2 removes ≤ the co-located hops' groups and cannot remove the rows. | 1,215 dependent probes + root = 1,216 read groups/request; 1,583 child rows/request; `products -> lines` 0.0 and `orders -> buyers` 0.0 under the best single key |
+| `star_fanout` | **L2 required for a structural read-count win.** Per-region parameters cannot remove a dependent hop; 64.79% of dependent parent groups are co-locatable on `sku`; the one non-co-locatable hop is a shared 64-row dimension. Per-region ceiling ≈1.2x on the 5-row movement tail only, and a net loss on the median (2 rows fit one 4 KiB page, 16K costs 1.25x), so a page-size-only route to the 15% bar is confined to the tail and unproven. L2 ceiling ≈2x on the whole shape. | 4 read groups/request (root + 3 dependent); 1.84 co-locatable groups/request; `supplier` hop co-located share 0.0 |
+| `multi_hop` | **Not determinable between the two spaces, and the dominant term is neither: it is fan-out volume.** 1,216 read groups (1,215.32 dependent + root) and 1,583 child rows per request, 5 hops, no single key co-locates the chain (best 0.5487). Page size can compress the per-row read cost by at most ≈8.2x and only if the fan-out rows are contiguous under the access path (unmeasured); L2 removes ≤ the co-located hops' groups and cannot remove the rows. | 1,215.32 dependent read groups + root = 1,216.32 read groups/request; 1,583 child rows/request; `products -> lines` 0.0 and `orders -> buyers` 0.0 under the best single key |
 | `as_of` | **Per-region parameters are not the lever and L2 is not justified by this shape.** 3 read groups, fan-out 1, one region/request, zero absent probes. Page size only makes single-row reads worse (1.25x / 1.95x), bloom has no absent probe to save, the trigger is throughput-neutral. L2 (sku-keyed) could collapse ≈3 reads to ≈1 on a shape that is already the cheapest of the four. | 2.88 read groups/request; absent share 0.0; 1.0 region/request |
-| `anti_join` | **Not determinable, and the evidence points against L2.** 107.64 distinct dependent probes/request over 106.64 sku regions; co-location cannot remove one probe (each is a distinct sku), it would fragment the 151-row demand scan into 107 regions, and 12.45% of probes have no row to place. The plausible per-region axes are the compaction trigger (tiles per probe region) and bloom only if the absent probes are in-range (unmeasured). | 106.64 distinct supply probes/request; 12.45% absent; 106.64 regions/request |
+| `anti_join` | **Not determinable, and the evidence points against L2.** 106.64 distinct dependent probes/request (107.64 read groups with the root) over 106.64 sku regions; co-location cannot remove one probe (each is a distinct sku), it would fragment the 151-row demand scan into 107 regions, and 12.45% of the parent rows have no row to place. The plausible per-region axes are the compaction trigger (tiles per probe region) and bloom only if the absent probes are in-range (unmeasured). | 106.64 distinct supply probes/request; 12.45% absent parent rows; 106.64 regions/request |
 
 **Overall recommendation (proposed to the author, not applied).** The M2 evidence does **not** support
 moving the layout space from per-region parameters to L2 as a general answer. It supports at most a
@@ -42,7 +43,7 @@ tail, so an L2 go must budget that write-amp/tail risk; it has not been measured
   compaction-flat (so the volume is bandwidth-bound and only the hop groups are left), or showing it is
   scattered (so page size cannot help and only a semantics change can) — either outcome replaces the
   "not determinable" verdict with a decided one.
-- A measurement showing `anti_join`'s absent probes are in-range and bloom saves ≥12% of its read
+- A measurement showing `anti_join`'s absent probes are in-range and bloom saves ≥18% of its read
   groups — that would make bloom (a per-region parameter) the lever, not placement.
 - Descriptors falsified by the data set: the numbers below come from `JoinWorld`, a modelled
   population (10k skus, 2k orders, 40 days), not a ≥10x instance. If real fan-out or co-location at
@@ -81,7 +82,7 @@ diff <(python3 -c "import json;print(json.dumps(json.load(open('/tmp/descriptors
 # no output
 
 uv run --offline --with pytest python -m pytest -q tests/test_join_shapes.py
-# 8 passed
+# 11 passed
 ```
 
 ## 2. The measured descriptor table (every number with its method)
@@ -109,8 +110,12 @@ Method per column:
 | co-location potential | share of dependent parent rows whose every matched child row carries the parent's co-location-key value, over parent rows that matched at least one row; such a child would share a region with its parent under a region key materialised on that field. Parent rows with no match are excluded and reported as absent share. |
 | absent share | dependent parent rows whose hop matched no row / all dependent parent rows. An absent row has no place to put anywhere, so no co-location key can make it cheap. |
 | best single key | co-location potential maximised over the stated candidate keys `sku`, `order_no`, `lot_no`, `supplier_no`; below 1.0 means no single key co-locates every hop. |
-| regions / request | distinct co-location-key values carried by the request's parent and child rows, averaged over the corpus: the number of regions a region keyed on that field makes one request touch. |
+| regions / request | distinct co-location-key values carried by the request's parent and child rows, averaged over the corpus: the number of regions a region keyed on that field makes one request touch. A **lower bound**: only rows that carry the key are counted, so a dimension row without it adds no region even though the request must still visit it (every `Supplier` row carries no `sku`; `multi_hop`'s root `items` rows carry no `order_no`). |
 | root rows | rows the request's root read returns, median and max over the corpus; it bounds the parent rows the dependent hops fan out from. |
+
+`multi_hop`'s 614 / 614 is not a median in the usual sense: it is the hottest sku's width, and the
+hottest sku is drawn into 13 of the 25 requests. Read it as "the hot sku sets the width"; §2.4 item 1
+states the check.
 
 ### 2.2 Per hop (all 25 requests of each shape pooled)
 
@@ -129,7 +134,7 @@ Method per column:
 | `as_of` | `facts` | StockMovement | 1 | - | 64 | 1 / 5 | 47 | 0 | 0.0 | - |
 | `as_of` | `versions` | ProductVersion | 2 | facts | - | 1 / 1 | 47 | 0 | 0.0 | 1.0 |
 | `anti_join` | `demand` | OrderLine | 1 | - | 512 | 153 / 165 | 3782 | 0 | 0.0 | - |
-| `anti_join` | `supply` | StockMovement | 2 | demand | 1 | 1.0 / 1 | 3311 | 0 | 0.1245 | 1.0 |
+| `anti_join` | `supply` | StockMovement | 2 | demand | 1 | 1 / 1 | 3311 | 0 | 0.1245 | 1.0 |
 
 The per-hop columns use the same counting rules restricted to one block: `fan-out median/max` is the
 per-parent child-row count after the block's `limit`; `rows total` is the child rows over the 25
@@ -143,32 +148,26 @@ The descriptors are counted per *hop*, and `dependent-read share` is a **hop** r
 ratio. A set-binding hop (`$lines.order_no`, `$demand.sku`) becomes one dependent read per distinct
 parent predicate, so the read count can exceed the hop count by the parent fan-out. This derivation
 resolves each request's blocks against `JoinWorld` and deduplicates the concrete child predicates
-(identical predicates are one read). It is the bridge from the descriptors to the cost model in §3.
+(identical predicates are one read). It is the bridge from the descriptors to the cost model in §3,
+and it is committed code (`join_descriptors.read_groups`, pinned by
+`test_read_group_cost_model_is_committed`), not a shell heredoc:
 
 ```
-cd harness && uv run --offline python - <<'EOF'
-from flashdb_harness.generator import Generator, JOIN_NAMES
-from flashdb_harness.join_descriptors import interpret
-g = Generator(42, 100); world = g.world
-pairs = list(zip([n for _ in range(25) for n in JOIN_NAMES], g.join_requests(25)))
-for name in JOIN_NAMES:
-    groups = rows = 0
-    for n, req in pairs:
-        if n != name: continue
-        hops = interpret(req, world)
-        groups += 1 + sum(len({tuple(sorted((k, repr(v)) for k, v in grp.where.items()))
-                              for grp in h.groups}) for h in hops if h.dependent)
-        rows += sum(len(h.matched) for h in hops if h.dependent)
-    print(name, "read_groups/req", round(groups / 25, 2), "child_rows/req", round(rows / 25, 2))
-EOF
+cd harness && uv run --offline python -m flashdb_harness.join_descriptors --groups \
+    --seed 42 --per-shape 25
 ```
 
-| shape | read groups / request | child rows / request | root rows / request | per-hop read groups / request |
-|---|---|---|---|---|
-| `star_fanout` | 4.00 | 4.16 | 1.00 | line 1.0 (root), product 1.0, movements 1.0, supplier 1.0 |
-| `multi_hop` | 1,216.32 | 1,582.56 | 4.44 | items 1.0 (root), products 4.44, lines 4.44, orders 410.6, returns 410.6, buyers 385.24 |
-| `as_of` | 2.88 | 1.88 | 1.88 | facts 1.0 (root), versions 1.88 |
-| `anti_join` | 107.64 | 132.44 | 151.28 | demand 1.0 (root scan), supply 106.64 |
+| shape | read groups / request | dependent read groups / request | child rows / request | root rows / request | per-hop read groups / request |
+|---|---|---|---|---|---|
+| `star_fanout` | 4.00 | 3.00 | 4.16 | 1.00 | line 1.00 (root), product 1.00, movements 1.00, supplier 1.00 |
+| `multi_hop` | 1216.32 | 1215.32 | 1582.56 | 4.44 | items 1.00 (root), products 4.44, lines 4.44, orders 410.60, returns 410.60, buyers 385.24 |
+| `as_of` | 2.88 | 1.88 | 1.88 | 1.88 | facts 1.00 (root), versions 1.88 |
+| `anti_join` | 107.64 | 106.64 | 132.44 | 151.28 | demand 1.00 (root scan), supply 106.64 |
+
+`read groups / request` is the total and counts the root read; the dependent-only count is the second
+column (1,215.32 for `multi_hop`, 106.64 for `anti_join`), so the totals 1,216.32 / 107.64 must not be
+quoted as "dependent". The command prints the values above; the table only adds the thousands
+separator.
 
 The parent-row co-location counts (same basis as the descriptor, one group per parent row) are
 `star_fanout` 1.84 co-located groups/request of 2.84 matched, `multi_hop` 601.32 of 1,095.84,
@@ -181,7 +180,10 @@ because the parent rows repeat the same sku.
 1. **It is a modelled population, not a data set.** `JoinWorld` has 10k skus, 2k orders, 40 days,
    6,000 order lines. `multi_hop`'s 614-row hop is a function of how many order lines the model holds
    per hot sku; at a ≥10x-history instance it grows. The descriptors are scale-dependent, and that
-   direction is not measured.
+   direction is not measured. The 614 / 614 shape row is the hot sku's width, not a central tendency:
+   the hottest catalogue sku is drawn into 13 of the 25 requests, so their widest dependent hop is its
+   614 order lines, while the other 12 requests span 1-311 rows. Read it as "the hot sku sets the
+   width" at this history length (check: `test_multi_hop_fanout_width_is_the_hot_sku` counts the 13).
 2. **Limits clip fan-out.** `star_fanout` movements `limit 128`, `as_of` facts `limit 64`,
    `anti_join` demand `limit 512` and supply `limit 1`; `multi_hop`'s `lines`, `orders`, `buyers` hops
    have no limit, which is why its fan-out is the only unbounded one.
@@ -193,6 +195,15 @@ because the parent rows repeat the same sku.
 5. **No per-hop byte count, page count, block read, or access path is measured.** The descriptors count
    rows a predicate reaches; whether those rows share a page depends on the engine's key order and the
    index the read path uses, which is exactly what is missing (§5).
+6. **`regions / request` is a lower bound, and rows without the key are uncounted.** `_regions` adds
+   only key values present in a row, so `star_fanout` reports 1.0 although the request must also visit
+   the `Supplier` dimension (Supplier rows carry no `sku`), and `multi_hop`'s root `items` rows
+   contribute no `order_no` region. Both are uncounted, so the true region count is at least the
+   reported value; the method string in `descriptors.json` says so.
+7. **The co-location key is reduced to a single field.** `docs/dev-loop.md` hypothesises co-location
+   along `(sku, loc, time-bucket)` for the replenishment shape; `CANDIDATE_KEYS` measures single
+   fields only (`sku`, `order_no`, `lot_no`, `supplier_no`), and `star_fanout`'s verdict rests on `sku`
+   alone. A composite key could co-locate rows no single field does; that is unmeasured.
 
 ## 3. The model: what each layout axis can and cannot move
 
@@ -220,6 +231,10 @@ cost(req) ≈ q · G · L_dep(page)          # one page read per distinct depend
   100-235 ms under compaction/fsync contention. The idle constants therefore understate a read by
   ≈6x under load, which makes the **count** `G` more decisive than the per-read constant.
 - `rows per request` for the volume term is §2.3's child rows plus the root rows.
+- **encoded row size ≈2 KiB/row** (assumed, not measured): the page arithmetic in §4 — 2 rows per
+  4K page, 8 per 16K, 32 per 64K — and the ≤8.2x page-size bound depend on it, as does
+  `star_fanout`'s tail figure. Doubling the row halves every rows-per-page count. It is an assumption
+  about the engine's encoding, not a device constant; §5.2's access-path measurement would replace it.
 
 ### 3.2 What the measured headroom says about these terms
 
@@ -270,10 +285,12 @@ Structure: 1 root row + 3 dependent hops (`product`, `movements`, `supplier`) = 
 **4.16 child rows** per request. Fan-out is 1-5; `movements` is the only multi-row hop.
 
 - **Page size**: `product` and `supplier` are single-row probes, so a larger page is a pure loss
-  (1.25x at 16K, 1.95x at 64K). `movements` reaches 2-5 rows; at 2 KiB/row that is 1-3 pages at 4K
-  and 1 page at 16K (≤≈2.4x on that hop if the pages are read serially, less if they are batched),
-  and zero if the movement rows are not adjacent. On a 4-read request that is **≈1.1-1.2x** — far
-  below the 15% bar, and it is the only hop page size can touch.
+  (1.25x at 16K, 1.95x at 64K). `movements` reaches 2-5 rows, i.e. 4-10 KiB at the assumed 2 KiB/row.
+  On the **median** request that is one 4 KiB page already, so a 16K page is 1.25x slower — a net
+  loss. Only the **5-row tail** has 2-3 pages at 4K to collapse into one at 16K: up to ≈2.4x on that
+  hop and ≈1.2x on the whole request's read-seconds (16.7%), and zero if the movement rows are not
+  adjacent. So a page-size-only route to the 15% bar is confined to that tail and unproven — it is not
+  a per-shape ceiling — and §5.2 lists the missing adjacency measurement that would decide it.
 - **Bloom**: absent share 0.0533 (16% of the movement hop's parents), so the most it can save is
   0.16 of one hop's read per request (≈4% of `G`), and ticket 29's range-reject result says it will
   usually save 0. `product`/`supplier` are always present.
@@ -290,15 +307,17 @@ Structure: 1 root row + 3 dependent hops (`product`, `movements`, `supplier`) = 
   into 10k sku regions is the wrong trade — so the shape's L2 ceiling is ≈2x and its **L2 floor after
   folding is 2 reads** (parent group + supplier).
 - **Verdict**: the cost is set by 3 dependent hop groups; the per-region space cannot remove one. L2 is
-  the required axis for a >15% move. The absolute win is small (4 → 2 reads), which is why this shape
-  alone does not justify L2 — but it is the cleanest case in the set.
+  the only structural route to a >15% move (a page-size-only 15% would be a 5-row-tail effect, and it
+  is unproven). The absolute win is small (4 → 2 reads), which is why this shape alone does not justify
+  L2 — but it is the cleanest case in the set.
 
 ### 4.2 `multi_hop` — fan-out volume dominates; neither axis alone is sufficient
 
-Structure: 5 hops, **1,216 read groups and 1,583 child rows per request**. The explosion is inside the
-shape: 4.44 products per lot fan out to 486.6 order lines per request, and each line then becomes a
-parent for `orders`, `returns`, and (through the order) `buyers`. The fan-out is uncapped by the
-request, and `dependent-read share` 0.8333 (5/6 hops) understates it by the parent-row count.
+Structure: 5 hops, **1,216 read groups (1,215.32 dependent + root) and 1,583 child rows per
+request**. The explosion is inside the shape: 4.44 products per lot fan out to 486.6 order lines per
+request, and each line then becomes a parent for `orders`, `returns`, and (through the order) `buyers`.
+The fan-out is uncapped by the request, and `dependent-read share` 0.8333 (5/6 hops) understates it by
+the parent-row count.
 
 - **Per-region page size / compaction**: the line fan-out is 486.6 rows (≈1 MB at 2 KiB/row). If those
   rows are contiguous under the access path, the read is bandwidth-bound (≈1.2 ms at 826.9 MiB/s) and
@@ -308,11 +327,14 @@ request, and `dependent-read share` 0.8333 (5/6 hops) understates it by the pare
   *bound* on the volume is 16/1.95 ≈ 8.2x read-seconds **only if the rows are contiguous**; if they
   are scattered, page size saves nothing. The compaction trigger likewise changes tiles per region
   and the tail, not the row count.
-- **Bloom**: absent parent share 0.2539, concentrated in `returns` (76.4% of its parent groups). If
-  those absent probes fall inside a tile's key range, bloom could remove up to ≈373 of the 1,216 read
-  groups (≈31%); if the `Return` index is keyed on `return_no` and an order with no returns is
-  range-rejected, it removes 0. Ticket 29's measured behaviour on the flat flow is the latter. This is
-  a per-region parameter with a **possibly large** headroom, and it is undetermined.
+- **Bloom**: the absent share 0.2539 is a share of **parent rows**: over 1,468.7 parent rows/request it
+  is 372.9 absent rows, and since deduplicating identical child predicates can only shrink a probe set,
+  that count bounds the removable groups at **at most ≈373 of the 1,216 (≈31%)** — and only if every
+  absent probe is in-range. The share must not be multiplied by the 1,216 distinct probes, which is a
+  different counting basis. It is concentrated in `returns` (76.4% of that hop's parents). If the
+  `Return` index is keyed on `return_no` and an order with no returns is range-rejected, bloom removes
+  0; ticket 29's measured behaviour on the flat flow is the latter. This is a per-region parameter with
+  a **possibly large** headroom, and it is undetermined.
 - **L2**: best single key 0.5487; under `order_no` the `orders` and `returns` hops are co-located
   (601.32 parent groups/request) while `products -> lines` and `orders -> buyers` are 0.0. Per-hop
   placement (L2 with multiple keys, dual copies or a handle map) could fold the order/return hops
@@ -346,14 +368,19 @@ share 0.0. The root reads 1-5 supply facts; each fact probes one SCD-2 version o
 ### 4.4 `anti_join` — not determinable; L2 cannot remove the probes and may fragment the scan
 
 Structure: 1 root scan (151.28 demand rows/request) + **106.64 distinct supply probes/request**
-(132.44 present child rows); 12.45% of the probes are absent; 106.64 regions/request.
+(132.44 present child rows); 12.45% of the **parent rows** are absent (19.1 rows/request); 106.64
+regions/request.
 
 - **Page size**: every supply probe reaches ≤1 row, so page size is a pure loss; the demand root is a
   151-row scan of one region (a few pages, bandwidth-bound), where page size is flat-to-modest cold.
-- **Bloom**: bounded by the 12.45% absent share × 106.64 probes ≈ **≤13.3 reads/request (≤12% of
-  `G`)**, and only if those absent probes are in-range. Ticket 29's measured flat-flow mechanism
-  (absent prefix range-rejected before the bloom) gives 0. The descriptor does not record the key
-  spelling, so this is the single largest undetermined item in this shape.
+- **Bloom**: bounded by the absent **parent rows**, not by the 12.45% share applied to the 106.64
+  distinct probes: 12.45% of 153.28 demand rows/request is **19.1 absent parent rows/request**, and
+  deduplication can only shrink that probe set, so **≤19.1 reads/request (≤18% of `G`)**, and only if
+  those absent probes are in-range. (Multiplying parent-row share by distinct probes gave 13.3, which
+  is not an established bound: the repeated skus are the hot ones, likelier to be present, so the
+  absent share over distinct probes can be higher than over parent rows.) Ticket 29's measured
+  flat-flow mechanism (absent prefix range-rejected before the bloom) gives 0. The descriptor does not
+  record the key spelling, so this is the single largest undetermined item in this shape.
 - **Compaction trigger**: 106.64 region consultations per request make tiles-per-region the tail
   driver; this is the plausible per-region lever, and it is a tail/endurance trade-off by measurement,
   not a throughput win.
@@ -367,12 +394,12 @@ Structure: 1 root scan (151.28 demand rows/request) + **106.64 distinct supply p
 
 ### 4.5 Summary
 
-| shape | dependent read groups / req | child rows / req | per-region parameter ceiling | L2 ceiling | verdict |
+| shape | read groups / req (root included) | child rows / req | per-region parameter ceiling | L2 ceiling | verdict |
 |---|---|---|---|---|---|
-| `star_fanout` | 4.00 | 4.16 | ≈1.1-1.2x (movement hop only) | ≈1.8-2x (supplier hop remains) | **L2 required** for a >15% move |
+| `star_fanout` | 4.00 | 4.16 | ≈1.2x on the 5-row tail only; net loss on the median | ≈1.8-2x (supplier hop remains) | **L2 required**; page size alone is tail-only |
 | `multi_hop` | 1,216.32 | 1,582.56 | page size ≤8.2x on the volume, contiguous only; trigger tail trade-off | ≈2x on groups, volume remains | **not determinable; volume-dominated** |
 | `as_of` | 2.88 | 1.88 | <1x (page size hurts) | ≈2.9x on a 3-read shape | **not the lever; do not build L2** |
-| `anti_join` | 107.64 | 132.44 | bloom ≤12% if in-range; trigger tail trade-off | ≈0, possibly negative | **not determinable; points against L2** |
+| `anti_join` | 107.64 | 132.44 | bloom ≤18% if in-range; trigger tail trade-off | ≈0, possibly negative | **not determinable; points against L2** |
 
 ## 5. What is unverified
 
@@ -388,7 +415,7 @@ Structure: 1 root scan (151.28 demand rows/request) + **106.64 distinct supply p
    `scattered` question that carries the page-size bound (≤8.2x) is entirely unmeasured, as is which
    entity index each hop would use.
 3. **The absent-probe in-range split is unmeasured** for all four shapes. It bounds bloom's headroom
-   (multi_hop ≤31%, anti_join ≤12%, star ≤4%, as_of 0) and it is the difference between "a per-region
+   (multi_hop ≤31%, anti_join ≤18%, star ≤4%, as_of 0) and it is the difference between "a per-region
    parameter matters" and "it is dead".
 4. **L2 is not implemented and has no real run.** The only measured co-location arm is *within-entity*
    family co-location (ticket 50/57): -16.6% blocks/request for ≈12.7x compaction write amplification
@@ -443,3 +470,40 @@ that does not exist yet. Neither is in this milestone's scope, and neither is ru
 None. No threshold, arm, workload, seed count or objective statement is changed. The report proposes no
 product-design change and implements no L2. The L2 go/no-go remains the author's reserved decision, and
 the pre-registration's rule stands: no claim about L2 until it is measured on a real run.
+
+## 8. M2 acceptance status
+
+`docs/roadmap.md` M2 is the acceptance home. Measured against that row — not against this ticket's
+engine-free slice:
+
+| M2 acceptance item (`docs/roadmap.md` M2) | status | evidence |
+|---|---|---|
+| fan-out / multi-hop depth / dependent-read share / co-location potential measured | **MET** | §2 and `descriptors.json` (seed 42, 25 requests/shape, corpus `ecc271e4…`), pinned by `test_committed_descriptor_values_are_pinned` |
+| an explicit go/no-go recommendation with evidence | **MET** | §0 and §4, proposed to the author; the L2 go/no-go stays author-reserved |
+| a headroom measurement at ≥10x | **UNMET** | no join shape has executed on the engine and no ≥10x instance exists for one (§5 items 1 and 6) |
+| learned vs declared headroom per shape with the latency rule | **UNMET** | neither a learned nor a declared arm has been run on a join shape, so there is no run for the pre-registered latency rule to apply to (§5 items 1 and 6) |
+
+**The M2 gate is UNMET (2 of 4).** This ticket's scope — "no engine execution, no L2 implementation" —
+is what WP 2.1-2.4 were allowed to do; it cannot narrow the milestone's acceptance, and the engine-free
+slice does not stand as the gate.
+
+Why the two unmeasured items cannot be closed inside that scope: the engine cannot execute any of the
+four shapes. `validate` (`engine/src/request.rs:129-155`) accepts only the `cust -> take` graph and the
+`sku/loc/qty/email/order_no` params; `validate_read` (`:230-263`) accepts only `Stock` get / `Customer`
+find / `StockMovement` scan by `order_no`; `bind` (`:176-190`) resolves one value per block, so a
+multi-row `$block.field` set binding has no execution path; and aggregate-to-write (contract L-07) is
+missing, so a replayed anti-join would measure only its detection half. The three missing capabilities
+— **multi-row binding**, **a validator that admits a graph other than `cust -> take`**, and
+**aggregate-to-write** — are the prerequisites for replaying these shapes at all.
+
+The smallest deciding measurement is **M-B** (§6): multi-row binding plus a cold ≥10x offered-load
+sweep per shape under declared 4K/64K, an eager and a deferred trigger and a co-located arm, with the
+pre-registered lag rule. It is the only measurement that can turn either unmet item into a verdict.
+
+Closing the M2 gate therefore needs one of:
+
+1. the engine work above plus the M-B run, which delivers both unmet items; or
+2. an explicit author waiver of the ≥10x headroom item (and of the learned-vs-declared item) for this
+   milestone, recorded in `docs/roadmap.md`, leaving the gate as "2 of 4 delivered by analysis".
+
+Neither is applied here: this report proposes, and the author decides.

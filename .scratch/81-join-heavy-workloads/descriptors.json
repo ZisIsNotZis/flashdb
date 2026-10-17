@@ -61,7 +61,7 @@
           "depth": 2,
           "entity": "StockMovement",
           "fanout_max": 1,
-          "fanout_median": 1.0,
+          "fanout_median": 1,
           "key_colocated_share": 1.0,
           "limit": 1,
           "parents": [
@@ -76,7 +76,7 @@
         "value": 2
       },
       "regions_per_request": {
-        "method": "distinct `sku` values carried by the request's parent and child rows, averaged over the corpus: the number of regions a region keyed on that field makes the request touch (a per-region-parameter cost driver, not a co-location one).",
+        "method": "distinct `sku` values carried by the request's parent and child rows, averaged over the corpus: the number of regions a region keyed on that field makes the request touch (a per-region-parameter cost driver, not a co-location one). A lower bound: only rows carrying the key are counted, so a row without it (every `Supplier` row carries no `sku`) adds no region although the request still has to visit it.",
         "value": 106.64
       },
       "root_rows": {
@@ -152,7 +152,7 @@
         "value": 2
       },
       "regions_per_request": {
-        "method": "distinct `sku` values carried by the request's parent and child rows, averaged over the corpus: the number of regions a region keyed on that field makes the request touch (a per-region-parameter cost driver, not a co-location one).",
+        "method": "distinct `sku` values carried by the request's parent and child rows, averaged over the corpus: the number of regions a region keyed on that field makes the request touch (a per-region-parameter cost driver, not a co-location one). A lower bound: only rows carrying the key are counted, so a row without it (every `Supplier` row carries no `sku`) adds no region although the request still has to visit it.",
         "value": 1.0
       },
       "root_rows": {
@@ -292,7 +292,7 @@
         "value": 5
       },
       "regions_per_request": {
-        "method": "distinct `order_no` values carried by the request's parent and child rows, averaged over the corpus: the number of regions a region keyed on that field makes the request touch (a per-region-parameter cost driver, not a co-location one).",
+        "method": "distinct `order_no` values carried by the request's parent and child rows, averaged over the corpus: the number of regions a region keyed on that field makes the request touch (a per-region-parameter cost driver, not a co-location one). A lower bound: only rows carrying the key are counted, so a row without it (every `Supplier` row carries no `sku`) adds no region although the request still has to visit it.",
         "value": 410.6
       },
       "root_rows": {
@@ -400,7 +400,7 @@
         "value": 3
       },
       "regions_per_request": {
-        "method": "distinct `sku` values carried by the request's parent and child rows, averaged over the corpus: the number of regions a region keyed on that field makes the request touch (a per-region-parameter cost driver, not a co-location one).",
+        "method": "distinct `sku` values carried by the request's parent and child rows, averaged over the corpus: the number of regions a region keyed on that field makes the request touch (a per-region-parameter cost driver, not a co-location one). A lower bound: only rows carrying the key are counted, so a row without it (every `Supplier` row carries no `sku`) adds no region although the request still has to visit it.",
         "value": 1.0
       },
       "root_rows": {
