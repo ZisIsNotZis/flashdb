@@ -26,3 +26,7 @@ worktrees/
 .env
 .env.*
 !.env.example
+
+# ticket-83 probe: instance copies are regenerable from the committed snapshot
+.scratch/83-index-probe/runs/live-*/
+.scratch/83-index-probe/runs/inst/
