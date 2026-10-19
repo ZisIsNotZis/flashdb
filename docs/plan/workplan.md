@@ -12,7 +12,7 @@ evidence, not a preference.
 
 ## M3 — access-path parity (current)
 
-Budget: 6 writer dispatches, 2 review cycles per package, 3 no-progress attempts per package, fresh
+Budget: 7 writer dispatches, 2 review cycles per package, 3 no-progress attempts per package, fresh
 context for every child. One writer per worktree or file area; the main agent integrates.
 
 | id | status | owner | scope (exact files) | acceptance and proof | depends |
@@ -21,6 +21,7 @@ context for every child. One writer per worktree or file area; the main agent in
 | WP-2 | queued | writer (fresh) | measurement only: `scripts/` + `.scratch/83-index-probe/` (no engine edits) | quiet box (loadavg < 2 sustained before each arm run), 5 paired 200 rps blocks with arm rotation, snapshot restore verified, stderr kept; reports paired per-block sustainment declared vs indexed plus `lag_breach_attribution` for every rejected window; verdict "indexed sustains >= declared" or the named phase still responsible | WP-1 |
 | WP-3 | **in flight** | worker (fresh) | `harness/flashdb_harness/baseline_0b.py` (+ its tests) | the run record carries the KPI-ladder instruments: bytes written/ingested, bytes read/request, CPU µs/request, resident bytes/data byte, recovery seconds — each with the command that read it; recomputing the M1 records yields a table whose throughput and latency columns reproduce ticket 82's report within its stated error band | none |
 | WP-6 | queued | worker (fresh) | `engine/src/wal.rs` (or the segment writer) + one 200 rps paired block in `.scratch/83-index-probe/` | preallocating the WAL segment is tested as the mechanism behind the +1,432 us barrier gap vs postgres (`docs/plan/gap-analysis.md` §5.1): the block reports service p50/p99 with and without preallocation, and if the gap does not close the sync-count-per-commit measurement is taken instead; verdict names the mechanism or records it unconfirmed | WP-3, quiet box |
+| WP-7 | **in flight** | worker (fresh, worktree `wp7-docs-reconcile`) | `README.md`, `docs/engine.md`, `docs/plan/evidence.md` | every current-state sentence resolves to a code path or a record path; no false absence and no false capability; every printed command ran; README states the negative external result, the licence and where to report a problem; `docs/plan/evidence.md` becomes the current reconciliation record (closes PLAN-readme-stale, PLAN-engine-doc-stale, PLAN-evidence-reconciliation) | none |
 | WP-4 | queued | reviewer (fresh) | read-only review of WP-1..WP-3 at the integrated revision | package verdicts with defect evidence (location, criterion, reproduction); no commit | WP-1..WP-3 |
 
 Stop conditions: a package that cannot meet acceptance reports incomplete with the exact blocker
