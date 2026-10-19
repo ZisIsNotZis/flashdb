@@ -12,7 +12,7 @@ evidence, not a preference.
 
 ## M3 — access-path parity (current)
 
-Budget: 4 writer dispatches, 2 review cycles per package, 3 no-progress attempts per package, fresh
+Budget: 6 writer dispatches, 2 review cycles per package, 3 no-progress attempts per package, fresh
 context for every child. One writer per worktree or file area; the main agent integrates.
 
 | id | status | owner | scope (exact files) | acceptance and proof | depends |
@@ -20,6 +20,7 @@ context for every child. One writer per worktree or file area; the main agent in
 | WP-1 | **in flight** | worker (fresh, worktree `wp1-index-merged`) | `engine/src/index.rs`, `engine/src/engine.rs` (merged primary scan with csn), `engine/src/readahead.rs` (startup warm source), `engine/src/bin/flashdb-load.rs` (eager build call site) + their tests | the index is built from the **merged** memtable+tile view: a region whose rows are all in the memtable yields one entry per row and `coverage_csn` = max covered csn, bound by a test; an empty build while the merged scan yields rows is a hard `io::Error` naming both counts; `startup_warm scan_entries` is non-zero for a memtable-only region; `cargo --config 'source.crates-io.replace-with="aliyun"' --config 'source.aliyun.registry="sparse+https://mirrors.aliyun.com/crates.io-index/"' test --workspace --offline` green; policy-off path unchanged | none |
 | WP-2 | queued | writer (fresh) | measurement only: `scripts/` + `.scratch/83-index-probe/` (no engine edits) | quiet box (loadavg < 2 sustained before each arm run), 5 paired 200 rps blocks with arm rotation, snapshot restore verified, stderr kept; reports paired per-block sustainment declared vs indexed plus `lag_breach_attribution` for every rejected window; verdict "indexed sustains >= declared" or the named phase still responsible | WP-1 |
 | WP-3 | **in flight** | worker (fresh) | `harness/flashdb_harness/baseline_0b.py` (+ its tests) | the run record carries the KPI-ladder instruments: bytes written/ingested, bytes read/request, CPU µs/request, resident bytes/data byte, recovery seconds — each with the command that read it; recomputing the M1 records yields a table whose throughput and latency columns reproduce ticket 82's report within its stated error band | none |
+| WP-6 | queued | worker (fresh) | `engine/src/wal.rs` (or the segment writer) + one 200 rps paired block in `.scratch/83-index-probe/` | preallocating the WAL segment is tested as the mechanism behind the +1,432 us barrier gap vs postgres (`docs/plan/gap-analysis.md` §5.1): the block reports service p50/p99 with and without preallocation, and if the gap does not close the sync-count-per-commit measurement is taken instead; verdict names the mechanism or records it unconfirmed | WP-3, quiet box |
 | WP-4 | queued | reviewer (fresh) | read-only review of WP-1..WP-3 at the integrated revision | package verdicts with defect evidence (location, criterion, reproduction); no commit | WP-1..WP-3 |
 
 Stop conditions: a package that cannot meet acceptance reports incomplete with the exact blocker
