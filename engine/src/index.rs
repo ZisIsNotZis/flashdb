@@ -16,10 +16,12 @@
 //! WAL-projection-verified at recovery), as a sidecar optimization that is
 //! rebuilt at open when lost.
 
+use std::fmt;
 use std::io;
 use std::path::Path;
 use std::sync::Arc;
 
+use crate::engine::Engine;
 use crate::keys;
 use crate::tile::Tile;
 
@@ -49,6 +51,81 @@ pub struct OrderNoIndexBuild {
     pub output_bytes: u64,
 }
 
+/// Evidence, read from engine state outside the build's scan, that the index's
+/// region holds at least one row.
+///
+/// The build cannot answer this itself: the scan reports how many rows it
+/// visited, but a source that misses part of the region reports zero and sees
+/// zero, so "zero rows and zero entries" looks exactly like an empty region
+/// while the region is in fact full. That is ticket 83: a tiles-only source saw
+/// no rows for a region that was entirely in the serving memtable, and the build
+/// wrote an empty sidecar. Only a structure the scan does not walk can testify
+/// that the region is non-empty.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RegionRows {
+    /// At least one active tile's first key names the region.
+    InTiles,
+    /// The serving memtable holds entries. The memtable is shared by every
+    /// region, so this witnesses "some rows are still live in the memtable",
+    /// not "rows of this region are": it can over-report, never under-report the
+    /// state a missed scan leaves behind.
+    InMemtable { entries: usize },
+    /// No engine structure holds a row in the region, so an empty build is
+    /// legitimate.
+    Empty,
+}
+
+impl RegionRows {
+    fn holds_rows(self) -> bool { !matches!(self, RegionRows::Empty) }
+}
+
+impl fmt::Display for RegionRows {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            RegionRows::InTiles => write!(f, "an active tile holds rows of this region"),
+            RegionRows::InMemtable { entries } => write!(f, "the serving memtable holds {entries} entries"),
+            RegionRows::Empty => write!(f, "no engine structure holds rows of this region"),
+        }
+    }
+}
+
+/// The `family|entity` name of the region the index covers, spelled from the
+/// same primary prefix the authoritative scan walks, so it matches what
+/// [`Engine::active_tile_regions`] reports for a tile of that region under the
+/// given key encoding (family-first gives `P|StockMovement`, the entity-first
+/// encoding `C|StockMovement`). `None` only for an entity the key codec rejects,
+/// which cannot happen for the literal [`INDEX_ENTITY`].
+fn region_name(encoding: keys::KeyEncoding) -> Option<String> {
+    let mut prefix = keys::primary_prefix_with(encoding, INDEX_ENTITY, 0).ok()?;
+    // Drop the 8-byte handle a prefix carries to leave `marker | entity | 0`.
+    prefix.truncate(prefix.len() - 8);
+    Some(keys::region_name(&prefix))
+}
+
+/// Whether the index's region holds rows, read from the engine structures the
+/// build's scan does not consume - the independent witness [`RegionRows`]
+/// describes. The caller reads it at the same boundary as the scan, so the build
+/// can fail on an empty result instead of writing a sidecar that would leave
+/// every scan on the full-entity fallback.
+///
+/// A tile witnesses the region only through its first key, which is exact for a
+/// region-partitioned tile and absent for a whole-keyspace one; the memtable arm
+/// covers the case a whole-keyspace tile or no tile at all leaves behind. Under a
+/// `RegionMode::Global` publish the only rows are tile-resident, so this signal
+/// cannot see them: it under-reports there, and the merged-view scan (which always
+/// reads tiles) is what keeps that state correct.
+pub fn movement_region_rows(engine: &Engine) -> RegionRows {
+    if let Some(region) = region_name(engine.key_encoding()) {
+        if engine.active_tile_regions().iter().flatten().any(|r| *r == region) {
+            return RegionRows::InTiles;
+        }
+    }
+    match engine.serving_memtable_entries() {
+        0 => RegionRows::Empty,
+        entries => RegionRows::InMemtable { entries },
+    }
+}
+
 /// Build the `order_no -> handle` index tile from the live `P|StockMovement`
 /// rows `scan_primary` visits. Runs off the request path (the caller owns the
 /// thread): it streams the whole entity prefix once, JSON-parses each document
@@ -57,20 +134,27 @@ pub struct OrderNoIndexBuild {
 /// file). The tile is written to a scratch name and atomically renamed over the
 /// final `name`, so a rebuild after a retire replaces the previous sidecar file
 /// rather than failing on `create_new`. The caller must sync the parent directory
-/// before adopting the tile, matching the compaction apply ordering. Memory is
-/// bounded by the entity's index entries (one sort buffer), not the document set.
+/// before adopting the tile, matching the compaction apply ordering.
+///
+/// Memory: this build holds one sort buffer of index entries (each a `U` unique
+/// key plus its 8-byte handle), not one per document. The production caller adds
+/// the scan source's own footprint on top: the engine's memtable cannot be shared
+/// with the builder thread, so the driver snapshots every movement document into
+/// a `Vec` first (one copy of the region's documents, held until the build
+/// returns). Neither side keeps a second copy of a document.
 ///
 /// `scan_primary` walks the rows at latest committed state and returns how many
 /// live rows it visited; the engine supplies the merged memtable + tile source so
-/// rows still in the serving memtable are covered, and a test may supply the
-/// tile-only `TileReadView::scan_primary` instead. Every visited row must produce
-/// an entry: a build that visits rows but yields fewer entries is a defect that
-/// would leave the region silently served by the full scan, so it fails here
-/// rather than writing an empty (or partial) sidecar.
+/// rows still in the serving memtable are covered. `region_rows` is the
+/// independent non-emptiness witness: an empty result for a region that holds
+/// rows fails here rather than writing an empty sidecar. The scan's own count is
+/// quoted in that failure but never compared against the entry count, because
+/// both come from the same iteration and can only agree.
 pub fn build_order_no_index(
     dir: &Path,
     key_encoding: keys::KeyEncoding,
     scan_primary: impl FnOnce(&mut dyn FnMut(u64, u64, &[u8]) -> io::Result<()>) -> io::Result<u64>,
+    region_rows: RegionRows,
     name: &str,
 ) -> io::Result<OrderNoIndexBuild> {
     // (encoded key, value). Keys must be strictly increasing, so collect and
@@ -87,10 +171,11 @@ pub fn build_order_no_index(
         coverage_csn = coverage_csn.max(csn);
         Ok(())
     })?;
-    if rows != entries.len() as u64 {
+    if entries.is_empty() && region_rows.holds_rows() {
         return Err(io::Error::new(io::ErrorKind::InvalidData, format!(
-            "order_no index build visited {rows} live StockMovement rows but produced {} entries",
-            entries.len())));
+            "order_no index build produced 0 entries for a region that holds rows ({region_rows}): \
+             the scan visited {rows} live StockMovement rows, so its source does not cover the \
+             region and the index would leave every scan on the full-entity fallback")));
     }
     entries.sort_by(|a, b| a.0.cmp(&b.0));
     let path = dir.join(name);

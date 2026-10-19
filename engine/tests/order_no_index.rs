@@ -2,9 +2,8 @@
 // never on the correctness path — a hit is cross-checked, a miss or an absent or
 // a stale index always falls back to the authoritative full-entity scan.
 
-use flashdb_engine::engine::{Engine, Op};
-use flashdb_engine::index::{build_order_no_index, OrderNoIndexBuild, INDEX_ENTITY, INDEX_FIELD};
-use flashdb_engine::keys::KeyEncoding;
+use flashdb_engine::engine::{Engine, Op, RegionMode};
+use flashdb_engine::index::{build_order_no_index, movement_region_rows, OrderNoIndexBuild, RegionRows, INDEX_ENTITY, INDEX_FIELD};
 use flashdb_engine::request::execute_request;
 use serde_json::{json, Value};
 use std::path::PathBuf;
@@ -40,6 +39,7 @@ fn build(e: &Engine, dir: &std::path::Path) -> std::io::Result<OrderNoIndexBuild
         dir,
         e.key_encoding(),
         |visit| e.scan_primary_with_csn(INDEX_ENTITY, visit),
+        movement_region_rows(e),
         "index-order-no.tile",
     )
 }
@@ -155,20 +155,24 @@ fn index_builder_rejects_a_non_string_order_no() {
 /// memtable, so a tile-only build wrote an empty sidecar (`entries = 0`,
 /// `coverage_csn = 0`) and every scan silently fell back to the full scan. The
 /// build must cover the memtable rows through the merged view.
+///
+/// The handles are committed OUT OF ORDER (3, then 1, then 2), so the scan visits
+/// them in handle order with the CSNs 2, 3, 1: the covered CSN is the maximum over
+/// the rows, which "the last row's csn" (1) would fail.
 #[test]
 fn index_build_covers_rows_that_live_only_in_the_memtable() {
     let dir = tmp_dir("memtable");
     let mut e = Engine::create(&dir.join("data.wal")).unwrap();
-    let orders = ["O00000001", "O00000002", "O00000003"];
-    for (i, order) in orders.iter().enumerate() {
-        e.commit_block(format!("m-{i}").as_bytes(), &[movement(i as u64 + 1, order, &format!("M{i}"))])
+    let orders = [(3u64, "O00000003"), (1, "O00000001"), (2, "O00000002")];
+    for (i, (handle, order)) in orders.iter().enumerate() {
+        e.commit_block(format!("m-{i}").as_bytes(), &[movement(*handle, order, &format!("M{i}"))])
             .unwrap();
     }
     assert!(e.active_tile_regions().is_empty(), "no tile exists, so a tile-only build sees zero rows");
 
     let build = build(&e, &dir).unwrap();
     assert_eq!(build.index.entries, orders.len() as u64, "one entry per memtable row");
-    assert_eq!(build.index.coverage_csn, e.csn(), "the covered CSN is the max row CSN");
+    assert_eq!(build.index.coverage_csn, 3, "the covered CSN is the max row CSN, not the last row's");
     e.adopt_order_no_index(build.index);
 
     assert_eq!(e.lookup_movement_by_order_no(b"O00000002").unwrap(), Some(2));
@@ -181,23 +185,87 @@ fn index_build_covers_rows_that_live_only_in_the_memtable() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
-/// A build that visits rows but produces no entries would write an empty sidecar
-/// and silently leave every scan on the full-scan fallback. The scan reports what
-/// it visited, so any disagreement is a hard error naming both counts.
+/// The non-emptiness signal the loud-error seam reads is derived from engine
+/// structures, not from the scan: an empty engine reports none, rows still in the
+/// serving memtable report the memtable, and a published region tile reports the
+/// tile.
 #[test]
-fn index_build_fails_loudly_when_visited_rows_and_entries_disagree() {
-    let dir = tmp_dir("disagree");
+fn region_signal_reads_the_tile_before_the_memtable() {
+    let dir = tmp_dir("signal");
+    let mut e = Engine::create(&dir.join("data.wal")).unwrap();
+    assert_eq!(movement_region_rows(&e), RegionRows::Empty, "an empty engine holds no rows");
+    e.commit_block(b"m0", &[movement(1, "O00000001", "M0")]).unwrap();
+    assert_eq!(movement_region_rows(&e), RegionRows::InMemtable { entries: 1 },
+        "the only row is still in the serving memtable");
+    e.set_region_mode(RegionMode::PerRegion);
+    e.publish_tile(dir.join("tile-0.tile"), e.csn()).unwrap();
+    assert_eq!(movement_region_rows(&e), RegionRows::InTiles,
+        "the published tile's first key names the region");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// An updated handle and a deleted handle: the index holds exactly one entry per
+/// LIVE row. The re-versioned handle contributes its newest order_no only (its
+/// superseded version is not indexed), the deleted handle is absent, and
+/// `coverage_csn` is the max CSN over the live versions - not the tombstone's,
+/// which is the largest CSN in the region.
+#[test]
+fn index_holds_one_entry_per_live_row_across_versions_and_deletes() {
+    let dir = tmp_dir("versions");
+    let mut e = Engine::create(&dir.join("data.wal")).unwrap();
+    // csn 1: handles 1 and 2.
+    e.commit_block(b"v0", &[movement(1, "O1", "M1"), movement(2, "O2", "M2")]).unwrap();
+    // csn 2: handle 1 is re-versioned under a new order_no.
+    e.commit_block(b"v1", &[movement(1, "O1b", "M1")]).unwrap();
+    // csn 3: handle 3 appears, so the region has a row newer than BOTH live rows.
+    e.commit_block(b"v2", &[movement(3, "O3", "M3")]).unwrap();
+    // csn 4: handle 3 is deleted. The max CSN over LIVE rows stays 2.
+    e.commit_block(b"v3", &[Op::DelDoc { entity: INDEX_ENTITY.to_vec(), handle: 3 }]).unwrap();
+    assert_eq!(e.csn(), 4, "the tombstone is the newest version in the region");
+
+    let build = build(&e, &dir).unwrap();
+    assert_eq!(build.index.entries, 2, "one entry per live row: handle 1's newest and handle 2");
+    assert_eq!(build.index.coverage_csn, 2, "the max csn over LIVING versions, not the tombstone's");
+    e.adopt_order_no_index(build.index);
+
+    assert_eq!(e.lookup_movement_by_order_no(b"O1b").unwrap(), Some(1), "the newest version is indexed");
+    assert_eq!(e.lookup_movement_by_order_no(b"O1").unwrap(), None, "the superseded version is not");
+    assert_eq!(e.lookup_movement_by_order_no(b"O2").unwrap(), Some(2));
+    assert_eq!(e.lookup_movement_by_order_no(b"O3").unwrap(), None, "the deleted handle is absent");
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// The loud-error seam that guards ticket 83: a build whose source visits NOTHING
+/// while the region holds rows must fail instead of writing an empty sidecar. The
+/// scan's own row count cannot witness this (a source that misses the region
+/// reports zero rows and produces zero entries, which is exactly what an empty
+/// region looks like), so the build is given the engine-derived non-emptiness
+/// signal and must fail on it. This test supplies the ticket-83 state - rows only
+/// in the serving memtable, a source that visits none - and a real engine, so the
+/// signal comes from real engine structures, not from the test.
+#[test]
+fn index_build_fails_when_the_source_visits_nothing_for_a_region_that_holds_rows() {
+    let dir = tmp_dir("emptysource");
+    let mut e = Engine::create(&dir.join("data.wal")).unwrap();
+    e.commit_block(b"m", &[movement(1, "O00000001", "M0"), movement(2, "O00000002", "M1")]).unwrap();
+    assert!(e.active_tile_regions().is_empty(), "no tile exists, so only the memtable holds the rows");
+    let region_rows = movement_region_rows(&e);
+    assert_ne!(region_rows, RegionRows::Empty, "the engine reports the region holds rows");
+
     let result = build_order_no_index(
         &dir,
-        KeyEncoding::FamilyFirst,
-        |_visit| Ok(2),
+        e.key_encoding(),
+        |_visit| Ok(0),
+        region_rows,
         "index-order-no.tile",
     );
-    let err = result.err().expect("rows visited with no entries is a defect, not an empty index");
+    let err = result.err().expect("an empty build over a non-empty region is a defect, not an empty index");
     assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     let message = err.to_string();
-    assert!(message.contains("visited 2 live"), "names the visited rows: {message}");
     assert!(message.contains("produced 0 entries"), "names the produced entries: {message}");
+    assert!(message.contains("visited 0 live"), "names the visited rows: {message}");
+    assert!(message.contains("the serving memtable holds 2 entries"), "names the signal: {message}");
     assert!(!dir.join("index-order-no.tile").exists(), "a rejected build writes no sidecar");
 
     std::fs::remove_dir_all(&dir).unwrap();

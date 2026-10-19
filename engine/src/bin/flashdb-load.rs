@@ -84,7 +84,7 @@ use std::io::{self, BufRead, BufReader, Write};
 use std::time::{Duration, Instant};
 
 use flashdb_engine::engine::{build_compaction_job, BarrierCompletion, CompactShape, CompactionJob, CompactionOutcome, Engine, LayoutPolicy, Op, Outcome, RegionMode, RequestOutcome, MAX_ACTIVE_TILES, MAX_PENDING_BARRIERS};
-use flashdb_engine::index::{build_order_no_index, OrderNoIndexBuild, INDEX_ENTITY};
+use flashdb_engine::index::{build_order_no_index, movement_region_rows, OrderNoIndexBuild, RegionRows, INDEX_ENTITY};
 use flashdb_engine::keys::KeyEncoding;
 use flashdb_engine::metrics::WindowSnapshot;
 use flashdb_engine::replay::submit_requests_grouped;
@@ -416,11 +416,13 @@ fn read_policy(path: &str) -> io::Result<LayoutPolicy> {
 /// `early_dispatches`, `window_us` (the window's actual wall time), `invalid` (the pacer's
 /// rejection flag), `reject_reason` (WHICH rule rejected it, `null` when valid),
 /// `service_ceiling_us`/`service_ceiling_breached` and `lag_ceiling_us`/`lag_ceiling_breached`,
-/// `compact_bytes` (this window's actuation output), `policy` (the active per-region policy, see
-/// [`LayoutPolicy::to_json`]), then `current` and `previous` window snapshots. A window snapshot
-/// is `{"patterns", "regions"}` as frozen by [`WindowSnapshot::to_json`]; `previous` is `null` for
-/// the first window. Object key order is serde_json's sorted map, so two identical runs emit
-/// identical lines.
+/// `compact_bytes` (this window's actuation output), `index_scan_us` (the previous window boundary's
+/// request-thread movement-region snapshot for the derived index; 0 when none ran), `policy` (the
+/// active per-region policy, see [`LayoutPolicy::to_json`]), then `current` and `previous` window
+/// snapshots. A window snapshot is `{"patterns", "regions"}` as frozen by [`WindowSnapshot::to_json`];
+/// `previous` is `null` only before anything has been rotated, and the startup rotation that clears
+/// the eager build/warm makes it non-null for window 0. Object key order is serde_json's sorted map,
+/// so two identical runs emit identical lines.
 ///
 /// `invalid`, the reject reason and `window_us` must be on the JSON line, not only the human
 /// `window=` line: a `--metrics-json` consumer builds the capacity curve from these lines, and
@@ -458,6 +460,12 @@ struct WindowLine<'a> {
     /// Requests issued before their due time by more than `EARLY_TOLERANCE_US` (always 0).
     early_dispatches: u64,
     window_us: u64,
+    /// Request-thread microseconds the PREVIOUS window boundary spent snapshotting
+    /// the movement region for the derived `order_no` index (0 when no snapshot
+    /// ran). Carried like `boundary_drain_prev_us`: it is boundary work that
+    /// stalls this window's first group, and folding it in is what keeps a breach
+    /// it causes out of the read bucket.
+    index_scan_us: u64,
     invalid: bool,
     reject_reason: Option<String>,
     service_ceiling_us: Option<u64>,
@@ -494,6 +502,7 @@ fn metrics_json_line(w: WindowLine) -> String {
         "groups_over_service_ceiling": w.groups_over_service_ceiling,
         "early_dispatches": w.early_dispatches,
         "window_us": w.window_us,
+        "index_scan_us": w.index_scan_us,
         "invalid": w.invalid,
         "reject_reason": w.reject_reason,
         "service_ceiling_us": w.service_ceiling_us,
@@ -1083,13 +1092,18 @@ fn order_no_index_wanted(policy: &LayoutPolicy) -> bool {
 /// every row may still be in the serving memtable, where a tile-only view sees
 /// none. The engine's memtable cannot be shared with the builder thread, so the
 /// scan runs here; the parse, sort and the synced tile write stay on the worker.
+///
+/// Memory: this holds one copy of the region's documents until the build returns
+/// (the engine cannot hand its memtable to another thread), on top of the
+/// builder's own sort buffer of index entries. The scan returns how many live
+/// rows it visited, the builder quotes it in a failure but does not compare it
+/// with its own count: both come from this one iteration.
 fn movement_rows(engine: &Engine) -> io::Result<Vec<(u64, u64, Vec<u8>)>> {
     let mut rows: Vec<(u64, u64, Vec<u8>)> = Vec::new();
-    let visited = engine.scan_primary_with_csn(INDEX_ENTITY, |handle, csn, doc| {
+    engine.scan_primary_with_csn(INDEX_ENTITY, |handle, csn, doc| {
         rows.push((handle, csn, doc.to_vec()));
         Ok(())
     })?;
-    debug_assert_eq!(visited, rows.len() as u64, "the scan reports what it visited");
     Ok(rows)
 }
 
@@ -1101,6 +1115,7 @@ fn spawn_order_no_index_build(
     dir: std::path::PathBuf,
     key_encoding: KeyEncoding,
     rows: Vec<(u64, u64, Vec<u8>)>,
+    region_rows: RegionRows,
 ) -> std::sync::mpsc::Receiver<io::Result<OrderNoIndexBuild>> {
     let (tx, rx) = std::sync::mpsc::channel::<io::Result<OrderNoIndexBuild>>();
     std::thread::spawn(move || {
@@ -1113,6 +1128,7 @@ fn spawn_order_no_index_build(
                 }
                 Ok(rows.len() as u64)
             },
+            region_rows,
             "order-no-index.tile",
         ));
     });
@@ -1122,11 +1138,23 @@ fn spawn_order_no_index_build(
 /// Adopt a finished off-path index build and reconcile the desired state with
 /// the current policy (WP-M). Non-blocking: the read path falls back to the full
 /// scan until a build is adopted, so the index is never on the correctness path.
+///
+/// Returns the microseconds this boundary spent snapshotting the region for a
+/// new build on the request thread (0 when no scan ran). The caller emits it as
+/// the window's `index_scan_us`, because the snapshot is the one part of the
+/// boundary index work that stalls the pacer.
+///
+/// A failed snapshot is one-shot (`scan_failed`): the read path already falls
+/// back to the authoritative scan, and the same snapshot would fail the same way
+/// at every later boundary, so it is not retried for the rest of the run. A
+/// policy toggle away from the index clears the latch, so selecting it again
+/// retries once.
 fn manage_order_no_index(
     engine: &mut Engine,
     index_build_rx: &mut Option<std::sync::mpsc::Receiver<io::Result<OrderNoIndexBuild>>>,
     index_dir: &std::path::Path,
-) -> io::Result<()> {
+    scan_failed: &mut bool,
+) -> io::Result<u64> {
     if let Some(rx) = index_build_rx.as_ref() {
         match rx.try_recv() {
             Ok(Ok(build)) => {
@@ -1151,20 +1179,30 @@ fn manage_order_no_index(
             }
         }
     }
-    match (
-        order_no_index_wanted(engine.layout_policy()),
-        engine.has_order_no_index(),
-        index_build_rx.is_some(),
-    ) {
+    let wanted = order_no_index_wanted(engine.layout_policy());
+    if !wanted { *scan_failed = false; }
+    let mut scan_us: u64 = 0;
+    match (wanted, engine.has_order_no_index(), index_build_rx.is_some()) {
+        (true, false, false) if *scan_failed => {}
         (true, false, false) => {
-            match movement_rows(engine) {
+            // The non-emptiness witness is read from the engine, not from the
+            // scan: a source that misses the region reports zero rows, so the
+            // scan cannot testify about its own coverage.
+            let region_rows = movement_region_rows(engine);
+            let scan_t0 = Instant::now();
+            let rows = movement_rows(engine);
+            scan_us = scan_t0.elapsed().as_micros() as u64;
+            match rows {
                 Ok(rows) => {
                     *index_build_rx = Some(spawn_order_no_index_build(
-                        index_dir.to_path_buf(), engine.key_encoding(), rows));
+                        index_dir.to_path_buf(), engine.key_encoding(), rows, region_rows));
                 }
                 // Non-fatal, like a failed build: the authoritative scan still
-                // serves correctly and a later boundary retries.
-                Err(e) => eprintln!("flashdb-load: order_no index scan failed; falling back to scan: {e}"),
+                // serves correctly. Latched, so the stall is not paid again.
+                Err(e) => {
+                    *scan_failed = true;
+                    eprintln!("flashdb-load: order_no index scan failed; falling back to scan: {e}");
+                }
             }
         }
         (false, true, _) => {
@@ -1172,7 +1210,7 @@ fn manage_order_no_index(
         }
         _ => {}
     }
-    Ok(())
+    Ok(scan_us)
 }
 
 /// Per-applied-actuation observability (slice 53): one `compact_actuation` line
@@ -1282,6 +1320,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // adopted (and on every miss/mismatch after). `None` = no build in flight.
     let index_dir = probe_dir(&args.target);
     let mut index_build_rx: Option<std::sync::mpsc::Receiver<io::Result<OrderNoIndexBuild>>> = None;
+    // The movement-region snapshot runs on this thread, so a failure is latched
+    // instead of re-scanning at every boundary for the rest of the run (the read
+    // path already falls back to the authoritative scan).
+    let mut index_scan_failed = false;
     // Startup warm-up (WP-R): when the frozen policy wants the index at open,
     // build and adopt it EAGERLY — bounded, synchronous, before the timed
     // windows begin — so window 0 already serves the index instead of a cold
@@ -1292,6 +1334,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             &index_dir,
             engine.key_encoding(),
             |visit| engine.scan_primary_with_csn(INDEX_ENTITY, visit),
+            movement_region_rows(&engine),
             "order-no-index.tile",
         )?;
         let output_bytes = build.output_bytes;
@@ -1308,6 +1351,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             .warm_startup(|visit| engine.scan_primary_with_csn(INDEX_ENTITY, visit))?;
         eprintln!("startup_warm scan_entries={} index_entries={}",
             warm.scan_entries, warm.index_entries);
+        // The eager build and this warm are startup work OFF the timed clock, but
+        // they resolve a scan sample and attribute their tile-cursor bytes to the
+        // region, so without a rotation window 0's `P|StockMovement` counters
+        // would carry up to two extra region scans. That counter is the one
+        // ticket 83 was measured with. Rotate here so the first timed window
+        // holds only the load's own reads.
+        engine.metrics_rotate_window();
     }
 
     // Read-ahead tile warming (slice 58): a background worker pre-reads the tile
@@ -1365,12 +1415,18 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut window_late_start: u64 = 0;
     // Boundary-vs-read lag-breach attribution (slice 57): the window-boundary
     // drain is now non-blocking, so `boundary_drain_prev_us` (the time the
-    // PREVIOUS boundary's drain blocked the pacer) should be ~0; when it is
-    // large enough to breach the lag ceiling by itself, every breach in the
-    // first group of THIS window is attributed to the boundary, and everything
-    // else to the request-path reads. `window_read_us` is the measured
-    // request-path probe/read time (group dispatch elapsed minus append/apply).
+    // PREVIOUS boundary's drain blocked the pacer) should be ~0; when the boundary
+    // work (`boundary_drain_prev_us + index_scan_prev_us`) is large enough to
+    // breach the lag ceiling by itself, every breach in the first group of THIS
+    // window is attributed to the boundary, and everything else to the
+    // request-path reads. `window_read_us` is the measured request-path
+    // probe/read time (group dispatch elapsed minus append/apply).
+    // `index_scan_prev_us` is the PREVIOUS boundary's request-thread snapshot of
+    // the movement region for the derived `order_no` index; it is carried and
+    // attributed exactly like the drain, because a boundary index scan stalls the
+    // same next-window first group a drain does.
     let mut boundary_drain_prev_us: u64 = 0;
+    let mut index_scan_prev_us: u64 = 0;
     let mut window_boundary_drain_us: u64;
     let mut first_group_count: u64 = 0;
     let mut window_read_us: u64 = 0;
@@ -1847,7 +1903,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             // and then it delays exactly the next window's FIRST group. After the
             // non-blocking fix `boundary_drain_prev_us` is ~0, so this bucket is
             // ~0 and the residual breaches are the synchronous cold reads.
-            let boundary_lag_breaches = if boundary_drain_prev_us > args.lag_ceiling_us {
+            let boundary_prev_us = boundary_drain_prev_us.saturating_add(index_scan_prev_us);
+            let boundary_lag_breaches = if boundary_prev_us > args.lag_ceiling_us {
                 lags.iter().take(first_group_count as usize)
                     .filter(|&&lag| lag > args.lag_ceiling_us).count() as u64
             } else {
@@ -1867,6 +1924,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             if lag_ceiling_breached { lag_ceiling_rejected_windows += 1 }
             if service_ceiling_breached || lag_ceiling_breached { ceil_rejected_windows += 1 }
             if saturated && saturated_at.is_none() { saturated_at = Some(window_rate) }
+            // Request-thread microseconds spent snapshotting the movement region for
+            // the derived index at THIS boundary; carried to the next window's
+            // record like `boundary_drain_prev_us`, because it stalls the same
+            // first group.
+            let mut boundary_index_scan_us: u64 = 0;
             if args.metrics_json {
                 // Machine-readable window line: the window just measured is
                 // `current` (it has not been rotated yet) and the one before it
@@ -1887,7 +1949,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 // (possibly) changed, so the window reflects the learner's latest
                 // selection.
                 if !args.dry_run {
-                    manage_order_no_index(&mut engine, &mut index_build_rx, &index_dir)?;
+                    boundary_index_scan_us =
+                        manage_order_no_index(&mut engine, &mut index_build_rx, &index_dir, &mut index_scan_failed)?;
                 }
                 let current = engine.metrics_snapshot();
                 let previous = engine.metrics_previous_window();
@@ -1912,6 +1975,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     groups_over_service_ceiling,
                     early_dispatches: early_dispatches_window,
                     window_us,
+                    index_scan_us: index_scan_prev_us,
                     invalid,
                     reject_reason: reason.clone(),
                     service_ceiling_us: args.ceiling_us,
@@ -1925,7 +1989,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 engine.metrics_rotate_window();
             } else {
                 if !args.dry_run {
-                    manage_order_no_index(&mut engine, &mut index_build_rx, &index_dir)?;
+                    boundary_index_scan_us =
+                        manage_order_no_index(&mut engine, &mut index_build_rx, &index_dir, &mut index_scan_failed)?;
                 }
                 writeln!(out, "window={window_index} rate_rps={:.0} requests={} completed={completed} \
                     errors={errors} service_p50_us={p50} service_p95_us={p95} service_p99_us={p99} \
@@ -1936,7 +2001,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     early_dispatches={early_dispatches_window} \
                     behind={behind} late_total={late_total} errors_window={window_error_count} \
                     invalid={invalid} reject_reason={} service_ceiling_us={} lag_ceiling_us={} \
-                    compact_bytes={compact_bytes_window}",
+                    compact_bytes={compact_bytes_window} index_scan_us={index_scan_prev_us}",
                     window_rate, lags.len(),
                     reason.clone().unwrap_or_else(|| "none".into()),
                     args.ceiling_us.map(|c| c.to_string()).unwrap_or_else(|| "none".into()),
@@ -1970,7 +2035,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             eprintln!(
                 "lag_breach_attribution window={window_index} total={window_late} \
                  boundary={boundary_lag_breaches} reads={read_lag_breaches} \
-                 boundary_drain_us={boundary_drain_prev_us} read_us={window_read_us}");
+                 boundary_drain_us={boundary_drain_prev_us} index_scan_us={index_scan_prev_us} \
+                 read_us={window_read_us}");
             proc_prev = proc_now;
             // Reset the per-window stall attribution for the next window.
             stall_group = GroupPhaseReport::default();
@@ -1979,6 +2045,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             max_sleep_us = 0;
             max_sleep_request_us = 0;
             boundary_drain_prev_us = window_boundary_drain_us;
+            index_scan_prev_us = boundary_index_scan_us;
             first_group_count = 0;
             window_read_us = 0;
             window_index += 1;
@@ -2251,7 +2318,7 @@ mod tests {
             lag_p50_us: 0, lag_p95_us: 0, lag_p99_us: 0, min_lag_us: 0,
             group_elapsed_us: 0, groups: 1, mean_group_size: 1.0, max_group_size: 1,
             groups_over_service_ceiling: 0, early_dispatches: 0,
-            window_us: 1_000_000, invalid: false, reject_reason: None,
+            window_us: 1_000_000, index_scan_us: 0, invalid: false, reject_reason: None,
             service_ceiling_us: None, service_ceiling_breached: false,
             lag_ceiling_us: 10_000, lag_ceiling_breached: false,
             policy: LayoutPolicy::declared_default().to_json(), current: &snap, previous: None,
@@ -2273,7 +2340,7 @@ mod tests {
             lag_p50_us: 0, lag_p95_us: 0, lag_p99_us: 5_000_000, min_lag_us: 3,
             group_elapsed_us: 200, groups: 1, mean_group_size: 64.0, max_group_size: 64,
             groups_over_service_ceiling: 1, early_dispatches: 0,
-            window_us: 1_280_000, invalid: true,
+            window_us: 1_280_000, index_scan_us: 0, invalid: true,
             reject_reason: Some("service_ceiling".into()),
             service_ceiling_us: Some(250_000), service_ceiling_breached: true,
             lag_ceiling_us: 10_000, lag_ceiling_breached: false,
@@ -2302,7 +2369,7 @@ mod tests {
             lag_p50_us: 10, lag_p95_us: 20, lag_p99_us: 30, min_lag_us: 0,
             group_elapsed_us: 900, groups: 3, mean_group_size: 32.0, max_group_size: 64,
             groups_over_service_ceiling: 2, early_dispatches: 0,
-            window_us: 1_000_000, invalid: false, reject_reason: None,
+            window_us: 1_000_000, index_scan_us: 0, invalid: false, reject_reason: None,
             service_ceiling_us: Some(500), service_ceiling_breached: false,
             lag_ceiling_us: 10_000, lag_ceiling_breached: false,
             policy: LayoutPolicy::declared_default().to_json(), current: &empty, previous: None,
@@ -2329,14 +2396,14 @@ mod tests {
             lag_p50_us: 0, lag_p95_us: 0, lag_p99_us: 0, min_lag_us: 0,
             group_elapsed_us: 0, groups: 2, mean_group_size: 5.0, max_group_size: 8,
             groups_over_service_ceiling: 0, early_dispatches: 0,
-            window_us: 1_000_000, invalid: false, reject_reason: None,
+            window_us: 1_000_000, index_scan_us: 0, invalid: false, reject_reason: None,
             service_ceiling_us: None, service_ceiling_breached: false,
             lag_ceiling_us: 10_000, lag_ceiling_breached: false,
             policy: policy.clone(), current: &empty, previous: None,
         });
         assert_eq!(
             line,
-            r#"{"compact_bytes":0,"completed":9,"current":{"patterns":[],"regions":[]},"early_dispatches":0,"errors":1,"group_elapsed_us":0,"groups":2,"groups_over_service_ceiling":0,"invalid":false,"lag_ceiling_breached":false,"lag_ceiling_us":10000,"lag_p50_us":0,"lag_p95_us":0,"lag_p99_us":0,"max_group_size":8,"mean_group_size":5.0,"min_lag_us":0,"p50_us":500,"p95_us":1000,"p99_us":1500,"policy":{"default":{"bloom_bits_per_key":10,"merge_min_tiles":2,"page_size":4096},"regions":{}},"previous":null,"rate_rps":120.0,"reject_reason":null,"requests":10,"service_ceiling_breached":false,"service_ceiling_us":null,"service_p50_us":500,"service_p95_us":1000,"service_p99_us":1500,"window":3,"window_us":1000000}"#
+            r#"{"compact_bytes":0,"completed":9,"current":{"patterns":[],"regions":[]},"early_dispatches":0,"errors":1,"group_elapsed_us":0,"groups":2,"groups_over_service_ceiling":0,"index_scan_us":0,"invalid":false,"lag_ceiling_breached":false,"lag_ceiling_us":10000,"lag_p50_us":0,"lag_p95_us":0,"lag_p99_us":0,"max_group_size":8,"mean_group_size":5.0,"min_lag_us":0,"p50_us":500,"p95_us":1000,"p99_us":1500,"policy":{"default":{"bloom_bits_per_key":10,"merge_min_tiles":2,"page_size":4096},"regions":{}},"previous":null,"rate_rps":120.0,"reject_reason":null,"requests":10,"service_ceiling_breached":false,"service_ceiling_us":null,"service_p50_us":500,"service_p95_us":1000,"service_p99_us":1500,"window":3,"window_us":1000000}"#
         );
         // A previous window is embedded as an object, not a string.
         let with_prev = metrics_json_line(WindowLine {
@@ -2345,7 +2412,7 @@ mod tests {
             lag_p50_us: 0, lag_p95_us: 0, lag_p99_us: 0, min_lag_us: 0,
             group_elapsed_us: 0, groups: 2, mean_group_size: 5.0, max_group_size: 8,
             groups_over_service_ceiling: 0, early_dispatches: 0,
-            window_us: 1_000_000, invalid: false, reject_reason: None,
+            window_us: 1_000_000, index_scan_us: 0, invalid: false, reject_reason: None,
             service_ceiling_us: None, service_ceiling_breached: false,
             lag_ceiling_us: 10_000, lag_ceiling_breached: false,
             policy, current: &empty, previous: Some(&empty),
@@ -2467,5 +2534,86 @@ mod tests {
         assert_eq!(group_elapseds, vec![300_000], "group elapsed = completion - first member's due time");
         assert_eq!(lags, vec![150_000, 50_000], "the service recorder must not touch lags");
         assert!(latencies.iter().all(|&l| l > 10_000), "service latency is not bounded by the lag ceiling");
+    }
+
+    /// `index_scan_us` must be on the JSON window record: a `--metrics-json`
+    /// consumer attributes a boundary stall from it, and the movement-region
+    /// snapshot was previously invisible there entirely.
+    #[test]
+    fn metrics_json_line_carries_the_index_scan_time() {
+        let empty = WindowSnapshot::default();
+        let line = metrics_json_line(WindowLine {
+            window: 5, rate: 100.0, requests: 1, completed: 1, errors: 0, compact_bytes: 0,
+            p50_us: 10, p95_us: 15, p99_us: 20,
+            lag_p50_us: 0, lag_p95_us: 0, lag_p99_us: 0, min_lag_us: 0,
+            group_elapsed_us: 0, groups: 1, mean_group_size: 1.0, max_group_size: 1,
+            groups_over_service_ceiling: 0, early_dispatches: 0,
+            window_us: 1_000_000, index_scan_us: 4321, invalid: false, reject_reason: None,
+            service_ceiling_us: None, service_ceiling_breached: false,
+            lag_ceiling_us: 10_000, lag_ceiling_breached: false,
+            policy: LayoutPolicy::declared_default().to_json(), current: &empty, previous: None,
+        });
+        let v: serde_json::Value = serde_json::from_str(&line).expect("valid json");
+        assert_eq!(v["index_scan_us"], 4321, "the snapshot cost is on the record: {line}");
+    }
+
+    /// A fresh directory for the driver tests that drive a real engine.
+    fn tmp_dir(name: &str) -> std::path::PathBuf {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let d = std::env::temp_dir().join(format!(
+            "flashdb-load-{}-{}-{name}", std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn movement_op(handle: u64, order_no: &str) -> Op {
+        Op::PutDoc {
+            entity: INDEX_ENTITY.to_vec(),
+            handle,
+            doc: format!(r#"{{"order_no":"{order_no}"}}"#).into_bytes(),
+        }
+    }
+
+    /// No snapshot ran, so the boundary's index-scan cost is zero - the value the
+    /// window record carries when the index is not requested at all.
+    #[test]
+    fn index_scan_is_zero_when_no_index_snapshot_runs() {
+        let dir = tmp_dir("indexscan");
+        let mut engine = Engine::create(dir.join("data.wal")).unwrap();
+        engine.commit_block(b"m0", &[movement_op(1, "O1")]).unwrap();
+        let mut rx = None;
+        let mut scan_failed = false;
+        let scan_us = manage_order_no_index(&mut engine, &mut rx, &dir, &mut scan_failed).unwrap();
+        assert_eq!(scan_us, 0, "the default policy requests no index, so no scan ran");
+        assert!(rx.is_none());
+        assert!(!dir.join("order-no-index.tile").exists(), "no build is started");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A failed movement-region snapshot is one-shot: the read path already falls
+    /// back to the authoritative scan, so the same stall is not paid at every
+    /// boundary for the rest of the run. Toggling the policy away from the index
+    /// clears the latch, so selecting it again retries once.
+    #[test]
+    fn a_failed_index_scan_is_not_retried_until_the_policy_toggles() {
+        let dir = tmp_dir("indexlatch");
+        let mut engine = Engine::create(dir.join("data.wal")).unwrap();
+        engine.commit_block(b"m0", &[movement_op(1, "O1")]).unwrap();
+        let wanted = LayoutPolicy::from_json_slice(
+            br#"{"regions":{"P|StockMovement":{"index_order_no":true}}}"#).unwrap();
+        assert!(order_no_index_wanted(&wanted), "the policy selects the index");
+        engine.set_layout_policy(wanted);
+
+        let mut rx = None;
+        let mut scan_failed = true;
+        let scan_us = manage_order_no_index(&mut engine, &mut rx, &dir, &mut scan_failed).unwrap();
+        assert_eq!(scan_us, 0, "a latched failure does not re-scan the region");
+        assert!(rx.is_none(), "and starts no build");
+
+        engine.set_layout_policy(LayoutPolicy::declared_default());
+        manage_order_no_index(&mut engine, &mut rx, &dir, &mut scan_failed).unwrap();
+        assert!(!scan_failed, "deselecting the index re-arms the one-shot snapshot");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -166,8 +166,8 @@ impl TileReadView {
 
     /// Walk a whole key prefix across every tile that could contain it, reading
     /// each block so it lands in the page cache. Returns how many entries the
-    /// walk yielded (the count is discarded by callers; it exists only so the
-    /// startup warm-up can be observed in tests).
+    /// walk yielded: the startup warm-up reports it as `index_entries`, while the
+    /// read-ahead worker discards it.
     fn warm_prefix_range(&self, prefix: &[u8]) -> io::Result<u64> {
         let mut entries = 0u64;
         for t in self.tiles.iter() {
@@ -370,6 +370,7 @@ mod tests {
             dir,
             e.key_encoding(),
             |visit| e.scan_primary_with_csn(crate::index::INDEX_ENTITY, visit),
+            crate::index::movement_region_rows(e),
             "order_no.idx",
         )
         .unwrap()
@@ -468,6 +469,7 @@ mod tests {
             &dir,
             e.key_encoding(),
             |visit| view.scan_primary(crate::index::INDEX_ENTITY, visit),
+            crate::index::movement_region_rows(&e),
             "order_no.idx",
         )
         .unwrap();
