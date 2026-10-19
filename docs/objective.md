@@ -1,14 +1,44 @@
 Budget: 180 lines / 18,000 chars
 
-# flashdb — the objective: angriness
+# flashdb — the objective
 
-**The governing objective is the constrained program** — maximise the highest sustained offered load, subject to the latency ceiling and the write-amplitude budget as hard feasibility conditions (`Endurance is a constraint, not a price`). **Angriness is the internal pricing form**, not a competing objective. Every decision in the system — which layout, when to reorganize, what tier to promote to, whether to speculate, whether to compile — is evaluated as a predicted angriness delta through one calibrated cost model (`design.md` I10).
+## 0. The product bar: an end-to-end win over sqlite and postgres (author-decided)
+
+The product is judged by one end-to-end comparison: flashdb against sqlite and postgres, on one reasonably specified machine, each engine in its own *reasonable* configuration, on the same frozen trace, through the same open-loop client, at equal durability and under the same memory cap. **The bar is that flashdb wins that comparison.** Nothing else is acceptance — not a learned-vs-declared ratio, not a microbenchmark, not a model's verdict.
+
+"Reasonably specified machine" means hardware a user would actually run this on (the measured box: 12-core, NVMe, 128 MiB memory cap for the engine, 1.57 GiB instance = 12.25x data:memory). "Reasonable configuration" means each baseline runs as its authors intend it to run for this workload, disclosed and un-handicapped: sqlite with its default WAL and automatic checkpoint on, postgres with the shared-buffer/work-mem figures a competent operator would set inside the same memory budget, both driven open-loop because a closed-loop client measures the client. A win obtained by drawing a baseline back — disabling its checkpointing, capping its buffers below its own recommendation, or pacing it with a synchronous client — is not a win and is recorded as an invalid arm.
+
+**Withdrawn (author-decided):** T6's "at least 3x the best baseline's sustained throughput" and the related "do not try to beat Postgres early" guidance. The 3x gate is *structurally unpassable*: two arms that both sustain a common offered level are each within 5% of it, so their ratio is confined to [0.95, 1.0526] (`.scratch/82-controlled-m1/report.md` §T6). The deferral rule was strawman-avoidance; it is inverted here — the baselines *are* the bar, and strawman avoidance is achieved by giving them a fair setup, never by postponing the comparison.
+
+### The KPI ladder (strict priority)
+
+| # | KPI | Instrument | Must be |
+|---|---|---|---|
+| 1 | **Efficiency** | bytes written / byte ingested (`summary.compact_bytes_total` / logical ingest); bytes read / request (region telemetry `bytes_read`, `count`); CPU µs / request (cgroup `cpu.stat` delta / requests); resident bytes / data byte (`memory.peak`); recovery seconds (open → first served request) | no worse than the best baseline on every component, and **strictly better outside the measured error band on at least one** |
+| 2 | **Sustained throughput** | the highest offered level sustained with 0 rejected windows and 0 errors, over paired blocks, quiet box | **at least the best baseline's level** |
+| 3 | **Tail latency** | schedule-lag p99 <= 10 ms (primary, `STATUS.md` §7.1) and service p99 reported with the device fsync floor beside it | reported; a breach while a baseline holds the same level is a loss, and throughput may never be bought by abandoning it |
+
+A comparison resolves to **win** (efficiency no worse with one strict gain, throughput at least equal), **not-worse**, or **loss**. A throughput tie with worse efficiency is a **loss**. Every number carries its condition: revision, corpus hash, machine state, memory cap, durability setting and the device's measured floor at that moment.
+
+### The gap-attribution rule (required before any tuning)
+
+When flashdb loses or ties, the gap is attributed from the saved records — run JSON/JSONL trajectories, stderr, region telemetry, on-disk format bytes, in-memory format bytes — to exactly one of:
+
+- **(a) not learned enough** — the policy chose a layout that the oracle-best candidate set beats by more than the error band, while the engine executes the chosen layout at its floor;
+- **(b) a defect** — a phase exceeds its theoretical floor by more than the error band, with a replicable mechanism that names a code path;
+- **(c) architecture** — every phase is at its floor and the remaining cost is the work itself (bytes moved, IOs issued, barriers per request), i.e. the competitor's design does less work per request.
+
+Each category has its own remedy, and an unattributed gap is not a licence to tune thresholds. The procedure and its instruments are in `dev-loop.md` §Gap attribution.
+
+## 1. The internal objective: angriness
+
+**The internal objective is the constrained program** — maximise the highest sustained offered load, subject to the latency ceiling and the write-amplitude budget as hard feasibility conditions (`Endurance is a constraint, not a price`). **Angriness is the internal pricing form**, not a competing objective. Every decision in the system — which layout, when to reorganize, what tier to promote to, whether to speculate, whether to compile — is evaluated as a predicted angriness delta through one calibrated cost model (`design.md` I10).
 
 Angriness is a **rate**, not a total: angriness per unit of offered load, or per unit time. Reported as a total it can be made to look good by simply receiving less work.
 
 > **Status: not yet well-posed.** 设备层校准常量已由实验 0a-redo 取得（见 `docs/engine.md` 与 `.scratch/05-engine-v0/evidence/0a-redo/analysis.md`）：依赖点读 89–174 µs（按粒度）、批量摊薄 4.9 µs/读、带宽 827 MiB/s、安静设备尾 1.26× 均值。**仍然未决的是 estimand/锚定/聚合**——常量就位不改变 F1–F5 的未决状态。 An adversarial review (aspect: optimisation and learning theory) found that the estimand, the anchor, the parameterisation, the aggregation, the oracle and the estimators are all undefined or self-contradictory. Findings and dispositions are recorded as `review-01` in `.scratch/01-design/issues/01-design.md`. The defects are marked `Open` inline below rather than deleted, because the decisions they need are the author's, not the reviewer's. **The objective cannot be implemented or falsified until F1–F5 are resolved.**
 
-**How these statements relate (2026-10-06).** The **governing objective** — what the pre-registered comparison scores — is a **constrained program**: maximise the **highest sustained offered load**, subject to the latency ceiling and the write-amplitude budget as **hard feasibility conditions** (`Endurance is a constraint, not a price`). **Angriness is the internal pricing / soft-penalty form**, not a competing objective, and is **not yet well-posed** (F1–F5 open; the banner above stays true). The **adopted decision (2026-10-09, `.scratch/STATUS.md` §7.1)** judges the primary metric on the per-request **schedule lag** p99 against a lag ceiling (default 10 ms — the number `pre-registration.md` writes the metric with); per-request **service latency** has its own ceiling and is reported separately as the latency/efficiency measure, so a throughput result can never be won by abandoning latency. **Open (author):** this lag-only primary is not yet reconciled with `pre-registration.md`'s validity rule, which invalidates a window when **either** the lag ceiling **or** the service ceiling is breached; `.scratch/STATUS.md` §7 records the concrete options. The *soft-penalty* section below explains why the internal form is priced; the *endurance* section explains why the ceiling and the budget are feasibility, not prices. The tie-breaks and the empty-feasible-set rule are stated with the endurance decision.
+**How these statements relate (2026-10-06).** The **internal objective** — what the pre-registered comparison scores — is a **constrained program**: maximise the **highest sustained offered load**, subject to the latency ceiling and the write-amplitude budget as **hard feasibility conditions** (`Endurance is a constraint, not a price`). **Angriness is the internal pricing / soft-penalty form**, not a competing objective, and is **not yet well-posed** (F1–F5 open; the banner above stays true). The **adopted decision (2026-10-09, `.scratch/STATUS.md` §7.1)** judges the primary metric on the per-request **schedule lag** p99 against a lag ceiling (default 10 ms — the number `pre-registration.md` writes the metric with); per-request **service latency** has its own ceiling and is reported separately as the latency/efficiency measure, so a throughput result can never be won by abandoning latency. **Decided (2026-10-19, delegated author authority):** lag-only p99 <= 10 ms is the primary throughput-feasibility rule; the service ceiling has no pre-registered veto and is reported beside the device's own fsync floor. Under the KPI ladder (§0) a service-latency breach loses the external comparison only when a baseline holds the same offered level without breaching. The §7.1 reconciliation is closed by that rule and by §0, not by re-reading the old thresholds. The *soft-penalty* section below explains why the internal form is priced; the *endurance* section explains why the ceiling and the budget are feasibility, not prices. The tie-breaks and the empty-feasible-set rule are stated with the endurance decision.
 
 ## Why a soft penalty and not a hard constraint
 

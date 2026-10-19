@@ -44,20 +44,33 @@ generator → trace → deterministic replay → pluggable storage simulator →
 - **Frozen, versioned replay corpora.** A trace is a dataset: freeze it, commit it with its hash, and treat changes to it as dataset changes. Results without a corpus hash are not comparable to anything.
 - **The cost model must be calibrated against measurements**, and its error tracked, because uncalibrated what-if prediction is optimistic — a promotion decided on an uncalibrated prediction is a guess wearing a number. **Open (`review-01` F14):** which *functional* is calibrated is unspecified. A mean-calibrated simulator systematically mispredicts the percentile the penalty consumes, so the calibration target must be the same statistic `x` that `objective.md` penalises, with a quantile-calibration error metric, prediction intervals and drift/out-of-distribution diagnostics.
 
-## Baselines
+## Baselines and the gap-attribution protocol
 
-Every comparison at **equal durability**. An engine that fsyncs less is not faster; it is a different product, and a raw throughput win against a stricter baseline is not a win.
+The bar, the KPI ladder and what makes a baseline setup *reasonable* are owned by `objective.md` §0. This section owns only the method that makes them measurable.
+
+Every comparison runs at **equal durability**. An engine that fsyncs less is not faster; it is a different product. The client is **open-loop** (offers the target rate regardless of completion), because a closed-loop client measures itself; every arm gets the same trace, the same frozen corpus hash, the same memory cap, the same quiet box (loadavg < 2 sustained before each arm), and a fresh restored instance.
 
 | Baseline | Isolates |
 |---|---|
 | LMDB | closest design relative — single writer, copy-on-write, A/B checksummed meta pages, no redo log |
-| SQLite | the page-cache comparison |
+| SQLite | the page-cache comparison; its default WAL autocheckpoint stays **on** |
 | RocksDB | the merge/compaction comparison |
-| Postgres | the general-purpose scoreboard — run from day one as passive measurement, **never** a step-1 goal |
+| Postgres | the general-purpose scoreboard; tuned the way a competent operator would tune it inside the same memory budget |
 | **`flashdb-declared`** | **the missing control (`review-02` F9):** flashdb with one fixed, author-chosen layout. Comparing learned layout against *other engines* conflates three variables — the tile architecture, the declared-versus-learned choice, and implementation quality — so a win over RocksDB proves nothing about learning. |
 | **`flashdb-static-derived`** | **the second missing control (`review-02` F9):** a layout derived offline from the trace, built once, no drift. The thesis is that learning *and* drift beat declaration, so both must be measured against this, and the reported quantity is the incremental gain over it. |
 
-Do not try to beat Postgres early. Beating it while it is untuned proves only that a strawman was beaten, and teaches nothing about the design. Running it from day one as a *scoreboard* and pursuing it as a *step-1 goal* are different activities: the first is passive measurement and the second is a milestone that is explicitly not one (`review-02` §3).
+### Gap attribution
+
+The rule that a gap must be attributed before anything is tuned is in `objective.md` §0. The procedure:
+
+1. **Freeze the record set.** The arm-run JSON, the arm's stderr, the trace (`trace.jsonl`), region telemetry, the revision and the corpus hash. A number without its record is not evidence.
+2. **Build the per-request phase ledger.** Dispatch → validate → WAL append → barrier → apply → reply, with the wall time of each phase per request. The engine already emits `lag_breach_attribution reads= read_us=`, and the driver records `group_elapsed_us`; where a phase is invisible, that blindness is itself a finding.
+3. **Compute each phase's theoretical floor** from the calibrated device constants (`engine.md`, experiment 0a-redo): dependent read 89-174 µs by granularity, batched independent read 4.9 µs, bandwidth 827 MiB/s, quiet-device tail 1.26x mean, plus the machine's own fsync p50 measured in the same session. The floor of a request is the minimum IOs, bytes and barriers its semantics require — not the floor of the current design.
+4. **Take the residual.** measured − floor, per phase, with the error band measured in the same session (a repeated-control block, not an assumption).
+5. **Classify.** Residual inside the band on every phase → the cost is the work itself: **architecture** (category c), and the only lever is doing less work per request. A phase outside the band with a replicable mechanism naming a code path → **defect** (b). Every phase at floor while the chosen layout loses to the oracle-best candidate set by more than the band → **not learned enough** (a).
+6. **Record it** in the milestone report with the evidence and the revision, before any fix is proposed. A fix without an attribution is a guess and is labelled as one.
+
+Format forensics is part of step 3-4, not a separate study: on-disk (tile directory and page overhead, index bytes, WAL bytes, manifest bytes) and in-memory (memtable `BTreeMap<Vec,Vec>` overhead, fence RAM, page cache, allocator arenas) are each compared against the format's declared minimum bytes per row, because that ratio is where a 10x data:memory target is actually won or lost.
 
 `ponytail:` start with a small thread pool for IO; add `io_uring` when a profile shows the syscall tax. `io_uring` is aligned with the design (many small independent reads, completion batching, registered fixed buffers and files) but it is the last 20%, and it maps cleanly onto the batch scheduler as an upgrade rather than a rewrite.
 

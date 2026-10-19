@@ -1,5 +1,9 @@
 # Active work
 
+> **Superseded on 2026-10-19.** The resume point is `docs/plan/workplan.md` (work packages, status,
+> blockers) with milestones in `docs/roadmap.md`. This file remains a per-ticket index into `.scratch/`
+> and is not the current status.
+
 > **START HERE ON RETURN: [`.scratch/STATUS.md`](STATUS.md)** - consolidated engine state, the
 > trustworthy measurement instrument, the first valid primary-metric evaluation, the twelve defects
 > found and their state, the decisions already adopted, and the staged resume plan

@@ -1,6 +1,11 @@
-# Status
+# Status (ticket-level evidence record — not the SSOT)
 
-Current single source of truth for project state. Facts only: every number names its conditions.
+> **Superseded as the single source of truth on 2026-10-19.** Project status is now owned by
+> `docs/roadmap.md` (§Where we are, §Milestone status) and `docs/plan/workplan.md`; per-item detail is
+> `docs/plan/open-items.md`. This file stays as the ticket-level measurement record the roadmap cites,
+> and it is not updated with new status: add a new measured fact at its owning layer instead.
+
+Facts only: every number names its conditions.
 History and process live in the tickets, not here.
 
 The remaining work is sequenced as milestones in [`docs/roadmap.md`](../docs/roadmap.md).
