@@ -48,13 +48,6 @@ impl TileReadView {
         TileReadView { tiles, key_encoding }
     }
 
-    /// The key spelling this view's tiles were written under. The derived-index
-    /// builder uses it so its index keys probe the same spelling the engine's
-    /// authoritative reads accept.
-    pub(crate) fn key_encoding(&self) -> keys::KeyEncoding {
-        self.key_encoding
-    }
-
     /// True when `other` names the same immutable tile set as `self` (same tile
     /// count and every `Arc<Tile>` pointer-identical). Kept tiles keep their
     /// `Arc<Tile>` across a publish/compaction, while replaced or newly adopted
@@ -67,19 +60,21 @@ impl TileReadView {
 
     /// Tile-only walk of an entity's whole primary prefix (the exact prefix
     /// [`crate::engine::Engine::scan_primary`] walks, minus the serving
-    /// memtable), yielding each live document's `(handle, csn, doc bytes)` once.
-    /// Used by the off-request-path secondary-access-path builder (WP-M): the
-    /// rows are exactly the tile-resident documents the authoritative scan would
-    /// visit, so an index built from them maps the right handles. Purely
-    /// observational; results never feed a correctness decision directly.
+    /// memtable), yielding each live document's `(handle, csn, doc bytes)` once
+    /// and returning how many live rows it visited. Test-only: the derived-index
+    /// builder's production source is the merged view
+    /// ([`crate::engine::Engine::scan_primary_with_csn`]), because a region whose
+    /// rows are all still in the serving memtable has no tiles at all.
+    #[cfg(test)]
     pub(crate) fn scan_primary(
         &self,
         entity: &[u8],
         mut visit: impl FnMut(u64, u64, &[u8]) -> io::Result<()>,
-    ) -> io::Result<()> {
+    ) -> io::Result<u64> {
         let mut prefix = keys::primary_prefix_with(self.key_encoding, entity, 0)?;
         prefix.truncate(prefix.len() - 8);
         let mut last_handle: Option<u64> = None;
+        let mut rows = 0u64;
         for t in self.tiles.iter() {
             if !t.could_contain_prefix(&prefix) { continue; }
             let mut cursor = t.prefix_cursor(&prefix)?;
@@ -89,11 +84,12 @@ impl TileReadView {
                 if last_handle == Some(handle) { continue; }
                 last_handle = Some(handle);
                 if !value.is_empty() {
+                    rows += 1;
                     visit(handle, csn, value)?;
                 }
             }
         }
-        Ok(())
+        Ok(rows)
     }
 
     /// Warm the unique-index block(s) for `(entity, field, value)` and, when the
@@ -182,20 +178,28 @@ impl TileReadView {
         Ok(entries)
     }
 
-    /// One bounded synchronous warm-up pass at run start (WP-R): page in the
-    /// movement scan prefix and, when the derived `order_no` index is adopted,
-    /// the index tile's blocks, so the first timed window's movement scans are
-    /// page-cache hits instead of cold page-ins on the pacer. Purely
-    /// observational: the walked rows are discarded and never feed a decision.
-    /// The caller runs this once before the timed windows begin (off the timed
-    /// clock), so it is a bounded startup read, never a second full scan on the
-    /// request path.
-    pub fn warm_startup(&self) -> io::Result<StartupWarm> {
-        // The authoritative movement scan's fallback reads the whole primary
-        // prefix; page it in so a miss/mismatch never cold-faults on the pacer.
-        let mut scan_prefix = keys::primary_prefix_with(self.key_encoding, crate::index::INDEX_ENTITY, 0)?;
-        scan_prefix.truncate(scan_prefix.len() - 8);
-        let scan_entries = self.warm_prefix_range(&scan_prefix)?;
+    /// One bounded synchronous warm-up pass at run start (WP-R): read the
+    /// movement region from the authoritative source and, when the derived
+    /// `order_no` index is adopted, page in the index tile's blocks, so the first
+    /// timed window's movement scans are page-cache hits instead of cold page-ins
+    /// on the pacer. Purely observational: the walked rows are discarded and
+    /// never feed a decision.
+    ///
+    /// `merged_scan` is the merged memtable + tile walk
+    /// ([`crate::engine::Engine::scan_primary_with_csn`]) and reports how many
+    /// live rows it visited. The view is tile-only, so it cannot count those rows
+    /// itself: on the workloads this serves the movement region is entirely in
+    /// the serving memtable, and a tile-only walk would report zero. The caller
+    /// runs this once before the timed windows begin (off the timed clock), so it
+    /// is a bounded startup read, never a second full scan on the request path.
+    pub fn warm_startup(
+        &self,
+        merged_scan: impl FnOnce(&mut dyn FnMut(u64, u64, &[u8]) -> io::Result<()>) -> io::Result<u64>,
+    ) -> io::Result<StartupWarm> {
+        // The authoritative movement scan's source reads every tile block the
+        // fallback touches (and the rows still in the memtable), so this single
+        // pass both pages the region in and counts what it covers.
+        let scan_entries = merged_scan(&mut |_, _, _| Ok(()))?;
         // The derived index tile is keyed under `U|StockMovement|order_no`; walking
         // that whole prefix pages in every index block the point probe could touch.
         // `unique_prefix_with` appends a length-delimited value, so strip the empty
@@ -334,7 +338,7 @@ fn worker(
 
 #[cfg(test)]
 mod tests {
-    use super::ScanWarmState;
+    use super::{ScanWarmState, StartupWarm};
     use crate::engine::{Engine, Op};
     use std::collections::HashSet;
     use std::path::PathBuf;
@@ -357,6 +361,25 @@ mod tests {
             value: value.to_vec(),
             handle,
         }
+    }
+
+    /// Build the derived `order_no` index from the engine's merged memtable + tile
+    /// view, the source the driver passes in production.
+    fn build_index(e: &Engine, dir: &std::path::Path) -> crate::index::OrderNoIndexBuild {
+        crate::index::build_order_no_index(
+            dir,
+            e.key_encoding(),
+            |visit| e.scan_primary_with_csn(crate::index::INDEX_ENTITY, visit),
+            "order_no.idx",
+        )
+        .unwrap()
+    }
+
+    /// The startup warm-up over the engine's merged view, as the driver runs it.
+    fn warm_startup(e: &Engine) -> StartupWarm {
+        e.tile_read_view()
+            .warm_startup(|visit| e.scan_primary_with_csn(crate::index::INDEX_ENTITY, visit))
+            .unwrap()
     }
 
     #[test]
@@ -438,7 +461,16 @@ mod tests {
             "no index is adopted, so the warm view has no order_no index probe");
 
         // Build and adopt the derived index (off-path in production; inline here).
-        let build = crate::index::build_order_no_index(&dir, &e.tile_read_view(), "order_no.idx").unwrap();
+        // This test feeds the builder the tile-only view: both sources resolve the
+        // same rows when every row is tile-resident.
+        let view = e.tile_read_view();
+        let build = crate::index::build_order_no_index(
+            &dir,
+            e.key_encoding(),
+            |visit| view.scan_primary(crate::index::INDEX_ENTITY, visit),
+            "order_no.idx",
+        )
+        .unwrap();
         std::fs::File::open(&dir).unwrap().sync_all().unwrap();
         e.adopt_order_no_index(build.index);
 
@@ -466,19 +498,39 @@ mod tests {
         ]).unwrap();
         e.publish_tile(dir.join("p.tile"), 1).unwrap();
 
-        // Without an adopted index the pass warms the scan prefix but no index rows.
-        let warm_before = e.tile_read_view().warm_startup().unwrap();
-        assert!(warm_before.scan_entries >= 2, "the movement scan prefix is walked: {}", warm_before.scan_entries);
+        // Without an adopted index the pass walks the region but no index rows.
+        let warm_before = warm_startup(&e);
+        assert!(warm_before.scan_entries >= 2, "the movement rows are counted: {}", warm_before.scan_entries);
         assert_eq!(warm_before.index_entries, 0, "no index tile is present yet");
 
         // Adopt the derived index; the pass must now also walk the index tile.
-        let build = crate::index::build_order_no_index(&dir, &e.tile_read_view(), "order_no.idx").unwrap();
+        let build = build_index(&e, &dir);
         std::fs::File::open(&dir).unwrap().sync_all().unwrap();
         e.adopt_order_no_index(build.index);
 
-        let warm_after = e.tile_read_view().warm_startup().unwrap();
-        assert!(warm_after.scan_entries >= 2, "the movement scan prefix is still walked");
+        let warm_after = warm_startup(&e);
+        assert!(warm_after.scan_entries >= 2, "the movement rows are still counted");
         assert!(warm_after.index_entries >= 2, "the adopted index tile's entries are walked: {}", warm_after.index_entries);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A region whose rows are all still in the serving memtable has no tiles, so
+    /// a tile-only warm reported `scan_entries = 0` and could not warm the region
+    /// the request path actually scans. The warm now reports what the merged
+    /// memtable + tile source visits.
+    #[test]
+    fn warm_startup_counts_rows_that_live_only_in_the_memtable() {
+        let dir = tmp_dir("startupmemtable");
+        let mut e = Engine::create(dir.join("data.wal")).unwrap();
+        e.commit_block(b"m", &[
+            Op::PutDoc { entity: b"StockMovement".to_vec(), handle: 1, doc: br#"{"order_no":"O1","movement_no":"M1"}"#.to_vec() },
+            Op::PutDoc { entity: b"StockMovement".to_vec(), handle: 2, doc: br#"{"order_no":"O2","movement_no":"M2"}"#.to_vec() },
+        ]).unwrap();
+        assert!(e.active_tile_regions().is_empty(), "the movements are still only in the memtable");
+
+        let warm = warm_startup(&e);
+        assert_eq!(warm.scan_entries, 2, "the warm counts the memtable rows it reads");
+        assert_eq!(warm.index_entries, 0, "no index tile is present");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -506,7 +558,7 @@ mod tests {
         assert!(no_index.same_tile_set(&e.tile_read_view()), "same tile set is detected");
 
         // Adopting the index appends a NEW tile, so the tile set changes.
-        let build = crate::index::build_order_no_index(&dir, &e.tile_read_view(), "order_no.idx").unwrap();
+        let build = build_index(&e, &dir);
         std::fs::File::open(&dir).unwrap().sync_all().unwrap();
         e.adopt_order_no_index(build.index);
         let with_index = e.tile_read_view();

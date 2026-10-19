@@ -84,10 +84,9 @@ use std::io::{self, BufRead, BufReader, Write};
 use std::time::{Duration, Instant};
 
 use flashdb_engine::engine::{build_compaction_job, BarrierCompletion, CompactShape, CompactionJob, CompactionOutcome, Engine, LayoutPolicy, Op, Outcome, RegionMode, RequestOutcome, MAX_ACTIVE_TILES, MAX_PENDING_BARRIERS};
-use flashdb_engine::index::{build_order_no_index, OrderNoIndexBuild};
+use flashdb_engine::index::{build_order_no_index, OrderNoIndexBuild, INDEX_ENTITY};
 use flashdb_engine::keys::KeyEncoding;
 use flashdb_engine::metrics::WindowSnapshot;
-use flashdb_engine::readahead::TileReadView;
 use flashdb_engine::replay::submit_requests_grouped;
 use flashdb_engine::request::execute_request;
 use serde_json::Value;
@@ -1079,17 +1078,43 @@ fn order_no_index_wanted(policy: &LayoutPolicy) -> bool {
     policy.index_order_no_for_region("P|StockMovement")
 }
 
-/// Spawn the off-request-path `order_no` index build for the current tile
-/// snapshot and return the channel it reports through. The build writes
-/// `order-no-index.tile` in `dir`; the driver syncs the directory before
-/// adopting the result.
+/// Snapshot the movement rows the off-path index build must cover. The build
+/// source is the merged memtable + tile view, because on an append-heavy region
+/// every row may still be in the serving memtable, where a tile-only view sees
+/// none. The engine's memtable cannot be shared with the builder thread, so the
+/// scan runs here; the parse, sort and the synced tile write stay on the worker.
+fn movement_rows(engine: &Engine) -> io::Result<Vec<(u64, u64, Vec<u8>)>> {
+    let mut rows: Vec<(u64, u64, Vec<u8>)> = Vec::new();
+    let visited = engine.scan_primary_with_csn(INDEX_ENTITY, |handle, csn, doc| {
+        rows.push((handle, csn, doc.to_vec()));
+        Ok(())
+    })?;
+    debug_assert_eq!(visited, rows.len() as u64, "the scan reports what it visited");
+    Ok(rows)
+}
+
+/// Spawn the off-request-path `order_no` index build over the merged-view rows
+/// `movement_rows` snapshotted, and return the channel it reports through. The
+/// build writes `order-no-index.tile` in `dir`; the driver syncs the directory
+/// before adopting the result.
 fn spawn_order_no_index_build(
     dir: std::path::PathBuf,
-    view: TileReadView,
+    key_encoding: KeyEncoding,
+    rows: Vec<(u64, u64, Vec<u8>)>,
 ) -> std::sync::mpsc::Receiver<io::Result<OrderNoIndexBuild>> {
     let (tx, rx) = std::sync::mpsc::channel::<io::Result<OrderNoIndexBuild>>();
     std::thread::spawn(move || {
-        let _ = tx.send(build_order_no_index(&dir, &view, "order-no-index.tile"));
+        let _ = tx.send(build_order_no_index(
+            &dir,
+            key_encoding,
+            |visit| {
+                for (handle, csn, doc) in &rows {
+                    visit(*handle, *csn, doc)?;
+                }
+                Ok(rows.len() as u64)
+            },
+            "order-no-index.tile",
+        ));
     });
     rx
 }
@@ -1132,7 +1157,15 @@ fn manage_order_no_index(
         index_build_rx.is_some(),
     ) {
         (true, false, false) => {
-            *index_build_rx = Some(spawn_order_no_index_build(index_dir.to_path_buf(), engine.tile_read_view()));
+            match movement_rows(engine) {
+                Ok(rows) => {
+                    *index_build_rx = Some(spawn_order_no_index_build(
+                        index_dir.to_path_buf(), engine.key_encoding(), rows));
+                }
+                // Non-fatal, like a failed build: the authoritative scan still
+                // serves correctly and a later boundary retries.
+                Err(e) => eprintln!("flashdb-load: order_no index scan failed; falling back to scan: {e}"),
+            }
         }
         (false, true, _) => {
             engine.clear_order_no_index();
@@ -1255,8 +1288,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // full-entity scan. This is the same off-path build that would otherwise run
     // async and be adopted one window boundary later (ticket 67/68).
     if !args.dry_run && order_no_index_wanted(&engine.layout_policy()) {
-        let view = engine.tile_read_view();
-        let build = build_order_no_index(&index_dir, &view, "order-no-index.tile")?;
+        let build = build_order_no_index(
+            &index_dir,
+            engine.key_encoding(),
+            |visit| engine.scan_primary_with_csn(INDEX_ENTITY, visit),
+            "order-no-index.tile",
+        )?;
         let output_bytes = build.output_bytes;
         File::open(&index_dir)?.sync_all()?;
         engine.adopt_order_no_index(build.index);
@@ -1267,7 +1304,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         // movement scan prefix and, when adopted, the `order_no` index tile, so
         // the first scans are page-cache hits independent of the worker's pacing.
         // Purely observational; the walked rows are discarded.
-        let warm = engine.tile_read_view().warm_startup()?;
+        let warm = engine.tile_read_view()
+            .warm_startup(|visit| engine.scan_primary_with_csn(INDEX_ENTITY, visit))?;
         eprintln!("startup_warm scan_entries={} index_entries={}",
             warm.scan_entries, warm.index_entries);
     }

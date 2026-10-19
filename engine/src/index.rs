@@ -1,6 +1,7 @@
 //! Derived secondary access path (WP-M): an off-request-path `order_no ->
-//! StockMovement handle` index, built from the `P|StockMovement` tiles and used
-//! by the authoritative read path only as a HINT.
+//! StockMovement handle` index, built from the merged (memtable + tile) view of
+//! the `P|StockMovement` rows and used by the authoritative read path only as a
+//! HINT.
 //!
 //! Correctness is by construction: the index is never on the correctness path.
 //! Every hit is cross-checked against the document's own `order_no` field, and a
@@ -20,7 +21,6 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::keys;
-use crate::readahead::TileReadView;
 use crate::tile::Tile;
 
 /// The entity and field this secondary path serves. Only the movement scan
@@ -49,36 +49,49 @@ pub struct OrderNoIndexBuild {
     pub output_bytes: u64,
 }
 
-/// Build the `order_no -> handle` index tile from the `P|StockMovement` tiles in
-/// `view`. Runs off the request path (the caller owns the thread): it streams
-/// the whole entity prefix once, JSON-parses each document once, sorts the
-/// `(order_no, handle, csn)` entries, and writes ONE 4 KiB-page, no-bloom tile
-/// with the existing [`crate::tile::TileWriter`] (which syncs the file). The
-/// tile is written to a scratch name and atomically renamed over the final
-/// `name`, so a rebuild after a retire replaces the previous sidecar file rather
-/// than failing on `create_new`. The caller must sync the parent directory before
-/// adopting the tile, matching the compaction apply ordering. Memory is bounded
-/// by the entity's index entries (one sort buffer), not the document set.
+/// Build the `order_no -> handle` index tile from the live `P|StockMovement`
+/// rows `scan_primary` visits. Runs off the request path (the caller owns the
+/// thread): it streams the whole entity prefix once, JSON-parses each document
+/// once, sorts the `(order_no, handle, csn)` entries, and writes ONE 4 KiB-page,
+/// no-bloom tile with the existing [`crate::tile::TileWriter`] (which syncs the
+/// file). The tile is written to a scratch name and atomically renamed over the
+/// final `name`, so a rebuild after a retire replaces the previous sidecar file
+/// rather than failing on `create_new`. The caller must sync the parent directory
+/// before adopting the tile, matching the compaction apply ordering. Memory is
+/// bounded by the entity's index entries (one sort buffer), not the document set.
+///
+/// `scan_primary` walks the rows at latest committed state and returns how many
+/// live rows it visited; the engine supplies the merged memtable + tile source so
+/// rows still in the serving memtable are covered, and a test may supply the
+/// tile-only `TileReadView::scan_primary` instead. Every visited row must produce
+/// an entry: a build that visits rows but yields fewer entries is a defect that
+/// would leave the region silently served by the full scan, so it fails here
+/// rather than writing an empty (or partial) sidecar.
 pub fn build_order_no_index(
     dir: &Path,
-    view: &TileReadView,
+    key_encoding: keys::KeyEncoding,
+    scan_primary: impl FnOnce(&mut dyn FnMut(u64, u64, &[u8]) -> io::Result<()>) -> io::Result<u64>,
     name: &str,
 ) -> io::Result<OrderNoIndexBuild> {
-    let enc = view.key_encoding();
     // (encoded key, value). Keys must be strictly increasing, so collect and
     // sort before pushing to the writer.
     let mut entries: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
     let mut coverage_csn: u64 = 0;
-    view.scan_primary(INDEX_ENTITY, |handle, csn, doc| {
+    let rows = scan_primary(&mut |handle, csn, doc| {
         let row: serde_json::Value = serde_json::from_slice(doc)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         let order_no = row[std::str::from_utf8(INDEX_FIELD).expect("ascii field name")].as_str()
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "StockMovement.order_no is not a string"))?;
-        let key = keys::unique_key_with(enc, INDEX_ENTITY, INDEX_FIELD, order_no.as_bytes(), handle, csn)?;
+        let key = keys::unique_key_with(key_encoding, INDEX_ENTITY, INDEX_FIELD, order_no.as_bytes(), handle, csn)?;
         entries.push((key, handle.to_be_bytes().to_vec()));
         coverage_csn = coverage_csn.max(csn);
         Ok(())
     })?;
+    if rows != entries.len() as u64 {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, format!(
+            "order_no index build visited {rows} live StockMovement rows but produced {} entries",
+            entries.len())));
+    }
     entries.sort_by(|a, b| a.0.cmp(&b.0));
     let path = dir.join(name);
     // Write to a scratch name and atomically rename over `name` so a rebuild
@@ -101,7 +114,7 @@ pub fn build_order_no_index(
         name: name.to_string(),
         index: OrderNoIndex {
             tile: Arc::new(tile),
-            key_encoding: enc,
+            key_encoding,
             coverage_csn,
             entries: entries.len() as u64,
         },

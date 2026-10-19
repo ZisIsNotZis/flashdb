@@ -3049,6 +3049,21 @@ impl Engine {
         entity: &[u8],
         mut visit: impl FnMut(u64, &[u8]) -> io::Result<()>,
     ) -> io::Result<()> {
+        self.scan_primary_with_csn(entity, |handle, _, doc| visit(handle, doc))?;
+        Ok(())
+    }
+
+    /// [`Engine::scan_primary`] with the CSN of the version that won, returning
+    /// how many live rows were visited. The source is the merged memtable + tile
+    /// view, so a region whose rows are all still in the serving memtable is
+    /// covered too - the tile-only view is not. The derived `order_no` index
+    /// build reads this source so its entries and `coverage_csn` span exactly the
+    /// rows the authoritative scan would serve.
+    pub fn scan_primary_with_csn(
+        &self,
+        entity: &[u8],
+        mut visit: impl FnMut(u64, u64, &[u8]) -> io::Result<()>,
+    ) -> io::Result<u64> {
         let t0 = self.timing();
         let id = self.metrics.borrow_mut().resolve_scan(entity);
         let mut sample = MetricsSample { metrics: &self.metrics, id, region: metrics::DISABLED, started: t0 };
@@ -3058,8 +3073,9 @@ impl Engine {
         let region = self.region_of_prefix(&prefix);
         sample.region = region;
         let mut last_handle = None;
+        let mut rows: u64 = 0;
         self.scan_merged(&prefix, region, |key, value| {
-            let (key_entity, handle, _) = keys::decode_primary(key)
+            let (key_entity, handle, csn) = keys::decode_primary(key)
                 .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "malformed primary key"))?;
             if key_entity != entity {
                 return Err(io::Error::new(io::ErrorKind::InvalidData, "primary entity mismatch"));
@@ -3067,10 +3083,12 @@ impl Engine {
             if last_handle == Some(handle) { return Ok(true); }
             last_handle = Some(handle);
             if !value.is_empty() {
-                visit(handle, value)?;
+                rows += 1;
+                visit(handle, csn, value)?;
             }
             Ok(true)
-        })
+        })?;
+        Ok(rows)
     }
 
     /// Full merged key-order pass over every serving key (primary, unique and
