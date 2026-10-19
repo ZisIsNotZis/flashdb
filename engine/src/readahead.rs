@@ -64,7 +64,7 @@ impl TileReadView {
     /// it visited.
     ///
     /// This is the TILE HALF of the derived index's hybrid source
-    /// ([`crate::index::spawn_rebuild`]): the builder thread calls it, so the cold
+    /// ([`crate::index::IndexRebuildSlot`]): the builder thread calls it, so the cold
     /// device stream a tiled region represents never crosses the pacing thread.
     /// It is not a read: a caller must merge it with the serving memtable through
     /// the newest-wins rule (an empty `doc` is a tombstone and must be yielded, or
@@ -97,6 +97,51 @@ impl TileReadView {
                 if key_entity != entity { continue; }
                 if last_handle == Some(handle) { continue; }
                 last_handle = Some(handle);
+                rows += 1;
+                visit(handle, csn, value)?;
+            }
+        }
+        Ok(rows)
+    }
+
+    /// [`TileReadView::scan_primary`] narrowed to the rows above `after_csn`: the
+    /// TILE HALF of a delta build, which indexes only the rows newer than the
+    /// coverage the adopted index already speaks for.
+    ///
+    /// Two filters keep the incremental rebuild cheap: a tile whose cutoff is at
+    /// or below `after_csn` cannot hold a row above it and is skipped WITHOUT
+    /// opening a cursor, so a region whose new rows are all still in the serving
+    /// memtable touches no tile at all; and a tile that straddles the coverage
+    /// yields only the rows above it. The caller merges this with the inline
+    /// memtable snapshot through the one newest-wins rule, exactly as
+    /// [`TileReadView::scan_primary`] is merged for a base build, and an empty
+    /// `doc` (tombstone) is yielded because it is what hides the handle's base
+    /// entry.
+    pub fn scan_primary_after(
+        &self,
+        entity: &[u8],
+        after_csn: u64,
+        mut visit: impl FnMut(u64, u64, &[u8]) -> io::Result<()>,
+    ) -> io::Result<u64> {
+        let mut prefix = keys::primary_prefix_with(self.key_encoding, entity, 0)?;
+        prefix.truncate(prefix.len() - 8);
+        let mut rows = 0u64;
+        for t in self.tiles.iter() {
+            if t.cutoff() <= after_csn { continue; }
+            if !t.could_contain_prefix(&prefix) { continue; }
+            // Per-tile, not per-walk: tiles are not in key order relative to each
+            // other over a handle's versions, so a carry would let one tile's key
+            // order hide a newer version in the next one.
+            let mut last_handle: Option<u64> = None;
+            let mut cursor = t.prefix_cursor(&prefix)?;
+            while let Some((key, value)) = cursor.next()? {
+                let Some((key_entity, handle, csn)) = keys::decode_primary(key) else { continue; };
+                if key_entity != entity { continue; }
+                if last_handle == Some(handle) { continue; }
+                last_handle = Some(handle);
+                // Keys are newest-first within a tile, so once this handle's first
+                // version is at or below the coverage every later one is too.
+                if csn <= after_csn { continue; }
                 rows += 1;
                 visit(handle, csn, value)?;
             }

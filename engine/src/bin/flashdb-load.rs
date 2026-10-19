@@ -84,9 +84,10 @@ use std::io::{self, BufRead, BufReader, Write};
 use std::time::{Duration, Instant};
 
 use flashdb_engine::engine::{build_compaction_job, BarrierCompletion, CompactShape, CompactionJob, CompactionOutcome, Engine, LayoutPolicy, Op, Outcome, RegionMode, RequestOutcome, MAX_ACTIVE_TILES, MAX_PENDING_BARRIERS};
-use flashdb_engine::index::{build_order_no_index, movement_region_rows, rebuild_trigger, spawn_rebuild,
-    MemtableRows, MemtableSnapshot, RebuildResult, INDEX_ENTITY, INDEX_REBUILD_STALE_CSN,
-    INDEX_TILE_NAME, INLINE_SNAPSHOT_MAX_BYTES, TRIGGER_POLICY};
+use flashdb_engine::index::{build_order_no_index, is_index_build_refused, movement_region_rows,
+    rebuild_trigger, FinishedJob, IndexProduct, IndexRebuildSlot, MemtableRows, MemtableSnapshot,
+    INDEX_DRAIN_TIMEOUT, INDEX_ENTITY, INDEX_REBUILD_STALE_CSN, INDEX_TILE_NAME,
+    INLINE_SNAPSHOT_MAX_BYTES, TRIGGER_MERGE, TRIGGER_POLICY, TRIGGER_STARTUP};
 use flashdb_engine::keys::KeyEncoding;
 use flashdb_engine::metrics::WindowSnapshot;
 use flashdb_engine::replay::submit_requests_grouped;
@@ -1095,6 +1096,11 @@ fn order_no_index_wanted(policy: &LayoutPolicy) -> bool {
 /// adopted", "the rebuild was skipped and why" and "the build failed and why"
 /// apart. The fields that a decision cannot know are `None` rather than zero, so a
 /// log reader never mistakes "not measured" for "measured as nothing".
+///
+/// `covered_rows` is what THIS job covered: the live entries of a base build or a
+/// merge, and the live entries an interval's delta added (0 for an interval that
+/// only deleted or changed nothing), so the line shows the incremental work rather
+/// than the index's total size.
 struct IndexDecision<'a> {
     trigger: &'a str,
     covered_rows: Option<u64>,
@@ -1118,30 +1124,31 @@ impl IndexDecision<'_> {
     }
 }
 
-/// The driver's derived-index state across window boundaries: the one rebuild in
-/// flight, the trigger it was scheduled with, the scan-demand baseline, and the
-/// refusal latch.
+/// The driver's derived-index state across window boundaries: the one job in
+/// flight, the scan-demand baseline, the refusal latch and the merge/limit knobs.
 ///
-/// One rebuild at a time is what keeps two of them from racing: the slot holds the
-/// only receiver, a spawn is refused while it is occupied, and adoption happens on
-/// the driver thread, so a rebuild's successor is always scheduled from a state
-/// that has already seen its result.
+/// The single-flight slot itself lives in [`IndexRebuildSlot`] (index.rs), which
+/// owns the receiver, the trigger and the sidecar name: one job at a time is what
+/// keeps two of them from racing, and a second caller is refused explicitly rather
+/// than starting a second writer.
 struct OrderNoIndexDriver {
-    rx: Option<std::sync::mpsc::Receiver<io::Result<RebuildResult>>>,
-    /// The trigger recorded when the in-flight rebuild was scheduled, logged with
-    /// its outcome.
-    in_flight_trigger: Option<String>,
+    slot: IndexRebuildSlot,
     /// `Engine::order_no_index_lookups` at the last adoption: scan demand means
     /// "consults since the index was last made current", not "since the run began",
     /// so a region that stopped being scanned stops paying for rebuilds.
     lookups_at_adopt: u64,
-    /// Latched after ANY refusal - a failed inline snapshot, a refused build, or a
-    /// builder thread that went away. The same engine state refuses the same way at
-    /// every later boundary and the snapshot is re-paid each time, so the refusal is
-    /// one-shot; toggling the policy away from the index clears the latch, so
-    /// selecting it again retries once.
+    /// Latched after a refused BUILD that adoption actually recorded: the loud
+    /// empty-build refusal, the delta's "snapshot rows but nothing indexed"
+    /// refusal, or a builder thread that went away. Those are properties of the
+    /// engine state, so the same state refuses the same way at every later
+    /// boundary. Two things are deliberately NOT latched: an inline snapshot that
+    /// is over the bound (a property of this boundary's write volume; the next
+    /// boundary retries) and an `Err` from the snapshot, which propagates out of
+    /// `manage` because a read failure is the run's to report rather than a hint to
+    /// skip. Toggling the policy away from the index clears the latch, so selecting
+    /// it again retries once.
     refused: bool,
-    /// How many document bytes the inline snapshot may copy (production value
+    /// How many charged bytes the inline snapshot may copy (production value
     /// [`INLINE_SNAPSHOT_MAX_BYTES`]; a field so a test can bind the over-bound skip
     /// without allocating 4 MiB).
     inline_max_bytes: usize,
@@ -1149,6 +1156,9 @@ struct OrderNoIndexDriver {
     /// [`INDEX_REBUILD_STALE_CSN`]; a field so a test can bind both arms of the rule
     /// without committing a thousand blocks).
     stale_bound: u64,
+    /// How long the end-of-run drain waits for the in-flight job (production value
+    /// [`INDEX_DRAIN_TIMEOUT`]; a field so a test can bind the bounded wait).
+    drain_timeout: Duration,
     /// The last decision's log line, kept so a test can bind the decision without
     /// capturing stderr. The load never branches on it.
     last_decision: String,
@@ -1157,12 +1167,12 @@ struct OrderNoIndexDriver {
 impl OrderNoIndexDriver {
     fn new() -> Self {
         OrderNoIndexDriver {
-            rx: None,
-            in_flight_trigger: None,
+            slot: IndexRebuildSlot::new(),
             lookups_at_adopt: 0,
             refused: false,
             inline_max_bytes: INLINE_SNAPSHOT_MAX_BYTES,
             stale_bound: INDEX_REBUILD_STALE_CSN,
+            drain_timeout: INDEX_DRAIN_TIMEOUT,
             last_decision: String::new(),
         }
     }
@@ -1172,10 +1182,22 @@ impl OrderNoIndexDriver {
         eprintln!("flashdb-load: {}", self.last_decision);
     }
 
+    fn refuse(&mut self, trigger: &str, error: io::Error) {
+        self.refused = true;
+        self.record(IndexDecision {
+            trigger,
+            covered_rows: None,
+            stale_rows: None,
+            inline_bytes: None,
+            outcome: &format!("failed: {error}"),
+        });
+    }
+
     /// One window boundary's derived-index work. Never blocks the request path:
-    /// adopting a finished build is a directory sync, scheduling one copies the
-    /// serving memtable (bounded) and hands every tile read to another thread, and
-    /// the tile half of the source is never touched here.
+    /// adopting a finished job is a directory sync when it wrote a base tile,
+    /// scheduling a delta copies the interval's serving-memtable rows (bounded) and
+    /// hands the tile half to another thread, and the delta itself writes no device
+    /// bytes.
     ///
     /// Returns the microseconds this boundary spent on the inline memtable
     /// snapshot (0 when no snapshot ran). The caller reports it as the window's
@@ -1190,8 +1212,13 @@ impl OrderNoIndexDriver {
             engine.clear_order_no_index();
             return Ok(0);
         }
-        if self.rx.is_some() || self.refused {
+        if self.slot.is_busy() || self.refused {
             return Ok(0);
+        }
+        // A delta at the merge threshold owes a base rewrite even if no state moved
+        // since: the next interval's writes would only grow it further.
+        if engine.order_no_index_needs_merge() {
+            return self.schedule_merge(engine, index_dir);
         }
         let trigger = match engine.order_no_index_coverage_csn() {
             // The policy wants the index and none is adopted: build it off-path.
@@ -1207,67 +1234,112 @@ impl OrderNoIndexDriver {
         self.schedule(engine, index_dir, trigger)
     }
 
-    /// Adopt (or report) a finished rebuild. A finished build cannot be stale: the
-    /// index is a hint whose hits are cross-checked, and its coverage is recorded
-    /// from the snapshot it was built from, so a boundary that already has a newer
-    /// one simply schedules the next rebuild.
-    fn collect(&mut self, engine: &mut Engine, index_dir: &Path) -> io::Result<()> {
-        let received = match self.rx.as_ref() {
-            None => return Ok(()),
-            Some(rx) => match rx.try_recv() {
-                Ok(result) => result,
-                Err(std::sync::mpsc::TryRecvError::Empty) => return Ok(()),
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    Err(io::Error::other("order_no index builder thread went away"))
-                }
-            },
-        };
-        self.rx = None;
-        let trigger = self.in_flight_trigger.take().unwrap_or_default();
-        match received {
-            Ok(result) => {
-                // The index tile's file was synced by TileWriter::finish; make its
-                // directory entry durable before the engine references it, the same
-                // ordering the compaction apply path uses.
-                File::open(index_dir)?.sync_all()?;
-                let decision = IndexDecision {
-                    trigger: &trigger,
-                    covered_rows: Some(result.build.index.entries),
-                    stale_rows: Some(result.stale_rows),
-                    inline_bytes: Some(result.inline_bytes),
-                    outcome: "adopted",
-                };
-                engine.adopt_order_no_index(result.build.index);
-                engine.record_order_no_index_build(result.build.output_bytes);
-                self.lookups_at_adopt = engine.order_no_index_lookups();
-                self.record(decision);
-            }
-            // Any refusal latches (see `refused`): the read path already falls back
-            // to the authoritative scan, so the failure costs correctness nothing and
-            // must not be re-paid at every boundary.
-            Err(e) => {
-                self.refused = true;
+    /// Drain the one in-flight job at the end of the run, bounded, and record the
+    /// final decision. Without this a job scheduled at the last boundary is never
+    /// adopted and its output bytes are never charged. A job that outlives the
+    /// bound is recorded as skipped rather than holding the run open.
+    fn finish(&mut self, engine: &mut Engine, index_dir: &Path) -> io::Result<()> {
+        let Some(finished) = self.slot.wait(self.drain_timeout) else {
+            if self.slot.is_busy() {
+                let trigger = self.slot.trigger().unwrap_or("none").to_string();
                 self.record(IndexDecision {
                     trigger: &trigger,
                     covered_rows: None,
                     stale_rows: None,
                     inline_bytes: None,
-                    outcome: &format!("failed: {e}"),
+                    outcome: "skipped: still building at the end of the run",
                 });
+            }
+            return Ok(());
+        };
+        self.adopt(engine, index_dir, finished)?;
+        // The drained delta may have reached the merge threshold; merge now so the
+        // run's index bytes are charged instead of dying in RAM with the process.
+        // One merge is enough (it empties the delta).
+        if engine.order_no_index_needs_merge() {
+            self.schedule_merge(engine, index_dir)?;
+            match self.slot.wait(self.drain_timeout) {
+                Some(finished) => self.adopt(engine, index_dir, finished)?,
+                None => {
+                    self.record(IndexDecision {
+                        trigger: TRIGGER_MERGE,
+                        covered_rows: None,
+                        stale_rows: None,
+                        inline_bytes: None,
+                        outcome: "skipped: still building at the end of the run",
+                    });
+                }
             }
         }
         Ok(())
     }
 
-    /// Copy the serving-memtable half of the source inline under the bound and hand
-    /// the tile half to the builder thread.
+    /// Adopt (or report) the job that finished since the last boundary. A finished
+    /// build cannot be harmful: the index is a hint whose hits are cross-checked,
+    /// and its coverage is recorded from the snapshot it was built from, so a
+    /// boundary that already has newer state simply schedules the next build.
+    fn collect(&mut self, engine: &mut Engine, index_dir: &Path) -> io::Result<()> {
+        let Some(finished) = self.slot.try_recv() else { return Ok(()) };
+        self.adopt(engine, index_dir, finished)
+    }
+
+    /// Adopt one finished job, or record its failure and latch it.
+    fn adopt(&mut self, engine: &mut Engine, index_dir: &Path, finished: FinishedJob) -> io::Result<()> {
+        let FinishedJob { trigger, result } = finished;
+        let result = match result {
+            Ok(result) => result,
+            Err(e) => {
+                self.refuse(&trigger, e);
+                return Ok(());
+            }
+        };
+        // A base tile's file was synced by `TileWriter::finish`; make its directory
+        // entry durable before the engine references it, the same ordering the
+        // compaction apply path uses. A delta writes nothing, so it needs no sync.
+        let writes_device_bytes = matches!(result.product, IndexProduct::Index(_));
+        if writes_device_bytes {
+            File::open(index_dir)?.sync_all()?;
+        }
+        let adopted: io::Result<u64> = match result.product {
+            IndexProduct::Index(build) => {
+                let covered = build.index.entries();
+                engine.adopt_order_no_index(build.index);
+                engine.record_order_no_index_build(build.output_bytes);
+                Ok(covered)
+            }
+            IndexProduct::Delta(build) => {
+                let covered = build.delta.live_entries();
+                engine.adopt_order_no_delta(build).map(|()| covered)
+            }
+        };
+        match adopted {
+            Ok(covered_rows) => {
+                self.lookups_at_adopt = engine.order_no_index_lookups();
+                self.record(IndexDecision {
+                    trigger: &trigger,
+                    covered_rows: Some(covered_rows),
+                    stale_rows: Some(result.stale_rows),
+                    inline_bytes: Some(result.inline_bytes),
+                    outcome: "adopted",
+                });
+            }
+            Err(e) => self.refuse(&trigger, e),
+        }
+        Ok(())
+    }
+
+    /// Copy the serving-memtable rows above the coverage inline under the bound and
+    /// hand the tile half to the builder thread.
     ///
     /// Over the bound nothing is copied and nothing is spawned: the rebuild is
     /// skipped with the reason recorded, so there is no partial index and the
-    /// previously adopted one is left exactly as it was.
+    /// previously adopted one is left exactly as it was. The source is narrowed to
+    /// the rows above the adopted coverage, so this copy is one interval's ingest,
+    /// not the region - the bound does not bind as the region grows.
     fn schedule(&mut self, engine: &mut Engine, index_dir: &Path, trigger: &str) -> io::Result<u64> {
+        let after_csn = engine.order_no_index_coverage_csn().unwrap_or(0);
         let started = Instant::now();
-        let snapshot = engine.snapshot_primary_memtable(INDEX_ENTITY, self.inline_max_bytes)?;
+        let snapshot = engine.snapshot_primary_memtable(INDEX_ENTITY, after_csn, self.inline_max_bytes)?;
         let inline_us = started.elapsed().as_micros() as u64;
         let memtable: MemtableRows = match snapshot {
             MemtableSnapshot::Copied(rows) => rows,
@@ -1282,23 +1354,80 @@ impl OrderNoIndexDriver {
                 return Ok(inline_us);
             }
         };
-        // The witness is read from the engine, not from the source: a source that
-        // misses the region reports zero rows, so the scan cannot testify about its
-        // own coverage.
-        let region_rows = movement_region_rows(engine);
         let view = engine.primary_tile_view();
-        self.rx = Some(spawn_rebuild(
-            index_dir.to_path_buf(),
-            engine.key_encoding(),
-            view,
-            |view, visit| view.scan_primary(INDEX_ENTITY, visit),
-            memtable,
-            region_rows,
-            trigger.to_string(),
-            INDEX_TILE_NAME.to_string(),
-        ));
-        self.in_flight_trigger = Some(trigger.to_string());
+        match engine.order_no_index_base_coverage_csn() {
+            // No base adopted: build one from the whole merged region. The witness
+            // is read from the engine, not from the source, because a source that
+            // misses the region reports zero rows and cannot testify about its own
+            // coverage.
+            None => self.slot.schedule_base(
+                index_dir.to_path_buf(),
+                engine.key_encoding(),
+                view,
+                move |view, visit| view.scan_primary(INDEX_ENTITY, visit),
+                memtable,
+                movement_region_rows(engine),
+                trigger,
+            )?,
+            // A base is adopted: index only the rows above the coverage. The delta
+            // is narrowed on purpose, so a legitimate empty delta exists and the
+            // base's witness does not apply.
+            Some(base_coverage) => self.slot.schedule_delta(
+                base_coverage,
+                view,
+                move |view, visit| view.scan_primary_after(INDEX_ENTITY, after_csn, visit),
+                memtable,
+                trigger,
+            )?,
+        }
         Ok(inline_us)
+    }
+
+    /// Schedule the off-path merge of base + delta once the delta is big enough.
+    fn schedule_merge(&mut self, engine: &mut Engine, index_dir: &Path) -> io::Result<u64> {
+        let snapshot = engine
+            .order_no_index_merge_snapshot()
+            .expect("the caller checked that a merge is due");
+        self.slot.schedule_merge(index_dir.to_path_buf(), snapshot, TRIGGER_MERGE)?;
+        Ok(0)
+    }
+}
+
+/// The startup eager build, off the timed clock: build the base index from the
+/// merged memtable + tile view and hand it back for adoption. A REFUSAL (the loud
+/// empty-build guard) is one logged decision and `None`: the run continues without
+/// the index, exactly as an off-path rebuild refusal does, because the read path is
+/// correct either way and the authoritative scan serves every request. A scan error
+/// is returned and aborts the run - that is an engine defect (a corrupt tile, a
+/// malformed document), not a refusal.
+fn startup_order_no_index(
+    engine: &Engine,
+    index_dir: &Path,
+) -> io::Result<Option<flashdb_engine::index::OrderNoIndexBuild>> {
+    match build_order_no_index(
+        index_dir,
+        engine.key_encoding(),
+        |visit| engine.scan_primary_with_csn(INDEX_ENTITY, visit),
+        movement_region_rows(engine),
+        engine.csn(),
+        INDEX_TILE_NAME,
+    ) {
+        Ok(build) => Ok(Some(build)),
+        Err(e) if is_index_build_refused(&e) => {
+            eprintln!(
+                "flashdb-load: {}",
+                IndexDecision {
+                    trigger: TRIGGER_STARTUP,
+                    covered_rows: None,
+                    stale_rows: None,
+                    inline_bytes: None,
+                    outcome: &format!("failed: {e}"),
+                }
+                .line()
+            );
+            Ok(None)
+        }
+        Err(e) => Err(e),
     }
 }
 
@@ -1418,18 +1547,18 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // build is the hybrid [`OrderNoIndexDriver`] one, whose tile half runs on the
     // builder thread.
     if !args.dry_run && order_no_index_wanted(&engine.layout_policy()) {
-        let build = build_order_no_index(
-            &index_dir,
-            engine.key_encoding(),
-            |visit| engine.scan_primary_with_csn(INDEX_ENTITY, visit),
-            movement_region_rows(&engine),
-            engine.csn(),
-            INDEX_TILE_NAME,
-        )?;
-        let output_bytes = build.output_bytes;
-        File::open(&index_dir)?.sync_all()?;
-        engine.adopt_order_no_index(build.index);
-        engine.record_order_no_index_build(output_bytes);
+        match startup_order_no_index(&engine, &index_dir)? {
+            Some(build) => {
+                let output_bytes = build.output_bytes;
+                File::open(&index_dir)?.sync_all()?;
+                engine.adopt_order_no_index(build.index);
+                engine.record_order_no_index_build(output_bytes);
+            }
+            // A refusal keeps the run: the read path is correct either way. Latched
+            // like the rebuild path's refusal, because the same engine state would
+            // refuse an off-path build the same way at every boundary.
+            None => index_driver.refused = true,
+        }
     }
     if !args.dry_run {
         // Bounded synchronous warm-up pass before the timed windows: prime the
@@ -2170,6 +2299,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // Drain the derived-index slot: a job scheduled at the last boundary would
+    // otherwise die with the process, unadopted and uncharged. Bounded by
+    // `INDEX_DRAIN_TIMEOUT`, and recorded as skipped if the bound is exceeded, so
+    // the run's index bytes and final coverage are in the record.
+    if !args.dry_run {
+        index_driver.finish(&mut engine, &index_dir)?;
+    }
+
     let elapsed = t0.elapsed();
     let device_end = probe_device(&probe_dir(&args.target), 50);
     writeln!(out, "device_fsync_end_p50_us={} device_fsync_end_p99_us={}",
@@ -2656,12 +2793,49 @@ mod tests {
         d
     }
 
+    /// A movement document at the shape the request adapter writes
+    /// (`engine/src/request.rs`): movement_no, sku, loc, delta, order_no, stock.
+    /// The write-amp bound is stated against these row bytes, so the tests commit
+    /// rows the production path would commit rather than a minimal stub.
     fn movement_op(handle: u64, order_no: &str) -> Op {
         Op::PutDoc {
             entity: INDEX_ENTITY.to_vec(),
             handle,
-            doc: format!(r#"{{"order_no":"{order_no}"}}"#).into_bytes(),
+            doc: serde_json::to_vec(&serde_json::json!({
+                "movement_no": format!("MV-{handle:09}"),
+                "sku": "SKU-0042",
+                "loc": "LOC-07",
+                "delta": -(handle as i64 % 7 + 1),
+                "order_no": order_no,
+                "stock": {"sku": "SKU-0042", "loc": "LOC-07"},
+            }))
+            .expect("the movement row serialises"),
         }
+    }
+
+    /// The movement region's `index_output_bytes` since the last rotation: the
+    /// production instrument, read the way the window record reads it.
+    fn movement_index_output_bytes(engine: &Engine) -> u64 {
+        engine
+            .metrics_rotate_window()
+            .regions
+            .iter()
+            .filter(|r| r.region == "P|StockMovement")
+            .map(|r| r.index_output_bytes)
+            .sum()
+    }
+
+    /// A movement scan request at the shape `execute_request` serves.
+    fn movement_scan_request(order_no: &str) -> serde_json::Value {
+        serde_json::json!({
+            "blocks": {"q": {"find": {
+                "StockMovement": {"where": {"order_no": order_no}},
+                "order": ["movement_no"],
+                "limit": 100,
+            }}},
+            "class": {"durability": "batched", "max_staleness": 5},
+            "id": "m"
+        })
     }
 
     /// The policy the index tests select: `index_order_no` on the movement region.
@@ -2675,7 +2849,7 @@ mod tests {
     fn settle(driver: &mut OrderNoIndexDriver, engine: &mut Engine, dir: &Path) {
         for _ in 0..400 {
             driver.manage(engine, dir).unwrap();
-            if driver.rx.is_none() { return; }
+            if !driver.slot.is_busy() { return; }
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         panic!("the derived index rebuild never finished");
@@ -2691,7 +2865,7 @@ mod tests {
         let mut driver = OrderNoIndexDriver::new();
         let scan_us = driver.manage(&mut engine, &dir).unwrap();
         assert_eq!(scan_us, 0, "the default policy requests no index, so no snapshot ran");
-        assert!(driver.rx.is_none());
+        assert!(!driver.slot.is_busy());
         assert!(!dir.join(INDEX_TILE_NAME).exists(), "no build is started");
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -2727,7 +2901,7 @@ mod tests {
         engine.commit_block(b"m2", &[movement_op(2, "O2")]).unwrap();
         let scan_us = driver.manage(&mut engine, &dir).unwrap();
         assert_eq!(scan_us, 0, "a latched refusal re-scans nothing");
-        assert!(driver.rx.is_none(), "and starts no build");
+        assert!(!driver.slot.is_busy(), "and starts no build");
         assert_eq!(driver.last_decision, latched, "and takes no new decision");
 
         // Deselecting the index re-arms the latch; selecting it again retries.
@@ -2736,7 +2910,7 @@ mod tests {
         assert!(!driver.refused, "deselecting the index re-arms the one-shot refusal");
         engine.set_layout_policy(index_wanted_policy());
         driver.manage(&mut engine, &dir).unwrap();
-        assert!(driver.rx.is_some(), "selecting it again retries the build");
+        assert!(driver.slot.is_busy(), "selecting it again retries the build");
         settle(&mut driver, &mut engine, &dir);
         assert!(engine.has_order_no_index(), "the retry adopts (handle 2 is live): {}", driver.last_decision);
         std::fs::remove_dir_all(&dir).unwrap();
@@ -2765,7 +2939,7 @@ mod tests {
             "the adopted index is stale: it covers no version of the new row");
 
         driver.manage(&mut engine, &dir).unwrap();
-        assert!(driver.rx.is_some(),
+        assert!(driver.slot.is_busy(),
             "a stale adopted index with scan demand must be rebuilt: {}", driver.last_decision);
         settle(&mut driver, &mut engine, &dir);
         let advanced = engine.order_no_index_coverage_csn().expect("an index is adopted");
@@ -2796,13 +2970,13 @@ mod tests {
         engine.commit_block(b"m1", &[movement_op(2, "O2")]).unwrap();
         let quiet = driver.manage(&mut engine, &dir).unwrap();
         assert_eq!(quiet, 0, "no snapshot is taken for a lag the rule does not honour");
-        assert!(driver.rx.is_none(), "no rebuild without demand or the stale bound");
+        assert!(!driver.slot.is_busy(), "no rebuild without demand or the stale bound");
         assert_eq!(engine.order_no_index_coverage_csn(), Some(coverage), "the index is left as it was");
 
         // The same lag with the bound reached: the stale arm fires on its own.
         driver.stale_bound = 1;
         driver.manage(&mut engine, &dir).unwrap();
-        assert!(driver.rx.is_some(), "a lag at the stale bound is rebuilt without scan demand");
+        assert!(driver.slot.is_busy(), "a lag at the stale bound is rebuilt without scan demand");
         settle(&mut driver, &mut engine, &dir);
         assert!(driver.last_decision.contains("trigger=stale"), "{}", driver.last_decision);
         assert!(engine.order_no_index_coverage_csn().expect("an index is adopted") > coverage);
@@ -2826,7 +3000,7 @@ mod tests {
         assert_eq!(engine.lookup_movement_by_order_no(b"O2").unwrap(), None, "scan demand on a stale index");
         driver.inline_max_bytes = 1;
         driver.manage(&mut engine, &dir).unwrap();
-        assert!(driver.rx.is_none(), "an over-bound snapshot spawns nothing");
+        assert!(!driver.slot.is_busy(), "an over-bound snapshot spawns nothing");
         assert!(driver.last_decision.contains("outcome=skipped: inline memtable snapshot would exceed the 1-byte bound"),
             "the skip states the reason: {}", driver.last_decision);
         assert_eq!(engine.order_no_index_coverage_csn(), Some(coverage), "the adopted index is untouched");
@@ -2839,9 +3013,162 @@ mod tests {
         // the next boundary rebuilds normally.
         driver.inline_max_bytes = INLINE_SNAPSHOT_MAX_BYTES;
         driver.manage(&mut engine, &dir).unwrap();
-        assert!(driver.rx.is_some(), "the next boundary retries once the region fits");
+        assert!(driver.slot.is_busy(), "the next boundary retries once the region fits");
         settle(&mut driver, &mut engine, &dir);
         assert!(engine.order_no_index_coverage_csn().expect("an index is adopted") > coverage);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// WP-9 acceptance 2: the incremental index's write bytes, over a scripted
+    /// sequence of appends, stay at or below 2x the movement-document bytes
+    /// committed - where a whole-index rebuild per boundary would have written the
+    /// entries built so far at every boundary.
+    ///
+    /// Why 2x: each row's index entry is written to the device exactly once, when a
+    /// merge folds its delta into the base, and a merge rewrites the base once per
+    /// `max(INDEX_MERGE_MIN_DELTA_ENTRIES, base entries)` merged entries, so the
+    /// amortised write per entry is `1 + base/delta <= 2`. Stating the bound in ROW
+    /// bytes (not entry bytes) also binds the entry/row ratio at the production
+    /// movement shape: the assertion would fail if a redesign made the index entries
+    /// bigger than the rows they index.
+    #[test]
+    fn incremental_index_writes_at_most_twice_the_row_bytes() {
+        const WINDOWS: u64 = 30;
+        const PER_WINDOW: u64 = 140;
+        let dir = tmp_dir("indexwriteamp");
+        let mut engine = Engine::create(dir.join("data.wal")).unwrap();
+        engine.set_layout_policy(index_wanted_policy());
+        let mut driver = OrderNoIndexDriver::new();
+        let mut row_bytes = 0u64;
+        let mut index_bytes = 0u64;
+        let mut handle = 0u64;
+        for window in 0..WINDOWS {
+            let mut ops = Vec::with_capacity(PER_WINDOW as usize);
+            for _ in 0..PER_WINDOW {
+                handle += 1;
+                let op = movement_op(handle, &format!("O{handle:08}"));
+                if let Op::PutDoc { doc, .. } = &op { row_bytes += doc.len() as u64; }
+                ops.push(op);
+            }
+            engine.commit_block(format!("w{window}").as_bytes(), &ops).unwrap();
+            // One consultation per window: the same scan demand a movement scan
+            // gives the demand arm of `rebuild_trigger`, which is the cadence a
+            // scanned region had before (one rebuild per boundary).
+            engine.lookup_movement_by_order_no(b"O00000001").unwrap();
+            settle(&mut driver, &mut engine, &dir);
+            index_bytes += movement_index_output_bytes(&engine);
+        }
+        assert_eq!(engine.order_no_index_entries(), Some(handle), "every committed row is covered");
+        assert!(
+            index_bytes <= 2 * row_bytes,
+            "the index wrote {index_bytes} B for {row_bytes} B of movement rows"
+        );
+        // The counterfactual a whole-index rebuild per boundary would have paid: the
+        // entries built so far at each of the 30 boundaries, i.e.
+        // PER_WINDOW * (1 + .. + WINDOWS) = 65,100 entries, at the smallest an entry
+        // can be (its key plus the 8-byte handle value). The incremental path must be
+        // an order of magnitude below it.
+        let entry_min_bytes = flashdb_engine::keys::unique_key(
+            INDEX_ENTITY, b"order_no", b"O00000001", 1, 1,
+        ).unwrap().len() as u64 + 8;
+        let rebuilt_entries = PER_WINDOW * WINDOWS * (WINDOWS + 1) / 2;
+        let rebuilt_min_bytes = rebuilt_entries * entry_min_bytes;
+        eprintln!(
+            "index_write_amp rows={handle} row_bytes={row_bytes} index_bytes={index_bytes} \
+             ratio={:.3} rebuilt_min_bytes={rebuilt_min_bytes}",
+            index_bytes as f64 / row_bytes as f64
+        );
+        assert!(
+            index_bytes * 8 < rebuilt_min_bytes,
+            "the incremental total {index_bytes} B must be far below the >= {rebuilt_min_bytes} B a whole-index rebuild per boundary would write"
+        );
+    }
+
+    /// WP-9 acceptance 3: a job scheduled at the LAST boundary is adopted by the
+    /// end-of-run drain and its output bytes are charged. Without the drain it dies
+    /// with the process, unadopted and uncharged.
+    #[test]
+    fn the_end_of_run_drain_adopts_and_charges_the_last_boundary_build() {
+        let dir = tmp_dir("indexdrain");
+        let mut engine = Engine::create(dir.join("data.wal")).unwrap();
+        engine.commit_block(b"m0", &[movement_op(1, "O1")]).unwrap();
+        engine.set_layout_policy(index_wanted_policy());
+        let mut driver = OrderNoIndexDriver::new();
+        // The last boundary schedules the first build and returns without waiting.
+        driver.manage(&mut engine, &dir).unwrap();
+        assert!(driver.slot.is_busy(), "the build is in flight at the end of the run");
+        assert!(!engine.has_order_no_index(), "and nothing is adopted yet");
+        driver.finish(&mut engine, &dir).unwrap();
+        assert!(engine.has_order_no_index(), "the drain adopts it: {}", driver.last_decision);
+        assert!(driver.last_decision.contains("outcome=adopted"), "{}", driver.last_decision);
+        assert_eq!(engine.order_no_index_coverage_csn(), Some(engine.csn()));
+        assert!(movement_index_output_bytes(&engine) > 0, "and its output bytes are charged");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The drain also closes the merge a drained delta made due, so the run's base
+    /// rewrite is charged instead of dying in RAM with the process.
+    #[test]
+    fn the_end_of_run_drain_merges_a_delta_that_reached_the_threshold() {
+        let dir = tmp_dir("indexdrainmerge");
+        let mut engine = Engine::create(dir.join("data.wal")).unwrap();
+        engine.commit_block(b"m0", &[movement_op(1, "O1")]).unwrap();
+        engine.set_layout_policy(index_wanted_policy());
+        let mut driver = OrderNoIndexDriver::new();
+        settle(&mut driver, &mut engine, &dir);
+        assert!(engine.has_order_no_index(), "{}", driver.last_decision);
+
+        // One interval large enough that the delta is due for a merge.
+        let ops: Vec<Op> = (2..=flashdb_engine::index::INDEX_MERGE_MIN_DELTA_ENTRIES + 1)
+            .map(|h| movement_op(h, &format!("O{h:08}")))
+            .collect();
+        engine.commit_block(b"interval", &ops).unwrap();
+        engine.lookup_movement_by_order_no(b"O1").unwrap();
+        driver.manage(&mut engine, &dir).unwrap();
+        assert!(driver.slot.is_busy(), "the delta build is in flight at the last boundary");
+        driver.finish(&mut engine, &dir).unwrap();
+        assert!(engine.has_order_no_index());
+        assert_eq!(engine.order_no_index_delta_entries(), Some(0),
+            "the drained delta reached the threshold, so the drain merged it: {}", driver.last_decision);
+        assert!(driver.last_decision.contains("trigger=merge"), "{}", driver.last_decision);
+        assert!(movement_index_output_bytes(&engine) > 0, "and the merge's bytes are charged");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// WP-9 acceptance 4: a REFUSAL at startup is one logged decision and the run
+    /// continues without the index (the read path answers either way); a scan error
+    /// is returned and aborts.
+    #[test]
+    fn a_startup_refusal_continues_while_a_scan_error_aborts() {
+        let dir = tmp_dir("indexstartup");
+        let mut engine = Engine::create(dir.join("data.wal")).unwrap();
+        engine.set_region_mode(RegionMode::PerRegion);
+        engine.commit_block(b"m0", &[movement_op(1, "O1")]).unwrap();
+        engine.publish_tile(dir.join("tile-0.tile"), engine.csn()).unwrap();
+        engine.commit_block(b"m1", &[Op::DelDoc { entity: INDEX_ENTITY.to_vec(), handle: 1 }]).unwrap();
+        let refused = startup_order_no_index(&engine, &dir).expect("a refusal is not a scan error");
+        assert!(refused.is_none(), "the run continues without the index");
+        assert!(!engine.has_order_no_index());
+        assert!(!dir.join(INDEX_TILE_NAME).exists(), "a refused build writes no sidecar");
+        // The run still serves: the movement scan answers from the authoritative scan.
+        let served = execute_request(&mut engine, &movement_scan_request("O1")).unwrap();
+        assert_eq!(served["q"].status, "empty", "the deleted region serves no row, index or not");
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        // A malformed movement document is a scan error, not a refusal: it aborts.
+        let dir = tmp_dir("indexstartupbad");
+        let mut engine = Engine::create(dir.join("data.wal")).unwrap();
+        engine.commit_block(b"bad", &[Op::PutDoc {
+            entity: INDEX_ENTITY.to_vec(),
+            handle: 1,
+            doc: br#"{"order_no":42}"#.to_vec(),
+        }]).unwrap();
+        let error = match startup_order_no_index(&engine, &dir) {
+            Ok(_) => panic!("a scan error aborts the run"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("order_no is not a string"), "{error}");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

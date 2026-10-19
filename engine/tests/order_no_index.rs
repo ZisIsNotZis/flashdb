@@ -4,9 +4,9 @@
 
 use flashdb_engine::engine::{Engine, Op, RegionMode};
 use flashdb_engine::index::{
-    build_order_no_index, movement_region_rows, rebuild_trigger, spawn_rebuild, MemtableRows,
-    MemtableSnapshot, OrderNoIndexBuild, RebuildResult, RegionRows, INDEX_ENTITY, INDEX_FIELD,
-    INLINE_SNAPSHOT_MAX_BYTES,
+    build_order_no_index, movement_region_rows, rebuild_trigger, IndexProduct, IndexRebuildSlot,
+    MemtableRows, MemtableSnapshot, OrderNoIndexBuild, RebuildResult, RegionRows, INDEX_ENTITY,
+    INDEX_FIELD, INLINE_SNAPSHOT_MAX_BYTES,
 };
 use flashdb_engine::request::execute_request;
 use serde_json::{json, Value};
@@ -73,7 +73,7 @@ fn movement_scan_uses_order_no_index_when_present() {
     assert!(e.serving_memtable_entries() == 0, "movements are now tile-resident");
 
     let build = build(&e, &dir).unwrap();
-    assert_eq!(build.index.entries, 3);
+    assert_eq!(build.index.entries(), 3);
     e.adopt_order_no_index(build.index);
     assert!(e.has_order_no_index());
 
@@ -125,7 +125,7 @@ fn movement_scan_falls_back_for_a_movement_newer_than_the_index() {
     e.publish_tile(dir.join("tile-0.tile"), e.csn()).unwrap();
 
     let build = build(&e, &dir).unwrap();
-    assert_eq!(build.index.entries, 1);
+    assert_eq!(build.index.entries(), 1);
     e.adopt_order_no_index(build.index);
 
     // A new movement lands in the serving memtable, not the index.
@@ -179,8 +179,8 @@ fn index_build_covers_rows_that_live_only_in_the_memtable() {
     assert!(e.active_tile_regions().is_empty(), "no tile exists, so a tile-only build sees zero rows");
 
     let build = build(&e, &dir).unwrap();
-    assert_eq!(build.index.entries, orders.len() as u64, "one entry per memtable row");
-    assert_eq!(build.index.coverage_csn, 3, "the covered CSN is the max row CSN, not the last row's");
+    assert_eq!(build.index.entries(), orders.len() as u64, "one entry per memtable row");
+    assert_eq!(build.index.coverage_csn(), 3, "the covered CSN is the max row CSN, not the last row's");
     e.adopt_order_no_index(build.index);
 
     assert_eq!(e.lookup_movement_by_order_no(b"O00000002").unwrap(), Some(2));
@@ -232,8 +232,8 @@ fn index_holds_one_entry_per_live_row_across_versions_and_deletes() {
     assert_eq!(e.csn(), 4, "the tombstone is the newest version in the region");
 
     let build = build(&e, &dir).unwrap();
-    assert_eq!(build.index.entries, 2, "one entry per live row: handle 1's newest and handle 2");
-    assert_eq!(build.index.coverage_csn, 2, "the max csn over LIVING versions, not the tombstone's");
+    assert_eq!(build.index.entries(), 2, "one entry per live row: handle 1's newest and handle 2");
+    assert_eq!(build.index.coverage_csn(), 2, "the max csn over LIVING versions, not the tombstone's");
     e.adopt_order_no_index(build.index);
 
     assert_eq!(e.lookup_movement_by_order_no(b"O1b").unwrap(), Some(1), "the newest version is indexed");
@@ -289,28 +289,63 @@ fn index_field_and_entity_names_are_the_observed_predicate() {
 
 // --- WP-8: the hybrid rebuild (memtable half inline, tile half off-thread) -----
 
-/// The bounded inline memtable snapshot of the region, as the driver takes it.
-fn memtable_rows(e: &Engine, max_bytes: usize) -> MemtableRows {
-    match e.snapshot_primary_memtable(INDEX_ENTITY, max_bytes).unwrap() {
+/// The bounded inline memtable snapshot of the region above `after_csn`, as the
+/// driver takes it.
+fn memtable_rows(e: &Engine, after_csn: u64, max_bytes: usize) -> MemtableRows {
+    match e.snapshot_primary_memtable(INDEX_ENTITY, after_csn, max_bytes).unwrap() {
         MemtableSnapshot::Copied(rows) => rows,
         MemtableSnapshot::OverBound(over) => panic!("the region does not fit the bound: {over}"),
     }
 }
 
-/// One full hybrid rebuild, exactly as the driver schedules it: the tile half runs on
-/// the builder thread, the memtable half was snapshotted here.
+/// Wait (bounded) for the slot's one job and return its product.
+fn settle(slot: &mut IndexRebuildSlot) -> RebuildResult {
+    for _ in 0..400 {
+        if let Some(finished) = slot.try_recv() {
+            return finished.result.expect("the index job succeeds");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    panic!("the index job never finished");
+}
+
+/// The base index inside a finished product.
+fn base_of(result: &RebuildResult) -> &flashdb_engine::index::OrderNoIndex {
+    match &result.product {
+        IndexProduct::Index(build) => &build.index,
+        IndexProduct::Delta(_) => panic!("the job built a delta, not a base index"),
+    }
+}
+
+/// One full hybrid base build, exactly as the driver schedules it: the tile half
+/// runs on the builder thread, the memtable half was snapshotted here.
 fn rebuild(e: &Engine, dir: &std::path::Path) -> RebuildResult {
-    let rx = spawn_rebuild(
+    let mut slot = IndexRebuildSlot::new();
+    slot.schedule_base(
         dir.to_path_buf(),
         e.key_encoding(),
         e.primary_tile_view(),
         |view, visit| view.scan_primary(INDEX_ENTITY, visit),
-        memtable_rows(e, INLINE_SNAPSHOT_MAX_BYTES),
+        memtable_rows(e, 0, INLINE_SNAPSHOT_MAX_BYTES),
         movement_region_rows(e),
-        "scan_demand".to_string(),
-        "rebuilt-index.tile".to_string(),
-    );
-    rx.recv().expect("the builder reports its outcome").expect("the rebuild succeeds")
+        "scan_demand",
+    )
+    .unwrap();
+    settle(&mut slot)
+}
+
+/// One delta build over the rows above `after_csn`, as the driver schedules it.
+fn rebuild_delta(e: &Engine, after_csn: u64) -> RebuildResult {
+    let mut slot = IndexRebuildSlot::new();
+    slot.schedule_delta(
+        e.order_no_index_base_coverage_csn().expect("a base is adopted"),
+        e.primary_tile_view(),
+        move |view, visit| view.scan_primary_after(INDEX_ENTITY, after_csn, visit),
+        memtable_rows(e, after_csn, INLINE_SNAPSHOT_MAX_BYTES),
+        "scan_demand",
+    )
+    .unwrap();
+    settle(&mut slot)
 }
 
 /// The rebuild's merge is the scan's newest-wins rule, not a second one: the version
@@ -332,19 +367,23 @@ fn rebuilt_index_takes_the_memtable_version_and_drops_a_tombstoned_handle() {
     e.commit_block(b"v2", &[Op::DelDoc { entity: INDEX_ENTITY.to_vec(), handle: 6 }]).unwrap();
 
     let result = rebuild(&e, &dir);
-    assert_eq!(result.build.index.entries, 1, "one live handle: 5 at its newest version");
+    assert_eq!(base_of(&result).entries(), 1, "one live handle: 5 at its newest version");
     assert_eq!(result.memtable_rows, 2, "one snapshot row per memtable handle");
     assert_eq!(result.stale_rows, 3,
         "two tile versions are superseded by the memtable and the tombstone removes its handle");
-    assert_eq!(result.build.index.coverage_csn, e.csn(),
+    assert_eq!(base_of(&result).coverage_csn(), e.csn(),
         "coverage is the snapshot's CSN, past the tombstone no entry records");
-    assert_eq!(result.build.index.lookup(b"B").unwrap(), Some(5), "the memtable version wins");
-    assert_eq!(result.build.index.lookup(b"A").unwrap(), None, "the superseded tile version is not indexed");
-    assert_eq!(result.build.index.lookup(b"C").unwrap(), None, "the tombstoned handle is gone");
+    assert_eq!(base_of(&result).lookup(b"B").unwrap(), Some(5), "the memtable version wins");
+    assert_eq!(base_of(&result).lookup(b"A").unwrap(), None, "the superseded tile version is not indexed");
+    assert_eq!(base_of(&result).lookup(b"C").unwrap(), None, "the tombstoned handle is gone");
 
     // Adopted, the rebuilt index answers the live state and the read path falls back
     // for the handle that no longer exists.
-    e.adopt_order_no_index(result.build.index);
+    let index = match result.product {
+        IndexProduct::Index(build) => build.index,
+        IndexProduct::Delta(_) => panic!("the base build produced a base"),
+    };
+    e.adopt_order_no_index(index);
     assert_eq!(e.lookup_movement_by_order_no(b"B").unwrap(), Some(5));
     assert_eq!(e.lookup_movement_by_order_no(b"A").unwrap(), None);
     std::fs::remove_dir_all(&dir).unwrap();
@@ -368,7 +407,7 @@ fn coverage_floor_covers_the_state_a_tombstone_hides() {
         "floor-0.tile",
     )
     .unwrap();
-    assert_eq!(live_only.index.coverage_csn, 1, "without a floor the coverage is the newest entry's CSN");
+    assert_eq!(live_only.index.coverage_csn(), 1, "without a floor the coverage is the newest entry's CSN");
 
     // csn 2 deletes the only handle: no entry, and the state still moved.
     e.commit_block(b"v1", &[Op::DelDoc { entity: INDEX_ENTITY.to_vec(), handle: 1 }]).unwrap();
@@ -381,13 +420,14 @@ fn coverage_floor_covers_the_state_a_tombstone_hides() {
         "floored.tile",
     )
     .unwrap();
-    assert_eq!(floored.index.entries, 0, "a deleted region indexes nothing");
-    assert_eq!(floored.index.coverage_csn, 2, "and the floor carries the state it covered");
+    assert_eq!(floored.index.entries(), 0, "a deleted region indexes nothing");
+    assert_eq!(floored.index.coverage_csn(), 2, "and the floor carries the state it covered");
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
-/// The inline snapshot is bounded by document bytes AND refuses before it copies, so
-/// the thread that schedules a rebuild never pays for a region over the bound.
+/// The inline snapshot is bounded by the bytes it holds AND refuses before it copies,
+/// so the thread that schedules a rebuild never pays for a region over the bound. The
+/// charge is the documents plus the per-row tuple, which is what the copy owns.
 #[test]
 fn the_inline_memtable_snapshot_is_bounded_and_copies_nothing_over_the_bound() {
     let dir = tmp_dir("bound");
@@ -395,7 +435,7 @@ fn the_inline_memtable_snapshot_is_bounded_and_copies_nothing_over_the_bound() {
     e.commit_block(b"v0", &[movement(1, "O1", "M1"), movement(2, "O2", "M2"), movement(3, "O3", "M3")])
         .unwrap();
 
-    let over = match e.snapshot_primary_memtable(INDEX_ENTITY, 10).unwrap() {
+    let over = match e.snapshot_primary_memtable(INDEX_ENTITY, 0, 10).unwrap() {
         MemtableSnapshot::OverBound(over) => over,
         MemtableSnapshot::Copied(_) => panic!("three movements do not fit 10 document bytes"),
     };
@@ -405,19 +445,28 @@ fn the_inline_memtable_snapshot_is_bounded_and_copies_nothing_over_the_bound() {
     assert!(reason.contains("would exceed the 10-byte bound"), "the reason is stated: {reason}");
     assert!(reason.contains("3 handles, 3 live"), "and counts the region: {reason}");
 
-    let copied = memtable_rows(&e, INLINE_SNAPSHOT_MAX_BYTES);
+    let copied = memtable_rows(&e, 0, INLINE_SNAPSHOT_MAX_BYTES);
     assert_eq!(copied.rows.len(), 3, "one row per handle");
     assert_eq!(copied.live_rows, 3);
     assert_eq!(copied.csn, e.csn(), "the snapshot states the CSN it speaks for");
-    assert_eq!(copied.bytes, copied.rows.iter().map(|(_, _, doc)| doc.len()).sum::<usize>(),
-        "the bound is charged against exactly the document bytes held");
+    assert_eq!(
+        copied.bytes,
+        copied.rows.iter().map(|(_, _, doc)| doc.len()).sum::<usize>()
+            + copied.rows.len() * flashdb_engine::index::MEMTABLE_ROW_OVERHEAD_BYTES,
+        "the bound is charged against the documents plus one owned row per handle"
+    );
+    // The filter is above the coverage: the same rows are copied for `after_csn` 0 and
+    // nothing is copied for a coverage at the newest committed version.
+    assert_eq!(memtable_rows(&e, 0, INLINE_SNAPSHOT_MAX_BYTES).rows.len(), 3);
+    assert_eq!(memtable_rows(&e, e.csn(), INLINE_SNAPSHOT_MAX_BYTES).rows.len(), 0,
+        "a snapshot above the coverage holds the interval's rows, not the region's");
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
 /// Over a TILED region the tile half is a cold device stream. It must run on the
 /// builder thread and never on the thread that schedules the rebuild - that is the
-/// WP-1 exposure `movement_rows` left on the pacer, and the seam `spawn_rebuild` takes
-/// is what makes it observable.
+/// WP-1 exposure `movement_rows` left on the pacer, and the seam the slot's base
+/// schedule takes is what makes it observable.
 #[test]
 fn a_rebuild_reads_no_tile_on_the_thread_that_schedules_it() {
     let dir = tmp_dir("thread");
@@ -431,7 +480,8 @@ fn a_rebuild_reads_no_tile_on_the_thread_that_schedules_it() {
     let walked_on: std::sync::Arc<std::sync::Mutex<Vec<std::thread::ThreadId>>> =
         std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let record = std::sync::Arc::clone(&walked_on);
-    let rx = spawn_rebuild(
+    let mut slot = IndexRebuildSlot::new();
+    slot.schedule_base(
         dir.to_path_buf(),
         e.key_encoding(),
         e.primary_tile_view(),
@@ -439,17 +489,17 @@ fn a_rebuild_reads_no_tile_on_the_thread_that_schedules_it() {
             record.lock().unwrap().push(std::thread::current().id());
             view.scan_primary(INDEX_ENTITY, visit)
         },
-        memtable_rows(&e, INLINE_SNAPSHOT_MAX_BYTES),
+        memtable_rows(&e, 0, INLINE_SNAPSHOT_MAX_BYTES),
         movement_region_rows(&e),
-        "scan_demand".to_string(),
-        "threaded-index.tile".to_string(),
-    );
-    let result = rx.recv().expect("the builder reports its outcome").expect("the rebuild succeeds");
+        "scan_demand",
+    )
+    .unwrap();
+    let result = settle(&mut slot);
     let threads = walked_on.lock().unwrap().clone();
     assert_eq!(threads.len(), 1, "the tile half is walked exactly once");
     assert_ne!(threads[0], seller, "and not on the thread that scheduled the rebuild");
-    assert_eq!(result.build.index.entries, 2, "the tile half still covered the region");
-    assert_eq!(result.build.index.lookup(b"O2").unwrap(), Some(2));
+    assert_eq!(base_of(&result).entries(), 2, "the tile half still covered the region");
+    assert_eq!(base_of(&result).lookup(b"O2").unwrap(), Some(2));
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -527,10 +577,10 @@ fn rebuilt_index_drops_a_handle_whose_tombstone_is_tile_resident() {
     assert_eq!(e.serving_memtable_entries(), 0, "everything is tile-resident");
 
     let result = rebuild(&e, &dir);
-    assert_eq!(result.build.index.entries, 1, "only handle 2 is live");
-    assert_eq!(result.build.index.lookup(b"B2").unwrap(), Some(2), "at its newest version");
-    assert_eq!(result.build.index.lookup(b"B").unwrap(), None, "the superseded version is not indexed");
-    assert_eq!(result.build.index.lookup(b"A").unwrap(), None,
+    assert_eq!(base_of(&result).entries(), 1, "only handle 2 is live");
+    assert_eq!(base_of(&result).lookup(b"B2").unwrap(), Some(2), "at its newest version");
+    assert_eq!(base_of(&result).lookup(b"B").unwrap(), None, "the superseded version is not indexed");
+    assert_eq!(base_of(&result).lookup(b"A").unwrap(), None,
         "the tile-resident tombstone removed handle 1, so its older live version is not indexed");
 
     // The authoritative scan agrees: the same rule, so the index and the scan cannot
@@ -538,5 +588,151 @@ fn rebuilt_index_drops_a_handle_whose_tombstone_is_tile_resident() {
     let mut served = Vec::new();
     e.scan_primary_with_csn(INDEX_ENTITY, |handle, _, _| { served.push(handle); Ok(()) }).unwrap();
     assert_eq!(served, vec![2], "the scan serves exactly the live handle the index names");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+// --- WP-9: incremental maintenance (durable base tile + in-RAM delta) ----------
+
+/// The answers the read path gives for a set of order numbers, so a test can
+/// compare them across a maintenance step.
+fn answers(e: &Engine, order_nos: &[String]) -> Vec<Option<u64>> {
+    order_nos.iter().map(|o| e.lookup_movement_by_order_no(o.as_bytes()).unwrap()).collect()
+}
+
+/// WP-9 acceptance 1, in one sequence: an entry written after the base coverage is
+/// answered by the delta without a base rewrite; a delta tombstone hides the base
+/// entry; and the merge of base + delta answers identically and drops the delta.
+#[test]
+fn the_delta_answers_rows_above_the_coverage_and_hides_base_entries_until_the_merge() {
+    let dir = tmp_dir("delta");
+    let mut e = Engine::create(&dir.join("data.wal")).unwrap();
+    // One base block of 1025 movements. The merge threshold is
+    // max(INDEX_MERGE_MIN_DELTA_ENTRIES, base entries) = 1025, so one interval of the
+    // same size reaches it without committing a second region.
+    let base_ops: Vec<Op> = (1..=1025).map(|h| movement(h, &format!("O{h:08}"), "M")).collect();
+    e.commit_block(b"base", &base_ops).unwrap();
+    let base = build(&e, &dir).unwrap();
+    let base_coverage = base.index.base_coverage_csn();
+    e.adopt_order_no_index(base.index);
+    assert_eq!(e.order_no_index_base_coverage_csn(), Some(base_coverage));
+    assert_eq!(e.lookup_movement_by_order_no(b"O00000001").unwrap(), Some(1), "the base answers");
+
+    // The interval: handle 1 deleted, handles 1026..=2050 appended.
+    let mut ops = vec![Op::DelDoc { entity: INDEX_ENTITY.to_vec(), handle: 1 }];
+    ops.extend((1026..=2050).map(|h| movement(h, &format!("O{h:08}"), "M")));
+    e.commit_block(b"interval", &ops).unwrap();
+
+    let delta = rebuild_delta(&e, base_coverage);
+    let IndexProduct::Delta(build) = delta.product else { panic!("the interval build produces a delta") };
+    assert_eq!(build.delta.live_entries(), 1025, "one entry per appended row");
+    assert_eq!(build.delta.entries(), 1026, "plus the handle the interval deleted");
+    e.adopt_order_no_delta(build).expect("the delta attaches to the base it was built against");
+
+    assert_eq!(e.order_no_index_coverage_csn(), Some(e.csn()), "the pair covers the interval");
+    assert_eq!(e.order_no_index_base_coverage_csn(), Some(base_coverage),
+        "and the base was not rewritten: its coverage did not move");
+    assert_eq!(e.lookup_movement_by_order_no(b"O00001026").unwrap(), Some(1026),
+        "the delta answers a row written after the base coverage");
+    assert_eq!(e.lookup_movement_by_order_no(b"O00000001").unwrap(), None,
+        "the delta tombstone hides the base entry for the deleted handle");
+    assert_eq!(e.lookup_movement_by_order_no(b"O00000002").unwrap(), Some(2),
+        "and the untouched rest of the base still answers");
+
+    // The pair is at the merge threshold; the merge answers identically and drops
+    // the delta.
+    let sample: Vec<String> = (1..=2050).step_by(37).map(|h| format!("O{h:08}")).collect();
+    let before = answers(&e, &sample);
+    assert!(e.order_no_index_needs_merge(), "1026 delta entries against a 1025-entry base is due");
+    let snapshot = e.order_no_index_merge_snapshot().expect("a due merge has a snapshot");
+    let mut slot = IndexRebuildSlot::new();
+    slot.schedule_merge(dir.to_path_buf(), snapshot, "merge").unwrap();
+    let merged = settle(&mut slot);
+    let IndexProduct::Index(build) = merged.product else { panic!("the merge produces a base index") };
+    assert!(build.output_bytes > 0, "the merge writes the base tile");
+    e.adopt_order_no_index(build.index);
+
+    assert_eq!(e.order_no_index_base_coverage_csn(), Some(e.csn()), "the merged base covers the delta");
+    assert_eq!(e.order_no_index_delta_entries(), Some(0), "the delta is dropped");
+    assert_eq!(e.order_no_index_entries(), Some(2049), "1024 base survivors + 1025 appended rows");
+    assert_eq!(answers(&e, &sample), before, "the merge changes no answer");
+    assert_eq!(e.lookup_movement_by_order_no(b"O00000001").unwrap(), None, "the deleted handle stays dead");
+    assert!(!e.order_no_index_needs_merge(), "the merged delta is empty, so no further merge is due");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// WP-9 item 5: a change already published into a tile is picked up by the delta's
+/// tile walk, which reads only the tiles above the coverage and only their rows above
+/// the coverage - so a delta hides a base entry even when the delete is tile-resident
+/// and the memtable is empty.
+#[test]
+fn a_delta_reads_a_tile_resident_tombstone_above_the_coverage() {
+    let dir = tmp_dir("deltatile");
+    let mut e = Engine::create(&dir.join("data.wal")).unwrap();
+    e.set_region_mode(RegionMode::PerRegion);
+    e.commit_block(b"v0", &[movement(1, "A", "M1"), movement(2, "B", "M2")]).unwrap();
+    e.publish_tile(dir.join("tile-0.tile"), e.csn()).unwrap();
+    let base = build(&e, &dir).unwrap();
+    let base_coverage = base.index.base_coverage_csn();
+    e.adopt_order_no_index(base.index);
+    assert_eq!(e.lookup_movement_by_order_no(b"A").unwrap(), Some(1), "the base answers");
+
+    // csn 2 deletes handle 1 and publishes, so the only source of the change is the
+    // newer tile: the serving memtable is empty afterwards.
+    e.commit_block(b"v1", &[Op::DelDoc { entity: INDEX_ENTITY.to_vec(), handle: 1 }]).unwrap();
+    e.publish_tile(dir.join("tile-1.tile"), e.csn()).unwrap();
+    assert_eq!(e.serving_memtable_entries(), 0, "the change is tile-resident, not memtable-resident");
+
+    let delta = rebuild_delta(&e, base_coverage);
+    let IndexProduct::Delta(build) = delta.product else { panic!("the interval build produces a delta") };
+    assert_eq!(build.delta.live_entries(), 0, "the only change above the coverage is a delete");
+    assert_eq!(build.delta.entries(), 1, "which the delta names as a tombstone");
+    e.adopt_order_no_delta(build).unwrap();
+    assert_eq!(e.lookup_movement_by_order_no(b"A").unwrap(), None,
+        "the tile-resident tombstone hides the base entry");
+    assert_eq!(e.lookup_movement_by_order_no(b"B").unwrap(), Some(2), "the unchanged row still answers");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// WP-9 review P2-4: the slot is the single-flight guard, so a second caller gets an
+/// explicit refusal instead of a second writer racing the same sidecar, and the
+/// in-flight job is untouched by the refused call.
+#[test]
+fn a_second_concurrent_index_job_is_refused() {
+    let dir = tmp_dir("singleflight");
+    let mut e = Engine::create(&dir.join("data.wal")).unwrap();
+    e.commit_block(b"v0", &[movement(1, "A", "M1")]).unwrap();
+    let mut slot = IndexRebuildSlot::new();
+    slot.schedule_base(
+        dir.to_path_buf(),
+        e.key_encoding(),
+        e.primary_tile_view(),
+        |view, visit| {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            view.scan_primary(INDEX_ENTITY, visit)
+        },
+        memtable_rows(&e, 0, INLINE_SNAPSHOT_MAX_BYTES),
+        movement_region_rows(&e),
+        "policy",
+    )
+    .unwrap();
+    assert!(slot.is_busy());
+    let second = slot.schedule_base(
+        dir.to_path_buf(),
+        e.key_encoding(),
+        e.primary_tile_view(),
+        |view, visit| view.scan_primary(INDEX_ENTITY, visit),
+        memtable_rows(&e, 0, INLINE_SNAPSHOT_MAX_BYTES),
+        movement_region_rows(&e),
+        "policy",
+    );
+    let error = match second {
+        Ok(()) => panic!("a second concurrent build must be refused"),
+        Err(error) => error,
+    };
+    assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+    assert!(error.to_string().contains("already in flight"), "{error}");
+    // The first job is still the slot's and finishes normally.
+    let result = settle(&mut slot);
+    assert_eq!(base_of(&result).entries(), 1);
     std::fs::remove_dir_all(&dir).unwrap();
 }

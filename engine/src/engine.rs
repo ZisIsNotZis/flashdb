@@ -815,10 +815,13 @@ pub struct Engine {
     /// and `LayoutPolicy`): recovery must be told the encoding used to write
     /// (slice 50), and reads accept both spellings regardless.
     key_encoding: keys::KeyEncoding,
-    /// Derived secondary access path (WP-M): an off-request-path `order_no ->
-    /// StockMovement handle` index tile, built from the `P|StockMovement` tiles.
-    /// `None` until the driver adopts a built index. Never on the correctness
-    /// path: a miss, mismatch or absent index falls back to the full scan.
+    /// Derived secondary access path (WP-M, WP-9): an off-request-path `order_no
+    /// -> StockMovement handle` index. Its durable base tile is built from the
+    /// merged (memtable + tile) view of the `P|StockMovement` rows and its delta -
+    /// the rows above the base coverage - is an in-RAM map maintained by the
+    /// driver. `None` until the driver adopts a built index. Never on the
+    /// correctness path: a miss, mismatch or absent index falls back to the full
+    /// scan.
     order_no_index: Option<crate::index::OrderNoIndex>,
     /// How many times the movement scan has consulted the derived `order_no`
     /// index ([`Engine::lookup_movement_by_order_no`]) since the process started.
@@ -2748,12 +2751,13 @@ impl Engine {
     /// snapshot only needs to be refreshed when publish/compaction replaces one.
     pub fn tile_read_view(&self) -> crate::readahead::TileReadView {
         // The read-ahead worker warms the exact blocks the authoritative reads
-        // touch. With the WP-M `order_no` index adopted, a movement scan's first
-        // probe is the index tile (a sidecar OUTSIDE `self.tiles`), so include it
-        // here too; otherwise every scan would cold-page-in the index on the
-        // pacer (the residual WP-P found at rung 50). The index tile uses the
-        // same `U` key spelling, so `TileReadView::warm_lookup` probes it with no
-        // special-casing. It is a pure hint: warming it never feeds a decision.
+        // touch. With the WP-M `order_no` index adopted, a movement scan's probe
+        // lands on the index's base tile (a sidecar OUTSIDE `self.tiles`), so
+        // include it here too; otherwise every scan would cold-page-in the index
+        // on the pacer (the residual WP-P found at rung 50). The base tile uses
+        // the same `U` key spelling, so `TileReadView::warm_lookup` probes it with
+        // no special-casing. It is a pure hint: warming it never feeds a decision.
+        // The delta half of the index is in RAM and needs no warming.
         let mut tiles = self.tiles.iter().map(|t| t.tile.clone()).collect::<Vec<_>>();
         if let Some(index) = &self.order_no_index {
             tiles.push(index.tile());
@@ -2981,11 +2985,13 @@ impl Engine {
         Ok(out)
     }
 
-    /// Adopt a derived secondary access path built off the request path (WP-M).
-    /// The index tile and its parent-directory entry must already be durable (the
-    /// builder syncs the file; the driver syncs the directory before calling
-    /// this). The index is never on the correctness path: the movement scan
-    /// cross-checks every hit and falls back to the full scan on a miss.
+    /// Adopt a derived secondary access path built off the request path (WP-M). The
+    /// base tile and its parent-directory entry must already be durable (the builder
+    /// syncs the file; the driver syncs the directory before calling this), and the
+    /// adopted index carries an empty delta until
+    /// [`Engine::adopt_order_no_delta`] attaches one. The index is never on the
+    /// correctness path: the movement scan cross-checks every hit and falls back to
+    /// the full scan on a miss.
     pub fn adopt_order_no_index(&mut self, index: crate::index::OrderNoIndex) {
         self.order_no_index = Some(index);
     }
@@ -3007,7 +3013,68 @@ impl Engine {
     /// committed state has moved past what the index covers, and no read path
     /// branches on it (a lookup miss always falls back to the full scan).
     pub fn order_no_index_coverage_csn(&self) -> Option<u64> {
-        self.order_no_index.as_ref().map(|index| index.coverage_csn)
+        self.order_no_index.as_ref().map(|index| index.coverage_csn())
+    }
+
+    /// The highest movement CSN the adopted index's BASE tile covers, or `None`
+    /// when no index is installed: the coverage a delta build attaches above, and
+    /// the value [`Engine::adopt_order_no_delta`] checks the delta against.
+    pub fn order_no_index_base_coverage_csn(&self) -> Option<u64> {
+        self.order_no_index.as_ref().map(|index| index.base_coverage_csn())
+    }
+
+    /// Live entries in the adopted index (base plus delta), or `None` when no
+    /// index is installed. The decision line reports it as `covered_rows`.
+    pub fn order_no_index_entries(&self) -> Option<u64> {
+        self.order_no_index.as_ref().map(|index| index.entries())
+    }
+
+    /// Handles the adopted index's delta says anything about (live or tombstoned),
+    /// or `None` when no index is installed. The merge threshold's numerator, and
+    /// what the decision line's reader needs to see the delta's growth: no read path
+    /// branches on it.
+    pub fn order_no_index_delta_entries(&self) -> Option<u64> {
+        self.order_no_index.as_ref().map(|index| index.delta_entries())
+    }
+
+    /// Whether the adopted index's delta has grown enough to pay for a merge that
+    /// rewrites the base (`delta_entries >= max(INDEX_MERGE_MIN_DELTA_ENTRIES,
+    /// base_entries)`); `false` when no index is installed. The driver schedules
+    /// that merge off the request path; nothing on the read path branches on it.
+    pub fn order_no_index_needs_merge(&self) -> bool {
+        self.order_no_index.as_ref().is_some_and(|index| index.needs_merge())
+    }
+
+    /// Base + a copy of the delta, for the driver's off-path merge, or `None`
+    /// until the delta is big enough to be worth merging. The copy is taken on
+    /// the caller's thread (the engine keeps serving the adopted delta while the
+    /// merge runs) and is the only place the delta is duplicated.
+    pub fn order_no_index_merge_snapshot(&self) -> Option<crate::index::MergeSnapshot> {
+        self.order_no_index.as_ref().and_then(|index| index.merge_snapshot())
+    }
+
+    /// Insert one interval's delta into the adopted index. The delta carries the
+    /// base coverage it was built against, so a delta attached to a different base
+    /// is refused instead of claiming coverage the index does not have.
+    pub fn adopt_order_no_delta(&mut self, build: crate::index::DeltaBuild) -> io::Result<()> {
+        let index = self.order_no_index.as_mut().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "no derived index is adopted, so a delta has no base to attach to",
+            )
+        })?;
+        if build.base_coverage_csn != index.base_coverage_csn() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "delta was built against base coverage {} but the adopted base covers {}",
+                    build.base_coverage_csn,
+                    index.base_coverage_csn()
+                ),
+            ));
+        }
+        index.extend_delta(build.delta);
+        Ok(())
     }
 
     /// How many times the movement scan has consulted the derived index since the
@@ -3167,29 +3234,47 @@ impl Engine {
         Ok(rows)
     }
 
-    /// The serving memtable's rows for `entity`'s primary region, one row per
-    /// handle at its newest committed version, ascending by handle.
+    /// The serving memtable's rows for `entity`'s primary region whose newest
+    /// committed version is above `after_csn`, one row per handle, ascending by
+    /// handle.
     ///
     /// This is the memtable half of the derived index's source: the caller takes
     /// it inline (the memtable cannot cross to the builder thread, which gets a
-    /// tile view instead), bounded by `max_bytes` of document bytes. A tombstone
-    /// row (empty `doc`) is included, because it is what makes a handle dead and a
-    /// source that dropped it would index the handle's older tile version.
+    /// tile view instead), bounded by `max_bytes`. `after_csn` is the coverage the
+    /// adopted index already speaks for, so a delta build copies ONE INTERVAL of
+    /// writes rather than the region, and the bound therefore does not bind as the
+    /// region grows. `after_csn = 0` copies the whole region, which is the first
+    /// base build and the only case that pays the region's size.
+    ///
+    /// A tombstone row (empty `doc`) is included, because it is what makes a
+    /// handle dead and a source that dropped it would index the handle's older
+    /// tile version.
     ///
     /// `max_bytes` bounds what is COPIED, not what is walked: the rows are first
-    /// collected as borrows and measured, and only a region that fits is cloned,
-    /// so an over-bound region costs one prefix walk and no allocation. The bound
-    /// is charged against document bytes only.
+    /// collected as a `Vec` of borrows (one `(u64, u64, &[u8])` per row, so that
+    /// vector is allocated even when the region is over the bound) and measured,
+    /// and only a region that fits is cloned into owned rows, so an over-bound
+    /// region copies no document. The bound is charged against the document bytes
+    /// held PLUS [`crate::index::MEMTABLE_ROW_OVERHEAD_BYTES`] per row: the copy
+    /// that lands on this thread owns the row tuples as well as their documents,
+    /// and charging only the documents understated a region of small documents by
+    /// up to ~1.4x.
     pub fn snapshot_primary_memtable(
         &self,
         entity: &[u8],
+        after_csn: u64,
         max_bytes: usize,
     ) -> io::Result<crate::index::MemtableSnapshot> {
         check_name(entity)?;
         let mut prefix = keys::primary_prefix_with(self.key_encoding, entity, 0)?;
         prefix.truncate(prefix.len() - 8);
-        let borrowed: Vec<(u64, u64, &[u8])> = self.memtable_newest_versions(&prefix).collect();
-        let bytes: usize = borrowed.iter().map(|(_, _, doc)| doc.len()).sum();
+        let borrowed: Vec<(u64, u64, &[u8])> = self
+            .memtable_newest_versions(&prefix)
+            .filter(|(_, csn, _)| *csn > after_csn)
+            .collect();
+        let doc_bytes: usize = borrowed.iter().map(|(_, _, doc)| doc.len()).sum();
+        let bytes = doc_bytes
+            .saturating_add(borrowed.len().saturating_mul(crate::index::MEMTABLE_ROW_OVERHEAD_BYTES));
         let live_rows = borrowed.iter().filter(|(_, _, doc)| !doc.is_empty()).count();
         if bytes > max_bytes {
             return Ok(crate::index::MemtableSnapshot::OverBound(crate::index::MemtableSnapshotOver {
