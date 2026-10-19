@@ -820,6 +820,13 @@ pub struct Engine {
     /// `None` until the driver adopts a built index. Never on the correctness
     /// path: a miss, mismatch or absent index falls back to the full scan.
     order_no_index: Option<crate::index::OrderNoIndex>,
+    /// How many times the movement scan has consulted the derived `order_no`
+    /// index ([`Engine::lookup_movement_by_order_no`]) since the process started.
+    /// Counts the consultation, not a hit: a scan consults the index even when it
+    /// misses, and the authoritative full scan serves it. Observational only -
+    /// the index rebuild rule reads it as "this region has scan demand", the read
+    /// path never branches on it. `Cell` because the read path takes `&self`.
+    order_no_index_lookups: std::cell::Cell<u64>,
     /// Per-pattern latency telemetry (slice 16). Observational only: never
     /// persisted, never read on the correctness path. `RefCell` is required
     /// because read paths take `&self`; it is the only interior mutability here.
@@ -843,6 +850,46 @@ impl TileHandle {
 
     fn tile_ref(&self) -> TileRef {
         TileRef { name: self.name.clone(), cutoff: self.tile.cutoff(), digest: *self.tile.digest() }
+    }
+}
+
+/// Newest-wins reduction for the versions of one primary handle, over a stream
+/// that presents a handle's versions newest-first.
+///
+/// This is the one rule the engine applies to decide which version of a handle is
+/// current, and both users read it here rather than re-implementing it:
+/// [`Engine::scan_primary_with_csn`] applies it to the authoritative merged
+/// memtable + tile stream (whose key order - handle ascending, CSN descending -
+/// puts the newest version first), and the derived index's hybrid rebuild applies
+/// it to the union of the tile walk and the inline memtable snapshot, sorted into
+/// that same order. A tombstone at the winning CSN means the handle is not live,
+/// which is why the returned row is `None` for it even on its first appearance.
+pub(crate) struct NewestPrimaryVersion {
+    current: Option<u64>,
+}
+
+impl NewestPrimaryVersion {
+    pub(crate) fn new() -> Self {
+        NewestPrimaryVersion { current: None }
+    }
+
+    /// `Some((handle, csn, doc))` when this row is the handle's newest version,
+    /// whatever it holds; `None` for a repeat of the handle (a superseded version).
+    /// The doc is returned even when it is empty, because a caller that merges tiers
+    /// must be able to see "this handle is deleted" instead of inferring the handle
+    /// is absent - an index built from that inference would resurrect an older tile
+    /// version.
+    pub(crate) fn accept_version<'a>(&mut self, handle: u64, csn: u64, doc: &'a [u8]) -> Option<(u64, u64, &'a [u8])> {
+        if self.current == Some(handle) { return None; }
+        self.current = Some(handle);
+        Some((handle, csn, doc))
+    }
+
+    /// [`NewestPrimaryVersion::accept_version`] restricted to LIVE versions: `None`
+    /// for a superseded version or a tombstone, which is the row set a caller visits
+    /// when it only serves live documents.
+    pub(crate) fn accept<'a>(&mut self, handle: u64, csn: u64, doc: &'a [u8]) -> Option<(u64, u64, &'a [u8])> {
+        self.accept_version(handle, csn, doc).filter(|(_, _, doc)| !doc.is_empty())
     }
 }
 
@@ -1014,6 +1061,7 @@ impl Engine {
             region_mode: RegionMode::Global,
             key_encoding: keys::KeyEncoding::FamilyFirst,
             order_no_index: None,
+            order_no_index_lookups: std::cell::Cell::new(0),
             metrics: RefCell::new(Metrics::new()),
             last_compaction: None,
             merge_floor: RefCell::new(HashMap::new()),
@@ -1216,7 +1264,7 @@ impl Engine {
         drop(records);
         drop(covered);
         Self::trim_retained_heap();
-        Ok(Engine { wal, mt, tiles, max_tiles: manifest::MAX_TILES, wal_path: wal_path.to_path_buf(), dir: parent_dir(wal_path), manifest: None, segment: None, segment_suffix_csn: csn, wal_detached: false, csn, dedup, max_handle, group_open: false, group_pending: false, group_frames: Vec::new(), group_defer_append: false, group_append_us: 0, group_apply_us: 0, group_fsync_us: 0, barrier_worker: None, barrier_in_flight: 0, layout: LayoutPolicy::declared_default(), region_mode: RegionMode::Global, key_encoding: encoding, order_no_index: None, metrics: RefCell::new(Metrics::new()), last_compaction: None, merge_floor: RefCell::new(HashMap::new()) })
+        Ok(Engine { wal, mt, tiles, max_tiles: manifest::MAX_TILES, wal_path: wal_path.to_path_buf(), dir: parent_dir(wal_path), manifest: None, segment: None, segment_suffix_csn: csn, wal_detached: false, csn, dedup, max_handle, group_open: false, group_pending: false, group_frames: Vec::new(), group_defer_append: false, group_append_us: 0, group_apply_us: 0, group_fsync_us: 0, barrier_worker: None, barrier_in_flight: 0, layout: LayoutPolicy::declared_default(), region_mode: RegionMode::Global, key_encoding: encoding, order_no_index: None, order_no_index_lookups: std::cell::Cell::new(0), metrics: RefCell::new(Metrics::new()), last_compaction: None, merge_floor: RefCell::new(HashMap::new()) })
     }
 
     /// The CSN floor below which the active WAL file holds no records: the
@@ -2386,8 +2434,12 @@ impl Engine {
     }
 
     /// Each active tile's region name in list order (inspection/benchmark hook),
-    /// derived from the tile's own first key, so it is correct for both layouts.
-    /// `None` for a whole-keyspace (Global) tile or an empty one.
+    /// derived from the tile's FIRST key only, so it is a report about which region
+    /// that key belongs to, not about which regions the tile holds. Under
+    /// [`RegionMode::PerRegion`] the two coincide (a tile holds one region); under
+    /// [`RegionMode::Global`] a whole-keyspace tile reports the region of its lowest
+    /// key and nothing about the others, so the answer can be wrong in either
+    /// direction there. `None` only for an empty tile (no first key).
     pub fn active_tile_regions(&self) -> Vec<Option<String>> {
         self.tiles.iter().map(|t| tile_first_region(t).map(keys::region_name)).collect()
     }
@@ -2709,6 +2761,16 @@ impl Engine {
         crate::readahead::TileReadView::new(Arc::new(tiles), self.key_encoding)
     }
 
+    /// The published-tile snapshot WITHOUT the derived index sidecar: the tile
+    /// half of the derived index's own source. A rebuild must not read its
+    /// predecessor's tile (it replaces it), so this view holds `self.tiles` only.
+    /// Tiles are immutable after publish, so the `Arc<Tile>` clones are a
+    /// consistent snapshot for the builder thread.
+    pub fn primary_tile_view(&self) -> crate::readahead::TileReadView {
+        let tiles = self.tiles.iter().map(|t| t.tile.clone()).collect::<Vec<_>>();
+        crate::readahead::TileReadView::new(Arc::new(tiles), self.key_encoding)
+    }
+
     /// Install the provisional layout policy the two tile write paths (publish and
     /// compaction) consult, including the per-region merge threshold the
     /// automatic compaction trigger reads. The default is
@@ -2940,6 +3002,21 @@ impl Engine {
         self.order_no_index.is_some()
     }
 
+    /// The highest movement CSN the adopted index covers, or `None` when no index
+    /// is installed. Observational: the rebuild rule reads it to decide whether the
+    /// committed state has moved past what the index covers, and no read path
+    /// branches on it (a lookup miss always falls back to the full scan).
+    pub fn order_no_index_coverage_csn(&self) -> Option<u64> {
+        self.order_no_index.as_ref().map(|index| index.coverage_csn)
+    }
+
+    /// How many times the movement scan has consulted the derived index since the
+    /// process started (see the field docstring). The rebuild rule reads the delta
+    /// across a boundary as "the region had scan demand".
+    pub fn order_no_index_lookups(&self) -> u64 {
+        self.order_no_index_lookups.get()
+    }
+
     /// Attribute the derived index tile's output bytes to the movement primary
     /// region's reorganisation counter, so the learner's reorg-priced reward
     /// charges the off-path index build exactly like a merge (WP-M).
@@ -2958,6 +3035,7 @@ impl Engine {
     /// authoritative: a hit is cross-checked against the returned document, and a
     /// miss falls back to the full scan.
     pub fn lookup_movement_by_order_no(&self, order_no: &[u8]) -> io::Result<Option<u64>> {
+        self.order_no_index_lookups.set(self.order_no_index_lookups.get().saturating_add(1));
         match &self.order_no_index {
             Some(index) => index.lookup(order_no),
             None => Ok(None),
@@ -3072,7 +3150,7 @@ impl Engine {
         prefix.truncate(prefix.len() - 8);
         let region = self.region_of_prefix(&prefix);
         sample.region = region;
-        let mut last_handle = None;
+        let mut newest = NewestPrimaryVersion::new();
         let mut rows: u64 = 0;
         self.scan_merged(&prefix, region, |key, value| {
             let (key_entity, handle, csn) = keys::decode_primary(key)
@@ -3080,15 +3158,76 @@ impl Engine {
             if key_entity != entity {
                 return Err(io::Error::new(io::ErrorKind::InvalidData, "primary entity mismatch"));
             }
-            if last_handle == Some(handle) { return Ok(true); }
-            last_handle = Some(handle);
-            if !value.is_empty() {
+            if let Some((handle, csn, doc)) = newest.accept(handle, csn, value) {
                 rows += 1;
-                visit(handle, csn, value)?;
+                visit(handle, csn, doc)?;
             }
             Ok(true)
         })?;
         Ok(rows)
+    }
+
+    /// The serving memtable's rows for `entity`'s primary region, one row per
+    /// handle at its newest committed version, ascending by handle.
+    ///
+    /// This is the memtable half of the derived index's source: the caller takes
+    /// it inline (the memtable cannot cross to the builder thread, which gets a
+    /// tile view instead), bounded by `max_bytes` of document bytes. A tombstone
+    /// row (empty `doc`) is included, because it is what makes a handle dead and a
+    /// source that dropped it would index the handle's older tile version.
+    ///
+    /// `max_bytes` bounds what is COPIED, not what is walked: the rows are first
+    /// collected as borrows and measured, and only a region that fits is cloned,
+    /// so an over-bound region costs one prefix walk and no allocation. The bound
+    /// is charged against document bytes only.
+    pub fn snapshot_primary_memtable(
+        &self,
+        entity: &[u8],
+        max_bytes: usize,
+    ) -> io::Result<crate::index::MemtableSnapshot> {
+        check_name(entity)?;
+        let mut prefix = keys::primary_prefix_with(self.key_encoding, entity, 0)?;
+        prefix.truncate(prefix.len() - 8);
+        let borrowed: Vec<(u64, u64, &[u8])> = self.memtable_newest_versions(&prefix).collect();
+        let bytes: usize = borrowed.iter().map(|(_, _, doc)| doc.len()).sum();
+        let live_rows = borrowed.iter().filter(|(_, _, doc)| !doc.is_empty()).count();
+        if bytes > max_bytes {
+            return Ok(crate::index::MemtableSnapshot::OverBound(crate::index::MemtableSnapshotOver {
+                rows: borrowed.len(),
+                live_rows,
+                bytes,
+                bound: max_bytes,
+            }));
+        }
+        Ok(crate::index::MemtableSnapshot::Copied(crate::index::MemtableRows {
+            rows: borrowed.into_iter().map(|(handle, csn, doc)| (handle, csn, doc.to_vec())).collect(),
+            bytes,
+            live_rows,
+            csn: self.csn,
+        }))
+    }
+
+    /// How many live rows of `entity`'s primary region the serving memtable holds:
+    /// one per handle whose newest committed version is not a tombstone. This is
+    /// the memtable arm of the derived index's non-emptiness witness
+    /// ([`crate::index::movement_region_rows`]); it reads no document bytes and
+    /// copies none, so it can be asked at a window boundary.
+    pub fn primary_region_live_rows(&self, entity: &[u8]) -> io::Result<usize> {
+        check_name(entity)?;
+        let mut prefix = keys::primary_prefix_with(self.key_encoding, entity, 0)?;
+        prefix.truncate(prefix.len() - 8);
+        Ok(self.memtable_newest_versions(&prefix).filter(|(_, _, doc)| !doc.is_empty()).count())
+    }
+
+    /// The memtable's versions under `prefix`, reduced to each handle's newest
+    /// committed version, in ascending handle order. Borrows the documents, so
+    /// callers that only count or measure pay no copy.
+    fn memtable_newest_versions<'a>(&'a self, prefix: &[u8]) -> impl Iterator<Item = (u64, u64, &'a [u8])> + 'a {
+        let mut newest = NewestPrimaryVersion::new();
+        self.mt.scan_iter(prefix).filter_map(move |(key, value)| {
+            let (_, handle, csn) = keys::decode_primary(key)?;
+            newest.accept_version(handle, csn, value)
+        })
     }
 
     /// Full merged key-order pass over every serving key (primary, unique and

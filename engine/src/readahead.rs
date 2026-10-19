@@ -60,33 +60,45 @@ impl TileReadView {
 
     /// Tile-only walk of an entity's whole primary prefix (the exact prefix
     /// [`crate::engine::Engine::scan_primary`] walks, minus the serving
-    /// memtable), yielding each live document's `(handle, csn, doc bytes)` once
-    /// and returning how many live rows it visited. Test-only: the derived-index
-    /// builder's production source is the merged view
-    /// ([`crate::engine::Engine::scan_primary_with_csn`]), because a region whose
-    /// rows are all still in the serving memtable has no tiles at all.
-    #[cfg(test)]
-    pub(crate) fn scan_primary(
+    /// memtable), yielding `(handle, csn, doc bytes)` and returning how many rows
+    /// it visited.
+    ///
+    /// This is the TILE HALF of the derived index's hybrid source
+    /// ([`crate::index::spawn_rebuild`]): the builder thread calls it, so the cold
+    /// device stream a tiled region represents never crosses the pacing thread.
+    /// It is not a read: a caller must merge it with the serving memtable through
+    /// the newest-wins rule (an empty `doc` is a tombstone and must be yielded, or
+    /// an older live version under it would be resurrected), and an index built
+    /// from this walk alone misses every row still in the memtable - the defect in
+    /// ticket 83.
+    ///
+    /// Within one tile a handle's newest version comes first, so a repeat of the
+    /// handle inside THAT tile is skipped. The dedupe does not carry across tiles: a
+    /// handle can hold a version in several tiles, its newest version may be in any
+    /// of them, and this walk is not a merge, so every tile's version is yielded and
+    /// the caller's newest-wins merge decides which one wins.
+    pub fn scan_primary(
         &self,
         entity: &[u8],
         mut visit: impl FnMut(u64, u64, &[u8]) -> io::Result<()>,
     ) -> io::Result<u64> {
         let mut prefix = keys::primary_prefix_with(self.key_encoding, entity, 0)?;
         prefix.truncate(prefix.len() - 8);
-        let mut last_handle: Option<u64> = None;
         let mut rows = 0u64;
         for t in self.tiles.iter() {
             if !t.could_contain_prefix(&prefix) { continue; }
+            // Per-tile, not per-walk: tiles are not in key order relative to each
+            // other over a handle's versions, so a carry would let one tile's key
+            // order hide a newer version in the next one.
+            let mut last_handle: Option<u64> = None;
             let mut cursor = t.prefix_cursor(&prefix)?;
             while let Some((key, value)) = cursor.next()? {
                 let Some((key_entity, handle, csn)) = keys::decode_primary(key) else { continue; };
                 if key_entity != entity { continue; }
                 if last_handle == Some(handle) { continue; }
                 last_handle = Some(handle);
-                if !value.is_empty() {
-                    rows += 1;
-                    visit(handle, csn, value)?;
-                }
+                rows += 1;
+                visit(handle, csn, value)?;
             }
         }
         Ok(rows)
@@ -371,6 +383,7 @@ mod tests {
             e.key_encoding(),
             |visit| e.scan_primary_with_csn(crate::index::INDEX_ENTITY, visit),
             crate::index::movement_region_rows(e),
+            0,
             "order_no.idx",
         )
         .unwrap()
@@ -463,13 +476,14 @@ mod tests {
 
         // Build and adopt the derived index (off-path in production; inline here).
         // This test feeds the builder the tile-only view: both sources resolve the
-        // same rows when every row is tile-resident.
+        // same rows when every row is tile-resident and none is a tombstone.
         let view = e.tile_read_view();
         let build = crate::index::build_order_no_index(
             &dir,
             e.key_encoding(),
             |visit| view.scan_primary(crate::index::INDEX_ENTITY, visit),
             crate::index::movement_region_rows(&e),
+            0,
             "order_no.idx",
         )
         .unwrap();
