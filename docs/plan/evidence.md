@@ -1,0 +1,10 @@
+# Implementation and evidence reconciliation
+Authored work record for the current implementation-status conflict; this is not authority to change the thesis, pre-registered thresholds, current milestone or engine code.
+## Confirmed conflict
+The design-draft claim that no engine exists is withdrawn: engine/src/engine.rs and engine/tests/order_flow.rs are inspectable, and README.md describes a Rust prototype. docs/roadmap.md also records learned/static pilot measurements and later external-baseline verdicts, while README.md says the learned-layout engine is not implemented. These descriptions concern potentially different mechanisms/revisions and cannot safely be collapsed into a single present-tense capability claim.
+## Required work
+Trace each claimed capability and measured verdict to its actual producer, artifact/code revision, workload, durability/resource conditions and implemented mechanism; distinguish the proposal, storage substrate, inventory adapter, pilot adaptation policy and any still-unimplemented general learner. Do not promote roadmap statements or old scratch references to measured fact without resolving their durable evidence.
+Reconcile README/design/roadmap current-status claims against that evidence, keeping scope limits and negative results explicit. No source may say no engine exists when engine code is inspectable, but code presence alone does not establish a valid learner or a production-ready database.
+## Acceptance and limits
+Completion requires resolving every conflicting implementation statement and opening the cited durable result/protocol records at their revisions; any unavailable result stays attributed and unverified. Run only the checks invalidated by the actual repair under the owning execution plan, with no new benchmark or baseline tuning implied by this record.
+The current catalogue's learned-engine status is also provisional pending this reconciliation. No tests, engine runs, benchmark, proof or numerical result were independently reproduced when recording this issue; no user milestone, threshold, design decision or active job was changed.

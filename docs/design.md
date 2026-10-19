@@ -2,7 +2,7 @@ Budget: 140 lines / 16,000 chars
 
 # flashdb — design
 
-Status: contract-level design draft, **under adversarial review**. Synthesized from a multi-round brainstorm with the author (a data scientist, not a database engineer); the raw attributed decision record lives in `.scratch/01-design/decisions.md`, and review findings and dispositions in `.scratch/01-design/issues/01-design.md`. Nothing is implemented; `flashdb` currently contains design documents, a decision log, a spec and a ticket, and no engine code. Where a review found a claim false, the claim is corrected and its consequence marked `Open` at the point of use rather than deleted.
+Status: contract-level design draft, **under adversarial review**. Synthesized from a multi-round brainstorm with the author (a data scientist, not a database engineer); the raw attributed decision record lives in `.scratch/01-design/decisions.md`, and review findings and dispositions in `.scratch/01-design/issues/01-design.md`. This design draft does not own current implementation status; the conflicting prototype, adaptation and measured-status claims must be reconciled through [the implementation/evidence work record](plan/evidence.md). Where a review found a claim false, the claim is corrected and its consequence marked `Open` at the point of use rather than deleted.
 
 Reading order: this file (thesis, invariants, open questions), then `objective.md`, `contracts.md`, `learning.md`, `dev-loop.md`, `glossary.md`.
 
