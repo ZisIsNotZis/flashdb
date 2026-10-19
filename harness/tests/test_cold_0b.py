@@ -155,6 +155,55 @@ def test_ceiling_breach_invalidates_the_level() -> None:
     assert by_rate[50.0]["ceiling_rejected_windows"] == 1
 
 
+def test_a_service_breach_is_reported_while_a_lag_breach_rejects_the_primary_rule() -> None:
+    """T-84: lag p99 <= 10 ms is the throughput-feasibility rule; service is reported, not a veto.
+
+    The both-ceilings reading (`sustained`/`ceiling_rejected_windows`) is unchanged, so a record
+    scored before the decision stays comparable; `sustained_primary` is the decided rule.
+    """
+    service_only = _curve_window(50.0, 50.0, p99=9_000)
+    service_only["service_ceiling_breached"] = True
+    service_only["lag_ceiling_breached"] = False
+    row = m.summarize_curve([service_only], ceiling_us=5_000)[0]
+    assert row["sustained"] is False, "the both-ceilings reading still rejects it"
+    assert row["ceiling_rejected_windows"] == 1
+    assert row["service_ceiling_rejected_windows"] == 1
+    assert row["sustained_primary"] is True, "a service breach is not a throughput veto"
+    assert row["service_ceiling_reported_windows"] == 1
+
+    lag_breach = _curve_window(100.0, 100.0)
+    lag_breach["lag_ceiling_breached"] = True
+    row = m.summarize_curve([lag_breach])[0]
+    assert row["sustained"] is False
+    assert row["sustained_primary"] is False, "a lag breach is the primary rule's rejection"
+    assert row["service_ceiling_reported_windows"] == 0
+
+
+def test_both_curve_flags_are_rederivable_from_the_row_alone() -> None:
+    """A verifier holding only a saved curve row must re-derive both flags, not trust them."""
+    service_only = _curve_window(50.0, 50.0, p99=9_000)
+    service_only["service_ceiling_breached"] = True
+    lag_breach = _curve_window(100.0, 100.0)
+    lag_breach["lag_ceiling_breached"] = True
+    curve = m.summarize_curve([_curve_window(10.0, 10.0), service_only, lag_breach,
+                               _curve_window(20.0, 10.0), _curve_window(40.0, 40.0, errors=1)],
+                              ceiling_us=5_000)
+    assert len(curve) == 5
+    for row in curve:
+        achieved_ok = row["achieved_rps"] >= row["sustained_tolerance"] * row["offered_rps"]
+        assert row["sustained_primary"] == (achieved_ok and row["error_windows"] == 0
+                                             and row["lag_ceiling_rejected_windows"] == 0
+                                             and not row["rate_exceeded"])
+        assert row["sustained"] == (achieved_ok and row["error_windows"] == 0
+                                     and row["invalid_windows"] == 0
+                                     and row["service_ceiling_rejected_windows"] == 0
+                                     and row["lag_ceiling_rejected_windows"] == 0
+                                     and not row["rate_exceeded"])
+        assert row["service_ceiling_reported_windows"] == row["service_ceiling_rejected_windows"]
+        assert row["service_ceiling_us"] == 5_000
+        assert row["sustained_tolerance"] == m.SUSTAINED_TOLERANCE
+
+
 # ---------------------------------------------------------------------------
 # Policy echo, sweep, argmin
 # ---------------------------------------------------------------------------

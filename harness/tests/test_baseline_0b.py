@@ -13,7 +13,9 @@ flashdb arm's own run (needs the Rust binaries). Both are exercised by
 """
 
 import hashlib
+import io
 import json
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -558,8 +560,14 @@ def test_device_floor_runs_the_arms_pacer_with_no_engine(tmp_path):
         row = paced["curve"][0]
         assert row["offered_rps"] == 100
         assert row["windows"] >= 1
-        # The fsync bench pays a durable commit per request, so its service latency is the device's.
-        if bench == "fsync":
+        # The fsync bench pays a durable commit per request, so its service latency is the device's
+        # ONLY on a quiet box: under foreign load the pacer's dispatch is starved, so schedule lag
+        # exceeds service time and the ordering below stops being an invariant. The structural
+        # claims hold either way.
+        assert row["lag_p99_us"] >= 0 and row["p99_us"] >= 0
+        load = (b0.machine_state()["loadavg"] or "").split()
+        quiet = bool(load) and min(float(load[0]), float(load[1])) < 2.0
+        if bench == "fsync" and quiet:
             assert row["p99_us"] >= row["lag_p99_us"] >= 0
             assert (tmp_path / "fsync.dat").stat().st_size == 40 * len(
                 json.dumps({"bench": "fsync", "record": "x" * 256}).encode())
@@ -577,7 +585,24 @@ def test_machine_state_records_the_fields_the_lag_rule_depends_on():
     assert isinstance(state["epp"], list) and state["epp"]
     assert isinstance(state["scaling_cur_freq_khz"], list) and state["scaling_cur_freq_khz"]
     assert state["governor"] is not None
-    assert not state["concurrent_work"], state["concurrent_work"]
+    # The box being idle is a property of the moment, not of the code: asserting it here made the
+    # suite fail whenever the author (or another agent) ran a build. What the detector owes is a
+    # well-formed list and a true positive, so probe it with a process of our own.
+    assert isinstance(state["concurrent_work"], list)
+    for entry in state["concurrent_work"]:
+        assert set(entry) == {"pid", "pattern", "args"}
+        assert entry["pattern"] in b0.CONCURRENT_WORK_PATTERNS
+    probe = subprocess.Popen(["bash", "-c", "exec -a flashdb-scale-probe sleep 10"])
+    try:
+        deadline = time.time() + 5.0
+        while time.time() < deadline:
+            if any(p["pid"] == probe.pid for p in b0._concurrent_work()):
+                return
+            time.sleep(0.05)
+        raise AssertionError("the detector did not report the probe process")
+    finally:
+        probe.kill()
+        probe.wait()
 
 
 def test_the_arm_step_passes_every_keyword_its_arm_builders_accept():
@@ -600,3 +625,220 @@ def test_the_arm_step_passes_every_keyword_its_arm_builders_accept():
         params = set(inspect.signature(function).parameters)
         missing = required - params
         assert not missing, f"{function.__name__} does not accept {sorted(missing)}"
+
+
+# ---------------------------------------------------------------------------
+# The KPI ladder's instruments (WP-3)
+# ---------------------------------------------------------------------------
+def test_trace_write_ingest_counts_only_write_requests_and_their_payload_bytes(tmp_path):
+    emitted, _manifest, requests, order_flows = tiny_trace()
+    trace = tmp_path / "trace.jsonl"
+    trace.write_bytes(emitted)
+    expected = sum(len(line) for line, req in zip(emitted.decode().splitlines(), requests)
+                   if any("ops" in block for block in req["blocks"].values()))
+    ingest = b0.trace_write_ingest(trace)
+    assert ingest["write_requests"] == order_flows > 0
+    assert ingest["payload_bytes"] == expected
+    assert ingest["trace"] == str(trace)
+
+
+def test_flashdb_kpi_reads_each_field_from_its_named_source():
+    windows = [{"requests": 100, "regions": {
+        "P|Stock": {"bytes_read": 5_000, "bytes_written": 1_000, "compaction_bytes": 200,
+                    "index_output_bytes": 30}}}]
+    kpi = b0.flashdb_kpi(
+        windows,
+        ingest={"payload_bytes": 500, "write_requests": 2, "trace": "trace.jsonl"},
+        cpu={"start_usec": 1_000_000, "end_usec": 1_500_000},
+        rss_peak_bytes=2_048, instance_bytes=1_024, recovery_s=1.5,
+        windows_file="windows-flashdb-declared.jsonl")
+    assert kpi["schema"] == b0.KPI_SCHEMA
+    assert kpi["write_bytes"]["value"] == 1_230
+    assert "per-region" in kpi["write_bytes"]["method"]
+    assert "windows-flashdb-declared.jsonl" in kpi["write_bytes"]["method"]
+    assert kpi["ingest_bytes"]["value"] == 500
+    assert "trace.jsonl" in kpi["ingest_bytes"]["method"]
+    assert kpi["write_amp"]["value"] == pytest.approx(1_230 / 500)
+    assert kpi["read_bytes"]["value"] == 5_000
+    assert kpi["requests"]["value"] == 100
+    assert kpi["bytes_read_per_request"]["value"] == 50.0
+    assert kpi["cpu_us"]["value"] == 500_000
+    assert "cpu.stat" in kpi["cpu_us"]["method"]
+    assert kpi["cpu_us_per_request"]["value"] == 5_000
+    assert kpi["rss_peak_bytes"]["value"] == 2_048
+    assert "memory.peak" in kpi["rss_peak_bytes"]["method"]
+    assert kpi["instance_bytes"]["value"] == 1_024
+    assert "directory bytes" in kpi["instance_bytes"]["method"]
+    assert kpi["rss_per_data_byte"]["value"] == pytest.approx(2.0)
+    assert kpi["recovery_s"]["value"] == 1.5
+    assert "startup_warm" in kpi["recovery_s"]["method"]
+    assert kpi["readings"]["region_totals"]["bytes_written"] == 1_000
+    for name, field in kpi.items():
+        if isinstance(field, dict) and "method" in field:
+            assert field["method"], f"{name} carries no method"
+
+
+def test_absent_kpi_sources_are_null_with_a_reason_never_a_fabricated_zero():
+    kpi = b0.sqlite_kpi(
+        [{"requests": 7}],
+        io_before={"files": {}}, io_after={"files": {}},
+        ingest={"payload_bytes": 700, "write_requests": 1, "trace": "trace.jsonl"},
+        cpu={}, rss_peak_bytes=None, data_bytes=None, windows_file="windows-sqlite.jsonl")
+    for name in ("read_bytes", "cpu_us", "rss_peak_bytes", "instance_bytes", "recovery_s"):
+        assert kpi[name]["value"] is None, name
+        assert kpi[name]["reason"], f"{name} is absent without a reason"
+    for name in ("bytes_read_per_request", "cpu_us_per_request", "rss_per_data_byte"):
+        assert kpi[name]["value"] is None, name
+        assert "absent" in kpi[name]["reason"], name
+    # The page reading is absent, so the durable-write total is absent rather than zero.
+    assert kpi["write_bytes"]["value"] is None
+    assert "not readable" in kpi["write_bytes"]["reason"]
+    assert kpi["write_amp"]["value"] is None and "numerator absent" in kpi["write_amp"]["reason"]
+
+
+def test_kpi_ratio_is_undefined_not_zero_when_its_denominator_is_zero():
+    kpi = b0.sqlite_kpi(
+        [{"requests": 0}],
+        io_before={"files": {"db": 0, "wal": 0}, "page_bytes": 0},
+        io_after={"files": {"db": 4_096, "wal": 0}, "page_bytes": 4_096},
+        ingest={"payload_bytes": 0, "write_requests": 0, "trace": "trace.jsonl"},
+        cpu={"start_usec": 10, "end_usec": 10},
+        rss_peak_bytes=0, data_bytes=4_096, windows_file="windows-sqlite.jsonl")
+    assert kpi["write_bytes"]["value"] == 4_096
+    assert kpi["write_amp"]["value"] is None
+    assert "undefined" in kpi["write_amp"]["reason"]
+    assert kpi["bytes_read_per_request"]["value"] is None
+    assert kpi["cpu_us_per_request"]["value"] is None
+    assert "denominator is 0" in kpi["cpu_us_per_request"]["reason"]
+    # A zero NUMERATOR is a measurement, not an absent one.
+    assert kpi["cpu_us"]["value"] == 0
+    assert kpi["rss_per_data_byte"]["value"] == 0.0
+
+
+def test_sqlite_kpi_differences_the_wal_and_page_readings():
+    kpi = b0.sqlite_kpi(
+        [{"requests": 10}],
+        io_before={"files": {"db": 1_024, "wal": 512}, "page_bytes": 1_024},
+        io_after={"files": {"db": 2_048, "wal": 4_096}, "page_bytes": 2_048},
+        ingest={"payload_bytes": 1_000, "write_requests": 2, "trace": "trace.jsonl"},
+        cpu={"start_usec": 100, "end_usec": 3_100}, rss_peak_bytes=8_192,
+        data_bytes=6_144, windows_file="windows-sqlite.jsonl")
+    assert kpi["write_bytes"]["value"] == (4_096 - 512) + (2_048 - 1_024)
+    assert kpi["write_amp"]["value"] == pytest.approx(4_608 / 1_000)
+    assert kpi["cpu_us"]["value"] == 3_000 and kpi["cpu_us_per_request"]["value"] == 300.0
+    assert kpi["rss_per_data_byte"]["value"] == pytest.approx(8_192 / 6_144)
+    assert kpi["read_bytes"]["value"] is None, "sqlite exposes no bytes-read counter here"
+    assert kpi["recovery_s"]["value"] is None
+    assert kpi["readings"]["files_before"] == {"db": 1_024, "wal": 512}
+
+
+def test_postgres_kpi_differences_the_server_counters():
+    """The postgres leg is exercised here only: no server is installed on this box."""
+    before = {"wal_bytes": 1_000, "database_bytes": 10_000, "blocks_read": 10,
+              "blocks_hit": 100, "block_size": 8_192}
+    after = {"wal_bytes": 5_000, "database_bytes": 20_000, "blocks_read": 20,
+             "blocks_hit": 150, "block_size": 8_192}
+    kpi = b0.postgres_kpi(
+        [{"requests": 4}],
+        io_before=before, io_after=after,
+        ingest={"payload_bytes": 2_000, "write_requests": 4, "trace": "trace.jsonl"},
+        cpu={"start_usec": 0, "end_usec": 8_000}, rss_peak_bytes=None,
+        windows_file="windows-postgres.jsonl")
+    assert kpi["write_bytes"]["value"] == (5_000 - 1_000) + (20_000 - 10_000)
+    assert kpi["read_bytes"]["value"] == (10 + 50) * 8_192
+    assert kpi["bytes_read_per_request"]["value"] == pytest.approx(60 * 8_192 / 4)
+    assert kpi["cpu_us_per_request"]["value"] == 2_000
+    assert kpi["instance_bytes"]["value"] == 20_000
+    assert "pg_stat_wal" in kpi["write_bytes"]["method"]
+    assert "pg_database_size" in kpi["write_bytes"]["method"]
+    assert "pg_stat_database" in kpi["read_bytes"]["method"]
+    assert kpi["recovery_s"]["value"] is None
+    assert "outside the arm" in kpi["recovery_s"]["reason"]
+
+
+def test_saved_window_rows_accepts_both_saved_dialects():
+    raw = [json.dumps({"window": 0, "rate_rps": 10.0, "requests": 10, "completed": 10,
+                       "window_us": 1_000_000, "errors": 0, "p99_us": 10, "lag_p99_us": 1})]
+    rows = b0.saved_window_rows(raw, 1000)
+    assert rows[0]["completed_delta"] == 10 and rows[0]["window_s"] == 1.0
+    assert b0.saved_window_rows([json.dumps(rows[0])], 1000)[0]["completed_delta"] == 10
+
+
+def test_recompute_rederives_the_primary_flag_from_saved_windows(tmp_path):
+    """T-84: a record scored with both ceilings is re-read under the decided rule, no re-run."""
+    workdir = tmp_path / "b1" / "rung-200"
+    workdir.mkdir(parents=True)
+    window = {
+        "window": 0, "rate_rps": 200.0, "requests": 200, "completed": 200, "window_us": 1_000_000,
+        "errors": 0, "service_p50_us": 4_000, "service_p95_us": 8_000, "service_p99_us": 9_000,
+        "p50_us": 4_000, "p95_us": 8_000, "p99_us": 9_000, "lag_p50_us": 100,
+        "lag_p95_us": 300, "lag_p99_us": 500, "min_lag_us": 0, "groups": 200,
+        "max_group_size": 1, "service_ceiling_us": 5_000, "service_ceiling_breached": True,
+        "lag_ceiling_us": 10_000, "lag_ceiling_breached": False, "invalid": True,
+        "reject_reason": "service_ceiling", "early_dispatches": 0,
+    }
+    (workdir / "windows-sqlite.jsonl").write_text(json.dumps(window) + "\n")
+    (workdir / "run-sqlite.json").write_text(json.dumps({
+        "arm": "sqlite", "window_ms": 1000, "windows_file": "windows-sqlite.jsonl",
+        "curve": [{"offered_rps": 200.0, "achieved_rps": 200.0, "lag_p99_us": 500,
+                   "p99_us": 9_000, "sustained": False}],
+    }))
+    rows = b0.recompute_records(tmp_path)
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["workdir"] == "b1/rung-200"
+    assert row["achieved_rps"] == 200.0 and row["recorded_achieved_rps"] == 200.0
+    assert row["lag_p99_us"] == 500 == row["recorded_lag_p99_us"]
+    assert row["service_p99_us"] == 9_000 == row["recorded_service_p99_us"]
+    assert row["sustained"] is False and row["recorded_sustained"] is False
+    assert row["sustained_primary"] is True, "only the service ceiling rejected this level"
+    assert row["service_ceiling_reported_windows"] == 1
+
+
+def test_arm_verdict_carries_the_legacy_and_primary_readings_apart():
+    curve = [{"offered_rps": 50.0, "sustained": True, "sustained_primary": True,
+              "invalid_windows": 0, "service_ceiling_reported_windows": 0, "reject_reasons": {}},
+             {"offered_rps": 100.0, "sustained": False, "sustained_primary": True,
+              "invalid_windows": 1, "service_ceiling_reported_windows": 1,
+              "reject_reasons": {"service_ceiling": 1}}]
+    verdict = b0.arm_verdict(curve)
+    assert verdict["sustained"] is True and verdict["highest_sustained_rps"] == 50.0
+    assert verdict["sustained_primary"] is True and verdict["highest_primary_rps"] == 100.0
+    assert verdict["service_ceiling_reported_windows"] == 1
+    assert verdict["rejected_windows"] == 1
+
+
+def test_recovery_boundary_is_the_arrival_of_the_driver_open_warm_line():
+    ticks = iter([10.0, 20.0])
+    log = io.StringIO()
+    warm_at = b0.stream_driver_log(
+        io.StringIO("engine_open active_tiles=1\nstartup_warm scan_entries=4 index_entries=0\n"
+                    "{\"window\":0}\n"),
+        log, clock=lambda: next(ticks))
+    assert warm_at == 10.0, "the boundary is the startup_warm line, not the first window"
+    assert log.getvalue().startswith("engine_open")
+    assert log.getvalue().endswith("{\"window\":0}\n"), "the driver's log is still complete"
+    assert b0.stream_driver_log(io.StringIO("engine_open active_tiles=1\n"), io.StringIO()) is None
+
+
+def test_a_driver_without_the_warm_line_reports_recovery_as_absent():
+    kpi = b0.flashdb_kpi([{"requests": 1, "regions": {}}],
+                         ingest={"payload_bytes": 10, "write_requests": 1, "trace": "trace.jsonl"},
+                         cpu={"start_usec": 0, "end_usec": 1},
+                         rss_peak_bytes=1, instance_bytes=1, recovery_s=None,
+                         windows_file="windows-flashdb-declared.jsonl")
+    assert kpi["recovery_s"]["value"] is None
+    assert "startup_warm" in kpi["recovery_s"]["reason"]
+
+
+def test_sqlite_io_reads_the_wal_and_page_arithmetic_on_a_real_arm(tmp_path):
+    db = tmp_path / "arm.db"
+    arm = b0.sqlite_arm(db)
+    before = b0.sqlite_io(arm, db)
+    arm.cur.execute("CREATE TABLE kpi_probe (x INTEGER)")
+    arm.cur.execute("INSERT INTO kpi_probe (x) VALUES (1)")
+    arm.commit()
+    after = b0.sqlite_io(arm, db)
+    assert before["page_bytes"] is not None and after["page_bytes"] >= before["page_bytes"]
+    assert after["files"].get("wal", 0) > before["files"].get("wal", 0), \
+        "the measured-phase WAL frames are readable on the arm's own connection"

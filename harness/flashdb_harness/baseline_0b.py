@@ -97,7 +97,8 @@ import time
 from pathlib import Path
 
 from flashdb_harness import load_profile
-from flashdb_harness.cold_0b import summarize_curve, window_records
+from flashdb_harness.cold_0b import (highest_primary_sustained_rate, summarize_curve,
+                                     window_records)
 from flashdb_harness.generator import loc_name, render, sku_name
 from flashdb_harness.seed import SeedGenerator
 
@@ -150,6 +151,10 @@ SQLITE_WAL_AUTOCHECKPOINT_PAGES = 0
 SCOPE_START_PREFIX = "scope_memory_start_bytes="
 ENGINE_PEAK_PREFIX = "engine_memory_peak_bytes="
 SEED_PEAK_PREFIX = "seed_memory_peak_bytes="
+# The same scope's `cpu.stat` `usage_usec` at the start and end of the invocation: the measured
+# phase's CPU time for an engine that is a separate process (flashdb's `flashdb-load`).
+CPU_START_PREFIX = "scope_cpu_start_usec="
+CPU_END_PREFIX = "scope_cpu_end_usec="
 # How often the measured-phase sampler reads `memory.current` (see `MemoryPeakSampler`).
 MEMORY_SAMPLE_INTERVAL_S = 0.05
 # The cgroup a runner-invoked arm's engine lives in when the engine is NOT in the arm's own cgroup
@@ -271,6 +276,27 @@ def iter_requests(trace: Path):
         for line in fh:
             if line.strip():
                 yield json.loads(line)
+
+
+def trace_write_ingest(trace: Path) -> dict:
+    """The write requests in a frozen trace and the payload bytes they carry.
+
+    A write request is one carrying an `ops` block (the contract's atomic multi-write block); its
+    payload is the trace line itself, i.e. the bytes the open-loop client sends for it. Every arm
+    replays the SAME trace, so this is the engine-independent denominator of the write-amplification
+    KPI rather than one engine's own encoding of the write.
+    """
+    write_requests = 0
+    payload_bytes = 0
+    with open(trace, encoding="utf-8") as fh:
+        for line in fh:
+            if not line.strip():
+                continue
+            blocks = json.loads(line).get("blocks") or {}
+            if any(isinstance(block, dict) and "ops" in block for block in blocks.values()):
+                write_requests += 1
+                payload_bytes += len(line.rstrip("\n"))
+    return {"write_requests": write_requests, "payload_bytes": payload_bytes, "trace": str(trace)}
 
 
 def iter_order_numbers(trace: Path):
@@ -1029,12 +1055,18 @@ def scoped_command(cmd: list[str], cap_mib: int, peak_prefix: str) -> list[str]:
     """
     inner = " ".join(shlex.quote(part) for part in cmd)
     cgroup = '$(grep "^0::" /proc/self/cgroup | cut -d: -f3)'
+    # `cpu.stat`'s `usage_usec` is read around the command for the CPU-per-request KPI. `grep | cut`
+    # keeps the shell one line: an `awk` program's braces would collide with the f-string's fields.
+    usage_usec = "grep '^usage_usec' $cg/cpu.stat 2>/dev/null | cut -d' ' -f2"
     script = (
         f'cg="/sys/fs/cgroup{cgroup}"; '
         f'echo "{SCOPE_START_PREFIX}$(cat $cg/memory.current 2>/dev/null || echo 0)"; '
+        f'echo "{CPU_START_PREFIX}$({usage_usec})"; '
         f"{inner}; rc=$?; "
         f'peak=$(cat $cg/memory.peak 2>/dev/null || echo 0); '
-        f'echo "{peak_prefix}$peak"; exit $rc'
+        f'echo "{peak_prefix}$peak"; '
+        f'echo "{CPU_END_PREFIX}$({usage_usec})"; '
+        f"exit $rc"
     )
     return ["systemd-run", "--user", "--scope", "-q",
             "-p", f"MemoryMax={cap_mib}M", "-p", "MemorySwapMax=0", "bash", "-c", script]
@@ -1046,6 +1078,12 @@ def _peak_from_log(lines: list[str], prefix: str) -> int | None:
             value = line[len(prefix):].strip()
             return int(value) if value.isdigit() else None
     return None
+
+
+def _scope_cpu_usec(lines: list[str]) -> dict:
+    """The `scoped_command` cgroup's `usage_usec` readings around the invocation."""
+    return {"start_usec": _peak_from_log(lines, CPU_START_PREFIX),
+            "end_usec": _peak_from_log(lines, CPU_END_PREFIX)}
 
 
 def cgroup_self_path() -> Path | None:
@@ -1068,6 +1106,22 @@ def cgroup_peak_bytes(cgroup: Path | None = None) -> int | None:
         return int((path / "memory.peak").read_text())
     except (OSError, ValueError):
         return None
+
+
+def cgroup_cpu_usec(cgroup: Path | None = None) -> int | None:
+    """A cgroup's cumulative `cpu.stat` `usage_usec` (None when the file is unreadable)."""
+    path = cgroup if cgroup is not None else cgroup_self_path()
+    if path is None:
+        return None
+    try:
+        text = (path / "cpu.stat").read_text()
+    except OSError:
+        return None
+    for line in text.splitlines():
+        key, _, value = line.partition(" ")
+        if key == "usage_usec" and value.strip().isdigit():
+            return int(value.strip())
+    return None
 
 
 class MemoryPeakSampler:
@@ -1327,6 +1381,330 @@ def run_sql_arm(
 
 
 # ---------------------------------------------------------------------------
+# The KPI ladder's instruments (`docs/objective.md` §0)
+# ---------------------------------------------------------------------------
+KPI_SCHEMA = "flashdb.baseline.kpi.v1"
+
+
+def _kpi(value, unit: str, method: str, reason: str | None = None) -> dict:
+    """One KPI-ladder reading: its value, its unit, and the command or file it was read from.
+
+    `value` is `None` only when the arm cannot supply the quantity, and `reason` then says what was
+    absent. A missing instrument never becomes a zero: zero is a measurement (nothing was written),
+    so the two states must not share a spelling.
+    """
+    field = {"value": value, "unit": unit, "method": method}
+    if value is None:
+        field["reason"] = reason or "the arm records no instrument for this quantity"
+    return field
+
+
+def _delta_field(before, after, *, unit: str, method: str, what: str) -> dict:
+    """A counter's delta across the measured phase, or an absent reading naming why."""
+    if before is None or after is None:
+        return _kpi(None, unit, method,
+                    f"{what} was not readable both before and after the measured phase"
+                    f" ({before!r} -> {after!r})")
+    if after < before:
+        return _kpi(None, unit, method,
+                    f"{what} went backwards ({before} -> {after}), so the difference is not a"
+                    " measured-phase cost")
+    return _kpi(after - before, unit, method)
+
+
+def _sum_fields(*fields: dict, unit: str, method: str) -> dict:
+    """The sum of readings that must ALL be present; one missing summand makes the total absent."""
+    missing = [field for field in fields if field["value"] is None]
+    if missing:
+        return _kpi(None, unit, method, "; ".join(field["reason"] for field in missing))
+    return _kpi(sum(field["value"] for field in fields), unit, method)
+
+
+def _ratio(numerator: dict, denominator: dict, *, unit: str, method: str) -> dict:
+    """A derived reading, undefined (never 0) when a side is absent or the denominator is 0."""
+    if numerator["value"] is None:
+        return _kpi(None, unit, method, f"numerator absent: {numerator['reason']}")
+    if denominator["value"] is None:
+        return _kpi(None, unit, method, f"denominator absent: {denominator['reason']}")
+    if denominator["value"] == 0:
+        return _kpi(None, unit, method,
+                    "the denominator is 0, so the ratio is undefined and is never reported as 0")
+    return _kpi(numerator["value"] / denominator["value"], unit, method)
+
+
+def kpi_record(*, write_bytes: dict, ingest_bytes: dict, read_bytes: dict, requests: dict,
+               cpu_us: dict, rss_peak_bytes: dict, instance_bytes: dict, recovery_s: dict,
+               readings: dict) -> dict:
+    """Assemble one arm-run's KPI-ladder readings from that arm's own named instruments.
+
+    Each input is a `_kpi` field, and every ratio is derived only from those fields, so a number in
+    the record cannot come from a second, unstated path. `readings` keeps the raw before/after
+    values a verifier needs to audit the deltas.
+    """
+    return {
+        "schema": KPI_SCHEMA,
+        "write_bytes": write_bytes,
+        "ingest_bytes": ingest_bytes,
+        "write_amp": _ratio(write_bytes, ingest_bytes, unit="bytes written / byte ingested",
+                            method="write_bytes / ingest_bytes"),
+        "read_bytes": read_bytes,
+        "requests": requests,
+        "bytes_read_per_request": _ratio(read_bytes, requests, unit="bytes / request",
+                                         method="read_bytes / requests"),
+        "cpu_us": cpu_us,
+        "cpu_us_per_request": _ratio(cpu_us, requests, unit="us / request",
+                                     method="cpu_us / requests"),
+        "rss_peak_bytes": rss_peak_bytes,
+        "instance_bytes": instance_bytes,
+        "rss_per_data_byte": _ratio(rss_peak_bytes, instance_bytes,
+                                    unit="resident bytes / data byte",
+                                    method="rss_peak_bytes / instance_bytes"),
+        "recovery_s": recovery_s,
+        "readings": readings,
+    }
+
+
+def _requests_total(windows: list[dict]) -> int:
+    return sum(int(window.get("requests", 0)) for window in windows)
+
+
+def _region_totals(windows: list[dict], keys: tuple[str, ...]) -> dict[str, int]:
+    """Sum named per-region telemetry counters over the measured-phase windows."""
+    totals = {key: 0 for key in keys}
+    for window in windows:
+        for region in (window.get("regions") or {}).values():
+            for key in keys:
+                totals[key] += int(region.get(key, 0) or 0)
+    return totals
+
+
+def _ingest_field(ingest: dict) -> dict:
+    return _kpi(ingest["payload_bytes"], "bytes",
+                "sum of the payload bytes of the trace's write requests (line bytes, newline"
+                " excluded), where a write request is one carrying an `ops` block: trace.jsonl, the"
+                " same frozen trace every arm replays")
+
+
+def _requests_field(requests: int, windows_file: str) -> dict:
+    return _kpi(requests, "requests",
+                f"sum of the per-window `requests` over the measured phase ({windows_file})")
+
+
+def _cpu_field(cpu: dict, method: str) -> dict:
+    return _delta_field(cpu.get("start_usec"), cpu.get("end_usec"), unit="us", method=method,
+                        what="cgroup cpu.stat usage_usec")
+
+
+def _rss_field(rss_peak_bytes: int | None, method: str) -> dict:
+    return _kpi(rss_peak_bytes, "bytes", method,
+                "the record's engine_memory.peak_bytes is null: the memory sampler could not read"
+                " the engine's cgroup")
+
+
+def flashdb_kpi(windows: list[dict], *, ingest: dict, cpu: dict, rss_peak_bytes: int | None,
+                instance_bytes: int | None, recovery_s: float | None,
+                windows_file: str) -> dict:
+    """flashdb's KPI from telemetry the arm already emits: its region counters and the trace.
+
+    `bytes_written` is the encoded WAL op bytes the engine durably appended, `compaction_bytes` the
+    merged tile output and `index_output_bytes` the derived index tile output, each attributed per
+    region by `engine/src/metrics.rs`. The driver's `compact_bytes` is those same merges split by
+    region, so it is not added a second time.
+    """
+    totals = _region_totals(windows, ("bytes_written", "compaction_bytes",
+                                      "index_output_bytes", "bytes_read"))
+    telemetry = f"the driver's --metrics-json region telemetry ({windows_file})"
+    write_bytes = _kpi(
+        totals["bytes_written"] + totals["compaction_bytes"] + totals["index_output_bytes"],
+        "bytes",
+        "sum over the measured-phase windows of per-region `bytes_written` (encoded WAL op bytes)"
+        " + `compaction_bytes` (merged tile output) + `index_output_bytes` (derived index tile"
+        f" output), from {telemetry}; an ordinary memtable publish's tile bytes are not attributed"
+        " per region, so those lie outside this sum")
+    read_bytes = _kpi(totals["bytes_read"], "bytes",
+                      "sum over the measured-phase windows of per-region `bytes_read` (data-block"
+                      f" bytes read from tiles while serving the region), from {telemetry}")
+    cpu_us = _cpu_field(cpu, "cpu.stat usage_usec of the flashdb-load scope at the end minus at the"
+                             " start of the invocation (the driver's whole measured phase)")
+    return kpi_record(
+        write_bytes=write_bytes, ingest_bytes=_ingest_field(ingest), read_bytes=read_bytes,
+        requests=_requests_field(_requests_total(windows), windows_file), cpu_us=cpu_us,
+        rss_peak_bytes=_rss_field(rss_peak_bytes,
+                                  "the record's engine_memory.peak_bytes: exact `memory.peak` of"
+                                  " the flashdb-load invocation's own scope, read inside it"),
+        instance_bytes=_kpi(instance_bytes, "bytes",
+                            "directory bytes of the instance the arm served, live WAL included"),
+        recovery_s=_kpi(recovery_s, "s",
+                        "wall time from the harness's subprocess start (the `systemd-run` scope"
+                        " launch) to the driver's `startup_warm` line: the end of the open +"
+                        " eager-warm phase, after which the first request is served on its due"
+                        " schedule",
+                        "the driver printed no `startup_warm` line, so no open/warm boundary was"
+                        " observed"),
+        readings={"region_totals": totals, "cpu_stat": cpu, "trace": ingest,
+                  "windows_file": windows_file, "recovery_s": recovery_s})
+
+
+def sqlite_kpi(windows: list[dict], *, io_before: dict, io_after: dict, ingest: dict, cpu: dict,
+               rss_peak_bytes: int | None, data_bytes: int | None, windows_file: str) -> dict:
+    """sqlite's KPI from the WAL and database file sizes plus the page arithmetic.
+
+    Both readings are taken on the arm's own connection before and after the measured phase, while
+    the post-run checkpoint has not yet run: with the automatic checkpoint deferred the WAL holds
+    every frame the run wrote, so its size delta IS the phase's durable write.
+    """
+    files_before, files_after = io_before.get("files") or {}, io_after.get("files") or {}
+    wal_delta = _delta_field(files_before.get("wal", 0), files_after.get("wal", 0), unit="bytes",
+                             method="sqlite `-wal` file size after the measured phase minus its size"
+                                    " before it (read on the arm's database file path)",
+                             what="the sqlite -wal file size")
+    page_delta = _delta_field(io_before.get("page_bytes"), io_after.get("page_bytes"),
+                              unit="bytes",
+                              method="`PRAGMA page_count * PRAGMA page_size` after the measured"
+                                     " phase minus before it, read on the arm's connection",
+                              what="the sqlite page_count * page_size reading")
+    write_bytes = _sum_fields(
+        wal_delta, page_delta, unit="bytes",
+        method="sqlite bytes durably written during the measured phase: the `-wal` file's size"
+               " delta plus the `PRAGMA page_count * PRAGMA page_size` growth; when an automatic"
+               " checkpoint rewrites the WAL in place the file delta is a lower bound and the"
+               " page growth covers the moved frames")
+    return kpi_record(
+        write_bytes=write_bytes, ingest_bytes=_ingest_field(ingest),
+        read_bytes=_kpi(None, "bytes",
+                        "no instrument: the SQL pacer emits no per-region byte telemetry, and sqlite"
+                        " exposes no bytes-read counter through this harness",
+                        "sqlite records no bytes-read counter; its page cache hides tile reads"),
+        requests=_requests_field(_requests_total(windows), windows_file),
+        cpu_us=_cpu_field(cpu, "cpu.stat usage_usec of this process's cgroup at the end minus at"
+                               " the start of the measured phase (sqlite is embedded, so the pacer"
+                               " shares the engine's cgroup)"),
+        rss_peak_bytes=_rss_field(rss_peak_bytes,
+                                  "the record's engine_memory.peak_bytes: the maximum of sampled"
+                                  " cgroup memory.current across the measured phase"),
+        instance_bytes=_kpi(data_bytes, "bytes",
+                            "the arm's on-disk footprint at the end of the measured phase: the"
+                            " database file plus its -wal and -shm sidecars"),
+        recovery_s=_kpi(None, "s", "no instrument: sqlite has no separately measured open phase",
+                        "sqlite recovers its WAL lazily on first access INSIDE the measured phase,"
+                        " where the cost is charged to service latency; the harness measures no"
+                        " separate open/warm boundary"),
+        readings={"files_before": files_before, "files_after": files_after,
+                  "page_bytes_before": io_before.get("page_bytes"),
+                  "page_bytes_after": io_after.get("page_bytes"), "cpu_stat": cpu,
+                  "trace": ingest, "windows_file": windows_file})
+
+
+def _pg_block_bytes(io: dict) -> int | None:
+    """The buffer manager's blocks reached (read + hit) times the cluster's block size."""
+    read, hit, size = io.get("blocks_read"), io.get("blocks_hit"), io.get("block_size")
+    if read is None or hit is None or not size:
+        return None
+    return (read + hit) * size
+
+
+def postgres_kpi(windows: list[dict], *, io_before: dict, io_after: dict, ingest: dict, cpu: dict,
+                 rss_peak_bytes: int | None, windows_file: str) -> dict:
+    """postgres's KPI from `pg_stat_wal`, `pg_database_size()` and the buffer-manager blocks.
+
+    All readings are taken on their own connection before and after the measured phase, so the
+    instrument never joins the arm's measured transaction. `write_bytes` is the WAL the server
+    generated plus the database's logical growth, each from the server's own cumulative counters.
+    """
+    wal_delta = _delta_field(io_before.get("wal_bytes"), io_after.get("wal_bytes"), unit="bytes",
+                             method="`SELECT wal_bytes FROM pg_stat_wal` after the measured phase"
+                                    " minus before it",
+                             what="pg_stat_wal.wal_bytes")
+    db_delta = _delta_field(io_before.get("database_bytes"), io_after.get("database_bytes"),
+                            unit="bytes",
+                            method="`pg_database_size(current_database())` after the measured phase"
+                                   " minus before it",
+                            what="pg_database_size(current_database())")
+    write_bytes = _sum_fields(
+        wal_delta, db_delta, unit="bytes",
+        method="postgres bytes durably written during the measured phase: the"
+               " `pg_stat_wal.wal_bytes` delta plus the `pg_database_size(current_database())`"
+               " delta")
+    read_bytes = _delta_field(
+        _pg_block_bytes(io_before), _pg_block_bytes(io_after), unit="bytes",
+        method="(`blks_read + blks_hit` from pg_stat_database for this database) x the cluster's"
+               " block_size, after the measured phase minus before: bytes reached through the"
+               " buffer manager, not device bytes",
+        what="pg_stat_database blocks x block_size")
+    instance_bytes = io_after.get("database_bytes")
+    return kpi_record(
+        write_bytes=write_bytes, ingest_bytes=_ingest_field(ingest), read_bytes=read_bytes,
+        requests=_requests_field(_requests_total(windows), windows_file),
+        cpu_us=_cpu_field(cpu, "cpu.stat usage_usec of the postgres server's own scope"
+                               " (M1_ENGINE_CGROUP) at the end minus at the start of the measured"
+                               " phase"),
+        rss_peak_bytes=_rss_field(rss_peak_bytes,
+                                  "the record's engine_memory.peak_bytes: the maximum of sampled"
+                                  " server-scope memory.current across the measured phase"),
+        instance_bytes=_kpi(instance_bytes, "bytes",
+                            "`pg_database_size(current_database())` at the end of the measured"
+                            " phase (logical size; the WAL is outside it)"),
+        recovery_s=_kpi(None, "s", "no open/warm phase inside the arm",
+                        "the postgres server is started outside the arm by"
+                        " scripts/baseline-env.sh and the arm only opens a client connection, so"
+                        " there is no engine open/warm phase to time"),
+        readings={"wal_bytes_before": io_before.get("wal_bytes"),
+                  "wal_bytes_after": io_after.get("wal_bytes"),
+                  "database_bytes_before": io_before.get("database_bytes"),
+                  "database_bytes_after": io_after.get("database_bytes"),
+                  "blocks_read_before": io_before.get("blocks_read"),
+                  "blocks_hit_before": io_before.get("blocks_hit"),
+                  "blocks_read_after": io_after.get("blocks_read"),
+                  "blocks_hit_after": io_after.get("blocks_hit"),
+                  "block_size": io_after.get("block_size"), "cpu_stat": cpu, "trace": ingest,
+                  "windows_file": windows_file})
+
+
+def sqlite_io(arm: SqlArm, db: Path) -> dict:
+    """The sqlite file and page readings the KPI is differenced from, read on the arm itself."""
+    return {"files": _sqlite_files(db), "page_bytes": sqlite_page_bytes(arm)}
+
+
+def sqlite_page_bytes(arm: SqlArm) -> int | None:
+    """`PRAGMA page_count * PRAGMA page_size`: sqlite's logical database size."""
+    try:
+        arm.cur.execute("PRAGMA page_count")
+        pages = arm.cur.fetchone()
+        arm.cur.execute("PRAGMA page_size")
+        size = arm.cur.fetchone()
+        return int(pages[0]) * int(size[0])
+    except (sqlite3.Error, TypeError, IndexError):
+        return None
+
+
+def postgres_io(database: str) -> dict:
+    """The postgres counters the KPI is differenced from, on their own short-lived connection.
+
+    A separate connection is used so the instrument cannot join the arm's measured transaction
+    (psycopg opens one on its first statement); the counters are cumulative server statistics, so
+    two reads around the phase are their delta.
+    """
+    with postgres_connect(database) as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT wal_bytes FROM pg_stat_wal")
+            row = cur.fetchone()
+            wal_bytes = int(row[0]) if row and row[0] is not None else None
+            cur.execute("SELECT pg_database_size(current_database())")
+            row = cur.fetchone()
+            database_bytes = int(row[0]) if row and row[0] is not None else None
+            cur.execute("SELECT blks_read, blks_hit FROM pg_stat_database"
+                        " WHERE datname = current_database()")
+            row = cur.fetchone()
+            blocks_read = int(row[0]) if row else None
+            blocks_hit = int(row[1]) if row else None
+            cur.execute("SHOW block_size")
+            row = cur.fetchone()
+            block_size = int(row[0]) if row and str(row[0]).isdigit() else None
+    return {"wal_bytes": wal_bytes, "database_bytes": database_bytes,
+            "blocks_read": blocks_read, "blocks_hit": blocks_hit, "block_size": block_size}
+
+
+# ---------------------------------------------------------------------------
 # The flashdb arm: the same trace through `flashdb-load`, the same windows
 # ---------------------------------------------------------------------------
 def flashdb_load_command(bins: Path, instance: Path, trace: Path, manifest: dict,
@@ -1389,6 +1767,22 @@ def seed_flashdb_instance(
     }
 
 
+def stream_driver_log(stream, log, clock=time.perf_counter) -> float | None:
+    """Copy the driver's streamed output into its log and time the open/warm boundary.
+
+    Returns the instant the driver's `startup_warm` line ARRIVED - the end of the open +
+    eager-warm phase, which is the recovery boundary the KPI ladder asks for - or `None` when the
+    driver printed no such line (an older build, or `--dry-run`, which has no engine reads to warm).
+    `clock` is injectable so the boundary can be tested without a driver.
+    """
+    warm_at = None
+    for line in stream:
+        log.write(line)
+        if warm_at is None and line.startswith("startup_warm"):
+            warm_at = clock()
+    return warm_at
+
+
 def run_flashdb_load(
     name: str,
     manifest: dict,
@@ -1413,10 +1807,18 @@ def run_flashdb_load(
     driver_log = workdir / f"driver-{name}.log"
     t0 = time.perf_counter()
     # The driver's dump is written straight to its log: the measured process must not hold a whole
-    # run's window samples in the instrument's memory.
+    # run's window samples in the instrument's memory. It is streamed line by line rather than
+    # captured whole for one reason: the `startup_warm` line is the end of the open + eager-warm
+    # phase, so its ARRIVAL time is the recovery boundary the KPI ladder asks for. `flashdb-load`
+    # warns it on stderr (merged into stdout here) immediately before its timed loop starts.
+    warm_at: float | None
     with open(driver_log, "w", encoding="utf-8") as log:
-        proc = subprocess.run(scoped_command(cmd, engine_cap_mib, ENGINE_PEAK_PREFIX),
-                              stdout=log, stderr=subprocess.STDOUT, text=True)
+        proc = subprocess.Popen(scoped_command(cmd, engine_cap_mib, ENGINE_PEAK_PREFIX),
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                                bufsize=1)
+        assert proc.stdout is not None
+        warm_at = stream_driver_log(proc.stdout, log)
+        proc.wait()
     elapsed = time.perf_counter() - t0
     lines = driver_log.read_text(encoding="utf-8").splitlines()
     engine_peak = _peak_from_log(lines, ENGINE_PEAK_PREFIX)
@@ -1427,6 +1829,12 @@ def run_flashdb_load(
     summary = _parse_flashdb_summary(lines)
     groups = sum(w["groups"] for w in windows)
     requests_run = sum(w["requests"] for w in windows)
+    instance_bytes = _dir_bytes(instance)
+    kpi = flashdb_kpi(windows, ingest=trace_write_ingest(trace),
+                      cpu=_scope_cpu_usec(lines), rss_peak_bytes=engine_peak,
+                      instance_bytes=instance_bytes,
+                      recovery_s=None if warm_at is None else warm_at - t0,
+                      windows_file=f"windows-{name}.jsonl")
     return {
         "arm": name,
         "durability": f"flashdb --group-requests {batch} (one WAL barrier per group)",
@@ -1445,7 +1853,7 @@ def run_flashdb_load(
                      "errors": summary.get("errors"),
                      "first_error": summary.get("first_error")},
         "summary": summary,
-        "instance_bytes": _dir_bytes(instance),
+        "instance_bytes": instance_bytes,
         "instance_files": _largest_files(instance),
         "engine_cap_mib": engine_cap_mib,
         "engine_memory": {
@@ -1456,6 +1864,7 @@ def run_flashdb_load(
             "scope": "measured phase only: the instance is BUILT in a separate construction scope",
         },
         "arm_scope_peak_bytes": None,
+        "kpi": kpi,
         "windows": windows,
         "curve": summarize_curve(windows, None),
         "windows_jsonl": [json.dumps(w, sort_keys=True) for w in windows],
@@ -1785,11 +2194,22 @@ def run_flashdb_probes(name: str, manifest: dict, workdir: Path, bins: Path, tra
 # Shared reporting
 # ---------------------------------------------------------------------------
 def arm_verdict(curve: list[dict]) -> dict:
-    """The ticket's verdict for one arm, computed only from `summarize_curve`'s rows."""
+    """The ticket's verdict for one arm, computed only from `summarize_curve`'s rows.
+
+    `sustained`/`highest_sustained_rps` are the both-ceilings reading every stored verdict was
+    scored with. The decided primary rule is the separate pair `sustained_primary`/
+    `highest_primary_rps`, and the service ceiling that breached is reported (not a veto) as a
+    window count.
+    """
     sustained = [row for row in curve if row["sustained"]]
+    highest_primary = highest_primary_sustained_rate(curve)
     return {
         "sustained": bool(sustained),
         "highest_sustained_rps": max((row["offered_rps"] for row in sustained), default=0.0),
+        "sustained_primary": bool(highest_primary),
+        "highest_primary_rps": highest_primary,
+        "service_ceiling_reported_windows": sum(
+            row.get("service_ceiling_reported_windows", 0) for row in curve),
         "rejected_windows": sum(row["invalid_windows"] for row in curve),
         "reject_reasons": {reason: count
                            for row in curve for reason, count in row["reject_reasons"].items()},
@@ -2352,8 +2772,14 @@ def cmd_arm(args: argparse.Namespace) -> int:
         # Read the durability back BEFORE the measured phase: the seeding path runs under
         # journal_mode=OFF / synchronous=OFF and a PRAGMA that cannot be applied fails silently.
         observed_durability = arm.require_measured_durability()
+        # The KPI's before-side, read on the arm itself and immediately before the measured phase:
+        # the KPI's write bytes are the WAL and page deltas across this phase only.
+        io_before = sqlite_io(arm, db)
+        cpu_before = cgroup_cpu_usec()
         record = run_sql_arm(arm, manifest, iter_requests(trace), spec["batch"],
                              spec["window_ms"], engine_cgroup=cgroup_self_path())
+        cpu_after = cgroup_cpu_usec()
+        io_after = sqlite_io(arm, db)
         record["seed_s"] = seed_s
         record["sqlite_cache_kib"] = args.sqlite_cache_kib
         record["durability_observed"] = observed_durability
@@ -2361,6 +2787,12 @@ def cmd_arm(args: argparse.Namespace) -> int:
         record["arm_scope_peak_bytes"] = cgroup_peak_bytes()
         record["arm_scope_peak_scope"] = ("this process's capped scope over the whole arm step"
                                           " (bulk load + measured phase)")
+        record["kpi"] = sqlite_kpi(record["windows"], io_before=io_before, io_after=io_after,
+                                   ingest=trace_write_ingest(trace),
+                                   cpu={"start_usec": cpu_before, "end_usec": cpu_after},
+                                   rss_peak_bytes=record["engine_memory"]["peak_bytes"],
+                                   data_bytes=sum(io_after["files"].values()),
+                                   windows_file=f"windows-{name}.jsonl")
         # The WAL policy is a measured-phase parameter, and with the automatic checkpoint deferred
         # the checkpoint itself runs here: after the run, before the oracle, and recorded.
         record["sqlite_wal"] = sqlite_wal_record(arm, db)
@@ -2375,7 +2807,7 @@ def cmd_arm(args: argparse.Namespace) -> int:
             record["oracle"] = oracle_sql(arm, manifest, record["counters"],
                                           spec["order_flow_requests"], spec["on_hand"])
     elif name == "postgres":
-        record = run_postgres_arm(name, manifest, spec, iter_requests(trace),
+        record = run_postgres_arm(name, manifest, spec, iter_requests(trace), trace,
                                   args.engine_cap_mib, restored=args.restored,
                                   database=args.database, verify=not args.skip_oracle)
     else:
@@ -2441,7 +2873,7 @@ def cmd_verify(args: argparse.Namespace) -> int:
     return 0
 
 
-def run_postgres_arm(name: str, manifest: dict, spec: dict, requests,
+def run_postgres_arm(name: str, manifest: dict, spec: dict, requests, trace: Path,
                      engine_cap_mib: int = ENGINE_CAP_MIB, restored: bool = False,
                      database: str = POSTGRES_DATABASE, verify: bool = True) -> dict:
     """The postgres arm against the user-space cluster `scripts/baseline-env.sh` provides.
@@ -2474,8 +2906,14 @@ def run_postgres_arm(name: str, manifest: dict, spec: dict, requests,
             seed_s = time.perf_counter() - seed_t0
         engine_cgroup = Path(os.environ[ENGINE_CGROUP_ENV]) if os.environ.get(
             ENGINE_CGROUP_ENV) else None
+        # The KPI's before-side, read on its own connection so the instrument never joins the arm's
+        # measured transaction; the server scope's cpu.stat gives the engine's own CPU time.
+        io_before = postgres_io(dbname)
+        cpu_before = cgroup_cpu_usec(engine_cgroup)
         record = run_sql_arm(arm, manifest, requests, spec["batch"], spec["window_ms"],
                              engine_cgroup=engine_cgroup)
+        cpu_after = cgroup_cpu_usec(engine_cgroup)
+        io_after = postgres_io(dbname)
         record["seed_s"] = seed_s
         record["database"] = dbname
         record["durability"] = PostgresArm.durability
@@ -2485,6 +2923,11 @@ def run_postgres_arm(name: str, manifest: dict, spec: dict, requests,
         record["arm_scope_peak_bytes"] = None
         record["arm_scope_peak_scope"] = ("the postgres server scope's lifetime (bulk load +"
                                           " measured phase); the client runs outside it")
+        record["kpi"] = postgres_kpi(record["windows"], io_before=io_before,
+                                      io_after=io_after, ingest=trace_write_ingest(trace),
+                                      cpu={"start_usec": cpu_before, "end_usec": cpu_after},
+                                      rss_peak_bytes=record["engine_memory"]["peak_bytes"],
+                                      windows_file=f"windows-{name}.jsonl")
         if verify:
             add_verify_index(arm)
             record["oracle"] = oracle_sql(arm, manifest, record["counters"],
@@ -2542,6 +2985,100 @@ def cmd_report(args: argparse.Namespace) -> int:
         print(f"ORACLE FAILED for {violations}", file=sys.stderr)
         return 2
     return 0
+
+
+def saved_window_rows(lines: list[str], window_ms: int) -> list[dict]:
+    """The reducer's rows for a saved window JSONL, whichever dialect the arm wrote.
+
+    flashdb's `windows-<arm>.jsonl` IS `cold_0b.window_records`'s output, while the SQL arms' file is
+    the pacer's raw `WindowSamples` snapshot (no per-window `completed_delta`), so those rows go
+    through the same reducer the stored curve was computed with. The reducer's `completed_delta` is
+    the marker: no writer emits it before the reducer does.
+    """
+    rows = [json.loads(line) for line in lines if line.strip()]
+    if rows and all("completed_delta" in row for row in rows):
+        return rows
+    return window_records(lines, window_ms)
+
+
+def recompute_records(root: Path) -> list[dict]:
+    """Re-derive every saved arm-run's curve from its own window JSONL, without re-running the arm.
+
+    The window samples (`windows-<arm>.jsonl`) are the record's evidence, so a record scored before
+    the lag-only decision can be re-read under the decided primary rule from the saved windows
+    alone: `sustained` recomputes exactly as recorded (the harness invoked every arm without a
+    service ceiling, so the service reading travels in each window's `service_ceiling_breached`),
+    and `sustained_primary` is the reading the record did not carry. The recorded columns are
+    returned beside the recomputed ones so a caller can show they agree instead of asserting it.
+
+    `root` is either one arm-run workdir (`run-*.json` in it) or a crossing tree
+    (`b*/rung-*/run-*.json`).
+    """
+    root = root.resolve()
+    candidates = sorted(set(root.glob("run-*.json")) | set(root.glob("*/rung-*/run-*.json")))
+    rows: list[dict] = []
+    for path in candidates:
+        record = _read_json(path)
+        if "curve" not in record or "arm" not in record:
+            continue  # `run-spec.json` and the like are not arm-run records
+        windows_file = path.parent / str(record.get("windows_file", ""))
+        if not windows_file.is_file():
+            raise SystemExit(f"{path} names no readable windows file: {windows_file}")
+        windows = saved_window_rows(
+            windows_file.read_text(encoding="utf-8").splitlines(),
+            int(record.get("window_ms") or DEFAULT_WINDOW_MS))
+        recorded = {float(row["offered_rps"]): row for row in record.get("curve", [])}
+        for row in summarize_curve(windows, None):
+            prior = recorded.get(float(row["offered_rps"]), {})
+            rows.append({
+                "workdir": str(path.parent.relative_to(root)) if path.parent != root else ".",
+                "arm": record.get("arm"),
+                "offered_rps": row["offered_rps"],
+                "achieved_rps": row["achieved_rps"],
+                "recorded_achieved_rps": prior.get("achieved_rps"),
+                "lag_p99_us": row["lag_p99_us"],
+                "recorded_lag_p99_us": prior.get("lag_p99_us"),
+                "service_p99_us": row["p99_us"],
+                "recorded_service_p99_us": prior.get("p99_us"),
+                "sustained": row["sustained"],
+                "recorded_sustained": prior.get("sustained"),
+                "sustained_primary": row["sustained_primary"],
+                "service_ceiling_reported_windows": row["service_ceiling_reported_windows"],
+            })
+    if not rows:
+        raise SystemExit(f"no run records or window samples under {root}")
+    return rows
+
+
+RECOMPUTE_FIELDS = (("achieved_rps", "recorded_achieved_rps"),
+                    ("lag_p99_us", "recorded_lag_p99_us"),
+                    ("service_p99_us", "recorded_service_p99_us"),
+                    ("sustained", "recorded_sustained"))
+
+
+def cmd_recompute(args: argparse.Namespace) -> int:
+    """Print the recomputed curve readings beside the recorded ones; write nothing by default."""
+    rows = recompute_records(Path(args.root))
+    mismatched = [row for row in rows
+                  if any(row[new] != row[old] for new, old in RECOMPUTE_FIELDS)]
+    print("| workdir | arm | offered rps | achieved rps (recomputed / recorded) |"
+          " lag p99 us (recomputed / recorded) | service p99 us (recomputed / recorded) |"
+          " sustained | sustained_primary | service reported |")
+    print("|---|---|---|---|---|---|---|---|---|")
+    for row in rows:
+        print(f"| {row['workdir']} | {row['arm']} | {row['offered_rps']:.0f}"
+              f" | {row['achieved_rps']:.2f} / {row['recorded_achieved_rps']}"
+              f" | {row['lag_p99_us']} / {row['recorded_lag_p99_us']}"
+              f" | {row['service_p99_us']} / {row['recorded_service_p99_us']}"
+              f" | {'yes' if row['sustained'] else 'no'}"
+              f" | {'yes' if row['sustained_primary'] else 'no'}"
+              f" | {row['service_ceiling_reported_windows']} |")
+    print(f"{len(rows)} rows re-derived from their window samples;"
+          f" {len(mismatched)} differ from the recorded curve")
+    if args.out:
+        Path(args.out).write_text(json.dumps(rows, sort_keys=True, indent=2) + "\n",
+                                  encoding="utf-8")
+    return 0 if not mismatched else 1
 
 
 def _arm_names(value: str) -> list[str]:
@@ -2662,6 +3199,13 @@ def main(argv: list[str]) -> int:
     report.add_argument("--workdir", required=True)
     report.add_argument("--arms", type=_arm_names, default=None)
     report.set_defaults(func=cmd_report)
+
+    rec = sub.add_parser("recompute",
+                         help="re-derive saved curve flags from their window samples (read-only)")
+    rec.add_argument("--root", required=True,
+                     help="one arm-run workdir, or a tree of b*/rung-*/ run records")
+    rec.add_argument("--out", default=None, help="also write the recomputed rows as JSON here")
+    rec.set_defaults(func=cmd_recompute)
 
     args = ap.parse_args(argv)
     try:

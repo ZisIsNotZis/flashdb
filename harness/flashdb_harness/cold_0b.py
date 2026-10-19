@@ -382,6 +382,15 @@ def summarize_curve(windows: list[dict], ceiling_us: int | None = None) -> list[
     and no window was rejected by either ceiling (the per-request service-latency p99 against
     ``ceiling_us`` or the per-request schedule-lag p99 against the lag ceiling). ``reject_reasons``
     counts the windows each rule fired for, so a report can state WHICH ceiling rejected them.
+
+    Two readings, because the decided rule is lag-only (`docs/objective.md` §1) and the recorded
+    evidence was scored with both ceilings. ``sustained`` above is unchanged, so every record and
+    verdict written before the decision stays comparable; ``sustained_primary`` is the decided
+    throughput-feasibility rule - achieved within tolerance, zero error windows, zero windows
+    rejected by the LAG ceiling - and ``service_ceiling_reported_windows`` keeps the service breach
+    visible as a reported quantity that never vetoes the level. Each row also carries the constants
+    its flags were computed with (``sustained_tolerance``, ``service_ceiling_us``, ``lag_ceiling_us``)
+    so a verifier can re-derive both flags from the row alone.
     """
     by_rate: dict[float, list[dict]] = {}
     for w in windows:
@@ -409,8 +418,13 @@ def summarize_curve(windows: list[dict], ceiling_us: int | None = None) -> list[
         p99 = (max(w.get("service_p99_us", w.get("p99_us", 0)) for w in valid) if valid
                else max(w.get("service_p99_us", w.get("p99_us", 0)) for w in ws))
         rejected = any(w["errors"] > 0 for w in ws) or any(w.get("invalid", False) for w in ws)
+        error_windows = sum(1 for w in ws if w["errors"] > 0)
         service_rejected_windows = sum(1 for w in ws if _ceiling_rejected(w, ceiling_us))
         lag_rejected_windows = sum(1 for w in ws if lag_ceiling_rejected(w))
+        # The lag ceiling the windows were actually scored with; the driver writes it per window and
+        # a rung mixes ceilings only if the run changed it mid-ladder.
+        lag_ceilings = {w["lag_ceiling_us"] for w in ws if w.get("lag_ceiling_us") is not None}
+        lag_ceiling_us = max(lag_ceilings) if lag_ceilings else None
         # A window rejected by EITHER ceiling (a window can breach both unnamed once here).
         ceiling_rejected_windows = sum(1 for w in ws
                                        if _ceiling_rejected(w, ceiling_us) or lag_ceiling_rejected(w))
@@ -451,7 +465,7 @@ def summarize_curve(windows: list[dict], ceiling_us: int | None = None) -> list[
             "early_dispatches": sum(w.get("early_dispatches", 0) for w in ws),
             "achieved_fraction": achieved / rate if rate else 0.0,
             "invalid_windows": sum(1 for w in ws if w.get("invalid", False)),
-            "error_windows": sum(1 for w in ws if w["errors"] > 0),
+            "error_windows": error_windows,
             "service_ceiling_rejected_windows": service_rejected_windows,
             "lag_ceiling_rejected_windows": lag_rejected_windows,
             "ceiling_rejected_windows": ceiling_rejected_windows,
@@ -459,9 +473,20 @@ def summarize_curve(windows: list[dict], ceiling_us: int | None = None) -> list[
             "valid_windows": len(valid),
             "compact_bytes": sum(w.get("compact_bytes", 0) for w in ws),
             "rate_exceeded": rate_exceeded,
+            # The rule's constants, so both flags below are re-derivable from this row alone.
+            "sustained_tolerance": SUSTAINED_TOLERANCE,
+            "service_ceiling_us": ceiling_us,
+            "lag_ceiling_us": lag_ceiling_us,
+            # The both-ceilings reading, unchanged: this is what every stored verdict was scored
+            # with, so rewriting it would invalidate that evidence.
             "sustained": (achieved >= SUSTAINED_TOLERANCE * rate and not rejected
                           and service_rejected_windows == 0 and lag_rejected_windows == 0
                           and not rate_exceeded),
+            # The decided primary rule: lag p99 <= 10 ms is throughput feasibility; a service
+            # breach is reported (below) but is not a veto.
+            "sustained_primary": (achieved >= SUSTAINED_TOLERANCE * rate and error_windows == 0
+                                  and lag_rejected_windows == 0 and not rate_exceeded),
+            "service_ceiling_reported_windows": service_rejected_windows,
         })
     return curve
 
@@ -469,6 +494,12 @@ def summarize_curve(windows: list[dict], ceiling_us: int | None = None) -> list[
 def highest_sustained_rate(curve: list[dict]) -> float:
     """The highest offered rate the arm sustained (0.0 when none did)."""
     rates = [row["offered_rps"] for row in curve if row["sustained"]]
+    return max(rates) if rates else 0.0
+
+
+def highest_primary_sustained_rate(curve: list[dict]) -> float:
+    """The highest offered rate sustained under the decided lag-only primary rule (0.0 if none)."""
+    rates = [row["offered_rps"] for row in curve if row.get("sustained_primary")]
     return max(rates) if rates else 0.0
 
 
