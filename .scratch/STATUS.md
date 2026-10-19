@@ -117,12 +117,11 @@ tails to 77-99 ms under the build's 93-147 MB input-tile stream reads, and to 99
 tail at seed 42 window 43) with NO build concurrent. The build's own durable flush is bounded to
 11-32 ms by the cadence; what remains is the device floor, not a learner gap.
 
-## 5. Open author items (not resolved here)
+## 5. Open author items (resolved by the 2026-10-19 decisions unless stated below)
 
-- (a) **§7.1 primary-vs-service-ceiling reconciliation.**
-- (b) **The 10-seed / 15% / 5% / 3x thresholds as written vs the shared-box reality.**
-- (c) **T5-T7 baseline harness:** postgres is NOT installed, and installing system dependencies
-  needs user authority.
+- (a) **§7.1 primary-vs-service-ceiling reconciliation** — decided: lag-only is the primary rule, service is reported (`docs/objective.md` §1).
+- (b) **The 10-seed / 15% / 5% / 3x thresholds** — decided: T1-T4 keep 15% / 5% / 10 seeds; the external 3x is withdrawn in favour of the ladder (`docs/objective.md` §0).
+- (c) **T5-T7 baseline harness:** postgres **18.6 (Ubuntu 18.6-3build2)** ran in the ticket-82 arms; the server is not installed on this box today (only `libpq5` remains), so an M5 re-run needs it reinstalled and its settings read back from the running server.
 
 ## 6. Evidence quality and accounting
 

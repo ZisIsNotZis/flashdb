@@ -34,10 +34,11 @@ explicit resume trigger instead of reporting a contended result as a verdict.
 
 ## Known blockers
 
-- **Postgres is not installed** (`psql` absent). M5's three-arm comparison cannot run the postgres
-  leg. Resume trigger: an authorised install (system package or an unprivileged user-space build) —
-  record the decided route in this file when taken, and never substitute a different engine for it
-  while reporting the comparison as external.
+- **Postgres is not installed** (`psql` absent; only `libpq5` remains), although ticket 82 measured
+  postgres **18.6 (Ubuntu 18.6-3build2)** on this box. M5's three-arm comparison cannot run the
+  postgres leg. Resume trigger: an authorised install (system package or an unprivileged user-space
+  build) — record the route here when taken, read the version and settings back from the running
+  server, and never substitute a different engine while reporting the comparison as external.
 - **Foreign load.** WP-2 requires a quiet box; ticket 83's first probe was invalidated by the
   author's other project. Record loadavg before and after each arm.
 
