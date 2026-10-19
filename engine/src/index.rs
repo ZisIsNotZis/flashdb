@@ -30,9 +30,42 @@
 //!   written after the base coverage is answered without rewriting the base; a
 //!   delta tombstone hides the base entry for that handle;
 //! - a **merge** rewrites base + delta into a new base tile once the delta holds
-//!   as many entries as the base (or [`INDEX_MERGE_MIN_DELTA_ENTRIES`]), so each
-//!   entry is written to the device once, when it is merged, and the base is
-//!   rewritten only once per base-sized batch of new rows.
+//!   as many entries as the base (or [`INDEX_MERGE_MIN_DELTA_ENTRIES`]), and in
+//!   any case at [`INDEX_DELTA_MAX_ENTRIES`], so each entry is written to the
+//!   device once, when it is merged, and the base is rewritten only once per
+//!   batch of new rows.
+//!
+//! # RAM
+//!
+//! An adopted index holds the base tile (`Arc`, shared with the read-ahead view),
+//! the serving delta, and — while a merge runs — a second copy of the delta plus
+//! the merge's working set. At 30,000 movement rows (a 30,000-entry base, so the
+//! ratio rule merges at 30,000 delta entries) the peak is ~17 MB, measured with a
+//! counting allocator over exactly these shapes:
+//!
+//! - the serving delta, ~3.2 MB: one `HashMap<Vec<u8>, (u64, u64)>` entry per
+//!   live handle above the coverage, 105 B each at a 9-byte `order_no` (a ~47 B
+//!   table slot — the `Vec` header, the handle/csn pair and one control byte —
+//!   plus the allocation holding the `order_no`, and the allocator's rounding); a
+//!   handle the interval deleted adds a `HashSet<u64>` tombstone, ~12 B, which this
+//!   figure omits;
+//! - the [`MergeSnapshot`] copy of it, another ~3.0 MB, so the read path keeps
+//!   serving the same delta while the merge runs;
+//! - the merge's `entries` buffer, ~6.5 MB: base + delta entries (~60,000 at this
+//!   size) at 109 B each (a 53 B `U` unique key, an 8-byte value, two 24-byte
+//!   `Vec` headers and the rounding of their two allocations);
+//! - the live-handle set and the newest-wins sort rows, ~1.6 MB;
+//! - the stable sort of `entries` into the tile's key order, ~2.9 MB: `sort_by`
+//!   allocates a scratch buffer of one 48-byte element per entry, held only while
+//!   the sort runs.
+//!
+//! [`INDEX_DELTA_MAX_ENTRIES`] is what keeps the delta's own half of that bounded
+//! independently of the base. The last three items are proportional to base +
+//! delta entries, so the merge peak keeps growing with the base: the cap bounds the
+//! delta's share of it, not the base's. At a 1,000,000-entry base with a
+//! 200,000-entry delta the merge holds 1.2M entries (~131 MB at 109 B each) plus
+//! ~58 MB of sort scratch, which is over the 128 MiB cap on its own - the base-side
+//! limit the delta cap does not address.
 //!
 //! The delta is deliberately not durable. The index is a hint, rebuilt at every
 //! open and never on the correctness path, so a lost delta costs the next build's
@@ -70,21 +103,43 @@ pub const INDEX_TILE_NAME: &str = "order-no-index.tile";
 
 /// The delta size at which a merge rewrites base + delta into a new base.
 ///
-/// The rule is `delta_entries >= max(INDEX_MERGE_MIN_DELTA_ENTRIES,
-/// base_entries)`. A merge writes the base's entries once more plus the delta's,
-/// i.e. `base + delta` bytes, so the *amortised* index write per new row is
-/// `1 + base/delta`: the base rewrite is at most as large as the delta that paid
-/// for it, which is what keeps the total index bytes at or below ~2x the entry
-/// bytes (each entry written once when merged, and at most once more by the next
-/// merge). The floor exists because a small base would otherwise merge on every
-/// interval and rewrite the whole base each time: at 1,024 movement entries the
-/// merge's fixed cost is spread over at least 1,024 rows (~7 s of ingest at the
-/// measured 200 rps rate, ~64 KiB of index), which is small enough that a tiny
-/// region still converges quickly.
+/// The rule is `delta_entries >= min(max(INDEX_MERGE_MIN_DELTA_ENTRIES,
+/// base_entries), INDEX_DELTA_MAX_ENTRIES)`. A merge writes the base's entries
+/// once more plus the delta's, i.e. `base + delta` bytes, so the *amortised*
+/// index write per new row is `1 + base/delta`: the base rewrite is at most as
+/// large as the delta that paid for it, which is what keeps the total index
+/// bytes at or below ~2x the entry bytes (each entry written once when merged,
+/// and at most once more by the next merge). The floor exists because a small
+/// base would otherwise merge on every interval and rewrite the whole base each
+/// time: at 1,024 movement entries the merge's fixed cost is spread over at
+/// least 1,024 rows (~7 s of ingest at the measured 200 rps rate, ~64 KiB of
+/// index), which is small enough that a tiny region still converges quickly.
+/// [`INDEX_DELTA_MAX_ENTRIES`] is the ceiling above the floor: without it the
+/// threshold grows with the base and the delta's RAM does too.
 pub const INDEX_MERGE_MIN_DELTA_ENTRIES: u64 = 1_024;
 
-/// How many bytes of the inline serving-memtable snapshot may be copied on the
-/// thread that schedules a rebuild.
+/// The absolute ceiling on the delta, whatever the base's size: a merge is due at
+/// this many delta entries even when the base holds more.
+///
+/// The ratio rule alone (`max(1_024, base_entries)`) makes the delta's RAM a
+/// function of the base, i.e. unbounded: at a 1,000,000-entry base the delta would
+/// grow to 1,000,000 entries, ~105 MB at the 105 B per entry the module docs
+/// measure, which is four fifths of the 128 MiB engine memory cap before the
+/// ~63 MiB serving peak measured on the 30,000-row instance is counted. 200,000
+/// entries bound the serving delta near 21 MB (200,000 x 105 B), which fits.
+///
+/// The cost is write amplification at a large base: merging 200,000 new entries
+/// into a 1,000,000-entry base rewrites the base once per 200,000 rows, so each
+/// new entry is written 1 + 1,000,000/200,000 = 5 times instead of 2. That is
+/// still bounded, still independent of the number of rebuild windows (which is
+/// what WP-9 removed), and it is the same `base/delta` term the ratio rule trades
+/// against RAM: a base large enough to pay 5x is the one whose delta would
+/// otherwise not fit in memory.
+pub const INDEX_DELTA_MAX_ENTRIES: u64 = 200_000;
+
+/// How many bytes of an inline rebuild half may be copied, for the two halves the
+/// driver copies itself: the serving-memtable snapshot on the thread that
+/// schedules a rebuild, and the delta build's tile buffer on the builder thread.
 ///
 /// The snapshot exists because the engine's memtable cannot cross to the builder
 /// thread, so its cost is paid by the thread that is also pacing requests. Two
@@ -96,9 +151,28 @@ pub const INDEX_MERGE_MIN_DELTA_ENTRIES: u64 = 1_024;
 /// is a refusal, not a truncation, so an over-bound snapshot copies nothing and
 /// the rebuild is skipped with the reason logged.
 ///
+/// The delta build's tile half ([`scan_hybrid_source`]) needs the same charge for
+/// the opposite reason: it runs on the builder thread, so it costs no pacer time,
+/// but it buffers one document per handle the tiles published above the coverage,
+/// and a publish that straddles the coverage can hold the WHOLE region in one
+/// tile, which is the region's bytes and not one interval's. Over the bound that
+/// buffer is dropped and the rebuild is skipped with the reason logged, exactly
+/// as an over-bound snapshot is; the base build's tile half is deliberately not
+/// charged, because building the base from the whole region is what a base build
+/// is for.
+///
 /// The charge includes [`MEMTABLE_ROW_OVERHEAD_BYTES`] per row on top of the
-/// document bytes, because the copy the scheduling thread pays for is the owned
-/// `(handle, csn, Vec<u8>)` rows, not only their documents.
+/// document bytes, because what is copied is the owned `(handle, csn, Vec<u8>)`
+/// row, not only its document. The tile buffer's hash-map key and control bytes
+/// are not charged: a few bytes per row, against a bound of 4 MiB, roughly 25x one
+/// interval's ~150 KiB ingest.
+///
+/// The tile half's skip is a stated limit, not a rescue: the same tiles stand
+/// above the coverage at every later boundary until a merge moves the coverage, and
+/// a merge needs a delta, so a region whose published-above-coverage documents
+/// alone exceed this bound (one whole-region tile at ~30,000 rows of the ~150 B
+/// movement shape) keeps its index at its last coverage and lets the authoritative
+/// scan serve, with one `skipped` decision line per boundary.
 pub const INLINE_SNAPSHOT_MAX_BYTES: usize = 4 << 20;
 
 /// Heap bytes one row of [`MemtableRows::rows`] costs beyond its document: the
@@ -242,10 +316,11 @@ impl IndexBase {
 }
 
 /// Everything a merge rewrites: the adopted base and a copy of the delta it is
-/// merging. The copy is taken on the scheduling thread (a one-off memory copy of
-/// at most the threshold's entries, ~1.8 MB at the 30 k-entry base) so the engine
-/// keeps serving the same delta while the merge runs; that copy is the 2x half of
-/// the RAM bound [`INDEX_MERGE_MIN_DELTA_ENTRIES`] states.
+/// merging. The copy is taken on the scheduling thread so the engine keeps
+/// serving the same delta while the merge runs; it is the second ~3.0 MB of the
+/// ~17 MB merge peak the module docs price at a 30,000-row region (the delta
+/// itself plus its clone here, plus the merge's `entries` buffer, its sort and its
+/// live set).
 pub struct MergeSnapshot {
     base: IndexBase,
     delta: DeltaMap,
@@ -392,13 +467,15 @@ impl IndexRebuildSlot {
     /// source to the rows above the coverage the adopted index speaks for;
     /// `base_coverage_csn` is the base tile's coverage the delta will attach above,
     /// which adoption re-checks. A delta writes no device bytes, so it needs no
-    /// directory.
+    /// directory. `tile_max_bytes` bounds the tile half's buffer (see
+    /// [`rebuild_delta`]).
     pub fn schedule_delta<F>(
         &mut self,
         base_coverage_csn: u64,
         view: TileReadView,
         tile_scan: F,
         memtable: MemtableRows,
+        tile_max_bytes: usize,
         trigger: &str,
     ) -> io::Result<()>
     where
@@ -409,7 +486,7 @@ impl IndexRebuildSlot {
         self.reserve(trigger)?;
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
-            let _ = tx.send(rebuild_delta(base_coverage_csn, view, tile_scan, memtable));
+            let _ = tx.send(rebuild_delta(base_coverage_csn, view, tile_scan, memtable, tile_max_bytes));
         });
         self.rx = Some(rx);
         Ok(())
@@ -497,6 +574,49 @@ pub fn is_index_build_refused(error: &io::Error) -> bool {
 
 fn refused(message: String) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, IndexBuildRefused(message))
+}
+
+/// Why a delta build stopped early: the tile half would buffer more document
+/// bytes than the caller's bound allows ([`INLINE_SNAPSHOT_MAX_BYTES`]).
+///
+/// It is its own type for the same reason [`IndexBuildRefused`] is: a skip is not
+/// an engine state that will refuse the same way at every later boundary, so the
+/// caller records it and retries at the next boundary instead of latching a
+/// refusal. See [`is_delta_tile_over_bound`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeltaTileOverBound {
+    /// Handles the tile half had buffered when the bound was crossed.
+    pub rows: usize,
+    /// Charged bytes those rows account for (documents plus
+    /// [`MEMTABLE_ROW_OVERHEAD_BYTES`] each).
+    pub bytes: usize,
+    /// The bound the caller set.
+    pub bound: usize,
+}
+
+impl fmt::Display for DeltaTileOverBound {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "delta tile half would exceed the {bound}-byte bound \
+             ({bytes} bytes over {rows} handles published above the base coverage)",
+            bound = self.bound,
+            bytes = self.bytes,
+            rows = self.rows,
+        )
+    }
+}
+
+impl std::error::Error for DeltaTileOverBound {}
+
+/// Whether `error` is a [`DeltaTileOverBound`] skip rather than a build refusal
+/// or a scan failure.
+pub fn is_delta_tile_over_bound(error: &io::Error) -> bool {
+    error.get_ref().and_then(|inner| inner.downcast_ref::<DeltaTileOverBound>()).is_some()
+}
+
+fn delta_tile_over_bound(bytes: usize, rows: usize, bound: usize) -> io::Error {
+    io::Error::other(DeltaTileOverBound { rows, bytes, bound })
 }
 
 /// The `family|entity` name of the region the index covers, spelled from the
@@ -676,6 +796,19 @@ pub fn build_order_no_index(
     })
 }
 
+/// The delta size at which a merge is due for a base of `base_entries` entries:
+/// `min(max(INDEX_MERGE_MIN_DELTA_ENTRIES, base_entries), INDEX_DELTA_MAX_ENTRIES)`.
+///
+/// Two bounds and a floor: the floor keeps a tiny base from merging on every
+/// interval, the ratio keeps the amortised base rewrite at or below one extra
+/// write per entry, and the ceiling keeps the delta's RAM independent of the
+/// base's size (see [`INDEX_DELTA_MAX_ENTRIES`]). The ceiling wins over the ratio
+/// on purpose, because exceeding it costs a bounded write amplification while
+/// exceeding RAM costs the run.
+pub fn merge_threshold(base_entries: u64) -> u64 {
+    INDEX_MERGE_MIN_DELTA_ENTRIES.max(base_entries).min(INDEX_DELTA_MAX_ENTRIES)
+}
+
 impl OrderNoIndex {
     /// The base tile (an `Arc<Tile>`) for the read-ahead worker's warm view.
     /// Sharing it is safe: the tile is immutable after `TileWriter::finish`.
@@ -699,9 +832,11 @@ impl OrderNoIndex {
     pub fn delta_entries(&self) -> u64 { self.delta.entries() }
 
     /// Whether the delta has grown enough to pay for rewriting the base:
-    /// `delta_entries >= max(INDEX_MERGE_MIN_DELTA_ENTRIES, base_entries)`.
+    /// `delta_entries >= merge_threshold(base_entries)`, i.e. the ratio rule
+    /// `max(INDEX_MERGE_MIN_DELTA_ENTRIES, base_entries)` capped at
+    /// [`INDEX_DELTA_MAX_ENTRIES`].
     pub fn needs_merge(&self) -> bool {
-        self.delta.entries() >= INDEX_MERGE_MIN_DELTA_ENTRIES.max(self.base.count())
+        self.delta.entries() >= merge_threshold(self.base.count())
     }
 
     /// The base + a copy of the delta, for an off-path merge. `None` until the
@@ -724,6 +859,18 @@ impl OrderNoIndex {
     /// entry, `None` otherwise (absent entry, a tombstone, or no index). Never
     /// authoritative: the caller cross-checks the returned document and falls back
     /// to the scan on a miss or mismatch.
+    ///
+    /// # A repeated `order_no`
+    ///
+    /// `StockMovement.order_no` is not unique, so a probe answers with ONE handle
+    /// where the authoritative scan may return up to its 100-row limit. The delta
+    /// is keyed by `order_no`, so every row of the interval that shares one
+    /// collapses into at most one entry there and that entry's handle answers;
+    /// once merged, the base tile answers with its first key for the prefix, which
+    /// is the LOWEST handle. Either answer is a hint: the scan path cross-checks it
+    /// against the returned document and keeps every answer correct (a hit serves
+    /// that handle, a mismatch falls back to the full scan), and no answer is ever
+    /// treated as the complete set of rows for that `order_no`.
     pub fn lookup(&self, order_no: &[u8]) -> io::Result<Option<u64>> {
         // The delta is the newest state of every row above the base coverage, so
         // it answers first; an empty delta costs one length check.
@@ -856,11 +1003,21 @@ pub enum MemtableSnapshot {
 /// A tie cannot arise: a publish evicts exactly the versions a tile holds, so the
 /// memtable's version of a handle is always newer than any tile's, and the union
 /// skips a tile row for a handle the snapshot already has.
+///
+/// `tile_max_bytes` bounds the tile half's buffer: one document per handle the
+/// tiles published above the coverage, charged as the document plus
+/// [`MEMTABLE_ROW_OVERHEAD_BYTES`] and checked as it grows. A delta build passes
+/// the caller's bound (a publish that straddles the coverage can put the whole
+/// region in one tile, so this half is the region's bytes and not one interval's);
+/// a base build passes [`usize::MAX`], because buffering the whole region is what
+/// it is for. Over the bound the build stops with a [`DeltaTileOverBound`], which
+/// the caller records as a skip rather than a refusal.
 /// Returns `(rows visited, rows the tile dedupe dropped)`.
 fn scan_hybrid_source<F>(
     tile_scan: F,
     view: &TileReadView,
     memtable: &MemtableRows,
+    tile_max_bytes: usize,
     mut visit: impl FnMut(u64, u64, &[u8]) -> io::Result<()>,
 ) -> io::Result<(u64, u64)>
 where
@@ -871,6 +1028,7 @@ where
     // can yield a handle once per tile that holds a version of it, and only the
     // newest can win, so holding the older ones would only grow the buffer.
     let mut tile_rows: HashMap<u64, (u64, Vec<u8>)> = HashMap::new();
+    let mut tile_bytes: usize = 0;
     let mut stale_rows: u64 = 0;
     tile_scan(view, &mut |handle, csn, doc| {
         if memtable_handles.contains(&handle) {
@@ -878,15 +1036,25 @@ where
             stale_rows += 1;
             return Ok(());
         }
+        let charged = doc.len() + MEMTABLE_ROW_OVERHEAD_BYTES;
         match tile_rows.get_mut(&handle) {
             Some(current) if current.0 < csn => {
+                tile_bytes -= current.1.len() + MEMTABLE_ROW_OVERHEAD_BYTES;
                 *current = (csn, doc.to_vec());
+                tile_bytes += charged;
                 stale_rows += 1;
             }
-            Some(_) => stale_rows += 1,
+            Some(_) => {
+                stale_rows += 1;
+                return Ok(());
+            }
             None => {
                 tile_rows.insert(handle, (csn, doc.to_vec()));
+                tile_bytes += charged;
             }
+        }
+        if tile_bytes > tile_max_bytes {
+            return Err(delta_tile_over_bound(tile_bytes, tile_rows.len(), tile_max_bytes));
         }
         Ok(())
     })?;
@@ -930,7 +1098,7 @@ where
         dir,
         key_encoding,
         |visit| {
-            let (rows, tile_stale) = scan_hybrid_source(tile_scan, &view, &memtable, |handle, csn, doc| {
+            let (rows, tile_stale) = scan_hybrid_source(tile_scan, &view, &memtable, usize::MAX, |handle, csn, doc| {
                 match newest.accept(handle, csn, doc) {
                     Some((handle, csn, doc)) => visit(handle, csn, doc),
                     None => {
@@ -970,11 +1138,18 @@ where
 /// refuses when the inline snapshot copied rows of this region and the reduce
 /// indexed none of them, which is a defect in the source or the merge rather
 /// than an empty interval.
+///
+/// `tile_max_bytes` bounds the tile half, which unlike the memtable half is not
+/// one interval's bytes: the walk takes every tile whose cutoff is above the
+/// coverage, and a publish that straddles the coverage holds the whole region in
+/// one tile. Over the bound the build stops with a [`DeltaTileOverBound`] and the
+/// delta is dropped, which the caller records as a skip.
 fn rebuild_delta<F>(
     base_coverage_csn: u64,
     view: TileReadView,
     tile_scan: F,
     memtable: MemtableRows,
+    tile_max_bytes: usize,
 ) -> io::Result<RebuildResult>
 where
     F: FnOnce(&TileReadView, &mut dyn FnMut(u64, u64, &[u8]) -> io::Result<()>) -> io::Result<u64>,
@@ -983,7 +1158,7 @@ where
     let mut delta = DeltaMap::with_coverage(memtable.csn);
     let mut stale_rows = 0u64;
     let mut newest = crate::engine::NewestPrimaryVersion::new();
-    let (rows, tile_stale) = scan_hybrid_source(tile_scan, &view, &memtable, |handle, csn, doc| {
+    let (rows, tile_stale) = scan_hybrid_source(tile_scan, &view, &memtable, tile_max_bytes, |handle, csn, doc| {
         match newest.accept_version(handle, csn, doc) {
             Some((handle, csn, doc)) => {
                 if doc.is_empty() {
@@ -1131,6 +1306,20 @@ mod tests {
         assert_eq!(tile.cutoff(), e.csn());
         assert_eq!(build.index.lookup(b"O1").unwrap(), None, "and it answers no lookup");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The merge rule's threshold: the floor, the ratio and the absolute cap. The
+    /// cap is what keeps the delta's RAM independent of the base: the ratio alone
+    /// (`max(floor, base_entries)`) lets a 1,000,000-entry base hold a
+    /// 1,000,000-entry delta, ~105 MB at the 105 B per entry the module docs measure,
+    /// four fifths of the 128 MiB engine cap before the ~63 MiB serving peak is
+    /// counted.
+    #[test]
+    fn the_merge_threshold_has_a_floor_a_ratio_and_an_absolute_cap() {
+        assert_eq!(merge_threshold(0), INDEX_MERGE_MIN_DELTA_ENTRIES, "a tiny base merges at the floor");
+        assert_eq!(merge_threshold(30_000), 30_000, "above the floor the ratio rule decides");
+        assert_eq!(merge_threshold(1_000_000), INDEX_DELTA_MAX_ENTRIES, "a large base merges at the cap, not at its own size");
+        assert!(INDEX_DELTA_MAX_ENTRIES > INDEX_MERGE_MIN_DELTA_ENTRIES, "the cap is above the floor");
     }
 
     /// The merge compacts the delta with the one newest-wins rule: a handle the

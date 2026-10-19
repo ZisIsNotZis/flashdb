@@ -342,6 +342,7 @@ fn rebuild_delta(e: &Engine, after_csn: u64) -> RebuildResult {
         e.primary_tile_view(),
         move |view, visit| view.scan_primary_after(INDEX_ENTITY, after_csn, visit),
         memtable_rows(e, after_csn, INLINE_SNAPSHOT_MAX_BYTES),
+        INLINE_SNAPSHOT_MAX_BYTES,
         "scan_demand",
     )
     .unwrap();

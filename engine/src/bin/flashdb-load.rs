@@ -84,9 +84,9 @@ use std::io::{self, BufRead, BufReader, Write};
 use std::time::{Duration, Instant};
 
 use flashdb_engine::engine::{build_compaction_job, BarrierCompletion, CompactShape, CompactionJob, CompactionOutcome, Engine, LayoutPolicy, Op, Outcome, RegionMode, RequestOutcome, MAX_ACTIVE_TILES, MAX_PENDING_BARRIERS};
-use flashdb_engine::index::{build_order_no_index, is_index_build_refused, movement_region_rows,
-    rebuild_trigger, FinishedJob, IndexProduct, IndexRebuildSlot, MemtableRows, MemtableSnapshot,
-    INDEX_DRAIN_TIMEOUT, INDEX_ENTITY, INDEX_REBUILD_STALE_CSN, INDEX_TILE_NAME,
+use flashdb_engine::index::{build_order_no_index, is_delta_tile_over_bound, is_index_build_refused,
+    movement_region_rows, rebuild_trigger, FinishedJob, IndexProduct, IndexRebuildSlot, MemtableRows,
+    MemtableSnapshot, INDEX_DRAIN_TIMEOUT, INDEX_ENTITY, INDEX_REBUILD_STALE_CSN, INDEX_TILE_NAME,
     INLINE_SNAPSHOT_MAX_BYTES, TRIGGER_MERGE, TRIGGER_POLICY, TRIGGER_STARTUP};
 use flashdb_engine::keys::KeyEncoding;
 use flashdb_engine::metrics::WindowSnapshot;
@@ -1141,14 +1141,18 @@ struct OrderNoIndexDriver {
     /// empty-build refusal, the delta's "snapshot rows but nothing indexed"
     /// refusal, or a builder thread that went away. Those are properties of the
     /// engine state, so the same state refuses the same way at every later
-    /// boundary. Two things are deliberately NOT latched: an inline snapshot that
-    /// is over the bound (a property of this boundary's write volume; the next
-    /// boundary retries) and an `Err` from the snapshot, which propagates out of
+    /// boundary. Deliberately NOT latched, because each is a property of one
+    /// boundary or of an interleaving rather than of the state: an inline rebuild
+    /// half that is over its bound (the memtable snapshot or the delta's tile
+    /// buffer; the next boundary retries), a delta adoption that finds no base or a
+    /// different one (the index was cleared by a policy reload, or a merge replaced
+    /// the base), and an `Err` from the snapshot itself, which propagates out of
     /// `manage` because a read failure is the run's to report rather than a hint to
     /// skip. Toggling the policy away from the index clears the latch, so selecting
     /// it again retries once.
     refused: bool,
-    /// How many charged bytes the inline snapshot may copy (production value
+    /// How many charged bytes an inline rebuild half may copy: the serving-memtable
+    /// snapshot and the delta build's tile buffer (production value
     /// [`INLINE_SNAPSHOT_MAX_BYTES`]; a field so a test can bind the over-bound skip
     /// without allocating 4 MiB).
     inline_max_bytes: usize,
@@ -1284,10 +1288,31 @@ impl OrderNoIndexDriver {
     }
 
     /// Adopt one finished job, or record its failure and latch it.
+    ///
+    /// Two failures are deliberately not latched, because neither is a property of
+    /// the engine state that will fail the same way at the next boundary:
+    ///
+    /// - an over-bound delta build ([`is_delta_tile_over_bound`]): this boundary's
+    ///   published bytes were larger than the bound, and the next one may not be;
+    /// - an `InvalidInput` from adoption, which for a delta means its base is gone or
+    ///   different: the index was cleared between the build's start and its
+    ///   collection (a `--policy-reload` boundary), or a merge replaced the base.
+    ///   Latching that would stop every later rebuild for the rest of the run over
+    ///   an interleaving that says nothing about the state.
     fn adopt(&mut self, engine: &mut Engine, index_dir: &Path, finished: FinishedJob) -> io::Result<()> {
         let FinishedJob { trigger, result } = finished;
         let result = match result {
             Ok(result) => result,
+            Err(e) if is_delta_tile_over_bound(&e) => {
+                self.record(IndexDecision {
+                    trigger: &trigger,
+                    covered_rows: None,
+                    stale_rows: None,
+                    inline_bytes: None,
+                    outcome: &format!("skipped: {e}"),
+                });
+                return Ok(());
+            }
             Err(e) => {
                 self.refuse(&trigger, e);
                 return Ok(());
@@ -1321,6 +1346,18 @@ impl OrderNoIndexDriver {
                     stale_rows: Some(result.stale_rows),
                     inline_bytes: Some(result.inline_bytes),
                     outcome: "adopted",
+                });
+            }
+            // Only the delta arm can fail here, and only for "no base adopted" or "a
+            // different base": discard the product instead of latching (see the doc
+            // comment above). The next boundary rebuilds what the policy wants.
+            Err(e) if e.kind() == io::ErrorKind::InvalidInput => {
+                self.record(IndexDecision {
+                    trigger: &trigger,
+                    covered_rows: None,
+                    stale_rows: Some(result.stale_rows),
+                    inline_bytes: Some(result.inline_bytes),
+                    outcome: &format!("discarded: {e}"),
                 });
             }
             Err(e) => self.refuse(&trigger, e),
@@ -1371,12 +1408,15 @@ impl OrderNoIndexDriver {
             )?,
             // A base is adopted: index only the rows above the coverage. The delta
             // is narrowed on purpose, so a legitimate empty delta exists and the
-            // base's witness does not apply.
+            // base's witness does not apply. Its tile half is charged against the same
+            // bound as the snapshot, because a straddling publish can hold the whole
+            // region in one tile there.
             Some(base_coverage) => self.slot.schedule_delta(
                 base_coverage,
                 view,
                 move |view, visit| view.scan_primary_after(INDEX_ENTITY, after_csn, visit),
                 memtable,
+                self.inline_max_bytes,
                 trigger,
             )?,
         }
@@ -2913,6 +2953,107 @@ mod tests {
         assert!(driver.slot.is_busy(), "selecting it again retries the build");
         settle(&mut driver, &mut engine, &dir);
         assert!(engine.has_order_no_index(), "the retry adopts (handle 2 is live): {}", driver.last_decision);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The latch's negative control: a delta job that is still in flight when a
+    /// policy boundary clears the index is DISCARDED when it is collected, not
+    /// latched. Its `InvalidInput` ("no derived index is adopted, so a delta has no
+    /// base to attach to") is a fact about the interleaving - the product describes a
+    /// base this run no longer serves - so the next boundary builds what the policy
+    /// wants; latching it would leave the rest of the run on the full scan over a
+    /// `--policy-reload` toggle.
+    #[test]
+    fn a_delta_collected_after_a_policy_reload_is_discarded_not_latched() {
+        let dir = tmp_dir("indexlatchdelta");
+        let mut engine = Engine::create(dir.join("data.wal")).unwrap();
+        engine.commit_block(b"m0", &[movement_op(1, "O1")]).unwrap();
+        engine.set_layout_policy(index_wanted_policy());
+        let mut driver = OrderNoIndexDriver::new();
+        settle(&mut driver, &mut engine, &dir);
+        assert!(engine.has_order_no_index(), "{}", driver.last_decision);
+
+        // One interval large enough (5,000 rows, published to a tile so the delta's
+        // tile walk is the slow half) that the build is still running when the next
+        // boundary clears the index: the assertion after that boundary PROVES the race
+        // window was taken rather than assumed.
+        let ops: Vec<Op> = (2..=5_001).map(|h| movement_op(h, &format!("O{h:08}"))).collect();
+        engine.commit_block(b"interval", &ops).unwrap();
+        engine.publish_tile(dir.join("tile-interval.tile"), engine.csn()).unwrap();
+        engine.lookup_movement_by_order_no(b"O1").unwrap();
+        driver.manage(&mut engine, &dir).unwrap();
+        assert!(driver.slot.is_busy(), "a delta build is in flight: {}", driver.last_decision);
+
+        // The policy reload: `manage` collects first and then clears the index.
+        engine.set_layout_policy(LayoutPolicy::declared_default());
+        driver.manage(&mut engine, &dir).unwrap();
+        assert!(!engine.has_order_no_index(), "the policy no longer wants the index");
+        assert!(driver.slot.is_busy(), "the delta was still building at the collecting boundary");
+
+        // The in-flight delta finishes into a run with no index. The drain waits for
+        // it and adopts whatever is left, exactly as a boundary's collect would.
+        driver.finish(&mut engine, &dir).unwrap();
+        assert!(!driver.refused, "a delta with no base to attach is not a state refusal: {}", driver.last_decision);
+
+        // Selecting the index again rebuilds it instead of inheriting a latch.
+        engine.set_layout_policy(index_wanted_policy());
+        driver.manage(&mut engine, &dir).unwrap();
+        assert!(driver.slot.is_busy(), "the boundary after the reload builds again: {}", driver.last_decision);
+        settle(&mut driver, &mut engine, &dir);
+        assert!(engine.has_order_no_index(), "and adopts: {}", driver.last_decision);
+        assert_eq!(engine.lookup_movement_by_order_no(b"O00000002").unwrap(), Some(2),
+            "the rebuilt index covers the interval the discarded delta held");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The delta build's tile half is charged against the same bound as the inline
+    /// memtable snapshot. A publish that straddles the base coverage puts the whole
+    /// region in one tile, so the delta's tile buffer is the region's documents and
+    /// not one interval's; over the bound the build is skipped with the reason
+    /// recorded, the adopted index is untouched, and the next boundary retries
+    /// instead of latching.
+    #[test]
+    fn an_over_bound_delta_tile_half_skips_the_build_and_keeps_the_adopted_index() {
+        let dir = tmp_dir("indextilebound");
+        let mut engine = Engine::create(dir.join("data.wal")).unwrap();
+        engine.set_region_mode(RegionMode::PerRegion);
+        engine.commit_block(b"m0", &[movement_op(1, "O1")]).unwrap();
+        engine.set_layout_policy(index_wanted_policy());
+        let mut driver = OrderNoIndexDriver::new();
+        settle(&mut driver, &mut engine, &dir);
+        let coverage = engine.order_no_index_coverage_csn().expect("an index is adopted");
+
+        // A publish above the coverage: the delta's tile walk now sees the whole
+        // region, and one memtable row above the coverage fits the 300-byte bound the
+        // tile half cannot.
+        let ops: Vec<Op> = (2..=5).map(|h| movement_op(h, &format!("O{h:08}"))).collect();
+        engine.commit_block(b"interval", &ops).unwrap();
+        engine.publish_tile(dir.join("tile-0.tile"), engine.csn()).unwrap();
+        engine.commit_block(b"tail", &[movement_op(6, "O00000006")]).unwrap();
+        engine.lookup_movement_by_order_no(b"O00000006").unwrap();
+
+        driver.inline_max_bytes = 300;
+        driver.manage(&mut engine, &dir).unwrap();
+        assert!(driver.slot.is_busy(), "the delta build is in flight: {}", driver.last_decision);
+        driver.finish(&mut engine, &dir).unwrap();
+        assert!(
+            driver.last_decision.contains("outcome=skipped: delta tile half would exceed the 300-byte bound"),
+            "the skip states which half was over the bound: {}",
+            driver.last_decision
+        );
+        assert!(!driver.refused, "an over-bound tile half is this boundary's bytes, not a state refusal");
+        assert_eq!(engine.order_no_index_coverage_csn(), Some(coverage), "the adopted index is untouched");
+        assert_eq!(engine.order_no_index_delta_entries(), Some(0), "and holds no partial delta");
+        assert_eq!(engine.lookup_movement_by_order_no(b"O1").unwrap(), Some(1), "it still answers what it covered");
+
+        // The bound is a property of this boundary, not a latch: once it is lifted the
+        // next boundary builds the delta that the skip left out.
+        driver.inline_max_bytes = INLINE_SNAPSHOT_MAX_BYTES;
+        settle(&mut driver, &mut engine, &dir);
+        assert!(engine.order_no_index_delta_entries().unwrap() > 0, "{}", driver.last_decision);
+        assert!(engine.order_no_index_coverage_csn().expect("an index is adopted") > coverage);
+        assert_eq!(engine.lookup_movement_by_order_no(b"O00000002").unwrap(), Some(2),
+            "the tile-published row is covered after the retry");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

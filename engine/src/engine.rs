@@ -3038,9 +3038,10 @@ impl Engine {
     }
 
     /// Whether the adopted index's delta has grown enough to pay for a merge that
-    /// rewrites the base (`delta_entries >= max(INDEX_MERGE_MIN_DELTA_ENTRIES,
-    /// base_entries)`); `false` when no index is installed. The driver schedules
-    /// that merge off the request path; nothing on the read path branches on it.
+    /// rewrites the base (`delta_entries >=
+    /// min(max(INDEX_MERGE_MIN_DELTA_ENTRIES, base_entries), INDEX_DELTA_MAX_ENTRIES)`);
+    /// `false` when no index is installed. The driver schedules that merge off the
+    /// request path; nothing on the read path branches on it.
     pub fn order_no_index_needs_merge(&self) -> bool {
         self.order_no_index.as_ref().is_some_and(|index| index.needs_merge())
     }
@@ -5628,6 +5629,50 @@ mod tests {
         };
         assert!(err.to_string().contains("outside its region"),
             "a single-region tile carrying another region's key must fail closed: {err}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A delta built against a DIFFERENT base coverage is refused and the adopted
+    /// index is left exactly as it was: the entries describe rows above ITS base, so
+    /// attaching them to another one would claim coverage the index does not have.
+    /// The refusal is `InvalidInput`, which the driver reads as "discard this
+    /// product" rather than as a state that will refuse the same way again (a policy
+    /// reload can clear the index between a delta's start and its collection).
+    #[test]
+    fn a_delta_built_against_a_different_base_coverage_is_refused_and_changes_nothing() {
+        let dir = tmp_dir("index_delta_mismatch");
+        let mut e = Engine::create(dir.join("data.wal")).unwrap();
+        let docs = vec![(7u64, br#"{"order_no":"O7"}"#.to_vec())];
+        let build = crate::index::build_order_no_index(
+            &dir,
+            e.key_encoding(),
+            |visit| {
+                for (handle, doc) in &docs {
+                    visit(*handle, 1, doc)?;
+                }
+                Ok(docs.len() as u64)
+            },
+            crate::index::RegionRows::Empty,
+            1,
+            "base.tile",
+        )
+        .unwrap();
+        let base_coverage = build.index.base_coverage_csn();
+        e.adopt_order_no_index(build.index);
+        let state = |e: &Engine| (e.order_no_index_entries(), e.order_no_index_delta_entries(), e.order_no_index_coverage_csn());
+        let before = state(&e);
+        assert_eq!(before, (Some(1), Some(0), Some(base_coverage)), "one live entry over the base");
+
+        // An empty delta is enough: the coverage check answers before the contents.
+        let error = e
+            .adopt_order_no_delta(crate::index::DeltaBuild {
+                delta: crate::index::DeltaMap::default(),
+                base_coverage_csn: base_coverage + 1,
+            })
+            .expect_err("a delta built above another base is refused, not attached");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("delta was built against base coverage"), "{error}");
+        assert_eq!(state(&e), before, "the refused delta changes nothing about the adopted index");
         let _ = fs::remove_dir_all(&dir);
     }
 
