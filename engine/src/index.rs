@@ -14,7 +14,7 @@
 //! writer/reader, so no new keyspace family and no change to recovery ordering.
 //! The tile lives OUTSIDE the engine's main `self.tiles` list (which is
 //! WAL-projection-verified at recovery), as a sidecar optimization that is
-//! rebuilt at open when lost.
+//! rebuilt at every open by the driver when the policy asks for it.
 
 use std::fmt;
 use std::io;
