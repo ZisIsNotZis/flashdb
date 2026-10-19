@@ -24,6 +24,8 @@ context for every child. One writer per worktree or file area; the main agent in
 | WP-7 | **in flight** | worker (fresh, worktree `wp7-docs-reconcile`) | `README.md`, `docs/engine.md`, `docs/plan/evidence.md` | every current-state sentence resolves to a code path or a record path; no false absence and no false capability; every printed command ran; README states the negative external result, the licence and where to report a problem; `docs/plan/evidence.md` becomes the current reconciliation record (closes PLAN-readme-stale, PLAN-engine-doc-stale, PLAN-evidence-reconciliation) | none |
 | WP-4 | queued | reviewer (fresh) | read-only review of WP-1..WP-3 at the integrated revision | package verdicts with defect evidence (location, criterion, reproduction); no commit | WP-1..WP-3 |
 
+**WP-1 known risk (recorded at integration, `8640a80`).** The async build now snapshots the merged rows into a `Vec` on the driver thread at a window boundary (`movement_rows`), because the memtable is not shareable with the builder thread. For a memtable-only region that is bounded RAM work, but for a tiled 624 KiB region it streams from device on the pacer — the same stall class M3 exists to remove. Follow-up if the review confirms the exposure: keep the tile scan on the worker and snapshot only the memtable rows inline (the hybrid), with a bound on the inline bytes.
+
 Stop conditions: a package that cannot meet acceptance reports incomplete with the exact blocker
 rather than widening scope; WP-2 never runs while the box carries foreign load and queues with an
 explicit resume trigger instead of reporting a contended result as a verdict.
