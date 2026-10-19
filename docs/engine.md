@@ -2,9 +2,9 @@
 
 Budget: 170 lines / 26,000 chars
 
-The storage layer resolves ticket `04-storage-soundness`. Shape chosen: **a log-structured document store** — WAL + memtable + immutable tile files + background compaction. Every mechanism is standard LSM practice; the thesis lives in the key-space layout and the learned policy, not here. This document supersedes the tile/relocation/root-flip ideas recorded in earlier rounds; the decisions it encodes were made to close `review-05`.
+The storage layer resolves ticket `04-storage-soundness`. Shape chosen: **a log-structured document store** — WAL + memtable + immutable tile files + compaction, with the scheduler outside the engine. Every mechanism is standard LSM practice; the thesis lives in the key-space layout and the learned policy, not here. This document supersedes the tile/relocation/root-flip ideas recorded in earlier rounds; the decisions it encodes were made to close `review-05`.
 
-Reference scale (v0, cgroup-limited): 200 GB data, 8 GB RAM, one NVMe. Data:RAM ≈ 25:1. **Implementation status:** the current prototype publishes multiple ordered tiles (strictly increasing, non-overlapping CSN ranges, bounded by `MAX_TILES`) through the durable A/B manifest, merges them with the memtable for latest-state reads, exposes an explicit `maybe_checkpoint(max_wal_bytes)` publish trigger, and `compact()` rewrites the tile list into one whole file holding only the newest version per logical key (per the 2026-09-29 resolution: historical reads do not exist, so superseded versions are dropped). A torn manifest page falls back to the older valid page, structural corruption fails closed, and every published tile is verified against the retained WAL at open. It does **not** yet implement the 16 KiB page/directory tile format, automatic background checkpointing, WAL rotation, bounded RAM or recovery-time targets described below.
+Reference scale (v0, cgroup-limited): 200 GB data, 8 GB RAM, one NVMe. Data:RAM ≈ 25:1. **Implementation status.** The prototype publishes multiple ordered tiles (strictly increasing, non-overlapping CSN ranges) through a chained A/B manifest whose capacity is the policy constant `MAX_TILES = 4096` (`engine/src/manifest.rs`; re-exported as `MAX_ACTIVE_TILES`, `engine/src/engine.rs:469`), merges them with the memtable for latest-state reads, and compacts with `maybe_compact_shape` (three run shapes, per-region `merge_min_tiles` trigger) or `compact()` for a whole-dataset collapse that keeps only the newest version per logical key. Tiles carry the `FDBTILE3` page/directory format described below, WAL rotation exists (`rotate_wal` retires a fully published segment onto `data-<cutoff>.wal`, named in the manifest), a torn manifest page falls back to the older valid page, structural corruption fails closed, and every published tile is verified against the retained WAL at open. What is still absent is named where it is argued: no power-loss proof (§Foreground commit), no engine-internal scheduler — checkpoint, rotation and compaction are calls the opening process makes (§Compaction, manifest, checkpoint, recovery), no bounded recovery time or RAM (same section), and no sweep for tiles retired by a lazy flip (same section).
 
 ## Key space — one LSM, four prefix families
 
@@ -32,7 +32,7 @@ block executes against snapshot + its own overlay (RAM)
     background FIFO worker → ack only after that covering fdatasync returns
 ```
 
-- Exactly **one** durability barrier per commit group, and it is on a log — there is no foreground structure over tiles, so the SS-01 ordering hazard (root durable, tile not) cannot arise. Tiles are written only by background compaction.
+- Exactly **one** durability barrier per commit group, and it is on a log — there is no foreground structure over tiles, so the SS-01 ordering hazard (root durable, tile not) cannot arise. Tiles enter the active list only from a checkpoint publish or a compaction, never from the commit path; the derived index writes a sidecar file outside that list.
 - The memtable is applied **before** the covering `fdatasync` returns (a grouped commit appends and
   applies immediately), so a reader can observe a block whose WAL record is not yet durable. That is
   harmless: the memtable is only a cache — the **ack**, and every state-mutating
@@ -57,7 +57,7 @@ block executes against snapshot + its own overlay (RAM)
 
 ## Tiles, pages, access granule (SS-03 resolved)
 
-- Tile file ≈ **32 MiB** (autotunable), holding **16 KiB pages** (calibrated in experiment 0a-redo, `.scratch/05-engine-v0/evidence/0a-redo/analysis.md`: 16 KB QD1 = 111 µs vs 4 KB = 89 µs vs 64 KB = 174 µs — a 25 % point-read premium over 4 KB buys 4× fewer directory entries, on an ~827 MiB/s device); a page = checksum + a run of documents contiguous in key order + per-page key bounds. This target has **2,048 pages per tile**, not 512; even at 16 bytes per directory entry that is ~32 KiB per tile. The directory cannot be packed into one small A/B root page at scale. Its immutable generation and root reference remain to be specified before a full-size manifest claim; the current tile prototype has no page directory.
+- Tile file: a `FDBTILE3` file — padded superblock, variable-length page-sized data blocks, an optional CRC-protected bloom section, a CRC-protected directory of fence records that **stays on disk**, and a fixed trailer (`engine/src/tile.rs`). The page size is a per-region `LayoutPolicy` value written into the tile's superblock (`MIN_PAGE_SIZE`..=`MAX_PAGE_SIZE`, 4 KiB..=64 KiB, **4 KiB default**), so a reader honours the stored value and a bad policy is slow, never wrong. RAM holds a sparse index with one entry per *directory block*, not one per data block: a lookup binary-searches it to pick one directory block, reads and verifies that block on demand, then binary-searches its fences — a wrong candidate costs one extra read and never a wrong answer. Tile size is whatever one publish or one bounded merge writes; there is no tile-size target in the code. The 16 KiB page calibrated in experiment 0a-redo (`.scratch/05-engine-v0/evidence/0a-redo/analysis.md`: 16 KB QD1 = 111 µs vs 4 KB = 89 µs vs 64 KB = 174 µs — a 25 % point-read premium over 4 KB buys 4× fewer directory entries, on an ~827 MiB/s device) is therefore a **policy choice, not the shipped default**: a 32 MiB tile of 16 KiB pages holds 2,048 pages and a ~32 KiB directory, which the in-tile directory accommodates without any separate root page. Measured on a 20,000-document seed: one 6.7 MB tile, 40,000 entries, `page_size=4096`, `dir_len=72,468`, 99 fences (`README.md` §Try it).
 - **The access granule is the page.** Calibrated by experiment 0a-redo (reduced-load window, min idle 67 %): a point read = one 16 KB page ≈ **111 µs** at QD1 (4 KB = 89 µs, 64 KB = 174 µs); a batch of 20 independent 4 KB reads at QD32 ≈ **97 µs** amortized vs **1 784 µs** serialized — an **18×** batching gain; a whole 8 MB tile read sequentially ≈ **9.9 ms**, ~100× worse than the batched page reads, which **falsifies** the original collapse-into-a-tile premise. The device tail is benign on a quiet machine (QD1 p99 = 1.26× mean): tail latency here comes from queueing and dependency chains, not device variance. Constants: `.scratch/05-engine-v0/evidence/0a-redo/analysis.md`.
 
 **Reduced-load calibration (2026-09-28 rerun):** 16 KB QD1 ≈ **117.4 µs** (fio; an engine-level 16 KB Rust measurement remains to be made); 4 KB QD1 = **96.3 µs** in both fio and Rust `O_DIRECT read_at` in the same window; 4 KB QD32 = **202.9k / 203.7k IOPS** (fio / Rust), ≈ **4.9 µs per completed read** at saturation; fio sequential 1 MiB QD8 = **831 MiB/s**. Minimum idle during the run was 57%, so these are indicative, not clean-idle constants. An earlier Rust 4 KB QD1 sample of 149 µs under different load was incorrectly called a 16 KB cost and attributed to syscall overhead; neither inference is supported. Source: `.scratch/05-engine-v0/evidence/0a-redo/summary.json` and `nvme-bench-analysis.md`.
@@ -66,29 +66,31 @@ block executes against snapshot + its own overlay (RAM)
 
 ## Compaction, manifest, checkpoint, recovery (SS-02, SS-21 resolved)
 
-- Compaction: pick inputs → merge-iterate in key order → write new whole tile files → `fdatasync` each → write new manifest page → `fdatasync` → flip. Crash before the flip: the new files are orphans, collected at recovery. Harmless by construction.
+- Compaction: pick inputs → merge-iterate in key order → write new whole tile files → `fdatasync` each → write the new manifest root → flip → unlink the retired inputs. Crash before the flip leaves the new files as orphans, which discovery ignores. There is **no orphan sweep**: `Engine::apply_compaction_job` flips the root lazily (`Manifest::publish_lazy`) and does not unlink its retired inputs, so they stay on disk until something else removes them, and a measured run's directory kept ~38 such retired tiles (`docs/plan/open-items.md` row `PLAN-orphan-cleanup`).
 - **Version dropping (resolved 2026-09-29): unconditional.** Because no read can address historical state, compaction keeps only the newest version per logical key and may drop every superseded version with no horizon computation. The earlier "keep the baseline for the oldest registered snapshot" rule is withdrawn together with the snapshot feature it served.
-- **A tile file is unlinked only when no reader holds it open** (fd-count per file; POSIX keeps the inode alive for open fds). The engine never writes into a file a reader may hold, so the allocator-reuse hazard of SS-02 cannot arise. Unlink-deferred files sit on a trash list persisted in the manifest; recovery re-attempts.
-- Manifest: one small file, **A/B pages, checksum + monotonic seq**, no rename; recovery takes the valid page with the highest seq (SS-26: two consecutive torn writes leave both invalid only if both tear — the write-always-inactive-page discipline plus per-page checksum bounds this to a double-torn-write window; accepted, documented).
-- Checkpoint: when 128 MB of WAL has accumulated since the last one (or 5 minutes). Checkpoint = flush memtable to an L0 file + fsync + manifest update + WAL rotation. **Recovery budget: replay ≤ 128 MB ≈ ~1–2 s** on the reference NVMe.
-- **Filesystems pinned: ext4 and XFS.** btrfs/ZFS/f2fs unsupported in v0 (CoW allocation semantics break the preallocated-WAL cost model). Tile allocation = whole files, so there is **no free-space map** on the tile side; the WAL is preallocated and rotated (SS-21).
+- **A tile is unlinked only once the manifest no longer names it**, and POSIX keeps the inode alive for any open fd, so the engine never writes into a file a reader may hold and the allocator-reuse hazard of SS-02 cannot arise. The durable paths (`compact`, `merge_run`, `merge_region_run`) flip durably and then unlink best-effort; `apply_compaction_job` does not unlink at all (previous bullet). No trash list is persisted, which is why the orphan count can be non-zero.
+- Manifest: one file, **A/B pages, checksum + monotonic seq**, no rename, plus chained continuation pages so the tile list reaches `MAX_TILES = 4096` (`CHAIN_MAX_RECORDS` per continuation page, bounded at `MAX_CHAIN_PAGES = 316`, self-checked by a compile-time assertion); recovery takes the valid page with the highest seq and a malformed chain fails closed (SS-26: two consecutive torn writes leave both invalid only if both tear — the write-always-inactive-page discipline plus per-page checksum bounds this to a double-torn-write window; accepted, documented).
+- Checkpoint and rotation are **caller-driven**: `maybe_checkpoint(max_wal_bytes)` publishes everything through the current CSN as `tile-<cutoff>.tile` once the retained WAL exceeds the threshold, and `rotate_wal(max_wal_bytes)` then retires that fully published segment onto `data-<cutoff>.wal`, recorded in the manifest. There is no timer and no background scheduler in the engine — `Engine::maybe_checkpoint` states that callers invoke it explicitly; each driver passes its own threshold (`flashdb-scale`: 64 MiB checkpoint and 64 MiB rotate; `flashdb-load`: `--checkpoint-bytes`/`--rotate-bytes`, opt-in, and with neither flag one growing WAL and no tiles). The **recovery budget of replay ≤ 128 MB ≈ ~1–2 s is a design target, not an enforced bound**: open streams every published tile and verifies it against the retained WAL, so open time grows with the data and with the retained suffix, and the only recorded figure is a peak, not a time — an 88 MB open-time peak on a 118 MB, 6-tile instance (`engine/src/engine.rs`, `open_impl`).
+- **Filesystems pinned: ext4 and XFS.** btrfs/ZFS/f2fs unsupported in v0 (CoW allocation semantics break the preallocated-WAL cost model). Tile allocation = whole files, so there is **no free-space map** on the tile side. The WAL is rotated; it is **not preallocated** — recovery tolerates an all-zero preallocated tail (`engine/src/wal.rs`) but nothing creates one (SS-21's preallocation half is open, `docs/plan/open-items.md`).
 
 ## Write path and budget (SS-04 resolved)
 
 - A one-field update = a ~200 B WAL record + a memtable entry. Hot-SKU decrements never touch a tile.
-- Write amplification = compaction bytes written ÷ user bytes written, measured live, budgeted (default ≤ 10×, charged to the shared budget). Budget exhaustion → compaction throttles, writes slow — visible, priced, never silently violated.
+- Write amplification = compaction bytes written ÷ user bytes written, measured live by the drivers (`flashdb-scale` reports `tile_bytes_compact` against `payload_bytes`). A merge call takes a byte budget and does not select a run that exceeds it, so a small budget delays reorganisation instead of slowing writes. **No throttling exists**: nothing slows or refuses foreground writes when a write-amplification budget is exceeded.
 - The "already sequential" justification is withdrawn; the sound argument for the WAL is small-update durability, which the workload needs.
 
 ## What the learner controls in v0
 
-The keyspace makes the thesis concrete: **materialized prefixes are the layout.**
+The learner's v0 surface is the engine's per-region policy actuator, driven by an out-of-process controller (`harness/flashdb_harness/layout_learner.py`): it rewrites a JSON policy file that the driver re-reads every window (`--policy-file`, `--policy-reload`), and the policy affects only new tiles and future merges because each tile stores its own page size. Nothing else about the layout is learned, and the policy is not persisted.
 
-| Learned (offline chooser, v0) | Fixed (v0) |
+| Learned (controller, v0) | Fixed (v0) |
 |---|---|
-| which `U` lookup prefixes to materialize (hot non-unique probes) | primary order = document handle |
-| which `R` reverse prefixes to retain (co-location of index entries) | all schema-declared `x-ref` reverse tiles materialized at create |
-| encoding per prefix (zstd level; BtrBlocks-class later) | compaction style (universal) |
-| compaction trigger per prefix-region | page size 16 KB (calibrated); tile target 32 MB |
+| per-region page size, `{4096, 65536}` | primary order = document handle (no clustering, no re-sorting) |
+| per-region compaction trigger, `merge_min_tiles` ∈ `{2, 8, 200}` | every declared `x-unique` `U` prefix and every declared `x-ref` `R` prefix is materialized — not chosen |
+| `index_order_no` for `P|StockMovement`: the derived `order_no → handle` access path, demand-gated and sticky per run | no compression and no per-prefix encoding (`engine/` has no codec dependency) |
+| — | page size 4096 and bloom 10 bits/key wherever the policy names nothing |
+| — | compaction run shape from the driver's `FLASHDB_COMPACT_SHAPE` (`cheapest_pair`, `ratio_group`, `budget_prefix`), merge budget per call |
+| — | region partition = `(family, entity)` prefix, selected by `FLASHDB_REGION_MODE`/`--region-mode`, not learned |
 
 Clustering-key learning (physically re-sorting documents) is deferred to v1 — it needs dual copies or a handle map and is not required to test the thesis. v0 has no speculation, so speculative/demand trace tagging is moot (SS-23 noted for v1).
 
@@ -96,25 +98,25 @@ Clustering-key learning (physically re-sorting documents) is deferred to v1 — 
 
 - **SS-16:** there is **no per-tile version field**. Versioning is per-document CSN in the key; validation is read-set CSN comparison; "self-describing tile" keeps layout metadata only.
 - **SS-24:** derived prefixes live in the same LSM and **do pay fsync**; the earlier claim that they skip it is retracted. `recomputable` now means: the prefix may be dropped and rebuilt from `P/` by scan, without violating I2.
-- **SS-18:** the scheduler contract is the group-commit paragraph above; v0 has no request-rewriting batcher, no admission control beyond the in-flight block cap (1024) and shed-by-class.
+- **SS-18:** the scheduler contract is the group-commit paragraph above; v0 has no request-rewriting batcher and no admission control — the only in-flight bounds are the driver's group size (`--group-requests`) and the barrier worker's `MAX_PENDING_BARRIERS`.
 - **SS-19:** `deadline` exists in the service class; v0 uses it only for shed priority and accounting, not for constraint evaluation.
 
 ## Resolution checklist
 
 | Finding | Resolution |
 |---|---|
-| SS-01 | one WAL barrier on the foreground; background checkpoint protocol; orphans collected |
-| SS-02 | immutable whole files + unlink-deferred by fd + snapshot horizon |
-| SS-03 | page granule (16 KB, calibrated by experiment 0a), directory in manifest/LRU, bandwidth + latency priced |
-| SS-04 | WAL + memtable + compaction; write-amplification budget |
-| SS-05 | snapshot reads + first-committer-wins on matched docs; scans unvalidated by design |
-| SS-06 | two named global structures: the keyspace layout (in the manifest) and the WAL position; tiles never relocated |
-| SS-09 | no relocation exists; compaction priced as LSM merge I/O; page-cache invalidation on tile drop |
+| SS-01 | one WAL barrier on the foreground; caller-driven checkpoint protocol; orphans ignored by discovery, not collected |
+| SS-02 | immutable whole files + unlink once the manifest stops naming them (no trash list); snapshot horizon withdrawn |
+| SS-03 | page granule is a per-region policy (4–64 KB, 4 KB default); directory kept in the tile with a sparse RAM index; bandwidth + latency priced |
+| SS-04 | WAL + memtable + compaction; write-amplification measured, not throttled |
+| SS-05 | first-committer-wins on matched docs; scans unvalidated by design (no historical reads, no snapshot parameter) |
+| SS-06 | two named global structures: the tile list plus live WAL segment (the manifest) and the prefix spelling in the keys; tiles never relocated |
+| SS-09 | no relocation exists; compaction priced as LSM merge I/O; no page-cache invalidation on tile drop is implemented |
 | SS-10 | dead — documents are atomic |
 | SS-11 | foreground fsyncs only the WAL fd |
 | SS-16 | no per-tile version; CSN in key |
 | SS-19/20 | deadline field; probe fields in read set; unique checks at publish |
-| SS-21 | whole-file allocation; WAL preallocated + rotated; ext4/XFS pinned; recovery ≤ ~2 s |
+| SS-21 | whole-file allocation; WAL rotated (preallocation not implemented); ext4/XFS pinned; recovery time is a design target, not enforced |
 | SS-22 | hop bound = dependent reads per hop, recorded in trace |
 | SS-24 | same LSM; recomputable = rebuildable prefix; fsync-saving claim retracted |
-| SS-25/26/28 | sequential claim retracted; A/B discipline + double-torn window documented; tile size owned by this document (32 MB target, autotunable) |
+| SS-25/26/28 | sequential claim retracted; A/B discipline + double-torn window documented; tile size is whatever a publish or bounded merge writes (no target in code) |
