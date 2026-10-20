@@ -39,7 +39,7 @@ cargo --config 'source.crates-io.replace-with="aliyun"' \
       test --workspace --offline
 ```
 
-Measured at revision `f1f9912`: 316 passed, 0 failed, 0 ignored, 27 test binaries, no compiler warnings. The Python harness is separate: `cd harness && env -u VIRTUAL_ENV uv run --with pytest pytest -q` -> 210 passed. Without the two `--config` flags cargo resolves against crates.io instead of the mirror; `--offline` also requires a warm cache, and an empty `CARGO_HOME` with `--offline` fails at resolution (`no matching package named serde`).
+Measured at revision `24c94f2`: 339 passed, 0 failed, 0 ignored, 27 test binaries, no compiler warnings. The Python harness is separate: `cd harness && env -u VIRTUAL_ENV uv run --with pytest pytest -q` -> 210 passed. Without the two `--config` flags cargo resolves against crates.io instead of the mirror; `--offline` also requires a warm cache, and an empty `CARGO_HOME` with `--offline` fails at resolution (`no matching package named serde`).
 
 ## What is in the tree
 

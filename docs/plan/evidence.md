@@ -29,9 +29,9 @@ The learner is a controller, not engine code: it rewrites the policy file the dr
 | Caller-driven checkpoint, WAL rotation onto a segment the manifest names, compaction over three run shapes with a per-region threshold | `engine/src/engine.rs` (`maybe_checkpoint`, `rotate_wal`, `maybe_compact_shape`, `compact`); `engine/src/manifest.rs` (`SegmentRef`) | `engine/tests/multi_tile.rs`, `engine/tests/region_compaction.rs`, `engine/tests/merge_threshold.rs`, `engine/tests/batch_commit.rs:243` |
 | Derived `order_no → handle` access path as a sidecar tile, hint-only, rebuilt at open, built from the merged memtable+tile view | `engine/src/index.rs`; `engine/src/bin/flashdb-load.rs` (`movement_rows`) | `engine/tests/order_no_index.rs` |
 | One blocking request shape (`cust → take`), fixed `params` and ops | `engine/src/request.rs:139-145` | `engine/tests/order_flow.rs` |
-| Deterministic trace generator and byte-frozen fixtures | `harness/flashdb_harness/generator.py` | `harness/tests/fixtures/*.jsonl`; `cd harness && env -u VIRTUAL_ENV uv run --with pytest pytest -q` → 210 passed at `f1f9912` |
+| Deterministic trace generator and byte-frozen fixtures | `harness/flashdb_harness/generator.py` | `harness/tests/fixtures/*.jsonl`; `cd harness && env -u VIRTUAL_ENV uv run --with pytest pytest -q` → 210 passed at `24c94f2` |
 | Device constants (page granularity, bandwidth, tail) | `bench/0a-redo.sh`, the `bench/nvme-bench/` crate | `.scratch/05-engine-v0/evidence/0a-redo/analysis.md`, `summary.json` |
-| Whole Rust workspace builds and passes | — | `cargo --config 'source.crates-io.replace-with="aliyun"' --config 'source.aliyun.registry="sparse+https://mirrors.aliyun.com/crates.io-index/"' test --workspace --offline` → 316 passed, 0 failed, 0 ignored, 27 binaries at `f1f9912` |
+| Whole Rust workspace builds and passes | — | `cargo --config 'source.crates-io.replace-with="aliyun"' --config 'source.aliyun.registry="sparse+https://mirrors.aliyun.com/crates.io-index/"' test --workspace --offline` → 339 passed, 0 failed, 0 ignored, 27 binaries at `24c94f2` |
 
 ## Absent, with the consequence
 
