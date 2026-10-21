@@ -14,7 +14,7 @@ id:      answers `inbox/2026-10-21-next-contract.md`; lands the verdict's four d
 1. **The four defects the verdict names are repaired, each with its reproduction run before and after
    at a named revision.** `defect-repros.sh <rev> present|absent` prints each observation and a verdict
    against its criterion and exits 0 only when all four match, so the run is the test: `e5fb0e1`
-   present (exit 0), `HEAD` absent (exit 0). d1 the mailbox README claims four header lines and lists
+   present (exit 0), `4eb236d` absent (exit 0). d1 the mailbox README claims four header lines and lists
    four, no `to:` line (direction is the directory); d2 no document claims one loadavg for every log —
    each citation now matches its log's line 1 (13.20 / 21.43 / 23.35 / 8.24), command `head -1
    .scratch/88-m3-notes/logs/*.out`; d3 max-over-rows is cited to `engine/tests/order_no_index.rs:171`
@@ -68,9 +68,9 @@ Not asking for anything tonight: the block is queued behind a trigger that did n
 gate refuses rather than reports. If you want M3 closed, the one thing that provides it is a quiet
 window on this box or a borrowed machine of the same storage class — nothing in this tree can make one.
 
-Evidence: commits `064f446`, `307ea39`, `f85785f`, `910f49f`, `9a26411`, `020fb65`;
+Evidence: commits `064f446`, `307ea39`, `f85785f`, `910f49f`, `9a26411`, `020fb65`, `4eb236d`;
 `.scratch/89-m3b-paired-200/{issues.md,defect-repros.sh,paired-200.sh,score-pair.py,instance-record.json}`;
-`logs/{defect-repros-before-e5fb0e1,defect-repros-final-head,paired-200-gate,window-observation,prepare-instance,scorer-plumbing-test-on-invalid-83}.out`.
+`logs/{defect-repros-before-e5fb0e1,defect-repros-after-4eb236d,paired-200-gate,window-observation,prepare-instance,scorer-plumbing-test-on-invalid-83}.out`.
 
 Effort: ~50 minutes of wall clock, idle class, no device held exclusively, one release build, ~3 GB of
 regenerable state, no arm run above the trigger and no number claimed from load.

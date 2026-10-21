@@ -1,5 +1,5 @@
-# defect repros at HEAD, expecting defects absent
-# loadavg at start: 5.46 7.63 9.84 6/2151 808145  (2026-10-21T22:35:38+08:00)
+# defect repros at 4eb236d, expecting defects absent
+# loadavg at start: 4.70 7.31 9.68 4/2145 808577  (2026-10-21T22:35:54+08:00)
 
 ## d1 mail/README.md (now inbox/README.md): the header count claimed vs the lines listed
   claims 'Four header lines': 1   lists header lines: 4
@@ -36,5 +36,5 @@
   re-derived from the committed log (115,888,464/188 and 793,037/188):
     before 616428 B/scan, after-tiled 4218 B/scan
 
-# loadavg at end: 5.46 7.63 9.84 2/2151 808193
+# loadavg at end: 4.70 7.31 9.68 3/2145 808625
 # RESULT: all four match the expected state (absent)

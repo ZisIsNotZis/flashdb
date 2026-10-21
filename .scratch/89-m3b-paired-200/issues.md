@@ -20,9 +20,9 @@ It also names four defects to repair at the source, each with its reproduction r
 verdict against its criterion; the exit code is 0 only when all four match the expected state, so the
 run is the test.
 
-| defect | criterion | before `e5fb0e1` | after `064f446` | repro |
+| defect | criterion | before `e5fb0e1` | after `4eb236d` | repro |
 |---|---|---|---|---|
-| d1 mailbox README | the header count it claims equals the lines it lists | claims four, lists five (`kind from to spend id`) | claims four, lists four | `logs/defect-repros-before-e5fb0e1.out`, `-after-064f446.out` |
+| d1 mailbox README | the header count it claims equals the lines it lists | claims four, lists five (`kind from to spend id`) | claims four, lists four | `logs/defect-repros-before-e5fb0e1.out`, `-after-4eb236d.out` |
 | d2 loadavg claim | a claim about "every log" is traceable to the logs | one mail asserts "loadavg 13.20 on the first line of every log"; the logs read 13.20 / 21.43 / 23.35 and 8.24 | no document claims one reading for every log; each citation matches its log's line 1 | same |
 | d3 M3 (a) citation | max-over-rows is cited to the test that binds it | `coverage_csn` = max covered csn attributed to `flashdb-load.rs:3065`, hits for `order_no_index.rs:171`: 0 | attributed to `order_no_index.rs:171` and `:221`; 3065 keeps only "a rebuild advances coverage" | same |
 | d4 M4 deliverable | a per-phase ledger for the M1 **and M3** records | `gap-analysis.md` §2 ledgers M1 only | §2.1 is the M3 record's ledger, time column marked historical | same |
