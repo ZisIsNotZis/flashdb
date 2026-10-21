@@ -110,13 +110,18 @@ tuned or re-measured.
 ## Current milestone
 
 **M3 — access-path parity** (ticket 83): reached on (a) and (c) and **deferred** on (b), whose quiet
-box does not exist here; `docs/plan/workplan.md` §M3 status carries the clause-by-clause state and the
-reopening condition. **M4**'s forensic report is delivered at `docs/plan/gap-analysis.md` and its
-acceptance is met as written — one reading, the ~573 ms group, is recorded **unmeasured** with its
-instrument named, and that instrument needs the same quiet box. So **the next milestone is M5**, and it
-is held, not idle: it needs a quiet window (person) and the postgres server reinstalled (person, raised
-as a cost report) and nothing in this tree can advance either. What the project does while it is held is
-the box-free work on M4's own ranked fix list — the record-side re-scoring of the M1 blocks under the
-decided lag rule and the barrier-path reading — because that can be done under load and it re-ranks what
-M5's re-run has to measure. Work packages, owners, acceptance and budgets are in
+box does not exist here; both readings are accepted by the layer above (2026-10-21), and WP-4's review of
+the evidence (PASS with notes) landed its three text notes at `31c85c6` with the runs that back them in
+`.scratch/88-m3-notes/`. `docs/plan/workplan.md` §M3 status carries the clause-by-clause state and the
+reopening condition. **M4** is met at `docs/plan/gap-analysis.md` — one reading, the ~573 ms group, is
+recorded **unmeasured** with its instrument named, and that instrument needs the same quiet box. So
+**the next milestone is M5**, and it is held, not idle: it needs a quiet window (person) and the postgres
+server reinstalled (person, raised as a cost report) and nothing in this tree can advance either. What
+the project does while it is held is the box-free work on M4's own ranked fix list, because that can be
+done under load and it re-ranks what M5's re-run has to measure: the record-side re-scoring of the M1
+blocks under the decided lag rule is **done** (WP-12: 0 of 45 rows move, so the headline is
+rule-invariant), the barrier-path reading is **in flight** as WP-6's code half (a WAL-preallocation
+switch, off by default, built and unit-tested; its timing verdict waits for the same quiet box), and what
+is left after those is fix #4's per-group phase timer, which is the instrument the ~573 ms group has no
+substitute for. Work packages, owners, acceptance and budgets are in
 `docs/plan/workplan.md`; the open-item inventory with leverage ranking is `docs/plan/open-items.md`.
