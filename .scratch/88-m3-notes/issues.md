@@ -34,7 +34,7 @@ were green; the documents were simply not pointing at them. They are now cited i
   coverage equals the csn the build snapshotted and advances to the rebuild's.
 - `startup_warm scan_entries` for a memtable-only region →
   `readahead::tests::warm_startup_counts_rows_that_live_only_in_the_memtable`
-  (`engine/src/readahead.rs:585`): `scan_entries == 2` with `active_tile_regions()` empty.
+  (`engine/src/readahead.rs:583`): `scan_entries == 2` with `active_tile_regions()` empty.
 - Both pass at `f38ec63` in `logs/workspace-head.out`.
 
 ## The review's note 3: the policy-off reading is restated with its limit
