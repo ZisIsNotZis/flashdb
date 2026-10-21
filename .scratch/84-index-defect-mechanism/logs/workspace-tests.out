@@ -1,6 +1,5 @@
-    Blocking waiting for file lock on package cache
-    Blocking waiting for file lock on package cache
-    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.04s
+== full suite ==
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.03s
      Running unittests src/lib.rs (target/debug/deps/flashdb_engine-0910e1580e762a65)
 
 running 136 tests
@@ -9,35 +8,35 @@ test bloom::tests::from_bytes_rejects_structural_damage ... ok
 test bloom::tests::zero_entry_filter_has_no_bits_set_and_rejects_everything ... ok
 test crc::tests::known_check_value ... ok
 test bloom::tests::round_trips_through_bytes ... ok
-test crc::tests::slice16_fallback_matches_reference ... ok
 test bloom::tests::false_positive_rate_at_10_bits_per_key ... ok
 test crc::tests::sse42_backend_matches_reference ... ok
 test crc::tests::one_shot_and_incremental_match_reference ... ok
-test crc::tests::one_byte_updates_compose_like_one_shot ... ok
+test crc::tests::slice16_fallback_matches_reference ... ok
 test bloom::tests::no_false_negatives_for_inserted_keys_and_their_prefixes ... ok
+test crc::tests::one_byte_updates_compose_like_one_shot ... ok
 test engine::tests::layout_policy_defaults_and_region_lookup ... ok
 test engine::tests::end_group_refuses_a_deferred_append_group ... ok
 test engine::tests::invalid_name_does_not_append_wal_or_advance_csn ... ok
-test engine::tests::commit_then_get ... ok
-test engine::tests::dedup_is_idempotent ... ok
-test engine::tests::end_group_after_a_failed_append_poisons_like_the_single_block_path ... ok
-test engine::tests::end_group_refuses_while_an_overlapped_barrier_is_in_flight ... ok
 test engine::tests::constraint_violation_rolls_back_whole_block ... ok
+test engine::tests::dedup_is_idempotent ... ok
+test engine::tests::end_group_refuses_while_an_overlapped_barrier_is_in_flight ... ok
+test engine::tests::commit_then_get ... ok
+test engine::tests::end_group_after_a_failed_append_poisons_like_the_single_block_path ... ok
 test engine::tests::a_delta_built_against_a_different_base_coverage_is_refused_and_changes_nothing ... ok
-test engine::tests::delete_frees_unique_and_hides_doc ... ok
-test engine::tests::overlapped_barrier_failure_is_observed_in_submission_order ... ok
-test engine::tests::recovery_replays_committed_blocks ... ok
 test engine::tests::overlapped_barrier_sync_error_fails_closed_and_poisons_the_wal ... ok
-test engine::tests::open_discover_fails_closed_on_pre_rotation_records_in_segment ... ok
+test engine::tests::delete_frees_unique_and_hides_doc ... ok
+test engine::tests::recovery_replays_committed_blocks ... ok
+test engine::tests::overlapped_barrier_failure_is_observed_in_submission_order ... ok
 test engine::tests::region_partitioned_tiles_are_single_region_and_ordered_by_region ... ok
+test engine::tests::open_discover_fails_closed_on_pre_rotation_records_in_segment ... ok
 test engine::tests::reopen_rejects_a_single_region_tile_holding_a_foreign_key ... ok
 test engine::tests::reopen_rejects_a_region_out_of_order_within_a_cutoff_group ... ok
 test engine::tests::open_discover_replays_segment_suffix_and_merges_checkpoint ... ok
 test engine::tests::same_block_sibling_reference_is_atomic ... ok
-test engine::tests::reverse_lookup_tracks_lifecycle ... ok
-test engine::tests::region_partitioned_publish_fault_leaves_the_previous_region_set_intact ... ok
-test engine::tests::get_probes_newest_first_across_tiles_and_memtable ... ok
 test engine::tests::published_and_compacted_tiles_carry_a_working_unique_bloom ... ok
+test engine::tests::region_partitioned_publish_fault_leaves_the_previous_region_set_intact ... ok
+test engine::tests::reverse_lookup_tracks_lifecycle ... ok
+test engine::tests::get_probes_newest_first_across_tiles_and_memtable ... ok
 test engine::tests::torn_wal_tail_drops_uncommitted_block ... ok
 test engine::tests::unique_lookup_tracks_reassignment_and_deletion ... ok
 test index::tests::the_merge_threshold_has_a_floor_a_ratio_and_an_absolute_cap ... ok
@@ -56,17 +55,17 @@ test keys::tests::unique_prefix_groups_by_value ... ok
 test keys::tests::zero_termination_prevents_prefix_collision ... ok
 test engine::tests::unique_transfer_and_last_overlay_operation ... ok
 test engine::tests::unique_tombstone_of_lower_handle_does_not_hide_live_higher_handle ... ok
-test engine::tests::unique_violation_then_distinct_value_succeeds ... ok
+test manifest::tests::chain_failures_make_that_page_invalid_and_fail_closed_without_fallback ... ok
 test manifest::tests::crc_torn_page_is_invalid_but_impossible_payload_is_corruption ... ok
 test manifest::tests::equal_seq_pages_fail_closed ... ok
 test manifest::tests::inline_root_files_still_open_byte_compatibly ... ok
-test manifest::tests::chain_failures_make_that_page_invalid_and_fail_closed_without_fallback ... ok
-test index::tests::a_merge_keeps_only_each_handles_newest_delta_entry ... ok
-test engine::tests::region_compaction_unlinks_retired_inputs_after_the_flip ... ok
-test manifest::tests::page_roundtrips_tiles_and_checkpoint ... ok
-test engine::tests::region_compaction_output_holds_only_its_region ... ok
+test engine::tests::unique_violation_then_distinct_value_succeeds ... ok
 test index::tests::an_empty_region_builds_a_zero_entry_sidecar ... ok
-test manifest::tests::chained_publish_write_failure_poisons_and_previous_page_wins ... ok
+test index::tests::a_merge_keeps_only_each_handles_newest_delta_entry ... ok
+test manifest::tests::page_roundtrips_tiles_and_checkpoint ... ok
+test engine::tests::region_compaction_unlinks_retired_inputs_after_the_flip ... ok
+test engine::tests::region_compaction_output_holds_only_its_region ... ok
+test manifest::tests::max_tiles_round_trips_within_the_chain_bound ... ok
 test manifest::tests::segment_roundtrips_and_structural_corruption_fails_closed ... ok
 test manifest::tests::valid_tile_name_bounds ... ok
 test memtable::tests::get_returns_newest_version ... ok
@@ -74,115 +73,115 @@ test memtable::tests::key_csn_roundtrip ... ok
 test memtable::tests::prefixes_are_isolated ... ok
 test memtable::tests::tombstone_hides_document ... ok
 test manifest::tests::open_missing_is_empty_and_created_manifest_starts_at_seq_zero ... ok
+test manifest::tests::chained_publish_write_failure_poisons_and_previous_page_wins ... ok
 test engine::tests::region_partitioned_compaction_merges_only_within_one_region ... ok
-test engine::tests::compact_publishes_one_tile_root_and_advances_manifest_seq ... ok
-test manifest::tests::chained_root_roundtrips_and_reopens ... ok
 test manifest::tests::publish_flips_slots_and_poisons_on_injected_io_errors ... ok
 test manifest::tests::open_selects_highest_valid_page_and_fails_closed_on_impossible_files ... ok
+test engine::tests::compact_publishes_one_tile_root_and_advances_manifest_seq ... ok
 test request::tests::request_read_lookups_extracts_the_probes_each_shape_pays ... ok
 test request::tests::request_scan_entities_names_only_the_full_entity_scans ... ok
+test manifest::tests::chained_root_roundtrips_and_reopens ... ok
 test tile::tests::absent_page_size_field_is_read_as_default ... ok
-test readahead::tests::warm_startup_counts_rows_that_live_only_in_the_memtable ... ok
 test tile::tests::bloom_bad_crc_rejected_at_open ... ok
+test readahead::tests::warm_startup_counts_rows_that_live_only_in_the_memtable ... ok
 test tile::tests::bloom_overlapping_data_region_rejected_at_open ... ok
 test tile::tests::bloom_past_directory_rejected_at_open ... ok
-test manifest::tests::max_tiles_round_trips_within_the_chain_bound ... ok
 test tile::tests::bloom_structure_rejected_at_open ... ok
-test readahead::tests::scan_prefix_warm_is_memoized_per_snapshot_and_reads_the_whole_entity ... ok
 test tile::tests::could_contain_prefix_has_no_false_negatives ... ok
-test tile::tests::dir_search_first_middle_last_and_absent ... ok
 test tile::tests::could_contain_prefix_boundaries ... ok
-test engine::tests::write_paths_honor_the_layout_policy ... ok
+test readahead::tests::scan_prefix_warm_is_memoized_per_snapshot_and_reads_the_whole_entity ... ok
 test readahead::tests::adopt_snapshot_rewinds_the_warm_cursor_only_when_the_tile_set_changes ... ok
+test tile::tests::dir_search_first_middle_last_and_absent ... ok
+test tile::tests::bloomed_tile_roundtrips_with_no_false_negatives_and_no_bloom_answers_true ... ok
+test tile::tests::flip_inside_data_block_detected_when_read_not_at_open ... ok
 test tile::tests::empty_tile_roundtrips ... ok
 test tile::tests::flip_inside_directory_detected_at_open ... ok
-test tile::tests::flip_inside_data_block_detected_when_read_not_at_open ... ok
-test tile::tests::bloomed_tile_roundtrips_with_no_false_negatives_and_no_bloom_answers_true ... ok
-test readahead::tests::tile_read_view_includes_the_adopted_order_no_index ... ok
-test readahead::tests::tile_read_view_resolves_published_unique_handles_without_the_memtable ... ok
+test engine::tests::write_paths_honor_the_layout_policy ... ok
 test tile::tests::many_entries_form_at_least_eight_blocks ... ok
+test tile::tests::custom_page_size_roundtrips_and_packs_larger_blocks ... ok
+test readahead::tests::tile_read_view_resolves_published_unique_handles_without_the_memtable ... ok
+test readahead::tests::tile_read_view_includes_the_adopted_order_no_index ... ok
 test tile::tests::prefix_successor_rule ... ok
-test tile::tests::overlapping_data_block_offsets_rejected_at_open ... ok
-test readahead::tests::warm_startup_walks_the_scan_prefix_and_the_adopted_index ... ok
 test tile::tests::set_bloom_twice_is_rejected ... ok
 test tile::tests::out_of_range_stored_page_size_rejected_at_open ... ok
 test tile::tests::oversized_entry_gets_its_own_block ... ok
-test tile::tests::custom_page_size_roundtrips_and_packs_larger_blocks ... ok
-test tile::tests::reordered_but_crc_valid_data_block_fails_closed_when_read ... ok
-test tile::tests::prefix_cursor_seeks_the_prefix_range_and_stops ... ok
+test tile::tests::overlapping_data_block_offsets_rejected_at_open ... ok
 test tile::tests::out_of_order_fence_keys_detected_at_open ... ok
+test tile::tests::prefix_cursor_seeks_the_prefix_range_and_stops ... ok
+test tile::tests::single_entry_roundtrips ... ok
+test tile::tests::reordered_but_crc_valid_data_block_fails_closed_when_read ... ok
 test tile::tests::streaming_writer_rejects_out_of_order_and_duplicate_keys ... ok
 test tile::tests::out_of_order_fence_keys_across_directory_blocks_detected_at_open ... ok
-test tile::tests::single_entry_roundtrips ... ok
-test tile::tests::writer_rejects_out_of_range_page_size ... ok
 test tile::tests::truncated_file_detected_at_open ... ok
 test tile::tests::untrusted_final_block_leaves_no_upper_bound ... ok
+test tile::tests::writer_rejects_out_of_range_page_size ... ok
+test readahead::tests::warm_startup_walks_the_scan_prefix_and_the_adopted_index ... ok
 test wal::tests::crc32c_matches_known_check_value ... ok
-test manifest::tests::publish_refuses_structurally_invalid_tile_lists_before_any_io ... ok
-test tile::tests::streaming_writer_gives_an_oversized_entry_its_own_block ... ok
 test tile::tests::sparse_index_spans_directory_blocks_and_seeks_correctly ... ok
-test wal::tests::append_replay_roundtrip ... ok
+test tile::tests::streaming_writer_gives_an_oversized_entry_its_own_block ... ok
 test wal::tests::empty_payload_rejected ... ok
 test tile::tests::streaming_writer_matches_memtable_write_byte_for_byte ... ok
+test wal::tests::append_replay_roundtrip ... ok
 test wal::tests::create_never_truncates_existing_wal ... ok
 test wal::tests::complete_corrupt_frame_fails_closed_without_truncation ... ok
+test manifest::tests::publish_refuses_structurally_invalid_tile_lists_before_any_io ... ok
 test wal::tests::impossible_nonzero_length_fails_closed ... ok
 test tile::tests::streaming_writer_handles_empty_and_exact_block_fill ... ok
-test wal::tests::replay_each_matches_replay_and_propagates_errors ... ok
 test wal::tests::oversized_payload_cannot_be_acknowledged_then_lost_on_replay ... ok
 test wal::tests::sync_failure_poison_requires_recovery_before_more_writes ... ok
+test wal::tests::replay_each_matches_replay_and_propagates_errors ... ok
+test wal::tests::partial_append_poison_prevents_later_ack_and_reopen_truncates ... ok
+test wal::tests::zeroed_region_is_log_tail ... ok
 test wal::tests::torn_tail_is_ignored ... ok
 test wal::tests::recover_truncates_then_continues ... ok
-test wal::tests::partial_append_poison_prevents_later_ack_and_reopen_truncates ... ok
-test manifest::tests::publish_replacing_retires_a_contiguous_run_and_fails_closed ... ok
-test wal::tests::zeroed_region_is_log_tail ... ok
 test tile::tests::streaming_writer_matches_memtable_write_with_and_without_bloom ... ok
+test manifest::tests::publish_replacing_retires_a_contiguous_run_and_fails_closed ... ok
 test wal::tests::zeroed_acknowledged_header_does_not_truncate_record ... ok
 test engine::tests::submit_group_at_the_in_flight_cap_leaves_the_group_open_for_retry ... ok
 test tile::tests::streaming_writer_periodic_sync_is_byte_identical ... ok
 
-test result: ok. 136 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 9.78s
+test result: ok. 136 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.65s
 
      Running unittests src/bin/flashdb-load.rs (target/debug/deps/flashdb_load-06d3ec55e1b908a2)
 
 running 35 tests
 test tests::argument_parsing_rejects_bad_input ... ok
-test tests::dry_run_flag_enables_the_host_stall_control ... ok
 test tests::compact_bytes_flag_enables_actuation_and_rejects_zero ... ok
+test tests::dry_run_flag_enables_the_host_stall_control ... ok
 test tests::key_encoding_flag_selects_and_rejects ... ok
 test tests::lag_ceiling_flag_parses_and_defaults ... ok
-test tests::max_tiles_flag_parses_and_bounds ... ok
 test tests::metrics_json_flag_is_parsed_off_by_default ... ok
-test tests::metrics_json_line_carries_group_statistics_and_min_lag ... ok
+test tests::max_tiles_flag_parses_and_bounds ... ok
 test tests::metrics_json_line_carries_per_region_compaction_fields ... ok
+test tests::metrics_json_line_carries_group_statistics_and_min_lag ... ok
 test tests::metrics_json_line_carries_the_index_scan_time ... ok
 test tests::metrics_json_line_carries_the_rejection_and_wall_time_fields ... ok
 test tests::peak_report_flag_is_parsed_off_by_default ... ok
 test tests::percentile_uses_nearest_rank_and_handles_tails ... ok
+test tests::metrics_json_line_freezes_the_wrapper_field_names ... ok
 test tests::policy_file_and_reload_flags_are_parsed ... ok
 test tests::proc_counters_since_differences_and_never_underflows ... ok
 test tests::rate_segments_split_by_request_count_and_clamp ... ok
 test tests::rate_segments_split_evenly_without_explicit_size ... ok
-test tests::metrics_json_line_freezes_the_wrapper_field_names ... ok
 test tests::ready_group_never_consumes_a_future_request ... ok
+test tests::ready_group_stops_at_the_offered_rate_boundary ... ok
+test tests::record_group_lag_and_service_split_dispatch_and_completion_scopes ... ok
 test tests::region_mode_flag_selects_and_rejects ... ok
 test tests::reject_reason_names_which_ceiling_failed ... ok
-test tests::record_group_lag_and_service_split_dispatch_and_completion_scopes ... ok
-test tests::ready_group_stops_at_the_offered_rate_boundary ... ok
 test tests::wal_maintenance_flags_are_parsed ... ok
 test tests::index_scan_is_zero_when_no_index_snapshot_runs ... ok
 test tests::the_end_of_run_drain_adopts_and_charges_the_last_boundary_build ... ok
-test tests::a_quiet_region_rebuilds_only_at_the_stale_bound ... ok
 test tests::a_stale_adopted_index_is_rebuilt_and_coverage_advances ... ok
+test tests::a_quiet_region_rebuilds_only_at_the_stale_bound ... ok
 test tests::an_over_bound_snapshot_skips_the_rebuild_and_keeps_the_adopted_index ... ok
 test tests::a_startup_refusal_continues_while_a_scan_error_aborts ... ok
+test tests::the_end_of_run_drain_merges_a_delta_that_reached_the_threshold ... ok
 test tests::a_refused_build_is_not_retried_until_the_policy_toggles ... ok
 test tests::an_over_bound_delta_tile_half_skips_the_build_and_keeps_the_adopted_index ... ok
-test tests::the_end_of_run_drain_merges_a_delta_that_reached_the_threshold ... ok
 test tests::a_delta_collected_after_a_policy_reload_is_discarded_not_latched ... ok
 test tests::incremental_index_writes_at_most_twice_the_row_bytes ... ok
 
-test result: ok. 35 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.87s
+test result: ok. 35 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.67s
 
      Running unittests src/bin/flashdb-replay.rs (target/debug/deps/flashdb_replay-20f916240367c5f6)
 
@@ -200,24 +199,24 @@ test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
 
 running 9 tests
 test empty_batch_is_a_no_op ... ok
-test intra_batch_duplicate_is_rejected_and_persists_nothing ... ok
 test batch_of_n_commits_all_blocks_with_n_csns ... ok
 test crash_recovery_replays_a_batch_appended_wal_in_order ... ok
+test intra_batch_duplicate_is_rejected_and_persists_nothing ... ok
 test intra_batch_release_then_reuse_is_legal ... ok
 test batch_of_one_is_byte_identical_to_commit_block ... ok
 test retry_inside_a_batch_returns_existing_csn_without_appending ... ok
 test batch_of_n_is_byte_identical_to_n_single_commits ... ok
 test republish_guard_and_rotation_work_after_a_batch ... ok
 
-test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.29s
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.14s
 
      Running tests/compaction_job.rs (target/debug/deps/compaction_job-cacfd7f121801341)
 
 running 5 tests
 test replay_file_is_bounded_to_the_captured_valid_len ... ok
 test apply_compaction_job_rejects_mismatched_digest_or_cutoff ... ok
-test missing_replacement_tile_fails_reopen_after_manifest_writeback ... ok
 test lazy_apply_can_be_made_manifest_durable_and_still_reopens ... ok
+test missing_replacement_tile_fails_reopen_after_manifest_writeback ... ok
 test job_build_apply_matches_sync_merge_and_reopens ... ok
 
 test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
@@ -230,13 +229,13 @@ test intra_block_release_then_reuse_is_legal ... ok
 test intra_block_unique_swap_is_legal ... ok
 test intra_block_release_then_reuse_works_across_a_published_tile ... ok
 
-test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.16s
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
 
      Running tests/family_colocation.rs (target/debug/deps/family_colocation-5d083472bfa814bc)
 
 running 3 tests
-test entity_first_reads_duplicate_owner_invariant_and_reopen ... ok
 test entity_first_puts_each_entitys_three_families_in_one_tile ... ok
+test entity_first_reads_duplicate_owner_invariant_and_reopen ... ok
 test family_first_keeps_each_family_in_its_own_tile ... ok
 
 test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
@@ -245,8 +244,8 @@ test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
 
 running 12 tests
 test group_phase_accounting_attributes_and_resets ... ok
-test deferred_append_buffers_on_the_pacer_and_lands_on_the_worker ... ok
 test a_complete_barrier_replays_the_whole_group ... ok
+test deferred_append_buffers_on_the_pacer_and_lands_on_the_worker ... ok
 test grouped_n_blocks_produce_n_csns ... ok
 test grouped_api_fails_closed_outside_and_around_a_group ... ok
 test conflict_in_the_middle_of_a_group_is_per_block ... ok
@@ -257,52 +256,52 @@ test overlapped_barriers_drain_in_order_and_recover ... ok
 test grouped_requests_are_byte_identical_to_sequential_requests ... ok
 test republish_guard_and_rotation_work_after_a_group ... ok
 
-test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.21s
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.18s
 
      Running tests/index_defect_mechanism.rs (target/debug/deps/index_defect_mechanism-8191bb4ffd7d72ed)
 
 running 1 test
 test index_defect_mechanism_is_gone_on_the_append_heavy_instance ... ok
 
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 20.07s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 18.18s
 
      Running tests/manifest_engine.rs (target/debug/deps/manifest_engine-06ebda6922a63508)
 
 running 6 tests
 test torn_manifest_create_is_reported_with_remediation_hint ... ok
-test manifest_durable_but_engine_crashed_before_flip_recovers_new_root ... ok
 test manifest_tile_reference_disagreeing_with_tile_header_fails_closed ... ok
+test manifest_durable_but_engine_crashed_before_flip_recovers_new_root ... ok
 test torn_or_corrupt_manifest_fails_closed_and_wal_only_open_still_works ... ok
 test publish_survives_reopen_via_manifest_and_ignores_unreferenced_tiles ... ok
 test adoption_refuses_manifest_with_active_tile_and_accepts_empty_root ... ok
 
-test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.20s
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.17s
 
      Running tests/merge_threshold.rs (target/debug/deps/merge_threshold-21565556f97531d6)
 
 running 8 tests
 test policy_file_schema_round_trips_and_rejects_invalid_input ... ok
-test explicit_compact_ignores_the_threshold_and_collapses_a_region ... ok
-test recovery_after_threshold_compaction_reopens_with_the_same_data ... ok
 test a_region_below_its_threshold_defers_and_merges_once_it_reaches_it ... ok
+test explicit_compact_ignores_the_threshold_and_collapses_a_region ... ok
 test a_region_at_its_threshold_does_not_remerge_without_new_tiles ... ok
+test recovery_after_threshold_compaction_reopens_with_the_same_data ... ok
 test two_regions_with_different_thresholds_compact_independently ... ok
-test an_eager_region_is_not_held_back_by_a_lazy_neighbour ... ok
 test default_policy_reproduces_todays_compaction_byte_for_byte ... ok
+test an_eager_region_is_not_held_back_by_a_lazy_neighbour ... ok
 
 test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
 
      Running tests/metrics.rs (target/debug/deps/metrics-11288ad273514e7a)
 
 running 15 tests
-test disabled_mode_records_no_regions ... ok
 test disabled_mode_resolves_and_records_nothing ... ok
+test disabled_mode_records_no_regions ... ok
 test region_index_output_is_separate_from_compaction_bytes ... ok
-test window_rollup_moves_region_counters_and_omits_idle_regions ... ok
 test window_rollup_moves_counts_to_previous_and_clears_current ... ok
+test window_rollup_moves_region_counters_and_omits_idle_regions ... ok
+test region_json_dump_is_deterministic_and_uses_frozen_field_names ... ok
 test pattern_cap_folds_extra_patterns_into_other ... ok
 test same_inputs_produce_the_same_snapshot ... ok
-test region_json_dump_is_deterministic_and_uses_frozen_field_names ... ok
 test region_cap_folds_extra_regions_into_other ... ok
 test engine_instruments_each_read_path_and_commit ... ok
 test region_counters_attribute_probes_misses_reads_writes_and_commits ... ok
@@ -311,7 +310,7 @@ test histogram_p99_matches_direct_percentile_within_tolerance ... ok
 test region_compaction_counters_attribute_the_merged_output_to_its_region ... ok
 test p99_estimator_error_on_known_exponential_distribution ... ok
 
-test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.18s
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.21s
 
      Running tests/multi_tile.rs (target/debug/deps/multi_tile-d60892b0f0265621)
 
@@ -319,51 +318,51 @@ running 33 tests
 test checkpoint_name_collision_fails_closed_without_side_effects ... ok
 test compact_refuses_under_two_tiles_and_leftover_candidates ... ok
 test compact_after_rotation_spans_the_segment_floor_and_reopens ... ok
-test compact_merges_tiles_into_one_and_serves_latest_state ... ok
 test compacted_tile_carries_a_working_unique_bloom ... ok
-test compaction_name_owned_by_live_tile_fails_closed_without_hint_to_delete ... ok
-test compaction_output_name_collides_with_its_own_newest_input_and_is_disambiguated ... ok
 test compact_releases_the_max_tiles_bound ... ok
+test compaction_name_owned_by_live_tile_fails_closed_without_hint_to_delete ... ok
+test compact_merges_tiles_into_one_and_serves_latest_state ... ok
+test compaction_output_name_collides_with_its_own_newest_input_and_is_disambiguated ... ok
 test maybe_checkpoint_triggers_only_past_threshold_and_advances_root ... ok
 test maybe_compact_chooses_the_cheapest_run_and_the_oldest_on_ties ... ok
 test manifest_refuses_more_than_max_tiles ... ok
 test maybe_compact_selects_nothing_below_the_cap ... ok
+test compact_shape_budget_prefix_grows_to_the_cap_boundary ... ok
 test bounded_compaction_keeps_cutoffs_disjoint_and_reopens_across_rounds ... ok
-test compact_shape_cheapest_pair_merges_the_exact_budget_pair_and_skips_the_middle_giant ... ok
-test overlapping_or_out_of_order_cutoffs_are_rejected ... ok
 test multi_tile_publish_cross_tier_reads_and_checkpointed_reopen ... ok
+test overlapping_or_out_of_order_cutoffs_are_rejected ... ok
 test publish_fails_closed_when_retained_wal_disagrees_with_serving_memtable ... ok
 test rotation_crash_windows_leave_recoverable_state ... ok
 test range_filter_preserves_scan_merged_results_across_tiles ... ok
 test tiles_and_compaction_keep_only_the_newest_version_per_logical_key ... ok
 test unique_bloom_keeps_a_tombstone_tile_consulted ... ok
-test compact_shape_ratio_group_merges_the_group_and_stops_at_the_ratio_boundary ... ok
+test compact_shape_budget_prefix_prefers_the_smaller_neighbour_and_stops_at_the_budget ... ok
 test unique_bloom_preserves_reads_and_rejects_in_range_absent_values ... ok
 test wal_rotation_rebinds_to_fresh_segment_and_drops_pre_rotation_ids ... ok
-test compact_shape_budget_prefix_prefers_the_smaller_neighbour_and_stops_at_the_budget ... ok
 test compact_shape_ratio_group_does_not_cross_a_middle_giant ... ok
-test compact_shape_budget_prefix_grows_to_the_cap_boundary ... ok
-test compact_shape_all_oversized_falls_back_to_the_two_smallest_adjacent ... ok
+test compact_shape_cheapest_pair_merges_the_exact_budget_pair_and_skips_the_middle_giant ... ok
+test compact_shape_ratio_group_merges_the_group_and_stops_at_the_ratio_boundary ... ok
 test compact_shapes_differ_on_one_size_pattern ... ok
+test compact_shape_all_oversized_falls_back_to_the_two_smallest_adjacent ... ok
 test compaction_streams_a_multi_block_merge_and_reopens ... ok
 test maybe_compact_falls_back_to_the_two_smallest_adjacent_tiles ... ok
 test maybe_compact_skips_an_oversized_middle_tile ... ok
 test bounded_compaction_skips_a_giant_middle_tier_across_rounds ... ok
 
-test result: ok. 33 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.28s
+test result: ok. 33 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.26s
 
      Running tests/order_flow.rs (target/debug/deps/order_flow-51396f14d21d3d9b)
 
 running 7 tests
-test insufficient_stock_only_backorder_and_replay ... ok
-test actual_python_generator_fixture_executes_through_engine ... ok
 test read_fallback_binds_applied_result_and_missing_customer_skips_write ... ok
-test malformed_or_conflicting_request_cannot_partially_write ... ok
+test insufficient_stock_only_backorder_and_replay ... ok
 test generator_order_flow_atomic_success_dedup_and_reopen ... ok
+test actual_python_generator_fixture_executes_through_engine ... ok
+test malformed_or_conflicting_request_cannot_partially_write ... ok
 test same_id_different_payload_executes_as_new_request_business_uniqueness_guards ... ok
 test order_and_backorder_numbers_are_exclusive_across_requests_and_reopen ... ok
 
-test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.17s
 
      Running tests/order_no_index.rs (target/debug/deps/order_no_index-cb87553bdcee0bd6)
 
@@ -371,24 +370,24 @@ running 19 tests
 test index_field_and_entity_names_are_the_observed_predicate ... ok
 test rebuild_trigger_needs_moved_state_and_a_reason ... ok
 test index_build_fails_when_the_source_visits_nothing_for_a_region_that_holds_rows ... ok
+test index_build_covers_rows_that_live_only_in_the_memtable ... ok
 test coverage_floor_covers_the_state_a_tombstone_hides ... ok
 test index_holds_one_entry_per_live_row_across_versions_and_deletes ... ok
-test index_build_covers_rows_that_live_only_in_the_memtable ... ok
-test a_second_concurrent_index_job_is_refused ... ok
-test movement_scan_falls_back_to_full_scan_when_index_absent ... ok
 test index_builder_rejects_a_non_string_order_no ... ok
+test movement_scan_falls_back_to_full_scan_when_index_absent ... ok
 test a_rebuild_reads_no_tile_on_the_thread_that_schedules_it ... ok
+test movement_scan_uses_order_no_index_when_present ... ok
 test the_inline_memtable_snapshot_is_bounded_and_copies_nothing_over_the_bound ... ok
 test movement_scan_falls_back_for_a_movement_newer_than_the_index ... ok
-test movement_scan_uses_order_no_index_when_present ... ok
+test a_second_concurrent_index_job_is_refused ... ok
 test region_signal_reads_the_tile_before_the_memtable ... ok
-test a_delta_reads_a_tile_resident_tombstone_above_the_coverage ... ok
-test rebuilt_index_drops_a_handle_whose_tombstone_is_tile_resident ... ok
 test rebuilt_index_takes_the_memtable_version_and_drops_a_tombstoned_handle ... ok
+test rebuilt_index_drops_a_handle_whose_tombstone_is_tile_resident ... ok
+test a_delta_reads_a_tile_resident_tombstone_above_the_coverage ... ok
 test the_delta_answers_rows_above_the_coverage_and_hides_base_entries_until_the_merge ... ok
 test region_witness_reads_a_global_tiles_first_key_in_both_directions ... ok
 
-test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.51s
+test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.29s
 
      Running tests/partitioned_publish_cap.rs (target/debug/deps/partitioned_publish_cap-1bf12cc889d88c4e)
 
@@ -396,7 +395,7 @@ running 2 tests
 test shipped_default_cadence_keeps_a_per_region_run_under_the_cap ... ok
 test per_region_publish_over_the_cap_fails_closed ... ok
 
-test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.81s
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.74s
 
      Running tests/read_requests.rs (target/debug/deps/read_requests-c7e5984dfdce89de)
 
@@ -407,26 +406,26 @@ test movement_scan_caps_total_retained_bytes ... ok
 test movement_scan_reads_latest_state_tombstones_and_ordered_top_100 ... ok
 test movement_cap_applies_to_final_top_100_not_evicted_prefix ... ok
 
-test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.58s
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.80s
 
      Running tests/region_compaction.rs (target/debug/deps/region_compaction-bbd4896429af8ffe)
 
 running 3 tests
-test floor_spanning_region_compaction_reopens ... ok
 test region_compaction_leaves_no_orphan_tile_files ... ok
+test floor_spanning_region_compaction_reopens ... ok
 test region_compaction_leaves_every_read_surface_identical ... ok
 
-test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
 
      Running tests/region_partition.rs (target/debug/deps/region_partition-97bee90982ae7afa)
 
 running 6 tests
 test partitioned_reopen_rejects_a_region_out_of_order_or_duplicated ... ok
-test per_region_policy_applies_and_reading_never_needs_it ... ok
-test rotation_then_reopen_works_with_several_tiles_per_cutoff ... ok
-test reads_are_identical_to_a_global_engine_and_survive_reopen ... ok
 test region_rule_is_entity_and_key_family ... ok
+test rotation_then_reopen_works_with_several_tiles_per_cutoff ... ok
+test per_region_policy_applies_and_reading_never_needs_it ... ok
 test compaction_merges_only_within_a_region ... ok
+test reads_are_identical_to_a_global_engine_and_survive_reopen ... ok
 
 test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
 
@@ -437,21 +436,21 @@ test repeated_hot_key_depletes_stock_then_backorders_without_movement ... ok
 test malformed_or_partial_trace_stops_at_line_without_claiming_hash ... ok
 test mixed_generator_corpus_executes_and_recovers_with_independent_stock_oracle ... ok
 
-test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.23s
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.22s
 
      Running tests/request_commit.rs (target/debug/deps/request_commit-bcbe5d5144aa6ec0)
 
 running 8 tests
-test repeated_block_id_across_two_requests_replays_the_first_and_costs_no_csn ... ok
 test two_requests_inserting_the_same_value_first_in_input_order_wins ... ok
+test repeated_block_id_across_two_requests_replays_the_first_and_costs_no_csn ... ok
 test duplicate_block_id_within_one_request_is_refused_and_changes_nothing ... ok
+test delete_then_reinsert_the_same_value_with_a_new_handle_commits ... ok
 test earlier_request_releases_a_value_a_later_request_takes ... ok
 test one_conflicting_request_leaves_its_neighbours_committed_without_a_csn_gap ... ok
 test swap_a_value_between_two_rows_in_one_block_commits ... ok
-test delete_then_reinsert_the_same_value_with_a_new_handle_commits ... ok
 test one_request_deleting_then_adding_an_owner_for_the_same_prefix_commits ... ok
 
-test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
 
      Running tests/scale_bin.rs (target/debug/deps/scale_bin-2eaf99fb6bcaaabf)
 
@@ -459,7 +458,7 @@ running 2 tests
 test seed_inventory_checkpoint_publishes_tiles_and_empties_memtable ... ok
 test seed_then_verify_roundtrip ... ok
 
-test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.15s
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.20s
 
      Running tests/tile_format.rs (target/debug/deps/tile_format-a2d98d9006f07ed3)
 
@@ -468,7 +467,7 @@ test new_superblock_fields_are_covered_by_the_superblock_crc ... ok
 test directory_corruption_is_rejected_at_engine_open_and_wal_stays_authoritative ... ok
 test multi_block_tile_roundtrips_and_directory_indexes_every_block ... ok
 
-test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.18s
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.25s
 
      Running tests/tile_layout.rs (target/debug/deps/tile_layout-3b15ba3aef1f31df)
 
@@ -477,17 +476,17 @@ test out_of_range_stored_page_size_rejected_at_open ... ok
 test absent_page_size_field_is_read_as_default ... ok
 test mixed_layout_directory_reads_after_reopen ... ok
 
-test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.19s
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.17s
 
      Running tests/tile_read.rs (target/debug/deps/tile_read-7ffff97a0246b3bd)
 
 running 12 tests
 test tile_mutation_child ... ok
+test interrupted_build_and_corrupt_or_missing_tile_fail_closed_wal_rebuild_explicit ... ok
 test point_read_checks_traversed_records_not_unrelated_later_entries ... ok
 test tile_malformed_key_with_valid_crc_returns_error_not_panic ... ok
-test tile_superblock_magic_pins_the_fdbtile3_format ... ok
 test tile_value_with_recomputed_crc_disagrees_with_retained_wal ... ok
-test interrupted_build_and_corrupt_or_missing_tile_fail_closed_wal_rebuild_explicit ... ok
+test tile_superblock_magic_pins_the_fdbtile3_format ... ok
 test cutoff_before_latest_replays_only_uncovered_versions_and_checks_tile_owner ... ok
 test covered_tombstones_are_the_newest_state_and_allow_new_owners ... ok
 test tile_requires_complete_matching_wal_prefix_and_survives_torn_newer_tail ... ok
@@ -509,4 +508,3 @@ running 0 tests
 
 test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
 
-exit=0

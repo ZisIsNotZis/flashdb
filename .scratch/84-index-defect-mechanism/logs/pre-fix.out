@@ -1,4 +1,26 @@
-    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.06s
+== BEFORE (pre-fix f584ecc) ==
+   Compiling version_check v0.9.5
+   Compiling proc-macro2 v1.0.107
+   Compiling unicode-ident v1.0.26
+   Compiling quote v1.0.47
+   Compiling typenum v1.20.1
+   Compiling serde_core v1.0.229
+   Compiling zmij v1.0.23
+   Compiling serde_json v1.0.151
+   Compiling serde v1.0.229
+   Compiling cpufeatures v0.2.17
+   Compiling memchr v2.8.3
+   Compiling itoa v1.0.18
+   Compiling cfg-if v1.0.5
+   Compiling generic-array v0.14.7
+   Compiling syn v3.0.6
+   Compiling block-buffer v0.10.4
+   Compiling crypto-common v0.1.7
+   Compiling digest v0.10.7
+   Compiling sha2 v0.10.9
+   Compiling serde_derive v1.0.229
+   Compiling flashdb-engine v0.1.0 (/home/z/vibe/flashdb/.worktrees/pre-fix-84/engine)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 17.78s
      Running tests/index_defect_mechanism.rs (target/debug/deps/index_defect_mechanism-8191bb4ffd7d72ed)
 
 running 1 test
@@ -8,7 +30,7 @@ arm=build index_entries=0 movements=2785
 arm=after requests=188 scans_entered=188 bytes_read=115888464 bytes_per_scan=616428 ok=188 empty=0 movement_row_probes=0
 arm=after index_adopted=1
 
-thread 'index_defect_mechanism_is_gone_on_the_append_heavy_instance' (48120) panicked at engine/tests/index_defect_mechanism.rs:260:5:
+thread 'index_defect_mechanism_is_gone_on_the_append_heavy_instance' (69936) panicked at engine/tests/index_defect_mechanism.rs:260:5:
 assertion `left == right` failed: one index entry per movement row, from the merged view
   left: 0
  right: 2785
@@ -20,7 +42,6 @@ failures:
 failures:
     index_defect_mechanism_is_gone_on_the_append_heavy_instance
 
-test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 33.43s
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 27.66s
 
 error: test failed, to rerun pass `-p flashdb-engine --test index_defect_mechanism`
-exit=101
