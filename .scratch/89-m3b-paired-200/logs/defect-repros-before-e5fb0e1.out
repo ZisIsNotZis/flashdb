@@ -1,5 +1,5 @@
 # defect repros at e5fb0e1, expecting defects present
-# loadavg at start: 15.53 13.45 11.79 9/2360 728176  (2026-10-21T22:11:42+08:00)
+# loadavg at start: 5.46 7.63 9.84 19/2151 808037  (2026-10-21T22:35:37+08:00)
 
 ## d1 mail/README.md (now inbox/README.md): the header count claimed vs the lines listed
   claims 'Four header lines': 1   lists header lines: 5
@@ -36,5 +36,5 @@
   re-derived from the committed log (115,888,464/188 and 793,037/188):
     before 616428 B/scan, after-tiled 4218 B/scan
 
-# loadavg at end: 15.53 13.45 11.79 19/2301 728242
+# loadavg at end: 5.46 7.63 9.84 5/2151 808085
 # RESULT: all four match the expected state (present)

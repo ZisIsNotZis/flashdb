@@ -44,9 +44,10 @@ echo
 echo "## d2 a document claiming ONE loadavg for EVERY log, against the logs themselves"
 echo "  head -1 .scratch/88-m3-notes/logs/*.out .scratch/85-m3-clause-c/workspace-pinned.out:"
 head -1 .scratch/88-m3-notes/logs/*.out .scratch/85-m3-clause-c/workspace-pinned.out 2>/dev/null | sed 's/^/    /'
-# `inbox/` is excluded: a message quoting the defective sentence while reporting it is not a
-# document asserting it, and messages are landed and deleted rather than owned.
-claims=$(git grep -l "first line of every log" "$REV" -- '*.md' ':!inbox/' 2>/dev/null || true)
+# `inbox/` and `.scratch/` are excluded: a message or a measurement record quoting the defective
+# sentence while reporting it is not a document asserting it. The criterion is about the project's
+# own documents (`docs/`, README, AGENTS.md).
+claims=$(git grep -l "first line of every log" "$REV" -- '*.md' ':!inbox/' ':!.scratch/' 2>/dev/null || true)
 echo "  documents claiming it: ${claims:-none}"
 if [ -n "$claims" ]; then verdict 1 "$claims"; else verdict 0 "no document claims one reading for every log"; fi
 
