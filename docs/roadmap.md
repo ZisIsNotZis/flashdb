@@ -30,10 +30,10 @@ changed here.
   That defect is fixed and the fix is **measured, not argued** (ticket 84): on a rebuilt instance of
   this record's shape the index holds 2,785 entries for 2,785 rows against 0 before the fix, 0 of 188
   scan requests enter the merged scan, and read bytes per request fall 42,240 → 13,466 against the
-  predicted 43,298 → 13,460. **The 200 rps comparison itself is `unmeasured`** (decision 7): the window is granted on a
-  trigger (loadavg under 2 for one minute, no other agent writing in this tree) and no paired block has
-  run, so no throughput number is claimed anywhere; the arms and the chain that regenerates what they
-  need are `.scratch/89-m3b-paired-200/`.
+  predicted 43,298 → 13,460. **The 200 rps comparison itself is `unmeasured`** (decision 7): the window
+  is granted on a trigger (loadavg under 2 for one minute, no other agent writing in this tree) and no
+  paired block has run, so no throughput number is claimed anywhere; the arms and the chain that
+  regenerates what they need are `.scratch/89-m3b-paired-200/`.
 - **Learner (pilot-grade, 3 seeds + 1 repeat, 12.25x):** T1 supported (+41.3% to +50.7%, median
   +47.6%, vs a ~4.0% noise band); T2 supported (reorg median 0.933x, 0 index builds on the 0-scan
   region); T3 supported (median 0.767x, max 0.941x); T4 evaluable, **not supported** (a real ~8-9%
@@ -88,11 +88,11 @@ roadmap's own text means.
 7. **The quiet window is granted on a trigger, and (b) may not be deferred a third time.** The layer
    above granted one exclusive window in root's contract (`e5fb0e1:inbox/2026-10-21-next-contract.md`,
    deleted after landing): the trigger is `uptime` reading loadavg under 2 for one minute with no other
-   agent writing in this tree, and the reading the block started at is recorded in the log. The pair lives in `.scratch/89-m3b-paired-200/`. What the
-   grant changes: clause (b) is `unmeasured` until a block runs — not "deferred", which names a state
-   where nobody is expected to measure it — and its instrument (the paired block, the regeneration
-   chain, the trigger) is written where the clause is. Everything else in the tree runs under load and
-   does not wait for the window.
+   agent writing in this tree, and the reading the block started at is recorded in the log. The pair
+   lives in `.scratch/89-m3b-paired-200/`. What the grant changes: clause (b) is `unmeasured` until a
+   block runs — not "deferred", which names a state where nobody is expected to measure it — and its
+   instrument (the paired block, the regeneration chain, the trigger) is written where the clause is.
+   Everything else in the tree runs under load and does not wait for the window.
 
 ## Milestones
 
