@@ -1,0 +1,40 @@
+# defect repros at e5fb0e1, expecting defects present
+# loadavg at start: 15.53 13.45 11.79 9/2360 728176  (2026-10-21T22:11:42+08:00)
+
+## d1 mail/README.md (now inbox/README.md): the header count claimed vs the lines listed
+  claims 'Four header lines': 1   lists header lines: 5
+  listed: kind: from: to: spend: id: 
+  VERDICT: defect present, as expected
+  (claim=1 listed=5)
+
+## d2 a document claiming ONE loadavg for EVERY log, against the logs themselves
+  head -1 .scratch/88-m3-notes/logs/*.out .scratch/85-m3-clause-c/workspace-pinned.out:
+    ==> .scratch/88-m3-notes/logs/index-defect-mechanism-rowbytes.out <==
+    # loadavg at start: 21.43 9.69 5.45 34/2403 640656
+    
+    ==> .scratch/88-m3-notes/logs/workspace-after-rowbytes.out <==
+    # loadavg at start: 23.35 14.30 7.68 25/2382 651541
+    
+    ==> .scratch/88-m3-notes/logs/workspace-head.out <==
+    # loadavg at start: 13.20 5.78 3.96 24/2290 636010
+    
+    ==> .scratch/85-m3-clause-c/workspace-pinned.out <==
+    == M3 clause (c), clause 1: the pinned-flag workspace suite at ba248dd on 2026-10-21T04:39Z, loadavg 8.24 10.35 8.29 ==
+  documents claiming it: e5fb0e1:mail/2026-10-22-m3-evidence-closed-m4-met.md
+  VERDICT: defect present, as expected
+  (e5fb0e1:mail/2026-10-22-m3-evidence-closed-m4-met.md)
+
+## d3 docs/roadmap.md M3 (a): max-over-rows cited to the test that binds it
+  cites order_no_index.rs:171 (max over the rows): 0   attributes max-csn to flashdb-load.rs:3065: 1
+  VERDICT: defect present, as expected
+  (strong=0 weak=1)
+
+## d4 docs/plan/gap-analysis.md: the M3 record's per-phase ledger the M4 deliverable names
+  §2.1 present: 0
+  VERDICT: defect present, as expected
+  (the ledger is M1-only)
+  re-derived from the committed log (115,888,464/188 and 793,037/188):
+    before 616428 B/scan, after-tiled 4218 B/scan
+
+# loadavg at end: 15.53 13.45 11.79 19/2301 728242
+# RESULT: all four match the expected state (present)
