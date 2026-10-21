@@ -6,8 +6,9 @@ exactly as the both-ceilings reducer reported — and it cannot change, because 
 was ever scored with a service ceiling**: both record-producing paths call
 `summarize_curve(windows, None)` (`harness/flashdb_harness/baseline_0b.py:1228` for the shared SQL
 pacer, `:1869` for the flashdb arm) and all 45 window files carry `"service_ceiling_us": null`. The
-"both ceilings" label on these records was therefore already the lag rule. **0 of 45 rows differ**
-between the two verdicts.
+"both ceilings" label on these records was therefore already the lag rule. **0 of 45 rung rows differ
+between the two verdicts** — and 0 of 47 saved arm-runs once the two `probe-checkpoint` runs are read
+too (§1.1).
 
 Status 2026-10-21, WP-12 of `docs/plan/workplan.md`, revision `1f31c44`. No arm, rung or engine change
 was run and no record was edited: every number below is re-derived from the committed window samples
@@ -49,6 +50,22 @@ verdicts.
 
 The 45-row, per-block table — every value with the file and field it came from — is **Appendix A**
 (`rows.md`, machine-readable `rows.json`).
+
+### 1.1 The two other saved arm-runs, so the inventory is complete rather than implied
+
+`runs/probe-checkpoint/` holds two sqlite arm-runs (the `wal_autocheckpoint` A/B of
+`.scratch/82-controlled-m1/report.md` §9.2). They are not rungs of the ladder — one arm, one offered
+rate, two settings — so they are reported beside the 45 rows rather than in them:
+
+| workdir | arm | rung | `sustained` | `sustained_primary` | `service_ceiling_reported_windows` | lag p99 us | service p99 us |
+|---|---|---|---|---|---|---|---|
+| `runs/probe-checkpoint/autocheckpoint-0/run-sqlite.json` | sqlite | 50 | yes | yes | 0 | 2,354 | 20,503 |
+| `runs/probe-checkpoint/autocheckpoint-1000/run-sqlite.json` | sqlite | 50 | yes | yes | 0 | 1,206 | 272,442 |
+
+Both verdicts agree with their stored `curve[0].sustained`, so **47 of 47 saved arm-runs are unchanged
+by the decided rule**. `runs/snapshot/*.json` are instance snapshots and `runs/floor/*/floor.json` are
+device-floor benches, not arm-runs; neither is scored. The floor benches do carry windows, but they
+carry no arm and no verdict, so reading them under either rule yields nothing to compare.
 
 ## 2. The differing rows, and every rejected window
 

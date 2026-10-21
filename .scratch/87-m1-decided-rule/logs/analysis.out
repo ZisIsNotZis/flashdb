@@ -15,6 +15,11 @@
 | sqlite | 200 | 5 | 5/5 | 5/5 | 0 | 79, 33, 170, 164, 151 | 0 |
 | postgres | 200 | 5 | 5/5 | 5/5 | 0 | 968, 274, 162, 906, 1731 | 0 |
 
+
+probe-checkpoint arm-runs read beside the ladder: 2 rows, 0 verdicts differ, 0 disagree with the record
+  probe-checkpoint/autocheckpoint-0  sqlite   50 rps sustained=yes sustained_primary=yes service_reported=0 lag=2354 service=20503
+  probe-checkpoint/autocheckpoint-1000 sqlite   50 rps sustained=yes sustained_primary=yes service_reported=0 lag=1206 service=272442
+
 service ceiling reported windows, total: 0 of 45 rows non-zero
 rung-level service p99 above 10000 us: 40 of 45 rows
 rung-level service p99 above 19821 us (10 ms + the 9821 us fsync floor): 36 of 45 rows

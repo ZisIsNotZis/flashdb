@@ -13,8 +13,10 @@ committed `runs/report.json` was not touched).
    `baseline_0b.recompute_records`. `achieved_rps`, `lag_p99_us`, `p99_us` and `sustained` agree with
    the stored `curve[0]` in **45 of 45** rows (`0` differ), so the recomputed `sustained_primary`
    beside them is read off the same evidence the published verdicts were.
-2. **The two verdicts differ in 0 of 45 rows**, and `service_ceiling_reported_windows` is `0` in every
-   row. The only rejections in the whole run are flashdb's two `lag_ceiling` breaches at 200 rps
+2. **The two verdicts differ in 0 of 45 rows** (and in 0 of the 2 saved `probe-checkpoint` arm-runs
+   read beside them, so 47 of 47 saved arm-runs are unchanged), and
+   `service_ceiling_reported_windows` is `0` in every row. The only rejections in the whole run are
+   flashdb's two `lag_ceiling` breaches at 200 rps
    (block 2 and block 3, window 10 of 20: lag p99 30,430 us and 33,747 us against 10,000 us; the
    ~575 ms group — 573,458 us and 583,421 us — is in the same window).
 3. **The headline is rule-invariant**: 200 rps, `flashdb-declared` 3 of 5 paired blocks, `sqlite` 5 of

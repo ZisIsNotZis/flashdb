@@ -1144,6 +1144,36 @@
   ],
   "differ": [],
   "mismatch": [],
+  "probe_rows": [
+    {
+      "arm": "sqlite",
+      "lag_p99_us": 2354,
+      "recomputed_sustained": true,
+      "record_file": "runs/probe-checkpoint/autocheckpoint-0/run-sqlite.json",
+      "record_sustained": true,
+      "reject_reasons": {},
+      "rung": 50.0,
+      "service_ceiling_reported_windows": 0,
+      "service_p99_us": 20503,
+      "sustained_primary": true,
+      "windows_file": "runs/probe-checkpoint/autocheckpoint-0/windows-sqlite.jsonl",
+      "workdir": "probe-checkpoint/autocheckpoint-0"
+    },
+    {
+      "arm": "sqlite",
+      "lag_p99_us": 1206,
+      "recomputed_sustained": true,
+      "record_file": "runs/probe-checkpoint/autocheckpoint-1000/run-sqlite.json",
+      "record_sustained": true,
+      "reject_reasons": {},
+      "rung": 50.0,
+      "service_ceiling_reported_windows": 0,
+      "service_p99_us": 272442,
+      "sustained_primary": true,
+      "windows_file": "runs/probe-checkpoint/autocheckpoint-1000/windows-sqlite.jsonl",
+      "workdir": "probe-checkpoint/autocheckpoint-1000"
+    }
+  ],
   "rows": [
     {
       "achieved_rps": 99.95,

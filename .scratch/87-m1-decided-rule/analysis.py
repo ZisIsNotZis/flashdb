@@ -114,6 +114,41 @@ def rejected_window_detail(root: Path) -> dict:
     return out
 
 
+def probe_rows(root: Path) -> list[dict]:
+    """The two saved sqlite arm-runs of the checkpoint A/B probe (`probe-checkpoint/*/`).
+
+    They are saved external records but not rungs of the ladder: one arm, one offered rate, two
+    variants of the `wal_autocheckpoint` setting. Read under the same rule so the inventory is
+    complete and their exclusion from the 45 rung rows is stated rather than implied.
+    """
+    out: list[dict] = []
+    for path in sorted(root.glob("probe-checkpoint/*/run-*.json")):
+        record = json.loads(path.read_text(encoding="utf-8"))
+        if "curve" not in record or "arm" not in record:
+            continue
+        windows_file = path.parent / str(record["windows_file"])
+        windows = saved_window_rows(windows_file.read_text(encoding="utf-8").splitlines(),
+                                   int(record.get("window_ms") or DEFAULT_WINDOW_MS))
+        for row in summarize_curve(windows, None):
+            stored = {float(c["offered_rps"]): c for c in record["curve"]}.get(
+                float(row["offered_rps"]), {})
+            out.append({
+                "workdir": str(path.parent.relative_to(root)),
+                "arm": record["arm"],
+                "rung": float(row["offered_rps"]),
+                "recomputed_sustained": bool(row["sustained"]),
+                "record_sustained": stored.get("sustained"),
+                "sustained_primary": bool(row["sustained_primary"]),
+                "service_ceiling_reported_windows": row["service_ceiling_reported_windows"],
+                "lag_p99_us": row["lag_p99_us"],
+                "service_p99_us": row["p99_us"],
+                "reject_reasons": row["reject_reasons"],
+                "record_file": f"runs/{path.parent.relative_to(root)}/{path.name}",
+                "windows_file": f"runs/{path.parent.relative_to(root)}/{windows_file.name}",
+            })
+    return out
+
+
 def build(root: Path, ceiling_us: int) -> dict:
     recorded = as_recorded(root)
     cf = counterfactual(root, ceiling_us)
@@ -151,8 +186,9 @@ def build(root: Path, ceiling_us: int) -> dict:
     differ = [row for row in rows if row["recomputed_sustained"] != row["sustained_primary"]]
     cf_differ = [row for row in rows
                  if row["sustained_primary"] != row["counterfactual"]["sustained_with_ceiling"]]
+    probes = probe_rows(root)
     return {"rows": rows, "mismatch": mismatch, "differ": differ,
-            "counterfactual_differ": cf_differ, "ceiling_us": ceiling_us}
+            "counterfactual_differ": cf_differ, "ceiling_us": ceiling_us, "probe_rows": probes}
 
 
 # ---------------------------------------------------------------------------
@@ -240,6 +276,20 @@ def main(argv: list[str]) -> int:
           f" both-ceilings reading at a {args.ceiling_us} us service ceiling")
     print()
     print(per_cell_table(rows))
+    print()
+    probes = result["probe_rows"]
+    print()
+    print(f"probe-checkpoint arm-runs read beside the ladder: {len(probes)} rows,"
+          f" {sum(1 for r in probes if r['recomputed_sustained'] != r['sustained_primary'])}"
+          " verdicts differ,"
+          f" {sum(1 for r in probes if r['record_sustained'] != r['recomputed_sustained'])}"
+          " disagree with the record")
+    for r in probes:
+        print(f"  {r['workdir']:<34} {r['arm']:<8} {r['rung']:.0f} rps"
+              f" sustained={fmt(r['recomputed_sustained'])}"
+              f" sustained_primary={fmt(r['sustained_primary'])}"
+              f" service_reported={r['service_ceiling_reported_windows']}"
+              f" lag={r['lag_p99_us']} service={r['service_p99_us']}")
     print()
     print("service ceiling reported windows, total:"
           f" {sum(row['service_ceiling_reported_windows'] for row in rows)} of {len(rows)} rows"
