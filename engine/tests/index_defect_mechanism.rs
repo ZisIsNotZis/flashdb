@@ -198,7 +198,12 @@ fn arm(e: &mut Engine, label: &str) -> (Counters, Vec<String>) {
     for n in 0..SCANS {
         let order = format!("O{:08}", (n % MOVEMENTS) + 1);
         let out = execute_request(e, &scan_req(&order)).unwrap();
-        answers.push(format!("{}:{}", out["q"].status, out["q"].row.as_ref().map(|r| r.as_array().map(|a| a.len()).unwrap_or(0)).unwrap_or(0)));
+        // The answer string carries the status AND the serialized row, so
+        // `before_answers == after_answers` compares the bytes the request
+        // returned. A row count alone would let two arms agree while
+        // returning different documents (review of ticket 84, note 1).
+        let row = out["q"].row.as_ref().map(|r| r.to_string()).unwrap_or_else(|| "-".to_string());
+        answers.push(format!("{}:{}", out["q"].status, row));
     }
     let after = e.metrics_snapshot();
     let c = Counters {
@@ -266,8 +271,15 @@ fn index_defect_mechanism_is_gone_on_the_append_heavy_instance() {
     assert_eq!(after.scans_entered, 0, "the index answers every scan, so the merged scan is not entered");
     assert_eq!(lookups, SCANS as u64, "the index was consulted on every scan request");
     assert_eq!(before.ok, SCANS as u64);
+    assert!(
+        before_answers.iter().all(|a| a.starts_with("ok:") && !a.ends_with(":-")),
+        "each answer carries a row, so the byte comparison below is not vacuous"
+    );
     assert_eq!(after.ok, SCANS as u64, "the same answers, from the index");
-    assert_eq!(before_answers, after_answers, "the index changed the work, not the answers");
+    assert_eq!(
+        before_answers, after_answers,
+        "the index changed the work, not the answers: status and serialized row, all {SCANS} requests"
+    );
     assert!(
         before_scan_budget >= BLOCK * tiles / 2,
         "the full scan reads a block per active tile: {before_scan_budget} B per scan over {tiles} tiles"
