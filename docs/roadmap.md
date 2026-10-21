@@ -86,9 +86,9 @@ roadmap's own text means.
    measured cost of doing that.
 
 7. **The quiet window is granted on a trigger, and (b) may not be deferred a third time.** The layer
-   above granted one exclusive window in `inbox/2026-10-21-next-contract.md`: the trigger is `uptime`
-   reading loadavg under 2 for one minute with no other agent writing in this tree, and the reading the
-   block started at is recorded in the log. The pair lives in `.scratch/89-m3b-paired-200/`. What the
+   above granted one exclusive window in root's contract (`e5fb0e1:inbox/2026-10-21-next-contract.md`,
+   deleted after landing): the trigger is `uptime` reading loadavg under 2 for one minute with no other
+   agent writing in this tree, and the reading the block started at is recorded in the log. The pair lives in `.scratch/89-m3b-paired-200/`. What the
    grant changes: clause (b) is `unmeasured` until a block runs — not "deferred", which names a state
    where nobody is expected to measure it — and its instrument (the paired block, the regeneration
    chain, the trigger) is written where the clause is. Everything else in the tree runs under load and

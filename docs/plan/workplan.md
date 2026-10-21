@@ -71,9 +71,9 @@ explicit resume trigger instead of reporting a contended result as a verdict.
   build) — record the route here when taken, read the version and settings back from the running
   server, and never substitute a different engine while reporting the comparison as external.
 - **The quiet window for M3 clause (b) is granted and armed, not denied.** Root granted one exclusive
-  window (`inbox/2026-10-21-next-contract.md`, landed as `../roadmap.md` decision 7): the trigger is
-  `uptime` reading loadavg under 2 for one minute with no other agent writing in this tree, and each
-  arm records the reading it started at. The trace and instance are regenerable from committed specs;
+  window (root's contract, `e5fb0e1:inbox/2026-10-21-next-contract.md`, landed as `../roadmap.md`
+  decision 7): the trigger is `uptime` reading loadavg under 2 for one minute with no other agent
+  writing in this tree, and each arm records the reading it started at. The trace and instance are regenerable from committed specs;
   the chain, the gate and the arms are `.scratch/89-m3b-paired-200/` (`issues.md`,
   `paired-200.sh`). While the trigger is unmet the clause reads **unmeasured** with that instrument
   named, and no throughput number is claimed.

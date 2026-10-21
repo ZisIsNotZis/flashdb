@@ -1,0 +1,20 @@
+loadavg at start: 14.40 13.15 11.66 16/2297 725003  (2026-10-21T22:11:20+08:00)
+== the 10x seed trace and the rung-50 trace (1.41 GB; sha must match the committed record) ==
+seed trace present and byte-identical to the record's sha (c8c6bac6...): not regenerated
+== the rung-200 4000-request trace, hard-linked to that seed ==
+warning: `VIRTUAL_ENV=/home/z/.venv` does not match the project environment path `.venv` and will be ignored; use `--active` to target the active environment instead
+trace /home/z/vibe/flashdb/.scratch/82-controlled-m1/runs/b2/rung-200/trace.jsonl: requests=4000 order_flow=2785 seed_bytes=1414978008 seed_sha256=c8c6bac66f37dde72f62ee0982237dd1227dc257fd58281740e035f4f0f4639a sha256=6472cf46477e037b67820a4fa5a7da9d46e1241e6d8d33f89e10f89b22b8f93f
+== the pre-load flashdb instance, snapshotted ==
+warning: `VIRTUAL_ENV=/home/z/.venv` does not match the project environment path `.venv` and will be ignored; use `--active` to target the active environment instead
+machine-state before: loadavg=13.57 epp=n/a freq_khz=3697883,3699448,3700183,3700198,3700226,3700238,3700252,3700977,3701100,3702351,3704639
+warning: `VIRTUAL_ENV=/home/z/.venv` does not match the project environment path `.venv` and will be ignored; use `--active` to target the active environment instead
+build-instance flashdb-declared: seed_s=325.0 bytes=1682111093
+warning: `VIRTUAL_ENV=/home/z/.venv` does not match the project environment path `.venv` and will be ignored; use `--active` to target the active environment instead
+snapshot flashdb-declared: 1682111093 bytes, 158 files, sha256=359c33c738a3a5ac1109e2c5bdc418441fb401206e28c902b0e5bf81985a2a55
+warning: `VIRTUAL_ENV=/home/z/.venv` does not match the project environment path `.venv` and will be ignored; use `--active` to target the active environment instead
+machine-state after: loadavg=11.97 epp=n/a freq_khz=3700224,3700243,3700245,3700256,3700257,3700262,3700264,3700269,3700270,3700303,3700336
+m1-baseline-run: mode instance, artefacts in /home/z/vibe/flashdb/.scratch/82-controlled-m1/runs/b2/rung-200
+== restoring the committed run records this regeneration rewrote ==
+ M .scratch/82-controlled-m1/runs/b2/rung-200/loadavg.jsonl
+ M .scratch/82-controlled-m1/runs/b2/rung-200/machine-state.jsonl
+DONE loadavg at end: 11.97 11.71 11.48 19/2332 750147  (2026-10-21T22:17:13+08:00)

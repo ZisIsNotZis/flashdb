@@ -1,0 +1,5 @@
+loadavg at start: 11.88 12.92 11.75 14/2268 733826 rev 307ea39
+   Compiling flashdb-engine v0.1.0 (/home/z/vibe/flashdb/engine)
+    Finished `release` profile [optimized] target(s) in 10.69s
+sha256 7ccc0dcd522d98878bf1d6cfca6b6e7188cbf2a56b1da41083555153403a8db0  target/release/flashdb-load
+loadavg at end: 11.14 12.73 11.70 12/2308 734491

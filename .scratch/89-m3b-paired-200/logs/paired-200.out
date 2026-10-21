@@ -1,0 +1,15 @@
+== paired 200 rps, started 2026-10-21T22:17:36+08:00 ==
+# loadavg at start: 10.55 11.41 11.39 19/2230 751285
+# paths modified in the tree (for the record; another agent mid-write is a judgement, not a file count): 12
+# preflight ok: snapshot 1.6G (1683012213 B per its record), trace sha 6472cf46477e037b
+== SMOKE: gate skipped, 1 pair at 50 rps on 100 requests — NOT evidence ==
+REFUSED: restore of .scratch/89-m3b-paired-200/runs/live-declared digests / B, the snapshot record says 67b3d10c23bca301/1683012213 B
+== paired 200 rps, started 2026-10-21T22:18:14+08:00 ==
+# loadavg at start: 13.44 12.02 11.60 25/2342 752971
+# paths modified in the tree (for the record; another agent mid-write is a judgement, not a file count): 12
+# preflight ok: snapshot 1.6G (1682111093 B per its record), trace sha 6472cf46477e037b
+== SMOKE: gate skipped, 1 pair at 50 rps on 100 requests — NOT evidence ==
+block p1 declared done: loadavg 19.25 13.55 12.12
+block p1 indexed done: loadavg 20.07 14.10 12.33
+== blocks done 2026-10-21T22:18:59+08:00; scoring ==
+smoke: not scored — a smoke block is plumbing, and its file names are outside the scorer's pattern

@@ -1,0 +1,2 @@
+warning: `VIRTUAL_ENV=/home/z/.venv` does not match the project environment path `.venv` and will be ignored; use `--active` to target the active environment instead
+trace /home/z/vibe/flashdb/.scratch/80-external-baselines/runs/m1-10x/rung-50/trace.jsonl: requests=1000 order_flow=694 seed_bytes=1414978008 seed_sha256=c8c6bac66f37dde72f62ee0982237dd1227dc257fd58281740e035f4f0f4639a sha256=859b99a1186ef6915d524d2fff339ed5eec88759468d7d942496f99f28faec65

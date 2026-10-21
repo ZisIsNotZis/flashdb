@@ -1,0 +1,12 @@
+{
+  "arm": "flashdb-declared",
+  "at": "2026-10-21T22:17:12",
+  "bytes": 1682111093,
+  "files": 158,
+  "live_path": "/home/z/vibe/flashdb/.scratch/82-controlled-m1/runs/live/instance-flashdb-declared",
+  "schema": "flashdb.baseline.instance-snapshot.v1",
+  "sha256": "359c33c738a3a5ac1109e2c5bdc418441fb401206e28c902b0e5bf81985a2a55",
+  "snapshot_path": "/home/z/vibe/flashdb/.scratch/82-controlled-m1/runs/snapshot/flashdb-declared",
+  "snapshot_s": 10.263,
+  "source": "the pre-load state built by `build-instance` (seeded; no request served)"
+}

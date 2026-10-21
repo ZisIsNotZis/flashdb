@@ -39,7 +39,7 @@ before deleting it: the next session reads the files, not the conversation.
 ## The quiet window
 
 M3 clause (b) is the only reading here that needs a quiet box, and it is the only one that may not be
-taken under load: a pair taken under load measures the load. Root granted the window in
-`inbox/2026-10-21-next-contract.md`; the trigger is `uptime` reading **loadavg under 2 for one
+taken under load: a pair taken under load measures the load. Root granted the window in its contract
+(`e5fb0e1:inbox/2026-10-21-next-contract.md`); the trigger is `uptime` reading **loadavg under 2 for one
 minute** with no other agent writing in this tree. Record the reading at the start of each arm and
 in every log; refuse the arm above the threshold. Everything else in the tree runs under load.

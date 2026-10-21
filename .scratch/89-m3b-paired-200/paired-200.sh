@@ -6,7 +6,7 @@
 #
 # The gate (root's grant, `docs/roadmap.md` decision 7): /proc/loadavg under 2.0 on twelve
 # consecutive 5-second readings (one quiet minute). Every poll is written to
-# `logs/paired-200-gate.log`, so a run that never fired still carries the series that shows why.
+# `logs/paired-200-gate.out`, so a run that never fired still carries the series that shows why.
 # Nothing is run above the gate; `--smoke` skips it and writes `smoke-*` files the scorer does not
 # read, so a smoke block cannot be mistaken for the pair.
 #
@@ -35,7 +35,7 @@ while [ $# -gt 0 ]; do
     esac
 done
 mkdir -p "$L" "$R"
-say() { echo "$*" | tee -a "$L/paired-200.log"; }
+say() { echo "$*" | tee -a "$L/paired-200.out"; }
 
 say "== paired 200 rps, started $(date -Is) =="
 say "# loadavg at start: $(cat /proc/loadavg)"
@@ -50,7 +50,12 @@ done
 [ "$missing" = 0 ] || { say "REFUSED: preflight failed; nothing was run"; exit 3; }
 systemd-run --user --scope -q -p MemoryMax=128M -p MemorySwapMax=0 true 2>/dev/null \
     || { say "REFUSED: no user systemd scope, so the 128 MiB cap cannot be enforced; nothing was run"; exit 3; }
-say "# preflight ok: snapshot $(du -sh "$SNAP" | cut -f1), trace sha $(sha256sum "$TRACE" | cut -c1-16)"
+# the snapshot's own record of what it is; overridable because the regenerated instance's record is
+# kept beside this ticket (the committed one is the M1 run's, and stays the M1 run's)
+SNAP_RECORD=${SNAP_RECORD:-"$(dirname "$SNAP")/$(basename "$SNAP").json"}
+SNAP_BYTES=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['bytes'])" "$SNAP_RECORD")
+SNAP_SHA=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['sha256'])" "$SNAP_RECORD")
+say "# preflight ok: snapshot $(du -sh "$SNAP" | cut -f1) ($SNAP_BYTES B per its record), trace sha $(sha256sum "$TRACE" | cut -c1-16)"
 
 if [ "$SMOKE" = 1 ]; then
     # Plumbing only: a 100-request trace at 50 rps. The outputs are named `smoke-*`, which the
@@ -65,7 +70,7 @@ else
     quiet=0
     while :; do
         read -r l1 _ < /proc/loadavg
-        echo "$(date -Is) loadavg1=$l1 quiet=${quiet}/12" >> "$L/paired-200-gate.log"
+        echo "$(date -Is) loadavg1=$l1 quiet=${quiet}/12" >> "$L/paired-200-gate.out"
         if awk -v l="$l1" 'BEGIN { exit !(l < 2.0) }'; then
             quiet=$(( quiet + 1 ))
         else
@@ -73,7 +78,7 @@ else
         fi
         [ "$quiet" -ge 12 ] && break
         if [ "$(date +%s)" -ge "$deadline" ]; then
-            say "GATE UNMET after ${WAIT_MIN} min: loadavg never held under 2.0 for one minute (series in logs/paired-200-gate.log)"
+            say "GATE UNMET after ${WAIT_MIN} min: loadavg never held under 2.0 for one minute (series in logs/paired-200-gate.out)"
             exit 4
         fi
         sleep 5
@@ -88,8 +93,19 @@ for p in $(seq 1 "$PAIRS"); do
         inst=$R/live-$variant
         rm -rf "$inst"
         cp -a --reflink=auto "$SNAP" "$inst"
+        # The restore is verified, not assumed: the copy's tree digest and byte total against the
+        # snapshot record (tree_sha256 is the harness's own function, so the units agree).
+        read -r got_sha got_bytes _ < <(uv run --project harness python -c \
+            "import sys; from pathlib import Path; sys.path.insert(0, 'harness'); from flashdb_harness.baseline_0b import tree_sha256; d,t,f=tree_sha256(Path(sys.argv[1])); print(d,t,f)" \
+            "$inst" 2>/dev/null)
+        if [ "$got_sha" != "$SNAP_SHA" ] || [ "$got_bytes" != "$SNAP_BYTES" ]; then
+            say "REFUSED: restore of $inst digests ${got_sha:0:16}/${got_bytes} B, the snapshot record says ${SNAP_SHA:0:16}/$SNAP_BYTES B"
+            exit 5
+        fi
+        # The record's own argv (`baseline_0b.flashdb_load_command`), plus nothing: the one
+        # difference between the arms is `--policy-file`.
         args=("$BIN" "$inst" "$TRACE" --rate-rps "$RATE" --window-ms 1000 --metrics-json
-              --group-requests 64 --lag-ceiling-us 10000 --peak-report)
+              --group-requests 64 --lag-ceiling-us 10000)
         [ "$variant" = indexed ] && args+=(--policy-file "$POL")
         prefix=p; [ "$SMOKE" = 1 ] && prefix=smoke-p
         out=$R/$prefix$p-$variant
@@ -109,7 +125,7 @@ if [ "$SMOKE" = 1 ]; then
     say "smoke: not scored — a smoke block is plumbing, and its file names are outside the scorer's pattern"
     exit 0
 fi
-uv run --project harness python .scratch/89-m3b-paired-200/score-pair.py "$R" 2>&1 | tee -a "$L/paired-200.log"
+uv run --project harness python .scratch/89-m3b-paired-200/score-pair.py "$R" 2>&1 | tee -a "$L/paired-200.out"
 rc=${PIPESTATUS[0]}
 say "== loadavg at end: $(cat /proc/loadavg)"
 exit "$rc"
