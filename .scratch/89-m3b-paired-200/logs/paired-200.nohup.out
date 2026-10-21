@@ -1,0 +1,5 @@
+== paired 200 rps, started 2026-10-21T22:19:13+08:00 ==
+# loadavg at start: 19.69 14.21 12.39 23/2338 756379
+# paths modified in the tree (for the record; another agent mid-write is a judgement, not a file count): 2
+# preflight ok: snapshot 1.6G (1682111093 B per its record), trace sha 6472cf46477e037b
+== gate: loadavg < 2.0 on twelve consecutive 5-second readings (--wait-min 55) ==

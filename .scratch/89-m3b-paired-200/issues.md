@@ -66,8 +66,40 @@ harness rewrites while regenerating:
 
 ## State
 
-- Regeneration finished; the four defects reproduced before and after; the instrument tested for
-  plumbing on ticket 83's invalid dumps (`logs/scorer-plumbing-test-on-invalid-83.out`, exit 3 —
-  "cannot decide", which is the intended refusal on unusable data).
-- The pair itself: see the verdict section below, and `logs/paired-200-gate.out` for the loadavg series
-  the gate saw.
+- Regeneration finished (all four artefacts byte-identical except the instance, see below); the four
+  defects reproduced before and after; the instrument exercised end to end on a smoke block and made to
+  refuse on unusable data (`logs/scorer-plumbing-test-on-invalid-83.out`, exit 3 — "cannot decide").
+- **The pair did not run: the window never opened.** The gate polled `/proc/loadavg` every 5 s for 16
+  minutes (191 readings, 22:19:13 → 22:35:05) and **not one reading was under 2.0** — minimum 4.92,
+  maximum 20.59, longest consecutive quiet run 0 of the 12 required
+  (`logs/paired-200-gate.out`, summary in `logs/window-observation.out`). The gate then waits on
+  nobody: it refuses every arm above the trigger, and no arm was taken. The series was stopped on the
+  layer above's direction after 16 minutes; the block stays **queued**, not abandoned.
+
+## Verdict: M3 clause (b) is `unmeasured`
+
+Not deferred again, and not met: the clause is `unmeasured`, with the instrument that would measure it
+named, built and exercised to the point the quiet box allows.
+
+- **What is missing is the box, not the instrument.** The trigger root granted (loadavg under 2.0 for
+  one minute, no other agent writing in this tree) did not occur in 191 consecutive readings; the box
+  carried 4.9-20.6 the whole time.
+- **What would measure it, in one command** once the trigger holds:
+  `SNAP_RECORD=.scratch/89-m3b-paired-200/instance-record.json bash .scratch/89-m3b-paired-200/paired-200.sh --wait-min 55`
+  — it re-checks the trigger itself, restores the instance per arm with a digest comparison against
+  `instance-record.json`, runs five blocks with the arm order rotated, writes each arm's start and end
+  loadavg into its own `.out`, and scores with `cold_0b.summarize_curve` on `sustained_primary`.
+  Exit 0 = met, 1 = falsified, 3 = the data cannot decide it, 4 = the gate never opened, 5 = a restore
+  did not verify.
+- **What was exercised, and what was not.** Exercised: preflight (including that a user systemd scope
+  really enforces 128 MiB), the digest-verified restore (in the refusing direction with a wrong record,
+  then in the passing direction with the regenerated instance), the two arms and the rotated block
+  loop, the policy reaching the engine (`engine_policy` line in `runs/smoke-p1-indexed.out`), and the
+  scorer on real dumps. **Not exercised: the transition through the gate to a scored pair**, which is
+  the one thing that needs the window; no throughput number is claimed anywhere in this ticket.
+- **The instance is a rebuild, not the M1 bytes.** The seed and rung-200 traces come back byte-identical
+  (`c8c6bac6…`, `6472cf46…`), but the rebuilt instance digests `359c33c7…` / 1,682,111,093 B against the
+  M1 run's `67b3d10c…` / 1,683,012,213 B (same 158 files; `instance-record.json` vs the committed
+  snapshot record). Both arms run on the same rebuild, so the pair is controlled; what it cannot do is
+  compare its *level* against the M1 3-of-5, because the instance's bytes differ. The clause asks only
+  for declared vs indexed in the same block, which the pair does answer.

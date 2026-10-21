@@ -1,0 +1,12 @@
+# loadavg at start: 4.87 7.66 9.89 5/2144 807321 (2026-10-21T22:35:17+08:00)
+# The gate as it actually ran: 191 readings at 5 s, 2026-10-21T22:19:13 -> 22:35:05, then stopped
+# on the parent's direction (the block stays queued; no arm was run).
+# Source: logs/paired-200-gate.out (one line per poll).
+readings=191
+min_loadavg1=4.92
+max_loadavg1=20.59
+readings_under_2=0
+longest_consecutive_run_under_2=0
+# recompute with: awk -F'loadavg1=' '{print $2}' .scratch/89-m3b-paired-200/logs/paired-200-gate.out | cut -d' ' -f1 | sort -n | head -1
+#                  (same file, counting $1<2.0 for the under-2 count)
+# loadavg at end: 4.87 7.66 9.89 3/2145 807342
