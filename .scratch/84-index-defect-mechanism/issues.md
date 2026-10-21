@@ -147,6 +147,18 @@ counters.
   the engine's own definition of read work (`engine/src/metrics.rs` §`bytes_read`),
   not `/proc` device counters.
 
+## Integrity of the twelve files marked invalid
+
+Each of `.scratch/83-index-probe/runs/p{1,2,3}-{declared,indexed}.{out,err}` gained exactly one
+line at the top (`# INVALID - do not cite: ...`) and nothing else. Verified per file, all twelve:
+
+```bash
+for f in .scratch/83-index-probe/runs/p*
+do cmp <(git show 23c4af1^:$f) <(tail -n +2 $f) && echo "IDENTICAL $f"
+done
+# 12 x IDENTICAL
+```
+
 ## Residual risks
 
 - The probe's tile block fill (3,951 B/tile) is 3.5% below the record's 4,096 B, so
