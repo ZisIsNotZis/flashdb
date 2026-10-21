@@ -1,3 +1,4 @@
+# INVALID - do not cite: 200 rps pair p1 declared arm (err), recorded 2026-10-19 under foreign load (loadavg 1.9 -> 9.9, the author's other project rendering) and with the derived order_no index EMPTY in BOTH arms (tiles-only build, ticket 83), so the pair measures contention rather than the fix. Data below is untouched; see .scratch/83-index-probe/issues.md and .scratch/84-index-defect-mechanism/issues.md.
 startup_warm scan_entries=0 index_entries=0
 group_phase window=0 seq=1 requests=1 due_dispatch_us=65 append_us=14 apply_us=3 fsync_us=4937 maintain_us=0 completion_us=5550
 group_phase window=0 seq=2 requests=1 due_dispatch_us=63 append_us=24 apply_us=6 fsync_us=3093 maintain_us=0 completion_us=3809

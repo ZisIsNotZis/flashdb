@@ -1,0 +1,26 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.06s
+     Running tests/index_defect_mechanism.rs (target/debug/deps/index_defect_mechanism-8191bb4ffd7d72ed)
+
+running 1 test
+instance=tiles=156 movements=2785 scans=188 region_mode=global
+arm=before requests=188 scans_entered=188 bytes_read=115888464 bytes_per_scan=616428 ok=188 empty=0 movement_row_probes=0
+arm=build index_entries=0 movements=2785
+arm=after requests=188 scans_entered=188 bytes_read=115888464 bytes_per_scan=616428 ok=188 empty=0 movement_row_probes=0
+arm=after index_adopted=1
+
+thread 'index_defect_mechanism_is_gone_on_the_append_heavy_instance' (48120) panicked at engine/tests/index_defect_mechanism.rs:260:5:
+assertion `left == right` failed: one index entry per movement row, from the merged view
+  left: 0
+ right: 2785
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test index_defect_mechanism_is_gone_on_the_append_heavy_instance ... FAILED
+
+failures:
+
+failures:
+    index_defect_mechanism_is_gone_on_the_append_heavy_instance
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 33.43s
+
+error: test failed, to rerun pass `-p flashdb-engine --test index_defect_mechanism`
+exit=101

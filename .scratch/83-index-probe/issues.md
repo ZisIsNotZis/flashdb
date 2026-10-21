@@ -61,6 +61,10 @@ ceiling. Two such alignments out of 20 windows per block is what "3/5 sustained"
 
 ## A/B run under foreign load (invalid, recorded for honesty)
 
+**Each of the twelve files in `runs/` now says so in its own first line** (added 2026-10-21 by
+F-M1: a `# INVALID - do not cite:` marker line; the recorded data below it is untouched, and a
+consumer must skip line 1 - `tail -n +2`).
+
 `probe.sh` ran 3 paired 200 rps blocks on the frozen snapshot: declared vs the same engine with the
 index policy. The box was carrying the author's other project (Remotion/Chromium renders): loadavg
 1.9 -> 9.9 during the probe. Results were inconsistent (pair 1: 14 vs 2 rejected windows; pair 3: 15

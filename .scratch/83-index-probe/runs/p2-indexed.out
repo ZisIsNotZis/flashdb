@@ -1,3 +1,4 @@
+# INVALID - do not cite: 200 rps pair p2 indexed arm (out), recorded 2026-10-19 under foreign load (loadavg 1.9 -> 9.9, the author's other project rendering) and with the derived order_no index EMPTY in BOTH arms (tiles-only build, ticket 83), so the pair measures contention rather than the fix. Data below is untouched; see .scratch/83-index-probe/issues.md and .scratch/84-index-defect-mechanism/issues.md.
 device_fsync_p50_us=3068 device_fsync_p99_us=3403
 engine_open target=.scratch/83-index-probe/runs/live-indexed discover=true active_tiles=156 serving_memtable_entries=0
 engine_policy policy={"default":{"bloom_bits_per_key":10,"merge_min_tiles":2,"page_size":4096},"regions":{"P|StockMovement":{"bloom_bits_per_key":10,"index_order_no":true,"merge_min_tiles":2,"page_size":4096}}}

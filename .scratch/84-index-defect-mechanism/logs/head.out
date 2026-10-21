@@ -1,0 +1,20 @@
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on build directory
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.04s
+     Running tests/index_defect_mechanism.rs (target/debug/deps/index_defect_mechanism-8191bb4ffd7d72ed)
+
+running 1 test
+instance=tiles=156 movements=2785 scans=188 region_mode=global
+arm=before requests=188 scans_entered=188 bytes_read=115888464 bytes_per_scan=616428 ok=188 empty=0 movement_row_probes=0
+arm=build index_entries=2785 movements=2785 tiles=156
+arm=after requests=188 scans_entered=0 bytes_read=0 bytes_per_scan=0 ok=188 empty=0 movement_row_probes=188
+arm=after index_lookups=188
+arm=after-tiled requests=188 scans_entered=0 bytes_read=793037 bytes_per_scan=4218 ok=188 empty=0 movement_row_probes=188
+arm=after-tiled index_lookups=188
+summary bytes_per_scan_before=616428 bytes_per_scan_after=0 bytes_per_scan_after_tiled=4218 scans_entered_before=188 scans_entered_after=0 index_entries=2785
+test index_defect_mechanism_is_gone_on_the_append_heavy_instance ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 27.63s
+
+exit=0
