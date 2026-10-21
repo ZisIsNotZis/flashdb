@@ -10,6 +10,7 @@ Analysis only: no benchmark was run, no engine code edited. Authority: `../objec
 | `Wf(b,w)` / `Ws(b,w)` / `Wp(b,w)` | same directory, `windows-{arm}.jsonl`, window index `w` (0-19) |
 | `FL(b)` | `.scratch/82-controlled-m1/runs/floor/{before,after}/floor.json` |
 | `P82` / `I83` / `B0` | `.scratch/82-controlled-m1/report.md` / `.scratch/83-index-probe/issues.md` / `harness/flashdb_harness/baseline_0b.py` |
+| `M3` | `.scratch/88-m3-notes/logs/index-defect-mechanism-rowbytes.out` (rev `f38ec63` + the test edit) plus `.scratch/84-index-defect-mechanism/logs/head.out` and `I83` |
 
 * **Corpus at 200 rps:** trace `6472cf46477e037b67820a4fa5a7da9d46e1241e6d8d33f89e10f89b22b8f93f` (4,000 requests, `B0` manifest, identical in all 15 rung-200 runs; rungs 50/100 carry `859b99a1…`/`583f9b4c…`). Instance digests: flashdb `67b3d10c…`, sqlite `46c6f1e1…`, postgres `7f9a4ea8…` (restore.sha256 in every run JSON).
 * **Run ids:** 45 arm-runs = 5 blocks × 3 rungs × 3 arms; rung 200 is 15 arm-runs × 20 windows = 300 windows, 20,000 requests per arm (4,000 × 5). Every window is 1,000 ms.
@@ -17,6 +18,8 @@ Analysis only: no benchmark was run, no engine code edited. Authority: `../objec
 * **Machine state:** loadavg median 1.95 (max 4.10) during the measured phase, 90 boundaries (`P82` §2), not the quieter state of the device floor.
 
 ## 2. Per-request phase ledger at 200 rps
+
+**Every reading below is the pre-fix access path** — the M1 records were taken before the derived index was built from the merged view, so the scan phase's cost here and the `(b) defect` classification it carries are historical, not current (`§2.1` gives the post-fix work, and the fix is measured in bytes: 42,240 -> 13,466 B/request). Reusing these phase costs as current would be wrong.
 
 Per-arm, pooled over the 100 windows at rung 200 (5 blocks × 20):
 
@@ -55,6 +58,22 @@ Read work averages **493 us/request** (865,962,320 B / 20,000; time = Σ mean_ns
 | barrier wait vs append vs apply | no per-phase timestamp exists | **no**; missing instrument = engine per-request phase timer (dispatch→validate→WAL append→fdatasync return→apply→reply), plus a `fdatasync` count and WAL bytes/req. `lag_breach_attribution reads= read_us=` is emitted only on breaches and ticket 82 did not keep stderr (`I83`) |
 
 The subtraction is **bounded, not exact**: the floor was taken in a quieter session (loadavg 1.22-2.76 vs 1.95 median here), so a 0.5 ms session delta is inside the uncertainty and the implied validation/apply figure can be negative. The defensible statement is: **the barrier accounts for 85-98% of the median, reads for ~6%, and no phase timer exists to split the rest.**
+
+### 2.1 The M3 record's ledger: the movement-scan phase, before and after the fix
+
+The deliverable asks for a per-phase ledger for the M1 **and M3** records. §2 is M1's; this is M3's. The M3 record is a *mechanism* measurement on a rebuilt instance of the same shape (2,785 movements still in the serving memtable, 188 `find StockMovement where order_no` through `execute_request`), so its ledger is work per scan against the same floor, not a timed run.
+
+| phase | before fix | after fix, rows in the memtable | after fix, rows published to a tile | floor | classification |
+|---|---|---|---|---|---|
+| index entries / movement rows | 0 / 2,785 | 2,785 / 2,785 | 2,785 / 2,785 | one entry per row | — |
+| merged scans entered | 188 / 188 | 0 / 188 | 0 / 188 | 0 | **(b) defect, closed** |
+| tile bytes per scan | 616,428 | 0 | **4,218** | one dependent 4 KiB page probe = 4,096 B | **(b), fixed**; 1.03x its floor |
+| bytes/request over the M1 mix (0.047 scans/req + 13,268 non-scan) | 42,240 | — | **13,466** | 13,460 predicted (`§7` fix #1) | **(b), fixed**; 0.04% from prediction |
+| scan time per scan | 5,902,888 ns mean (`I83`, from the M1 windows; 6,053.6 us in §2) | unmeasured | **unmeasured** | 89 us per dependent 4 KiB probe | **(b) by mechanism; the time is `unmeasured`** |
+
+Sources: `.scratch/88-m3-notes/logs/index-defect-mechanism-rowbytes.out` (rev `f38ec63` + the test edit, loadavg 21.43 on line 1; `arm=before/after/after-tiled` lines), `.scratch/84-index-defect-mechanism/logs/head.out`, and the M1 windows for the mix (§2). The derivation of 42,240 -> 13,466 is the README's own arithmetic (0.047 x 616,428 + 13,268 = 42,240; 0.047 x 4,218 + 13,268 = 13,466) and is reproduced in `§9`.
+
+**Read the time column as historical.** The 5.9-6.05 ms/scan figure is the *pre-fix* phase from the M1 record; the fix is now measured in bytes and counters, not in time, because a post-fix timing needs a quiet box and this one was under loadavg 13-23. The ledger therefore says the phase's *work* is closed and its *cost* is `unmeasured` — which is exactly what M3 clause (b) and M5 have to decide, with the paired block in `.scratch/89-m3b-paired-200/` as the instrument.
 
 ## 3. Theoretical floor per phase
 
