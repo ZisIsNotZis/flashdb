@@ -77,14 +77,13 @@ roadmap's own text means.
    `docs/plan/workplan.md` §M3 status carried a stale restatement of it. Recorded as assumed by the
    layer above; reversing it would move M3 from "awaiting a quiet box" to "needs postgres too", which
    this roadmap's own text does not support.
-6. **The claim splits: mechanism now, throughput deferred.** "Is the defect fixed" is work done per
-   request — counted from the engine's own counters, invariant under foreign load, and measured at
-   ticket 84. "Does it now beat sqlite and postgres at 200 rps" is a rate, needs a quiet box, and the
-   person has stated that no quiet window is coming to this machine. The deferral is written where the
-   claim lives (`README.md` §Status of the thesis, the M3 row above, `docs/plan/workplan.md` §M3
-   status), no throughput number is claimed, and the comparison may not be run early under load — the
-   twelve invalid `.scratch/83-index-probe/runs/` probe files are the measured cost of doing that.
-   Reopens on: a quiet window on this box, or a borrowed machine of the same storage class.
+6. **The claim splits: mechanism now, throughput in a window.** "Is the defect fixed" is work done
+   per request — counted from the engine's own counters, invariant under foreign load, and measured at
+   ticket 84. "Does it now beat sqlite and postgres at 200 rps" is a rate and needs a quiet box; the
+   window is granted on a trigger in decision 7, which replaces this decision's "deferred" with
+   `unmeasured`. No throughput number is claimed until a block runs, and the comparison may not be
+   taken early under load — the twelve invalid `.scratch/83-index-probe/runs/` probe files are the
+   measured cost of doing that.
 
 7. **The quiet window is granted on a trigger, and (b) may not be deferred a third time.** The layer
    above granted one exclusive window in `inbox/2026-10-21-next-contract.md`: the trigger is `uptime`

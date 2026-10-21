@@ -1,0 +1,16 @@
+# PLUMBING TEST ONLY — the input is ticket 83's twelve files, each marked '# INVALID - do not cite'.
+# This run exists to prove the scorer parses the driver's dumps and calls the project's reducer,
+# and that it refuses a vacuous reading. It decides nothing about the fix: both arms in those
+# files ran pre-fix code with an empty index.
+# loadavg at start: 11.88 12.92 11.75 14/2276 733615 (2026-10-21T22:13:03+08:00)
+pair       arm  achieved lag_rej  reqs sustained  primary  loadavg start
+   1  declared     200.0      14    20     False    False  (not
+   1   indexed     199.9       1    20     False    False  (not
+   2  declared     200.0       7    20     False    False  (not
+   2   indexed     200.0      11    20     False    False  (not
+   3  declared     200.0      15    20     False    False  (not
+   3   indexed     200.0      17    20     False    False  (not
+
+blocks sustained under the decided lag-only rule: declared 0/3, indexed 0/3
+cannot decide: no block sustained by either arm — the box was not quiet or the run broke; this is not a reading for or against the fix
+EXIT=3

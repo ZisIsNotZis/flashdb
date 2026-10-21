@@ -1,0 +1,3 @@
+# instance copies and the truncated smoke trace are regenerable state, not evidence
+live-*/
+smoke-trace.jsonl

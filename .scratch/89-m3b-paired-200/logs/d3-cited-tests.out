@@ -1,0 +1,12 @@
+# loadavg at start: 11.76 12.75 11.73 9/2358 735593 (2026-10-21T22:13:35+08:00)
+# rev: 307ea39
+# d3: the two tests the roadmap now cites for coverage_csn = max over the rows (and over live versions)
+     Running tests/order_no_index.rs (target/debug/deps/order_no_index-cb87553bdcee0bd6)
+
+running 2 tests
+test index_build_covers_rows_that_live_only_in_the_memtable ... ok
+test index_holds_one_entry_per_live_row_across_versions_and_deletes ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 17 filtered out; finished in 0.10s
+
+EXIT=0

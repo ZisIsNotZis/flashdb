@@ -69,7 +69,7 @@ The learner is a controller, not engine code: it rewrites the policy file the dr
 
 ## What stays unverified, and what would settle it
 
-- **Whether the index fix closes the throughput gap.** Deferred, not pending: settled by the paired 200 rps blocks re-run at the integrated revision (`workplan.md` WP-2), which needs a quiet box — a quiet window on this box or a borrowed machine of the same storage class. No throughput number is claimed until then.
+- **Whether the index fix closes the throughput gap.** Unmeasured: settled by the paired 200 rps blocks re-run at the integrated revision (`.scratch/89-m3b-paired-200/`, `workplan.md` WP-2), which needs the quiet window root granted on a trigger (`roadmap.md` decision 7) — loadavg under 2 for one minute, no other agent writing in this tree. No throughput number is claimed until a block runs.
 - **Whether an acknowledged write survives a power cut.** Settled by a crash or power-cut injection at the ack point, committed and bound to a revision (`open-items.md` row `PLAN-powerloss-durability`).
 - **The external comparison's postgres leg on the current box.** The server that ran the measured arm is not installed now; settled by reinstalling it and reading its settings back from the running server (`open-items.md` row `PLAN-postgres-absent`).
 - **Open-cost behaviour at larger data sizes.** The single recorded open figure is a peak on a 118 MB instance; settled by an open-time measurement across instance sizes.
