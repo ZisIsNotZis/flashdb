@@ -22,7 +22,9 @@ before deleting it: the next session reads the files, not the conversation.
   `run.sh` (the command that reproduces it), `logs/*.out` (the output as produced). Ticket 84 is the
   index-defect mechanism, 83 the index probe, 82 the external M1 scoreboard, 85 the M3 clause (c) run,
 89 the M3 clause (b) paired block and the quiet-window trigger it waits on (90 is the M5 postgres server:
-`postgres-server.sh` starts and checks it, `issues.md` carries the environment read with its moment).
+`postgres-server.sh` starts and checks it, `scripts/m1-baseline-run.sh` runs the postgres arm through
+it at the version it reads back, `pull-postgres18.sh` is the repeatable 18.x attempt, and `issues.md`
+carries the environment read with its moment).
 - Code: `engine/` — the request path in `engine/src/request.rs`, the derived index in
   `engine/src/index.rs`, the driver in `engine/src/bin/flashdb-load.rs`; `harness/` is Python;
   `scripts/` holds the M1 runs and their scoring.

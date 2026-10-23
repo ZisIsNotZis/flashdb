@@ -142,10 +142,14 @@ recorded **unmeasured** with its instrument named, and that instrument needs the
 **the next milestone is M5**, and it is held, not idle: it needs a quiet window (person), and the
 postgres leg's server is no longer the blocker it was — this box carries 16.15 in container
 `jolly_lamarr` (read 2026-10-23, method in `.scratch/90-m5-postgres-env/issues.md`), the M5 server
-starts and checks on 5433 with the M1 record's settings, and the arm's schema, migration and settings
-were read back from it at 16.15; what is left there is the container wiring into the M1 run chain and
-the choice of major version (18.x if the image pulls, 16.15 otherwise — decision needed). Nothing in
-this tree can produce the quiet window. What
+starts and checks on 5433 with the M1 record's settings, and `scripts/m1-baseline-run.sh` now runs
+the **postgres arm through that checked container**: the version is read back from the running server
+and carried in the record (`16.15 (Debian 16.15-1.pgdg13+2)`, arm log
+`.scratch/90-m5-postgres-env/logs/arm-16.15-chain-203101.out`), a setting or a required version that
+differs stops the arm, and the data directory is restored under a stopped container. That run was
+under loadavg 3.77, so it is a chain check and no rate is claimed; an 18.x arm follows only if the
+image pull lands (`pull-postgres18.sh`), and then it names the 18.x it reads. Nothing in this tree can
+produce the quiet window. What
 the project does while it is held is the box-free work on M4's own ranked fix list, because that can be
 done under load and it re-ranks what M5's re-run has to measure: the record-side re-scoring of the M1
 blocks under the decided lag rule is **done** (WP-12: 0 of 45 rows move, so the headline is
