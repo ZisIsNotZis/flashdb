@@ -147,8 +147,11 @@ the **postgres arm through that checked container**: the version is read back fr
 and carried in the record (`16.15 (Debian 16.15-1.pgdg13+2)`, arm log
 `.scratch/90-m5-postgres-env/logs/arm-16.15-chain-203101.out`), a setting or a required version that
 differs stops the arm, and the data directory is restored under a stopped container. That run was
-under loadavg 3.77, so it is a chain check and no rate is claimed; an 18.x arm follows only if the
-image pull lands (`pull-postgres18.sh`), and then it names the 18.x it reads. Nothing in this tree can
+under loadavg 3.77, so it is a chain check and no rate is claimed; one further block, taken inside
+the quiet trigger at 20:34 (1-minute loadavg 0.92), measured the arm at **200 rps: 199.87 achieved,
+21 windows, 0 rejected, service p99 41,652 µs, serving peak 39.5 MiB**, with the version 16.15
+stated — not the three-arm comparison and not comparable to ticket 82's 200k/2.65M rung. An 18.x
+arm follows only if the image pull lands (`pull-postgres18.sh`), and then it names the 18.x it reads. Nothing in this tree can
 produce the quiet window. What
 the project does while it is held is the box-free work on M4's own ranked fix list, because that can be
 done under load and it re-ranks what M5's re-run has to measure: the record-side re-scoring of the M1

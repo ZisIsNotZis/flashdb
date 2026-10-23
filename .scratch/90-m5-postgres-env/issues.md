@@ -108,6 +108,34 @@ measurement** — its 200-request 50 rps row is a window rule, not a rate, and t
 → `3.3.6` (`Installed 3 packages` from the cache, no network); `psycopg-binary` is in the uv cache.
 The pin was left as it is; the earlier "does not resolve offline" line is wrong and this replaces it.
 
+## The quiet window opened for ~2.5 minutes, and one block is measured
+
+Read 2026-10-23: the 1-minute loadavg was 1.84 at 20:32:35 and 0.95 at 20:34:57, with no other agent
+writing in this tree — the trigger (under 2 for one minute) held. Inside it, one block at 200 rps:
+
+```
+M5_PG_IMAGE=postgres:16 M5_PG_REQUIRE=16.15 bash scripts/m1-baseline-run.sh \
+  --mode full --arms postgres --requests 4000 --rate 200 --skip-build \
+  --workdir .tmp/m5-arm-16.15-200rps
+```
+
+Log `logs/arm-16.15-200rps-quiet-203431.out`; `loadavg.jsonl` in that work directory reads
+`0.92 2.54 2.94` at the arm's start and `0.95 2.39 2.88` at its end, so a reader sees that the
+1-minute reading was the quiet one and the smoothed ones were not.
+
+| quantity | value |
+|---|---|
+| offered / achieved | 200 / 199.87 rps (99.9%) |
+| sustained | yes — 21 windows, 0 rejected, lag ceiling 10,000 µs p99 |
+| lag p99 / service p99 | 4 µs / 41,652 µs |
+| serving peak / arm scope | 39.5 MiB / 41.4 MiB under a 128 MiB cap |
+| oracle | PASS |
+| version | 16.15 (Debian 16.15-1.pgdg13+2), read back from the server |
+
+What it is not: the three-arm comparison (sqlite and flashdb-declared were not run in this window),
+and not comparable to ticket 82's rung-200, which ran 200,000 customers / 2,650,000 SKUs on postgres
+18.6. The version is part of the number.
+
 ## The 18.x pull: one command, repeatable, and where it stands
 
 ```
