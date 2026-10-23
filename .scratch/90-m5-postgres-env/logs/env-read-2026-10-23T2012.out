@@ -1,0 +1,35 @@
+# read at 2026-10-23T20:14:14+08:00 by z on z3
+# method: docker ps --format '{{.Names}} {{.Image}} {{.Ports}} {{.Status}}'
+jolly_lamarr postgres:16  Up 4 days
+
+# method: docker exec jolly_lamarr psql -U postgres -tAc 'select version()'
+PostgreSQL 16.15 (Debian 16.15-1.pgdg13+2) on x86_64-pc-linux-gnu, compiled by gcc (Debian 14.2.0-19) 14.2.0, 64-bit
+
+# method: docker exec jolly_lamarr psql -U postgres -tAc "select name, setting, source from pg_settings where name in (...)"
+data_directory|/var/lib/postgresql/data|override
+fsync|on|default
+listen_addresses|*|configuration file
+maintenance_work_mem|65536|default
+max_connections|100|configuration file
+max_wal_senders|10|default
+port|5432|default
+server_version_num|160015|default
+shared_buffers|16384|configuration file
+synchronous_commit|on|default
+wal_level|replica|default
+work_mem|4096|default
+
+# method: ss -ltn | grep 5432
+LISTEN 0      200          0.0.0.0:5432       0.0.0.0:*          
+LISTEN 0      200             [::]:5432          [::]:*          
+
+# method: command -v psql pg_ctl pg_isready (host)
+psql: absent
+pg_ctl: absent
+pg_isready: absent
+
+# method: docker images --format '{{.Repository}}:{{.Tag}} {{.ID}} {{.Size}}'
+docker.litellm.ai/berriai/litellm:main-stable 501909ec6f50 1.69GB
+prom/prometheus:latest efd719c99d83 381MB
+postgres:16 e17e86066e5e 639MB
+eclipse-mosquitto:2 a908c65cc8e6 37.4MB

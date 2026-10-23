@@ -4,6 +4,12 @@ Docker daemon is up but cannot pull (Docker Hub, PyPI, GitHub unreachable; HTTP 
 `mirrors.aliyun.com` and `mirrors.tuna.tsinghua.edu.cn` works). No sudo without a password.
 Therefore both baselines run natively; the apt route needs no root for `apt-get download`.
 
+**Re-read 2026-10-23T20:14** (`docker images`, `docker info`, `docker ps`, 25 s `curl
+https://registry-1.docker.io/v2/`): `postgres:16` is now a local image and the daemon carries the
+registry mirror `docker.1ms.run`, which serves pulls slowly; direct Docker Hub is still unreachable.
+The M5 leg uses a container (`.scratch/90-m5-postgres-env/`); the paragraphs below remain the M1
+record's route and its verification, not a statement about the box today.
+
 ## sqlite
 
 - Available in the Python standard library: `python3 -c "import sqlite3; print(sqlite3.sqlite_version)"`

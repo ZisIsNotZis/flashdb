@@ -1,0 +1,6 @@
+export M1_PGHOST=127.0.0.1
+export M1_PGPORT=5433
+export M1_PGUSER=postgres
+export M1_PGDATABASE=postgres
+export M1_PG_SERVER_VERSION=16.15
+export M5_PG_ROOT=/var/tmp/m5-pg

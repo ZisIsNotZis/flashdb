@@ -1,11 +1,15 @@
 #!/usr/bin/env bash
 # User-space postgres for the M1 external baselines: download, extract, init, start. No root.
 #
-# Why this shape: Docker Hub is unreachable on this box and no images are local, so postgres runs
-# natively from the distro's own packages, extracted into a private root and pointed at a private
-# data directory (`.scratch/80-external-baselines/env.md` records the verified sequence and the
-# config below). `apt-get download` resolves through the machine's configured apt mirror, which is
-# the aliyun Ubuntu mirror (`/etc/apt/sources.list.d/*.sources`).
+# Why this shape, as it was read on 2026-10-17 when this route was chosen: Docker Hub unreachable and
+# no images local. Re-read 2026-10-23T20:14 (`docker images`; `docker info`): `postgres:16` is local,
+# the daemon has a registry mirror (`docker.1ms.run`), and direct Docker Hub is still unreachable
+# (25 s curl timeout). The M5 leg therefore runs a container, not this route — see
+# `.scratch/90-m5-postgres-env/` — and this script stays as the M1 record's user-space extraction:
+# distro packages into a private root, pointed at a private data directory
+# (`.scratch/80-external-baselines/env.md` records the verified sequence and the config below).
+# `apt-get download` resolves through the machine's configured apt mirror, the aliyun Ubuntu mirror
+# (`/etc/apt/sources.list.d/*.sources`).
 #
 # The config is chosen so a shared-buffer-sized engine fits the same 128 MiB cgroup as flashdb. It
 # is minimal, not tuned, and is disclosed verbatim in the run record.

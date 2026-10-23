@@ -42,7 +42,8 @@ changed here.
   tail (77-166 ms) sits above the 10 ms lag ceiling with no build concurrent. Attribution to the
   device is recorded, not inferred.
 - **Footprint:** postgres 16.40x by data directory (inside the regime), sqlite 4.04x (below the 10x
-  floor, so its 5/5 is a reading at a smaller physical size).
+  floor, so its 5/5 is a reading at a smaller physical size). Both figures are against **postgres
+  18.6 (Ubuntu 18.6-3build2)**, ticket 82; a run against another version re-takes them.
 - **M2 (join-heavy descriptors):** delivered and merged; its gate is UNMET (2/4) because the >=10x
   and learned-vs-declared join measurements need three engine capabilities that do not exist
   (multi-row `$block.field` binding, a validator wider than `cust -> take`, aggregate-to-write).
@@ -94,6 +95,16 @@ roadmap's own text means.
    instrument (the paired block, the regeneration chain, the trigger) is written where the clause is.
    Everything else in the tree runs under load and does not wait for the window.
 
+8. **The postgres leg runs from a container, and every result names the version it measured.**
+   Root's answer of 2026-10-23 (`mail/2026-10-23-answer-postgres-present.md`) reads this box as
+   carrying **postgres 16.15 (Debian 16.15-1.pgdg13+2)** in container `jolly_lamarr` on 5432 and no
+   18.x, and forbids installing a system package. The M5 arm therefore comes from a docker image
+   (`docker pull postgres:18` for the major version ticket 82 measured; a second container on 5433
+   with the M1 record's settings block, read back from the running server), and
+   `.scratch/90-m5-postgres-env/postgres-server.sh` is the one command that starts and checks it.
+   No document inherits the 18.6 conclusion for a server of another version, and an environment
+   fact is written with the moment it was read and the method that read it.
+
 ## Milestones
 
 | # | Milestone (user gate) | Deliverable / vertical slice | Acceptance (decidable) | Depends |
@@ -126,8 +137,13 @@ the evidence (PASS with notes) landed its three text notes at `31c85c6` with the
 `.scratch/88-m3-notes/`. `docs/plan/workplan.md` §M3 status carries the clause-by-clause state and the
 reopening condition. **M4** is met at `docs/plan/gap-analysis.md` — one reading, the ~573 ms group, is
 recorded **unmeasured** with its instrument named, and that instrument needs the same quiet box. So
-**the next milestone is M5**, and it is held, not idle: it needs a quiet window (person) and the postgres
-server reinstalled (person, raised as a cost report) and nothing in this tree can advance either. What
+**the next milestone is M5**, and it is held, not idle: it needs a quiet window (person), and the
+postgres leg's server is no longer the blocker it was — this box carries 16.15 in container
+`jolly_lamarr` (read 2026-10-23, method in `.scratch/90-m5-postgres-env/issues.md`), the M5 server
+starts and checks on 5433 with the M1 record's settings, and the arm's schema, migration and settings
+were read back from it at 16.15; what is left there is the container wiring into the M1 run chain and
+the choice of major version (18.x if the image pulls, 16.15 otherwise — decision needed). Nothing in
+this tree can produce the quiet window. What
 the project does while it is held is the box-free work on M4's own ranked fix list, because that can be
 done under load and it re-ranks what M5's re-run has to measure: the record-side re-scoring of the M1
 blocks under the decided lag rule is **done** (WP-12: 0 of 45 rows move, so the headline is

@@ -1,0 +1,14 @@
+# server at 127.0.0.1:5433 as postgres (16.15), workdir /home/z/vibe/flashdb/.tmp/m5-postgres-smoke
+# method: uv run --with psycopg python -m flashdb_harness.baseline_0b prepare --workdir /home/z/vibe/flashdb/.tmp/m5-postgres-smoke
+warning: `VIRTUAL_ENV=/home/z/.venv` does not match the project environment path `.venv` and will be ignored; use `--active` to target the active environment instead
+# method: uv run --with psycopg python -m flashdb_harness.baseline_0b build-instance --workdir /home/z/vibe/flashdb/.tmp/m5-postgres-smoke --arms postgres
+warning: `VIRTUAL_ENV=/home/z/.venv` does not match the project environment path `.venv` and will be ignored; use `--active` to target the active environment instead
+build-instance postgres: seed_s=0.2 bytes=8150039
+# database the harness built: m1-controlled (read from /home/z/vibe/flashdb/.tmp/m5-postgres-smoke/build-postgres.json)
+# method: docker exec flashdb-m5-pg psql -U postgres -d m1-controlled -tAc '<counts>'
+customers=200
+stocks=2000
+database_bytes=8150039
+# method: docker exec flashdb-m5-pg psql -U postgres -tAc 'select version()'
+PostgreSQL 16.15 (Debian 16.15-1.pgdg13+2) on x86_64-pc-linux-gnu, compiled by gcc (Debian 14.2.0-19) 14.2.0, 64-bit
+smoke: schema, rows and counts read back from the running server
