@@ -68,25 +68,71 @@ Log `logs/smoke-migration-16.15.out`: database `m1-controlled`, `customers=200`,
 harness's own count check (`expected_counts`) passed before the shell read it back. This is setup and
 connection, not a measurement: no arm ran, no window opened, no rate measured.
 
+## The chain, closed (2026-10-23 20:31) — and the arm ran at 16.15 as a chain check
+
+`scripts/m1-baseline-run.sh`'s postgres branch no longer starts a host cluster the box does not have.
+It now starts the checked container:
+
+- `down` before each step, then `postgres-server.sh up` — pull if the image is absent, run under
+  `--memory`, wait for `pg_isready`, then check **every** setting against the M1 record and refuse a
+  mismatch (and refuse a version `M5_PG_REQUIRE` does not name). `env` hands the harness the endpoint
+  and the version read back from the server.
+- The container's `HostConfig.Memory` is compared with `--cap-mib` and the step refuses another cap;
+  the lifetime peak is read from the container's cgroup before the container is removed, so the run
+  record's `arm_scope_peak_bytes` is the container's, not a scope's.
+- `restore_arm` removes the container **before** the harness writes the snapshot into
+  `$M1_PG_ROOT/data`, so the restore's digest check covers the bytes the next start serves.
+- The data directory is bind-mounted at the host path itself (`-v $ROOT/data:$ROOT/data`,
+  `PGDATA=$ROOT/data`): `show data_directory` then reports the path the harness restored, which is
+  what its restored-run check compares. Verified 2026-10-23T20:30, log `logs/up-16.15.out`.
+- `M1_PG_ROOT` defaults to `/var/tmp/m5-pg`; no host `pg_ctl`, no debs, no system package.
+
+One command ran the arm through the chain at 16.15:
+
+```
+M5_PG_IMAGE=postgres:16 M5_PG_REQUIRE=16.15 bash scripts/m1-baseline-run.sh \
+  --mode full --arms postgres --requests 200 --rate 50 --skip-build --workdir .tmp/m5-arm-16.15
+```
+
+Log `logs/arm-16.15-chain-203101.out`. Read back: `postgres_settings.server_version` =
+`16.15 (Debian 16.15-1.pgdg13+2)` in `run-postgres.json`; `postgres-server.jsonl` carries
+`image=postgres:16`, `require=16.15`, `server_version=16.15`, `data_directory=/var/tmp/m5-pg/data`;
+the settings block checked; oracle PASS; cap 128 MiB; serving peak 36.8 MiB. **Loadavg at the arm's
+start was 3.77 (trigger: under 2 for a minute), so this is a chain check and not a throughput
+measurement** — its 200-request 50 rps row is a window rule, not a rate, and throughput stays
+`unmeasured`.
+
+**Correction, same class as root's message: a fact read at 20:24 was already false at 20:30.** The
+`psycopg[binary]==3.3.6` pin does resolve offline on this box. Read 2026-10-23T20:30:
+`uv run --offline --with 'psycopg[binary]==3.3.6' python -c 'import psycopg; print(psycopg.__version__)'`
+→ `3.3.6` (`Installed 3 packages` from the cache, no network); `psycopg-binary` is in the uv cache.
+The pin was left as it is; the earlier "does not resolve offline" line is wrong and this replaces it.
+
+## The 18.x pull: one command, repeatable, and where it stands
+
+```
+bash .scratch/90-m5-postgres-env/pull-postgres18.sh          # one attempt
+nohup bash .scratch/90-m5-postgres-env/pull-postgres18.sh & # same command, in the background
+```
+
+Each attempt resumes: the daemon keeps the layers it already holds. Started 2026-10-23T20:29, log
+`logs/pull-postgres18-20261023.out` (append-only, one header per attempt). Read 20:32: `postgres:18`
+still absent from `docker images`; the attempt sits at "Pulling fs layer" and has completed no layer.
+If it lands before the end of the day: `M5_PG_IMAGE=postgres:18 M5_PG_REQUIRE=<the version
+`select version()` reports>` `postgres-server.sh up`, then the same arm command with
+`--workdir .tmp/m5-arm-18.x`, and the result names the 18.x it read — never "18.6" inherited from
+ticket 82. If it does not land, the 16.15 arm above stands as its own measurement, with its version
+stated wherever it is quoted.
+
 ## What this does not settle
 
-- **The arm's version.** Ticket 82's postgres was **18.6 (Ubuntu 18.6-3build2)**. The M5 arm should
-  report the same major version if it can; the `postgres:18` pull is the only route to it (no system
-  package, per root) and five minutes of it moved no layer, so it was stopped at 20:24 and `up`
-  resumes it. Until it lands, the box's working server is **16.15** and any "lost to postgres" from it
-  must read 16.15.
-- **The container wired into the M1 run chain.** `scripts/m1-baseline-run.sh` and
-  `scripts/m1-ladder-run.sh` start the postgres server with `pg_ctl` in a user systemd scope and stop
-  it the same way; a container needs the start/stop/restore equivalents (`docker start/stop`,
-  digest-checked copy of `/var/tmp/m5-pg/data`). That is work package `workplan.md` WP-13, and it is
-  what makes the M5 arm one command.
-- **One blocker found in the chain itself.** `scripts/m1-baseline-run.sh:305,315` runs
-  `uv run --with 'psycopg[binary]==3.3.6'`, which **does not resolve offline on this box** — read at
-  20:24: `psycopg-binary` 3.3.6 is not in the uv cache, while plain `psycopg` 3.3.6 is and imports.
-  The postgres arm would die at seed time on the offline path; the fix belongs to WP-13.
+- **The version a comparison may report.** The 16.15 arm is in hand and its version is read back;
+  the 18.x arm waits on the pull. A later reader may not carry the 18.6 conclusion onto a 16.15
+  result: the M5 comparison's meaning moves with the version, so the version travels with the number.
 - **Throughput on any version.** Not measured, and the quiet window is still not held: `uptime` at
-  20:12 read 3.07 / 2.09 / 1.69 and no arm was taken. `.scratch/89-m3b-paired-200/`'s gate and the
-  M5 comparison wait for the trigger unchanged.
+  the arm's start read 3.77 / 4.03 / 3.40 and at 20:31 3.57 / 3.98 / 3.39. `.scratch/89-m3b-paired-200/`'s
+  gate and the M5 comparison wait for the trigger unchanged. The trigger is not lowered to get a
+  number.
 
 ## Stale environment facts this read corrects, with their moment
 
