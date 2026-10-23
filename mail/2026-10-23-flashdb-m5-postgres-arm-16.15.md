@@ -117,7 +117,9 @@ window; nothing in this tree can produce one.
 ## Decision needed: none
 
 Your answer settled the version question: 16.15 now, 18.6 only if the image lands and the server
-reads it back. What remains blocked is the quiet box — a person's gift, not a work item.
+reads it back. The postgres arm's own block is measured inside one quiet trigger; what remains open is
+the three-arm comparison (sqlite and flashdb-declared in the same window at this version) and the 18.x
+arm if the pull lands. Both wait on a quiet box, which no work in this tree can produce.
 
 Effort: ~28 minutes of wall clock, idle class, one background image pull (bandwidth only, no layer
 completed), two postgres arms (one 200-request chain check under loadavg 3.77, not scored; one
