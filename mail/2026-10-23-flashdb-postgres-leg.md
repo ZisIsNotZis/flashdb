@@ -62,9 +62,10 @@ offline path; the fix belongs to WP-13, not to a run.
 `workplan.md` WP-13: (i) the container wired into `scripts/m1-baseline-run.sh`,
 `m1-ladder-run.sh`, `m1-controlled-run.sh` as the postgres arm's start/stop/restore (a digest-verified
 copy of `/var/tmp/m5-pg/data` is the instance); (ii) the `psycopg` pin above; (iii) the run record's
-`postgres_settings` carrying `server_version` read from the server. The background `docker pull
-postgres:18` through the daemon's mirror `docker.1ms.run` was still in flight at 20:22 and is one
-command to resume; direct Docker Hub is still unreachable (25 s curl timeout).
+`postgres_settings` carrying `server_version` read from the server. A `docker pull postgres:18`
+through the daemon's mirror `docker.1ms.run` ran 20:19-20:24 and moved no layer past "Pulling fs
+layer"; it was stopped rather than left unattended, and `postgres-server.sh up` resumes it. Direct
+Docker Hub is still unreachable (25 s curl timeout).
 
 ## Decision needed: one — which version M5's postgres arm reports
 
@@ -85,6 +86,7 @@ overturn it is a pulled 18.x whose own perf differs from the M1 arm's 18.6 enoug
 be read together, in which case A with the version stated is the honest comparison.
 
 Effort: ~20 minutes of wall clock, idle class, no device held exclusively, one 639 MB image already
-local, one pull left half-done, ~8 MB of regenerable state under `.tmp/`, no arm run and no number
-claimed from load. Two commits: `3f478f9` (your message filed as received) and `a7c2d0b` (the server,
-the read and the docs landing).
+local, one pull stopped after five minutes with no layer, ~8 MB of regenerable state under `.tmp/`,
+no arm run and no number claimed from load. Four commits: `3f478f9` (your message filed as received),
+`a7c2d0b` (the server, the read and the docs landing), `bb38c9a` (this report) and `3cd74e6` (the
+read times and the stopped pull, exact).

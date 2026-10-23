@@ -74,8 +74,9 @@ explicit resume trigger instead of reporting a contended result as a verdict.
 - **Postgres: no longer absent, and not the version ticket 82 measured.** Read at 2026-10-23T20:14
   (`docker ps`, `docker exec jolly_lamarr psql -U postgres -tAc 'select version()'`, `ss -ltn`): this
   box carries **16.15 (Debian 16.15-1.pgdg13+2)** in container `jolly_lamarr` on 5432, the host has
-  no `psql`/`pg_ctl`, and `postgres:18` is not among the local images (a pull through the daemon's
-  mirror `docker.1ms.run` was in flight at 20:28). The M5 server is a container this tree starts and
+  no `psql`/`pg_ctl`, and `postgres:18` is not among the local images — a pull through the daemon's
+  mirror `docker.1ms.run` ran 20:19-20:24 and moved no layer, so it was stopped and `up` resumes it.
+  The M5 server is a container this tree starts and
   checks itself — `.scratch/90-m5-postgres-env/postgres-server.sh up|check|env` runs it on 5433 with
   the M1 record's settings block, a 128 MiB cap and `/var/tmp/m5-pg/data` on ext4, and refuses when
   a setting or a required version differs. No system package is installed. What still blocks M5 on

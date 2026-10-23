@@ -24,9 +24,11 @@ changed here.
 
 - **External (M1, ticket 82):** T5 PASS (deficit 1.001), T7 PASS, **T6 measured and withdrawn** as
   structurally unpassable. At 200 rps flashdb-declared sustained 3/5 blocks while sqlite and postgres
-  each sustained 5/5 (highest-level ratio 0.5x). The external-superiority claim is **not supported at
-  this revision**, and the cause is now diagnosed (ticket 83): the derived `order_no` index is built
-  from tiles only and was empty on this workload, so every scan request paid a 5.6 MB full scan.
+  (**18.6, Ubuntu 18.6-3build2**) each sustained 5/5 (highest-level ratio 0.5x); the postgres version
+  is the one that arm read from its running server, and a claim from another version names it. The
+  external-superiority claim is **not supported at this revision**, and the cause is now diagnosed
+  (ticket 83): the derived `order_no` index is built from tiles only and was empty on this workload,
+  so every scan request paid a 5.6 MB full scan.
   That defect is fixed and the fix is **measured, not argued** (ticket 84): on a rebuilt instance of
   this record's shape the index holds 2,785 entries for 2,785 rows against 0 before the fix, 0 of 188
   scan requests enter the merged scan, and read bytes per request fall 42,240 → 13,466 against the

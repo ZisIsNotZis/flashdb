@@ -7,7 +7,7 @@ still stops the work. No throughput number is measured or claimed here.
 
 ## What is true at the moment it was read
 
-All reads 2026-10-23 between 20:10 and 20:28 +08:00, on `z3`, user `z`. Log:
+All reads 2026-10-23 between 20:10 and 20:24 +08:00, on `z3`, user `z`. Log:
 `logs/env-read-2026-10-23T2012.out` (the first block) and `logs/up-16.15.out` (the M5 server).
 
 | fact | value | read with |
@@ -15,7 +15,7 @@ All reads 2026-10-23 between 20:10 and 20:28 +08:00, on `z3`, user `z`. Log:
 | container carrying postgres | `jolly_lamarr`, image `postgres:16`, up 4 days, `0.0.0.0:5432` | `docker ps --format '{{.Names}} {{.Image}} {{.Ports}} {{.Status}}'`; `ss -ltn \| grep 5432` |
 | its version | `PostgreSQL 16.15 (Debian 16.15-1.pgdg13+2) on x86_64-pc-linux-gnu` | `docker exec jolly_lamarr psql -U postgres -tAc 'select version()'` |
 | its settings | `shared_buffers=128MB`, `max_connections=100`, `work_mem=4MB`, `maintenance_work_mem=64MB`, `fsync=on`, `synchronous_commit=on`, `wal_level=replica`, `max_wal_senders=10`, trust auth, **no memory cap** (`HostConfig.Memory` 0) | `select name, setting, source from pg_settings where name in (...)`; `docker inspect` |
-| 18.x on the box | **absent at 20:28**: not in `docker images`; `docker pull postgres:18` through the daemon's mirror `docker.1ms.run` was in flight when the budget ran out (attempt 2, log `logs/pull-postgres18-attempt2.out`). A direct `curl https://registry-1.docker.io/v2/` timed out at 25 s | `docker images`; `docker info` (mirrors); `curl` |
+| 18.x on the box | **absent at 20:24**: not in `docker images`; `docker pull postgres:18` through the daemon's mirror `docker.1ms.run` ran 20:19-20:24 and moved no layer past "Pulling fs layer" (attempt 2, log `logs/pull-postgres18-attempt2.out`), so it was stopped and `up` resumes it. A direct `curl https://registry-1.docker.io/v2/` timed out at 25 s | `docker images`; `docker info` (mirrors); `curl` |
 | host client tools | `psql`, `pg_ctl`, `pg_isready` all absent | `command -v` each |
 
 `jolly_lamarr` is therefore **not** the M5 arm's server: it is 16.15, it has no memory cap, its
@@ -72,8 +72,9 @@ connection, not a measurement: no arm ran, no window opened, no rate measured.
 
 - **The arm's version.** Ticket 82's postgres was **18.6 (Ubuntu 18.6-3build2)**. The M5 arm should
   report the same major version if it can; the `postgres:18` pull is the only route to it (no system
-  package, per root) and it did not finish inside this budget. Until it does, the box's working server
-  is **16.15** and any "lost to postgres" from it must read 16.15.
+  package, per root) and five minutes of it moved no layer, so it was stopped at 20:24 and `up`
+  resumes it. Until it lands, the box's working server is **16.15** and any "lost to postgres" from it
+  must read 16.15.
 - **The container wired into the M1 run chain.** `scripts/m1-baseline-run.sh` and
   `scripts/m1-ladder-run.sh` start the postgres server with `pg_ctl` in a user systemd scope and stop
   it the same way; a container needs the start/stop/restore equivalents (`docker start/stop`,
