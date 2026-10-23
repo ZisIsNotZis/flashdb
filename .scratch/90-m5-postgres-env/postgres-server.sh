@@ -106,13 +106,14 @@ up() {
     absent)
       # `--user $(id -u):$(id -g)`: the official image supports an arbitrary user, and it is what
       # lets the data directory be a host bind mount this account owns (no root, no chown to 999).
-      # PGDATA is pinned to the 16-and-earlier path for every image so the bind is the cluster.
+      # The bind target is the host path itself: the server then reports `data_directory` = the path
+      # the harness restores (`$ROOT/data`), which is what its restored-run check compares.
       local args=(-d --name "$NAME"
         --user "$(id -u):$(id -g)"
         --memory "$MEM" --memory-swap "$MEM"
         -p "127.0.0.1:$PORT:5432"
-        -v "$ROOT/data:/var/lib/postgresql/data"
-        -e PGDATA=/var/lib/postgresql/data
+        -v "$ROOT/data:$ROOT/data"
+        -e PGDATA="$ROOT/data"
         -e POSTGRES_HOST_AUTH_METHOD=trust
         -e POSTGRES_USER="$USER_NAME")
       local item cmd=()
@@ -169,7 +170,9 @@ env_out() {
   printf 'export M1_PGHOST=%q\nexport M1_PGPORT=%q\nexport M1_PGUSER=%q\nexport M1_PGDATABASE=%q\n' \
     127.0.0.1 "$PORT" "$USER_NAME" "$DATABASE"
   printf 'export M1_PG_SERVER_VERSION=%q\n' "$(server_version | sed 's/PostgreSQL \([0-9.]*\).*/\1/')"
-  printf 'export M5_PG_ROOT=%q\n' "$ROOT"
+  # The data directory is bind-mounted at the SAME path inside the container, so the server reports
+  # the path a restore wrote and the harness's restored-run check compares like with like.
+  printf 'export M1_PG_ROOT=%q\n' "$ROOT"
 }
 
 status() {
