@@ -80,7 +80,12 @@ no `pg_ctl`, and the box's postgres is a container, so the branch could not run 
   covers the bytes the next start serves;
 - bind-mounts the data directory at the host path itself, so `show data_directory` equals the path
   the harness restored and the harness's restored-run check compares like with like (verified at
-  20:30).
+  20:30);
+- was exercised through the controlled protocol's two state steps: `--mode instance` seeded and
+  snapshotted (65,201,798 B, 1,294 files, sha256 `b0c8efef…de2177`), `--mode arm` restored it
+  (digest verified, 0.5 s), started the container on the restored directory and returned oracle PASS
+  (logs `chain-instance-16.15.out`, `chain-arm-restored-16.15.out`). A relative `--instance-root`
+  used to land under `harness/.tmp/`; both state paths are resolved once now.
 
 Two facts from the earlier read are now corrected, both with their moment:
 

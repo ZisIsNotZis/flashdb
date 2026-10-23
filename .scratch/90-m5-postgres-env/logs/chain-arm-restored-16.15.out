@@ -1,0 +1,30 @@
+warning: `VIRTUAL_ENV=/home/z/.venv` does not match the project environment path `.venv` and will be ignored; use `--active` to target the active environment instead
+machine-state before: loadavg=2.31 epp=n/a freq_khz=1200000,1200148,1200268,1287825,1891262,2500199,2500833,2599922,2600244,2900832,3912776
+warning: `VIRTUAL_ENV=/home/z/.venv` does not match the project environment path `.venv` and will be ignored; use `--active` to target the active environment instead
+restore postgres: 65201798 bytes from /home/z/vibe/flashdb/.tmp/m5-snap/postgres (sha256 verified, 0.5 s)
+image: postgres:16 present (sha256:e17e86066e5e)
+container: started flashdb-m5-pg from postgres:16, memory cap 128m, data /var/tmp/m5-pg, port 127.0.0.1:5433
+# read at 2026-10-23T20:36:49+08:00 on z3, user z
+# method: docker exec flashdb-m5-pg psql -U postgres -tAc 'select version()'
+version: PostgreSQL 16.15 (Debian 16.15-1.pgdg13+2) on x86_64-pc-linux-gnu, compiled by gcc (Debian 14.2.0-19) 14.2.0, 64-bit
+# method: docker image inspect -f '{{.Id}}' postgres:16; docker inspect -f '{{.HostConfig.Memory}}' flashdb-m5-pg
+image:   postgres:16 sha256:e17e86066e5e
+memory:  134217728 bytes cap on the container
+# method: docker exec flashdb-m5-pg psql -U postgres -tAc 'select name, setting, source from pg_settings ...'
+setting: data_directory=/var/tmp/m5-pg/data (override)
+setting: fsync=on (command line)
+setting: maintenance_work_mem=16384 (command line)
+setting: max_connections=32 (command line)
+setting: max_wal_senders=0 (command line)
+setting: port=5432 (default)
+setting: shared_buffers=2048 (command line)
+setting: synchronous_commit=on (command line)
+setting: wal_level=minimal (command line)
+setting: work_mem=4096 (command line)
+checked: every setting above matches the M1 record's block
+warning: `VIRTUAL_ENV=/home/z/.venv` does not match the project environment path `.venv` and will be ignored; use `--active` to target the active environment instead
+postgres: oracle PASS; sustained=True highest=50 rps rejected_windows=0 serving_peak=24530944 cap_mib=128 sha256=99afa54ecf2caea95467fa52fcb4463ab07cd8c424d7605e93ca477accc58946
+container: flashdb-m5-pg removed (data /var/tmp/m5-pg kept)
+warning: `VIRTUAL_ENV=/home/z/.venv` does not match the project environment path `.venv` and will be ignored; use `--active` to target the active environment instead
+machine-state after: loadavg=2.03 epp=n/a freq_khz=1200000,1200104,1200199,1200563,1201675,1202402,1992869,2501499,3871011,3902574
+m1-baseline-run: mode arm, artefacts in /home/z/vibe/flashdb/.tmp/m5-arm-16.15

@@ -108,6 +108,17 @@ measurement** — its 200-request 50 rps row is a window rule, not a rate, and t
 → `3.3.6` (`Installed 3 packages` from the cache, no network); `psycopg-binary` is in the uv cache.
 The pin was left as it is; the earlier "does not resolve offline" line is wrong and this replaces it.
 
+### The restore path, exercised
+
+`--mode instance` built the pre-load instance and snapshotted it (`65,201,798 B`, 1,294 files,
+sha256 `b0c8efef…de2177`, log `logs/chain-instance-16.15.out`), then `--mode arm` restored it
+(digest verified, 0.5 s), started the container **on the restored directory**, passed the harness's
+`data_directory` check (`/var/tmp/m5-pg/data` on both sides) and returned oracle PASS (log
+`logs/chain-arm-restored-16.15.out`). Getting there found one more path bug: the chain resolved
+`$WORKDIR` to an absolute path but not `--snapshot-dir`/`--instance-root`, and the harness `cd`s into
+`harness/` — so a relative path silently landed under `harness/.tmp/`. Both are resolved once now,
+and the payloads get the absolute `M1_INSTANCE_ROOT`.
+
 ## The quiet window opened for ~2.5 minutes, and one block is measured
 
 Read 2026-10-23: the 1-minute loadavg was 1.84 at 20:32:35 and 0.95 at 20:34:57, with no other agent

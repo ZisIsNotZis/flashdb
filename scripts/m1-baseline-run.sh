@@ -382,6 +382,13 @@ case "$MODE" in
         [ -n "$SNAPSHOT_DIR" ] || die "mode $MODE needs --snapshot-dir"
         [ -n "$INSTANCE_ROOT" ] || die "mode $MODE needs --instance-root"
         mkdir -p "$SNAPSHOT_DIR" "$INSTANCE_ROOT"
+        # The harness runs from its own directory, so a relative path handed to it would silently
+        # land under harness/. Resolve both once, the way $WORKDIR is resolved above.
+        SNAPSHOT_DIR=$(cd "$SNAPSHOT_DIR" && pwd)
+        INSTANCE_ROOT=$(cd "$INSTANCE_ROOT" && pwd)
+        # The payloads `cd` into the harness, so they get the absolute path too: a relative
+        # `M1_INSTANCE_ROOT` resolved under harness/ and the restore record was looked for there.
+        export M1_INSTANCE_ROOT=$INSTANCE_ROOT
         ;;
     *) die "unknown --mode $MODE (expected full, instance or arm)" ;;
 esac
