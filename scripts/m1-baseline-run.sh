@@ -21,8 +21,8 @@
 #   * the same memory regime: every arm runs inside `systemd-run --user --scope
 #     -p MemoryMax=<cap>M -p MemorySwapMax=0`, and the arm record carries the scope's own
 #     `memory.peak`;
-#   * postgres is a container this tree starts and checks (`scripts/../.scratch/90-m5-postgres-env/
-#     postgres-server.sh`): the SERVER (the engine) is a container capped with `--memory` and the
+#   * postgres is a container this tree starts and checks
+#     (`.scratch/90-m5-postgres-env/postgres-server.sh`): the SERVER (the engine) is a container capped with `--memory` and the
 #     client stays OUTSIDE it, so the cap covers the engine and not the instrument. The image's
 #     settings block is the M1 record's, read back from the running server; a setting that differs
 #     stops the arm, and `M5_PG_REQUIRE` stops an arm measured against a version nobody named. The
