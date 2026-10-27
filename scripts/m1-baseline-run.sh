@@ -1,10 +1,14 @@
 #!/usr/bin/env bash
-# The M1 external-baseline run: one frozen trace, three arms, each in its own 128 MiB scope.
+# The M1 external-baseline run: one frozen trace, each arm in its own 128 MiB scope.
 #
 #   scripts/m1-baseline-run.sh [--mode full|instance|arm] [--workdir DIR] [--requests N] [--rate R]
 #                              [--arms a,b,c] [--on-hand N] [--cap-mib M] [--seed-cap-mib M]
 #                              [--snapshot-dir DIR] [--instance-root DIR] [--database NAME]
-#                              [--skip-build]
+#                              [--policy-file PATH] [--skip-build]
+#
+# `flashdb-indexed` is the product arm: the declared control's instance and trace plus
+# `--policy-file PATH` (default: ticket 89's indexed.policy.json), which is its only difference.
+# `flashdb-declared` stays the control and passes no policy.
 #
 # Modes (ticket 82's controlled protocol; `full` is the ticket-80 one-shot run and is unchanged):
 #   full      prepare the trace, build each arm's instance, serve it, report.
@@ -54,6 +58,9 @@ BATCH=64
 # the backorder arm of the oracle is exercised end to end.
 ON_HAND=1000000
 ARMS=flashdb-declared,sqlite,postgres
+# The indexed product arm's policy: the SAME file ticket 89's M3(b) pair uses, so M5 cannot
+# measure a policy M3 did not. `--policy-file` overrides it; the declared control passes no policy.
+POLICY_FILE=$REPO/.scratch/89-m3b-paired-200/policy/indexed.policy.json
 # sqlite's page cache, stated to the arm exactly as `baseline_0b.SQLITE_CACHE_KIB` defaults it.
 SQLITE_CACHE_KIB=8192
 # sqlite's WAL auto-checkpoint, stated rather than left to sqlite's compiled default (1000 pages).
@@ -93,6 +100,7 @@ while [ $# -gt 0 ]; do
         --snapshot-dir) SNAPSHOT_DIR=$2; shift 2 ;;
         --instance-root) INSTANCE_ROOT=$2; shift 2 ;;
         --database) DATABASE=$2; shift 2 ;;
+        --policy-file) POLICY_FILE=$2; shift 2 ;;
         --sqlite-cache-kib) SQLITE_CACHE_KIB=$2; shift 2 ;;
         --sqlite-wal-autocheckpoint) SQLITE_WAL_AUTOCHECKPOINT=$2; shift 2 ;;
         --skip-build) SKIP_BUILD=1; shift ;;
@@ -134,17 +142,18 @@ record_runner() {
     python3 - "$WORKDIR/spec.json" "$CAP_MIB" "$SEED_CAP_MIB" "$LOCK" \
         "${M1_PG_ROOT:-}" "$RUNNER_CMD" "$RUNNER_CWD" "$MODE" "$SNAPSHOT_DIR" \
         "$INSTANCE_ROOT" "$DATABASE" "${LOCK_HELD_BY:-}" "${M1_PG_PORT:-}" \
-        "${M1_PG_REQUIRE:-}" <<'PY'
+        "${M1_PG_REQUIRE:-}" "$POLICY_FILE" <<'PY'
 import json, sys
 (path, cap, seed_cap, lock, pg_root, argv, cwd, mode, snap, live, db, held,
- pg_port, pg_require) = sys.argv[1:15]
+ pg_port, pg_require, policy_file) = sys.argv[1:16]
 spec = json.load(open(path))
 spec["runner"] = {"argv": argv, "cwd": cwd, "engine_cap_mib": int(cap),
                   "seed_cap_mib": int(seed_cap), "lock": lock, "postgres_root": pg_root,
                   "postgres_port": int(pg_port) if pg_port else None,
                   "postgres_require": pg_require or None,
                   "mode": mode, "snapshot_dir": snap or None, "instance_root": live or None,
-                  "postgres_database": db, "lock_held_by_caller": held == "1"}
+                  "postgres_database": db, "lock_held_by_caller": held == "1",
+                  "index_policy_file": policy_file or None}
 json.dump(spec, open(path, "w"), sort_keys=True, indent=2)
 PY
 }
@@ -240,15 +249,27 @@ export M1_HARNESS=$HARNESS M1_REPO=$REPO M1_SKIP_VERIFY=$SKIP_VERIFY
 export M1_INSTANCE_ROOT=$INSTANCE_ROOT M1_DATABASE=$DATABASE
 export M1_SQLITE_CACHE_KIB=$SQLITE_CACHE_KIB M1_SKIP_ORACLE=${M1_SKIP_ORACLE:-0}
 export M1_SQLITE_WAL_AUTOCHECKPOINT=$SQLITE_WAL_AUTOCHECKPOINT
+# The payloads `cd` into the harness, so the policy path must be absolute or the driver would look
+# for it under harness/. A run that asks for the indexed arm without the file stops here.
+case ",$ARMS," in
+    *,flashdb-indexed,*)
+        [ -f "$POLICY_FILE" ] || die "--arms names flashdb-indexed but the policy file $POLICY_FILE is missing"
+        POLICY_FILE=$(cd "$(dirname "$POLICY_FILE")" && pwd)/$(basename "$POLICY_FILE")
+        ;;
+esac
+export M1_INDEX_POLICY=$POLICY_FILE
 
 run_step() {
     local name=$1
     local payload=$PAYLOADS/$name.sh
     case "$name" in
-        flashdb-declared|flashdb-learned)
+        flashdb-declared|flashdb-indexed|flashdb-learned)
             cat > "$payload" <<'EOF'
 set -euo pipefail
 cd "$M1_HARNESS"
+# The ONE difference between the declared control and the indexed product arm: the policy file.
+policy_args=()
+[ "ARG_ARM" = flashdb-indexed ] && policy_args=(--policy-file "$M1_INDEX_POLICY")
 if [ "$M1_STEP" = instance ]; then
     uv run python -m flashdb_harness.baseline_0b build-instance --workdir "$M1_WORKDIR" \
         --arms ARG_ARM --engine-cap-mib "$M1_CAP_MIB" --seed-cap-mib "$M1_SEED_CAP_MIB" \
@@ -262,7 +283,7 @@ else
 fi
 uv run python -m flashdb_harness.baseline_0b arm --workdir "$M1_WORKDIR" --arm ARG_ARM \
     --engine-cap-mib "$M1_CAP_MIB" --seed-cap-mib "$M1_SEED_CAP_MIB" --skip-verify \
-    --database "$M1_DATABASE" "${restored_args[@]}"
+    --database "$M1_DATABASE" "${policy_args[@]}" "${restored_args[@]}"
 if [ "$M1_SKIP_VERIFY" = 1 ]; then
     echo "flashdb read-back DEFERRED (--skip-verify): see the run record" >&2
 else

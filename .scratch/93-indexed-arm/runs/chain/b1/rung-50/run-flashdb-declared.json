@@ -1,0 +1,247 @@
+{
+  "arm": "flashdb-declared",
+  "arm_scope_peak_bytes": null,
+  "batch": 64,
+  "counters": {
+    "backorder": 0,
+    "errors": 0,
+    "first_error": null,
+    "miss": 0,
+    "take": 183
+  },
+  "curve": [
+    {
+      "achieved_fraction": 1.0,
+      "achieved_rps": 50.0,
+      "ceiling_rejected_windows": 0,
+      "compact_bytes": 0,
+      "early_dispatches": 0,
+      "error_windows": 0,
+      "group_elapsed_us": 6934,
+      "groups": 250,
+      "groups_over_service_ceiling": 0,
+      "invalid_windows": 0,
+      "lag_ceiling_rejected_windows": 0,
+      "lag_ceiling_us": 10000,
+      "lag_p50_us": 61,
+      "lag_p95_us": 387,
+      "lag_p99_us": 926,
+      "max_group_size": 1,
+      "mean_group_size": 1.0,
+      "min_lag_us": 1,
+      "offered_rps": 50.0,
+      "p50_us": 3636,
+      "p95_us": 4213,
+      "p99_us": 6934,
+      "rate_exceeded": false,
+      "reject_reasons": {},
+      "service_ceiling_rejected_windows": 0,
+      "service_ceiling_reported_windows": 0,
+      "service_ceiling_us": null,
+      "sustained": true,
+      "sustained_primary": true,
+      "sustained_tolerance": 0.95,
+      "valid_windows": 5,
+      "windows": 5
+    }
+  ],
+  "durability": "flashdb --group-requests 64 (one WAL barrier per group)",
+  "elapsed_s": 5.0,
+  "engine_cap_mib": 128,
+  "engine_memory": {
+    "method": "exact memory.peak of the flashdb-load invocation's own scope, read inside it",
+    "peak_bytes": 63799296,
+    "samples": null,
+    "scope": "measured phase only: the instance is BUILT in a separate construction scope",
+    "start_bytes": 3878912
+  },
+  "engine_policy": {
+    "default": {
+      "bloom_bits_per_key": 10,
+      "merge_min_tiles": 2,
+      "page_size": 4096
+    },
+    "regions": {}
+  },
+  "groups": 250,
+  "index": {
+    "adopted": 0,
+    "decisions": [],
+    "engine_policy": {
+      "default": {
+        "bloom_bits_per_key": 10,
+        "merge_min_tiles": 2,
+        "page_size": 4096
+      },
+      "regions": {}
+    },
+    "index_output_bytes_total": 0,
+    "index_scan_us_total": 0,
+    "index_tile_bytes": null,
+    "policy_file": null,
+    "policy_json": null,
+    "region": {
+      "P|StockMovement": {
+        "bytes_read": 4472566,
+        "count": 7,
+        "index_output_bytes": 0,
+        "probe_misses": 0,
+        "probes": 0
+      }
+    },
+    "requested": false,
+    "scan_path": "the policy requests no derived index (declared default), so no order_no_index decision line, no index sidecar and no index_output_bytes are expected; the movement scan is the full scan",
+    "startup_warm": {
+      "index_entries": 0,
+      "scan_entries": 0
+    },
+    "window_policy": {
+      "default": {
+        "bloom_bits_per_key": 10,
+        "merge_min_tiles": 2,
+        "page_size": 4096
+      },
+      "regions": {}
+    },
+    "windows_with_index_output": 0
+  },
+  "instance_bytes": 1683247343,
+  "instance_files": {
+    "tile-154.tile": 10958445,
+    "tile-228.tile": 10868619,
+    "tile-4218.tile": 10842579,
+    "tile-77.tile": 10958445
+  },
+  "instance_root": "/home/z/vibe/worktrees/flashdb/wp16-indexed-arm/.scratch/93-indexed-arm/runs/chain/live",
+  "kpi": {
+    "bytes_read_per_request": {
+      "method": "read_bytes / requests",
+      "unit": "bytes / request",
+      "value": 32101.16
+    },
+    "cpu_us": {
+      "method": "cpu.stat usage_usec of the flashdb-load scope at the end minus at the start of the invocation (the driver's whole measured phase)",
+      "unit": "us",
+      "value": 1182659
+    },
+    "cpu_us_per_request": {
+      "method": "cpu_us / requests",
+      "unit": "us / request",
+      "value": 4730.636
+    },
+    "ingest_bytes": {
+      "method": "sum of the payload bytes of the trace's write requests (line bytes, newline excluded), where a write request is one carrying an `ops` block: trace.jsonl, the same frozen trace every arm replays",
+      "unit": "bytes",
+      "value": 135798
+    },
+    "instance_bytes": {
+      "method": "directory bytes of the instance the arm served, live WAL included",
+      "unit": "bytes",
+      "value": 1683247343
+    },
+    "read_bytes": {
+      "method": "sum over the measured-phase windows of per-region `bytes_read` (data-block bytes read from tiles while serving the region), from the driver's --metrics-json region telemetry (windows-flashdb-declared.jsonl)",
+      "unit": "bytes",
+      "value": 8025290
+    },
+    "readings": {
+      "cpu_stat": {
+        "end_usec": 1198234,
+        "start_usec": 15575
+      },
+      "recovery_s": 1.247693673001777,
+      "region_totals": {
+        "bytes_read": 8025290,
+        "bytes_written": 89999,
+        "compaction_bytes": 0,
+        "index_output_bytes": 0
+      },
+      "trace": {
+        "payload_bytes": 135798,
+        "trace": "/home/z/vibe/worktrees/flashdb/wp16-indexed-arm/.scratch/93-indexed-arm/runs/chain/b1/rung-50/trace.jsonl",
+        "write_requests": 183
+      },
+      "windows_file": "windows-flashdb-declared.jsonl"
+    },
+    "recovery_s": {
+      "method": "wall time from the harness's subprocess start (the `systemd-run` scope launch) to the driver's `startup_warm` line: the end of the open + eager-warm phase, after which the first request is served on its due schedule",
+      "unit": "s",
+      "value": 1.247693673001777
+    },
+    "requests": {
+      "method": "sum of the per-window `requests` over the measured phase (windows-flashdb-declared.jsonl)",
+      "unit": "requests",
+      "value": 250
+    },
+    "rss_peak_bytes": {
+      "method": "the record's engine_memory.peak_bytes: exact `memory.peak` of the flashdb-load invocation's own scope, read inside it",
+      "unit": "bytes",
+      "value": 63799296
+    },
+    "rss_per_data_byte": {
+      "method": "rss_peak_bytes / instance_bytes",
+      "unit": "resident bytes / data byte",
+      "value": 0.03790250806889288
+    },
+    "schema": "flashdb.baseline.kpi.v1",
+    "write_amp": {
+      "method": "write_bytes / ingest_bytes",
+      "unit": "bytes written / byte ingested",
+      "value": 0.6627417193183994
+    },
+    "write_bytes": {
+      "method": "sum over the measured-phase windows of per-region `bytes_written` (encoded WAL op bytes) + `compaction_bytes` (merged tile output) + `index_output_bytes` (derived index tile output), from the driver's --metrics-json region telemetry (windows-flashdb-declared.jsonl); an ordinary memtable publish's tile bytes are not attributed per region, so those lie outside this sum",
+      "unit": "bytes",
+      "value": 89999
+    }
+  },
+  "lag_ceiling_us": 10000,
+  "max_group_size": 1,
+  "mean_group_size": 1.0,
+  "oracle": {
+    "checks": [],
+    "order_no_uniqueness": "deferred to the verify step",
+    "status": "DEFERRED"
+  },
+  "policy": "declared default (no learner controller wired in M1; no --policy-file)",
+  "policy_file": null,
+  "policy_requested": null,
+  "requests_run": 250,
+  "restore": {
+    "arm": "flashdb-declared",
+    "at": "2026-10-27T22:29:20",
+    "bytes": 1683012213,
+    "files": 158,
+    "from": "/home/z/vibe/flashdb/.scratch/82-controlled-m1/runs/snapshot/flashdb-declared",
+    "restore_s": 5.055,
+    "sha256": "67b3d10c23bca301881278ab8bb739110c725d0bcd8e852124e2a2901acd37ac",
+    "snapshot_sha256": "67b3d10c23bca301881278ab8bb739110c725d0bcd8e852124e2a2901acd37ac",
+    "to": "/home/z/vibe/worktrees/flashdb/wp16-indexed-arm/.scratch/93-indexed-arm/runs/chain/live/instance-flashdb-declared",
+    "verified": true
+  },
+  "restored": true,
+  "summary": {
+    "completed": 250,
+    "early_dispatches": 0,
+    "elapsed_ms": 5000,
+    "else_used": 0,
+    "errors": 0,
+    "first_error": null,
+    "invalid_windows": 0,
+    "lag_ceiling_rejected_windows": 0,
+    "requests": 250,
+    "windows": 5
+  },
+  "trace_sha256": "13404d21548b5acbf9d95ef171e961f4e731fa30c202b44cad338b5a3b84bed0",
+  "verdict": {
+    "highest_primary_rps": 50.0,
+    "highest_sustained_rps": 50.0,
+    "reject_reasons": {},
+    "rejected_windows": 0,
+    "service_ceiling_reported_windows": 0,
+    "sustained": true,
+    "sustained_primary": true
+  },
+  "window_ms": 1000,
+  "windows_file": "windows-flashdb-declared.jsonl"
+}

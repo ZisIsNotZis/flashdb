@@ -181,12 +181,27 @@ POSTGRES_DATABASE = "m1-controlled"
 # paired within one machine state, so a steady desktop load is a controlled condition.
 CONCURRENT_WORK_PATTERNS = ("cargo", "rustc", "flashdb-scale", "seed-inventory", "baseline_0b")
 
-# flashdb arms and the policy each runs. M1 wires both names to the same declared-default wiring;
-# `flashdb-learned` exists as a separate arm name so the scoreboard's shape is stable when a
-# learner controller is wired in, and the run record says which policy actually ran.
-FLASHDB_ARMS = ("flashdb-declared", "flashdb-learned")
+# flashdb arms and the policy each runs. `flashdb-declared` and `flashdb-indexed` are the M5
+# product pair: the same engine build and the same pre-load instance, differing only in the
+# `--policy-file` handed to the driver (`{"regions":{"P|StockMovement":{"index_order_no":true}}}`
+# for the indexed arm). `flashdb-learned` is kept as a separate name so the scoreboard's shape is
+# stable when a learner controller is wired in; the run record says which policy actually ran.
+FLASHDB_ARMS = ("flashdb-declared", "flashdb-indexed", "flashdb-learned")
 SQL_ARMS = ("sqlite", "postgres")
 ARM_NAMES = ("flashdb-declared", "sqlite", "postgres")
+# `flashdb-indexed` serves the DECLARED arm's pre-load instance: the policy does not change the
+# seeded bytes (the derived index is written while serving), so one snapshot and one seed serve
+# both arms. Without the alias the runner would demand a second 1.6 GiB instance and snapshot whose
+# bytes are identical to the declared one.
+FLASHDB_INSTANCE_ALIASES = {"flashdb-indexed": "flashdb-declared"}
+# The one region the derived index is built for (WP-M): the run record's index counters are that
+# region's, spelled exactly as the engine's telemetry spells it.
+INDEX_REGION = "P|StockMovement"
+
+
+def instance_arm(name: str) -> str:
+    """The arm whose instance and snapshot `name` serves (see FLASHDB_INSTANCE_ALIASES)."""
+    return FLASHDB_INSTANCE_ALIASES.get(name, name)
 
 # Order-flow outcomes and read outcomes, one spelling each.
 TAKE = "take"
@@ -349,10 +364,13 @@ def instance_path(name: str, workdir: Path, instance_root: Path | None = None) -
     `instance_root` lets the controlled protocol keep ONE live instance per arm across many work
     directories: a snapshot is restored into it before every run, so the rung a run belongs to
     decides the work directory its records land in, never which bytes the engine read.
+
+    `flashdb-indexed` resolves to the DECLARED arm's instance (see `FLASHDB_INSTANCE_ALIASES`):
+    the two arms differ only in the policy file, and the snapshot's bytes are the same.
     """
     root = Path(instance_root) if instance_root else workdir
     if name in FLASHDB_ARMS:
-        return root / f"instance-{name}"
+        return root / f"instance-{instance_arm(name)}"
     if name == "sqlite":
         return root / "sqlite.db"
     if name == "postgres":
@@ -369,12 +387,17 @@ def _remove(path: Path) -> None:
 
 def snapshot_instance(name: str, workdir: Path, snapshot_dir: Path,
                       instance_root: Path | None = None) -> dict:
-    """Copy the live pre-load instance aside and record the digest that identifies it."""
+    """Copy the live pre-load instance aside and record the digest that identifies it.
+
+    The snapshot is keyed by the INSTANCE arm (`instance_arm`), so a `flashdb-indexed` request
+    snapshots the declared instance under the name the declared arm restores.
+    """
     live = instance_path(name, workdir, instance_root)
     if not live.exists():
         raise SystemExit(f"no live instance at {live}; run the instance build step first")
+    key = instance_arm(name)
     snapshot_dir.mkdir(parents=True, exist_ok=True)
-    target = snapshot_dir / (f"{name}.db" if live.is_file() else name)
+    target = snapshot_dir / (f"{key}.db" if live.is_file() else key)
     _remove(target)
     started = time.perf_counter()
     if live.is_dir():
@@ -395,7 +418,7 @@ def snapshot_instance(name: str, workdir: Path, snapshot_dir: Path,
         "at": datetime.datetime.now().isoformat(timespec="seconds"),
         "source": "the pre-load state built by `build-instance` (seeded; no request served)",
     }
-    _write_json(snapshot_dir / f"{name}.json", record)
+    _write_json(snapshot_dir / f"{key}.json", record)
     print(f"snapshot {name}: {total} bytes, {files} files, sha256={digest}")
     return record
 
@@ -403,7 +426,7 @@ def snapshot_instance(name: str, workdir: Path, snapshot_dir: Path,
 def restore_instance(name: str, workdir: Path, snapshot_dir: Path,
                      instance_root: Path | None = None) -> dict:
     """Put the snapshot back as the live instance and FAIL LOUDLY unless its digest matches."""
-    meta_path = snapshot_dir / f"{name}.json"
+    meta_path = snapshot_dir / f"{instance_arm(name)}.json"
     if not meta_path.exists():
         raise SystemExit(f"no snapshot for {name} at {meta_path}; run the snapshot step first")
     meta = _read_json(meta_path)
@@ -1708,13 +1731,21 @@ def postgres_io(database: str) -> dict:
 # The flashdb arm: the same trace through `flashdb-load`, the same windows
 # ---------------------------------------------------------------------------
 def flashdb_load_command(bins: Path, instance: Path, trace: Path, manifest: dict,
-                         batch: int, window_ms: int) -> list[str]:
-    """The driver invocation: one rung, `--group-requests B`, the pre-registered lag ceiling."""
+                         batch: int, window_ms: int,
+                         policy_file: Path | str | None = None) -> list[str]:
+    """The driver invocation: one rung, `--group-requests B`, the pre-registered lag ceiling.
+
+    `policy_file` is the ONE difference between the declared and indexed arms: the same engine,
+    instance, trace, window and durability settings, plus `--policy-file`. `None` runs the
+    declared default (the M1 control).
+    """
     segments = manifest["segments"]
     rates = ",".join(str(seg["offered_rate"]) for seg in segments)
     cmd = [str(bins / "flashdb-load"), str(instance), str(trace),
            "--rate-rps", rates, "--window-ms", str(window_ms), "--metrics-json",
            "--group-requests", str(batch), "--lag-ceiling-us", str(LAG_CEILING_US)]
+    if policy_file is not None:
+        cmd += ["--policy-file", str(policy_file)]
     if len(segments) > 1:
         counts = {int(seg["count"]) for seg in segments}
         if len(counts) != 1:
@@ -1783,6 +1814,114 @@ def stream_driver_log(stream, log, clock=time.perf_counter) -> float | None:
     return warm_at
 
 
+def flashdb_index_record(lines: list[str], windows: list[dict],
+                         policy_file: Path | str | None, instance: Path) -> dict:
+    """The access-path evidence the driver already prints, read back into the run record.
+
+    The engine emits, and this parser keeps:
+
+    * `engine_policy policy=<json>` - the policy the driver ACTUALLY applied, read back from the
+      engine at open (not the file's bytes);
+    * `startup_warm scan_entries=N index_entries=N` - how much of the eager index tile the warm
+      pass walked;
+    * every `order_no_index trigger=... covered_rows=... stale_rows=... inline_bytes=...
+      outcome=...` decision line - the adopted/refused/skipped history. A `trigger=scan_demand`
+      line is the driver's own evidence that `Engine::order_no_index_lookups` advanced, i.e. that
+      the movement read path consulted the index;
+    * the per-window `P|StockMovement` region counters - `probes`, `probe_misses`, `count` and
+      `index_output_bytes` - summed over the emitted windows, plus `index_scan_us`.
+
+    There is no per-scan `index hit` counter on the driver's stream: the read path returns through
+    the index but does not increment a metric for it, so this record names the decision lines and
+    the charged index bytes rather than inventing a hit count. For the declared arm (no policy
+    file) every one of these is zero/empty, and the record says so explicitly.
+    """
+    startup: dict = {}
+    decisions: list[dict] = []
+    engine_policy = None
+    for line in lines:
+        if line.startswith("startup_warm "):
+            startup = {key: int(value) for key, value in
+                       re.findall(r"\b(scan_entries|index_entries)=(\d+)", line)}
+        elif "order_no_index " in line:
+            body = line.split("order_no_index ", 1)[1]
+            fields = dict(re.findall(r"(\w+)=(\S+)", body))
+            fields["raw"] = line
+            decisions.append(fields)
+        elif line.startswith("engine_policy policy="):
+            try:
+                engine_policy = json.loads(line.split("policy=", 1)[1])
+            except json.JSONDecodeError:
+                engine_policy = None
+    region = {key: 0 for key in ("probes", "probe_misses", "count", "bytes_read",
+                                 "index_output_bytes")}
+    windows_with_index_output = 0
+    index_scan_us = 0
+    window_policy = None
+    for window in windows:
+        index_scan_us += int(window.get("index_scan_us") or 0)
+        window_policy = window.get("policy") or window_policy
+        stats = (window.get("regions") or {}).get(INDEX_REGION)
+        if not stats:
+            continue
+        for key in region:
+            region[key] += int(stats.get(key) or 0)
+        if int(stats.get("index_output_bytes") or 0) > 0:
+            windows_with_index_output += 1
+    requested = None
+    source = None
+    if policy_file is not None:
+        source = str(Path(policy_file).resolve())
+        requested = _read_json(Path(source))
+    index_requests = bool(engine_policy) and bool(
+        (engine_policy.get("regions") or {}).get(INDEX_REGION, {}).get("index_order_no"))
+    if requested is not None:
+        index_requests = bool((requested.get("regions") or {})
+                              .get(INDEX_REGION, {}).get("index_order_no"))
+    # The index sidecar on disk after the run: the eager base build runs BEFORE the first metrics
+    # rotation, so its bytes are in no emitted window, and an interval delta writes no device
+    # bytes. A chain check therefore legitimately shows index_output_bytes 0 beside adopted
+    # decisions; the sidecar's own size is the device-side evidence that a build happened.
+    tile = instance / "order-no-index.tile"
+    tile_bytes = tile.stat().st_size if tile.is_file() else None
+    if not index_requests:
+        scan_path = (
+            "the policy requests no derived index (declared default), so no order_no_index "
+            "decision line, no index sidecar and no index_output_bytes are expected; the "
+            "movement scan is the full scan")
+    elif region["index_output_bytes"] == 0:
+        scan_path = (
+            "the engine policy read back requests the index and the decision lines show builds "
+            "adopted; index_output_bytes is 0 over the emitted windows because the eager base "
+            "build runs before the first metrics rotation and an interval delta writes no device "
+            "bytes (`index_tile_bytes` is the sidecar the builds left). A trigger=scan_demand "
+            "line is the driver's own evidence that Engine::order_no_index_lookups advanced, i.e. "
+            "the movement read path consulted the index; the driver prints no per-scan hit counter")
+    else:
+        scan_path = (
+            "the engine policy read back requests the index, the decision lines show builds "
+            "adopted, and index_output_bytes was charged to P|StockMovement in "
+            f"{windows_with_index_output} window(s); a trigger=scan_demand line is the driver's "
+            "own evidence that Engine::order_no_index_lookups advanced; the driver prints no "
+            "per-scan hit counter")
+    return {
+        "requested": index_requests,
+        "policy_file": source,
+        "policy_json": requested,
+        "engine_policy": engine_policy,
+        "window_policy": window_policy,
+        "startup_warm": startup,
+        "decisions": decisions,
+        "adopted": sum(1 for d in decisions if d.get("outcome") == "adopted"),
+        "region": {INDEX_REGION: region},
+        "index_output_bytes_total": region["index_output_bytes"],
+        "index_scan_us_total": index_scan_us,
+        "windows_with_index_output": windows_with_index_output,
+        "index_tile_bytes": tile_bytes,
+        "scan_path": scan_path,
+    }
+
+
 def run_flashdb_load(
     name: str,
     manifest: dict,
@@ -1793,17 +1932,19 @@ def run_flashdb_load(
     window_ms: int = DEFAULT_WINDOW_MS,
     engine_cap_mib: int = ENGINE_CAP_MIB,
     instance_root: Path | None = None,
+    policy_file: Path | str | None = None,
 ) -> dict:
     """Serve the trace through `flashdb-load` in the instance's own engine cap and parse its windows.
 
     The instance is the PRE-LOAD one (restored from the snapshot by the controlled protocol); this
-    function serves and measures, and never seeds.
+    function serves and measures, and never seeds. `policy_file` is the indexed arm's one
+    difference from the declared control.
     """
     instance = instance_path(name, workdir, instance_root)
     if not instance.exists():
         raise SystemExit(f"no instance at {instance}; build or restore it before running the arm")
     trace = workdir / "trace.jsonl"
-    cmd = flashdb_load_command(bins, instance, trace, manifest, batch, window_ms)
+    cmd = flashdb_load_command(bins, instance, trace, manifest, batch, window_ms, policy_file)
     driver_log = workdir / f"driver-{name}.log"
     t0 = time.perf_counter()
     # The driver's dump is written straight to its log: the measured process must not hold a whole
@@ -1835,10 +1976,20 @@ def run_flashdb_load(
                       instance_bytes=instance_bytes,
                       recovery_s=None if warm_at is None else warm_at - t0,
                       windows_file=f"windows-{name}.jsonl")
+    index = flashdb_index_record(lines, windows, policy_file, instance)
+    if policy_file is None:
+        policy = "declared default (no learner controller wired in M1; no --policy-file)"
+    else:
+        policy = (f"indexed: --policy-file {index['policy_file']} "
+                  f"(index_order_no on {INDEX_REGION})")
     return {
         "arm": name,
         "durability": f"flashdb --group-requests {batch} (one WAL barrier per group)",
-        "policy": "declared default (no learner controller wired in M1)",
+        "policy": policy,
+        "policy_file": index["policy_file"],
+        "policy_requested": index["policy_json"],
+        "engine_policy": index["engine_policy"],
+        "index": index,
         "batch": batch,
         "window_ms": window_ms,
         "lag_ceiling_us": LAG_CEILING_US,
@@ -1881,6 +2032,7 @@ def run_flashdb_arm(
     window_ms: int = DEFAULT_WINDOW_MS,
     engine_cap_mib: int = ENGINE_CAP_MIB,
     seed_cap_mib: int = SEED_CAP_MIB,
+    policy_file: Path | str | None = None,
 ) -> dict:
     """Seed a fresh instance, then serve the trace under the engine's own cap (the M1 path).
 
@@ -1892,7 +2044,7 @@ def run_flashdb_arm(
     """
     seeded = seed_flashdb_instance(name, workdir, bins, seed_cap_mib)
     record = run_flashdb_load(name, manifest, workdir, bins, order_flow_requests, batch, window_ms,
-                              engine_cap_mib)
+                              engine_cap_mib, policy_file=policy_file)
     record["seed_s"] = seeded["seed_s"]
     record["construction_memory"] = seeded["construction_memory"]
     return record
@@ -2734,14 +2886,19 @@ def cmd_arm(args: argparse.Namespace) -> int:
         raise SystemExit("--restored requires --instance-root: the restore writes the instance"
                          " outside this work directory")
     if name in FLASHDB_ARMS:
+        # The indexed arm's ONE difference from the declared control: this file. The runner passes
+        # it for `flashdb-indexed` only (see scripts/m1-baseline-run.sh).
+        policy_file = Path(args.policy_file).resolve() if args.policy_file else None
         if args.restored:
             record = run_flashdb_load(name, manifest, workdir, Path(args.bins),
                                       spec["order_flow_requests"], spec["batch"],
-                                      spec["window_ms"], args.engine_cap_mib, instance_root)
+                                      spec["window_ms"], args.engine_cap_mib, instance_root,
+                                      policy_file=policy_file)
         else:
             record = run_flashdb_arm(name, manifest, workdir, Path(args.bins),
                                      spec["order_flow_requests"], spec["batch"], spec["window_ms"],
-                                     args.engine_cap_mib, args.seed_cap_mib)
+                                     args.engine_cap_mib, args.seed_cap_mib,
+                                     policy_file=policy_file)
         if args.skip_verify:
             # The read-back is verification, not workload: it is the `verify` step's job and it runs
             # outside the engine's memory budget (see `run_flashdb_probes`).
@@ -3138,6 +3295,9 @@ def main(argv: list[str]) -> int:
     arm.add_argument("--skip-oracle", action="store_true",
                      help="defer the SQL inventory oracle (the restored state is the same in every"
                           " block, so it is verified once per arm and not once per block)")
+    arm.add_argument("--policy-file", default=None,
+                     help="the driver's --policy-file (the indexed arm's one difference from the"
+                          " declared control); omit for the declared default")
     arm.set_defaults(func=cmd_arm)
 
     build = sub.add_parser("build-instance",

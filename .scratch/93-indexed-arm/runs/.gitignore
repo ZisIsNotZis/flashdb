@@ -1,0 +1,22 @@
+# Regenerable state of the 93 chain check. The evidence IS committed: per work directory
+# {manifest,spec}.json, run-<arm>.json, windows-<arm>.jsonl, restore-*.json, machine-state.jsonl,
+# loadavg.jsonl, postgres-server.jsonl; plus run-spec.json, the floor records and snapshot/*.json.
+# Everything below comes back from the frozen seed trace + `run-spec.json` (or, for the reused
+# snapshot, from ticket 82's tracked metadata), so it is not committed.
+trace.jsonl
+seed.jsonl
+instance-*
+live/
+**/snapshot/*
+!**/snapshot/*.json
+pg/
+**/floor/*/floor-*.dat
+driver-*.log
+probe-*.jsonl
+probe-*.log
+*.db
+*.db-wal
+*.db-shm
+pg.log
+socket/
+stdout.log

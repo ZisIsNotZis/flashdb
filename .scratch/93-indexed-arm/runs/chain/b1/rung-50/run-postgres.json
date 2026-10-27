@@ -1,0 +1,265 @@
+{
+  "arm": "postgres",
+  "arm_scope_peak_bytes": 40620032,
+  "arm_scope_peak_scope": "the postgres server scope's lifetime (bulk load + measured phase); the client runs outside it",
+  "batch": 64,
+  "counters": {
+    "backorder": 0,
+    "errors": 0,
+    "first_error": null,
+    "miss": 0,
+    "take": 183
+  },
+  "curve": [
+    {
+      "achieved_fraction": 1.0,
+      "achieved_rps": 50.0,
+      "ceiling_rejected_windows": 0,
+      "compact_bytes": 0,
+      "early_dispatches": 0,
+      "error_windows": 0,
+      "group_elapsed_us": 0,
+      "groups": 250,
+      "groups_over_service_ceiling": 0,
+      "invalid_windows": 0,
+      "lag_ceiling_rejected_windows": 0,
+      "lag_ceiling_us": 10000,
+      "lag_p50_us": 2,
+      "lag_p95_us": 222,
+      "lag_p99_us": 253,
+      "max_group_size": 1,
+      "mean_group_size": 1.0,
+      "min_lag_us": 0,
+      "offered_rps": 50.0,
+      "p50_us": 2513,
+      "p95_us": 5707,
+      "p99_us": 5872,
+      "rate_exceeded": false,
+      "reject_reasons": {},
+      "service_ceiling_rejected_windows": 0,
+      "service_ceiling_reported_windows": 0,
+      "service_ceiling_us": null,
+      "sustained": true,
+      "sustained_primary": true,
+      "sustained_tolerance": 0.95,
+      "valid_windows": 5,
+      "windows": 5
+    }
+  ],
+  "data_bytes": 1103484607,
+  "database": "m1-controlled",
+  "durability": "postgres fsync=on + synchronous_commit=on (baseline-env.sh), one COMMIT per batch",
+  "elapsed_s": 4.980913287,
+  "engine_cap_mib": 128,
+  "engine_memory": {
+    "method": "sampled memory.current every 50 ms",
+    "peak_bytes": 26865664,
+    "samples": 99,
+    "scope": "measured phase",
+    "start_bytes": 21532672
+  },
+  "groups": 250,
+  "instance_root": "/home/z/vibe/worktrees/flashdb/wp16-indexed-arm/.scratch/93-indexed-arm/runs/chain/live",
+  "kpi": {
+    "bytes_read_per_request": {
+      "method": "read_bytes / requests",
+      "unit": "bytes / request",
+      "value": 132481.024
+    },
+    "cpu_us": {
+      "method": "cpu.stat usage_usec of the postgres server's own scope (M1_ENGINE_CGROUP) at the end minus at the start of the measured phase",
+      "unit": "us",
+      "value": 136566
+    },
+    "cpu_us_per_request": {
+      "method": "cpu_us / requests",
+      "unit": "us / request",
+      "value": 546.264
+    },
+    "ingest_bytes": {
+      "method": "sum of the payload bytes of the trace's write requests (line bytes, newline excluded), where a write request is one carrying an `ops` block: trace.jsonl, the same frozen trace every arm replays",
+      "unit": "bytes",
+      "value": 135798
+    },
+    "instance_bytes": {
+      "method": "`pg_database_size(current_database())` at the end of the measured phase (logical size; the WAL is outside it)",
+      "unit": "bytes",
+      "value": 1103468223
+    },
+    "read_bytes": {
+      "method": "(`blks_read + blks_hit` from pg_stat_database for this database) x the cluster's block_size, after the measured phase minus before: bytes reached through the buffer manager, not device bytes",
+      "unit": "bytes",
+      "value": 33120256
+    },
+    "readings": {
+      "block_size": 8192,
+      "blocks_hit_after": 35288448,
+      "blocks_hit_before": 35285044,
+      "blocks_read_after": 72315,
+      "blocks_read_before": 71676,
+      "cpu_stat": {
+        "end_usec": 271283,
+        "start_usec": 134717
+      },
+      "database_bytes_after": 1103468223,
+      "database_bytes_before": 1103353535,
+      "trace": {
+        "payload_bytes": 135798,
+        "trace": "/home/z/vibe/worktrees/flashdb/wp16-indexed-arm/.scratch/93-indexed-arm/runs/chain/b1/rung-50/trace.jsonl",
+        "write_requests": 183
+      },
+      "wal_bytes_after": 2819857737,
+      "wal_bytes_before": 2818491162,
+      "windows_file": "windows-postgres.jsonl"
+    },
+    "recovery_s": {
+      "method": "no open/warm phase inside the arm",
+      "reason": "the postgres server is started outside the arm by scripts/baseline-env.sh and the arm only opens a client connection, so there is no engine open/warm phase to time",
+      "unit": "s",
+      "value": null
+    },
+    "requests": {
+      "method": "sum of the per-window `requests` over the measured phase (windows-postgres.jsonl)",
+      "unit": "requests",
+      "value": 250
+    },
+    "rss_peak_bytes": {
+      "method": "the record's engine_memory.peak_bytes: the maximum of sampled server-scope memory.current across the measured phase",
+      "unit": "bytes",
+      "value": 26865664
+    },
+    "rss_per_data_byte": {
+      "method": "rss_peak_bytes / instance_bytes",
+      "unit": "resident bytes / data byte",
+      "value": 0.024346567884809857
+    },
+    "schema": "flashdb.baseline.kpi.v1",
+    "write_amp": {
+      "method": "write_bytes / ingest_bytes",
+      "unit": "bytes written / byte ingested",
+      "value": 10.907841058042091
+    },
+    "write_bytes": {
+      "method": "postgres bytes durably written during the measured phase: the `pg_stat_wal.wal_bytes` delta plus the `pg_database_size(current_database())` delta",
+      "unit": "bytes",
+      "value": 1481263
+    }
+  },
+  "lag_ceiling_us": 10000,
+  "max_group_size": 1,
+  "mean_group_size": 1.0,
+  "oracle": {
+    "checks": [
+      {
+        "check": "on_hand_matches_movements",
+        "detail": "stock(S000003,L000).on_hand=1000000, initial 1000000 + sum(delta) 0 = 1000000",
+        "ok": true,
+        "subjects": 10600000
+      },
+      {
+        "check": "on_hand_non_negative",
+        "detail": "stock(S000003,L000).on_hand=1000000",
+        "ok": true,
+        "subjects": 10600000
+      },
+      {
+        "check": "cell_count",
+        "detail": "10600000 stock cells, expected 10600000 (2650000 sku x 4 loc)",
+        "ok": true,
+        "subjects": 1
+      },
+      {
+        "check": "no_duplicate_order_no",
+        "detail": "0 order numbers appear in both/again: []",
+        "ok": true,
+        "subjects": 1
+      },
+      {
+        "check": "movement_count_is_committed_takes",
+        "detail": "183 movements, 183 committed take blocks",
+        "ok": true,
+        "subjects": 1
+      },
+      {
+        "check": "order_count_is_committed_takes",
+        "detail": "183 orders, 183 committed take blocks",
+        "ok": true,
+        "subjects": 1
+      },
+      {
+        "check": "backorder_count_is_committed_fallbacks",
+        "detail": "0 backorders, 0 committed fallbacks",
+        "ok": true,
+        "subjects": 1
+      },
+      {
+        "check": "every_order_flow_accounted",
+        "detail": "183 take + 0 backorder + 0 miss against 183 order_flow requests",
+        "ok": true,
+        "subjects": 1
+      },
+      {
+        "check": "no_skipped_take",
+        "detail": "0 order_flow requests found no customer (every seeded email exists)",
+        "ok": true,
+        "subjects": 1
+      },
+      {
+        "check": "movement_deltas_match_order_lines",
+        "detail": "every movement has its order, with delta == -qty and the same sku",
+        "ok": true,
+        "subjects": 1
+      },
+      {
+        "check": "movement_delta_sum",
+        "detail": "sum(delta) over movements == -sum(qty) over fulfilled orders",
+        "ok": true,
+        "subjects": 1
+      },
+      {
+        "check": "stock_decrements_match_orders",
+        "detail": "sum(on_hand) == 10600000 cells x 1000000 - taken qty",
+        "ok": true,
+        "subjects": 1
+      }
+    ],
+    "order_no_uniqueness": "queried",
+    "status": "PASS"
+  },
+  "pacing": "open loop: dispatch on the due schedule, one worker executes and commits each group and acks on completion (flashdb-load's shape)",
+  "postgres_settings": {
+    "data_directory": "/home/z/vibe/worktrees/flashdb/wp16-indexed-arm/.scratch/93-indexed-arm/runs/chain/pg/data",
+    "fsync": "on",
+    "server_version": "18.6 (Ubuntu 18.6-3build2)",
+    "shared_buffers": "16MB",
+    "synchronous_commit": "on",
+    "unix_socket_directories": "/home/z/vibe/worktrees/flashdb/wp16-indexed-arm/.scratch/93-indexed-arm/runs/chain/pg/socket"
+  },
+  "requests_run": 250,
+  "restore": {
+    "arm": "postgres",
+    "at": "2026-10-27T22:30:22",
+    "bytes": 2201362806,
+    "files": 1361,
+    "from": "/home/z/vibe/flashdb/.scratch/82-controlled-m1/runs/snapshot/postgres",
+    "restore_s": 8.031,
+    "sha256": "7f9a4ea8edb0c1a287a201389ab08aba61e82bd8cdd92f51fe64ddf48cad1b92",
+    "snapshot_sha256": "7f9a4ea8edb0c1a287a201389ab08aba61e82bd8cdd92f51fe64ddf48cad1b92",
+    "to": "/home/z/vibe/worktrees/flashdb/wp16-indexed-arm/.scratch/93-indexed-arm/runs/chain/pg/data",
+    "verified": true
+  },
+  "restored": true,
+  "seed_s": 0.0,
+  "trace_sha256": "13404d21548b5acbf9d95ef171e961f4e731fa30c202b44cad338b5a3b84bed0",
+  "verdict": {
+    "highest_primary_rps": 50.0,
+    "highest_sustained_rps": 50.0,
+    "reject_reasons": {},
+    "rejected_windows": 0,
+    "service_ceiling_reported_windows": 0,
+    "sustained": true,
+    "sustained_primary": true
+  },
+  "window_ms": 1000,
+  "windows_file": "windows-postgres.jsonl"
+}

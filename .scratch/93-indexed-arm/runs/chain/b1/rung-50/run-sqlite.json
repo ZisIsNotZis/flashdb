@@ -1,0 +1,303 @@
+{
+  "arm": "sqlite",
+  "arm_scope_peak_bytes": 27435008,
+  "arm_scope_peak_scope": "this process's capped scope over the whole arm step (bulk load + measured phase)",
+  "batch": 64,
+  "counters": {
+    "backorder": 0,
+    "errors": 0,
+    "first_error": null,
+    "miss": 0,
+    "take": 183
+  },
+  "curve": [
+    {
+      "achieved_fraction": 1.0,
+      "achieved_rps": 50.0,
+      "ceiling_rejected_windows": 0,
+      "compact_bytes": 0,
+      "early_dispatches": 0,
+      "error_windows": 0,
+      "group_elapsed_us": 0,
+      "groups": 250,
+      "groups_over_service_ceiling": 0,
+      "invalid_windows": 0,
+      "lag_ceiling_rejected_windows": 0,
+      "lag_ceiling_us": 10000,
+      "lag_p50_us": 2,
+      "lag_p95_us": 3,
+      "lag_p99_us": 295,
+      "max_group_size": 1,
+      "mean_group_size": 1.0,
+      "min_lag_us": 0,
+      "offered_rps": 50.0,
+      "p50_us": 3524,
+      "p95_us": 6305,
+      "p99_us": 9270,
+      "rate_exceeded": false,
+      "reject_reasons": {},
+      "service_ceiling_rejected_windows": 0,
+      "service_ceiling_reported_windows": 0,
+      "service_ceiling_us": null,
+      "sustained": true,
+      "sustained_primary": true,
+      "sustained_tolerance": 0.95,
+      "valid_windows": 5,
+      "windows": 5
+    }
+  ],
+  "data_bytes": 541937664,
+  "durability": "sqlite WAL + synchronous=FULL, one COMMIT per batch",
+  "durability_observed": {
+    "journal_mode": "wal",
+    "journal_size_limit": -1,
+    "synchronous": 2,
+    "synchronous_name": "FULL",
+    "wal_autocheckpoint_pages": 0
+  },
+  "elapsed_s": 4.980336223,
+  "engine_cap_mib": 128,
+  "engine_memory": {
+    "method": "sampled memory.current every 50 ms",
+    "peak_bytes": 27430912,
+    "samples": 100,
+    "scope": "measured phase",
+    "start_bytes": 19640320
+  },
+  "groups": 250,
+  "instance_root": "/home/z/vibe/worktrees/flashdb/wp16-indexed-arm/.scratch/93-indexed-arm/runs/chain/live",
+  "kpi": {
+    "bytes_read_per_request": {
+      "method": "read_bytes / requests",
+      "reason": "numerator absent: sqlite records no bytes-read counter; its page cache hides tile reads",
+      "unit": "bytes / request",
+      "value": null
+    },
+    "cpu_us": {
+      "method": "cpu.stat usage_usec of this process's cgroup at the end minus at the start of the measured phase (sqlite is embedded, so the pacer shares the engine's cgroup)",
+      "unit": "us",
+      "value": 159682
+    },
+    "cpu_us_per_request": {
+      "method": "cpu_us / requests",
+      "unit": "us / request",
+      "value": 638.728
+    },
+    "ingest_bytes": {
+      "method": "sum of the payload bytes of the trace's write requests (line bytes, newline excluded), where a write request is one carrying an `ops` block: trace.jsonl, the same frozen trace every arm replays",
+      "unit": "bytes",
+      "value": 135798
+    },
+    "instance_bytes": {
+      "method": "the arm's on-disk footprint at the end of the measured phase: the database file plus its -wal and -shm sidecars",
+      "unit": "bytes",
+      "value": 546478104
+    },
+    "read_bytes": {
+      "method": "no instrument: the SQL pacer emits no per-region byte telemetry, and sqlite exposes no bytes-read counter through this harness",
+      "reason": "sqlite records no bytes-read counter; its page cache hides tile reads",
+      "unit": "bytes",
+      "value": null
+    },
+    "readings": {
+      "cpu_stat": {
+        "end_usec": 249586,
+        "start_usec": 89904
+      },
+      "files_after": {
+        "db": 541876224,
+        "shm": 32768,
+        "wal": 4569112
+      },
+      "files_before": {
+        "db": 541876224,
+        "shm": 32768,
+        "wal": 0
+      },
+      "page_bytes_after": 541904896,
+      "page_bytes_before": 541876224,
+      "trace": {
+        "payload_bytes": 135798,
+        "trace": "/home/z/vibe/worktrees/flashdb/wp16-indexed-arm/.scratch/93-indexed-arm/runs/chain/b1/rung-50/trace.jsonl",
+        "write_requests": 183
+      },
+      "windows_file": "windows-sqlite.jsonl"
+    },
+    "recovery_s": {
+      "method": "no instrument: sqlite has no separately measured open phase",
+      "reason": "sqlite recovers its WAL lazily on first access INSIDE the measured phase, where the cost is charged to service latency; the harness measures no separate open/warm boundary",
+      "unit": "s",
+      "value": null
+    },
+    "requests": {
+      "method": "sum of the per-window `requests` over the measured phase (windows-sqlite.jsonl)",
+      "unit": "requests",
+      "value": 250
+    },
+    "rss_peak_bytes": {
+      "method": "the record's engine_memory.peak_bytes: the maximum of sampled cgroup memory.current across the measured phase",
+      "unit": "bytes",
+      "value": 27430912
+    },
+    "rss_per_data_byte": {
+      "method": "rss_peak_bytes / instance_bytes",
+      "unit": "resident bytes / data byte",
+      "value": 0.050195811688001316
+    },
+    "schema": "flashdb.baseline.kpi.v1",
+    "write_amp": {
+      "method": "write_bytes / ingest_bytes",
+      "unit": "bytes written / byte ingested",
+      "value": 33.85752367487003
+    },
+    "write_bytes": {
+      "method": "sqlite bytes durably written during the measured phase: the `-wal` file's size delta plus the `PRAGMA page_count * PRAGMA page_size` growth; when an automatic checkpoint rewrites the WAL in place the file delta is a lower bound and the page growth covers the moved frames",
+      "unit": "bytes",
+      "value": 4597784
+    }
+  },
+  "lag_ceiling_us": 10000,
+  "max_group_size": 1,
+  "mean_group_size": 1.0,
+  "oracle": {
+    "checks": [
+      {
+        "check": "on_hand_matches_movements",
+        "detail": "stock(S000001,L000).on_hand=999995, initial 1000000 + sum(delta) -5 = 999995",
+        "ok": true,
+        "subjects": 10600000
+      },
+      {
+        "check": "on_hand_non_negative",
+        "detail": "stock(S000001,L000).on_hand=999995",
+        "ok": true,
+        "subjects": 10600000
+      },
+      {
+        "check": "cell_count",
+        "detail": "10600000 stock cells, expected 10600000 (2650000 sku x 4 loc)",
+        "ok": true,
+        "subjects": 1
+      },
+      {
+        "check": "no_duplicate_order_no",
+        "detail": "0 order numbers appear in both/again: []",
+        "ok": true,
+        "subjects": 1
+      },
+      {
+        "check": "movement_count_is_committed_takes",
+        "detail": "183 movements, 183 committed take blocks",
+        "ok": true,
+        "subjects": 1
+      },
+      {
+        "check": "order_count_is_committed_takes",
+        "detail": "183 orders, 183 committed take blocks",
+        "ok": true,
+        "subjects": 1
+      },
+      {
+        "check": "backorder_count_is_committed_fallbacks",
+        "detail": "0 backorders, 0 committed fallbacks",
+        "ok": true,
+        "subjects": 1
+      },
+      {
+        "check": "every_order_flow_accounted",
+        "detail": "183 take + 0 backorder + 0 miss against 183 order_flow requests",
+        "ok": true,
+        "subjects": 1
+      },
+      {
+        "check": "no_skipped_take",
+        "detail": "0 order_flow requests found no customer (every seeded email exists)",
+        "ok": true,
+        "subjects": 1
+      },
+      {
+        "check": "movement_deltas_match_order_lines",
+        "detail": "every movement has its order, with delta == -qty and the same sku",
+        "ok": true,
+        "subjects": 1
+      },
+      {
+        "check": "movement_delta_sum",
+        "detail": "sum(delta) over movements == -sum(qty) over fulfilled orders",
+        "ok": true,
+        "subjects": 1
+      },
+      {
+        "check": "stock_decrements_match_orders",
+        "detail": "sum(on_hand) == 10600000 cells x 1000000 - taken qty",
+        "ok": true,
+        "subjects": 1
+      }
+    ],
+    "order_no_uniqueness": "queried",
+    "status": "PASS"
+  },
+  "pacing": "open loop: dispatch on the due schedule, one worker executes and commits each group and acks on completion (flashdb-load's shape)",
+  "requests_run": 250,
+  "restore": {
+    "arm": "sqlite",
+    "at": "2026-10-27T22:29:41",
+    "bytes": 541876224,
+    "files": 1,
+    "from": "/home/z/vibe/flashdb/.scratch/82-controlled-m1/runs/snapshot/sqlite.db",
+    "restore_s": 1.633,
+    "sha256": "46c6f1e1e2a149f8e55bb4f29a39b2ca57a53d1a50daa0ae5a3e30c2d4367130",
+    "snapshot_sha256": "46c6f1e1e2a149f8e55bb4f29a39b2ca57a53d1a50daa0ae5a3e30c2d4367130",
+    "to": "/home/z/vibe/worktrees/flashdb/wp16-indexed-arm/.scratch/93-indexed-arm/runs/chain/live/sqlite.db",
+    "verified": true
+  },
+  "restored": true,
+  "seed_s": 0.0,
+  "sqlite_cache_kib": 8192,
+  "sqlite_files": {
+    "db": 541904896,
+    "shm": 32768,
+    "wal": 0
+  },
+  "sqlite_wal": {
+    "autocheckpoint_pages": 0,
+    "checkpoint": {
+      "at": "after the measured phase, before the oracle",
+      "pragma": "wal_checkpoint(TRUNCATE)",
+      "result": [
+        0,
+        0,
+        0
+      ]
+    },
+    "data_bytes_after_checkpoint": 541937664,
+    "files_after_checkpoint": {
+      "db": 541904896,
+      "shm": 32768,
+      "wal": 0
+    },
+    "journal_size_limit": -1,
+    "passive_checkpoint": {
+      "at": "after the measured phase, before the TRUNCATE checkpoint",
+      "pragma": "wal_checkpoint(PASSIVE)",
+      "result": [
+        0,
+        1109,
+        1109
+      ]
+    },
+    "wal_bytes_after_run": 4569112
+  },
+  "trace_sha256": "13404d21548b5acbf9d95ef171e961f4e731fa30c202b44cad338b5a3b84bed0",
+  "verdict": {
+    "highest_primary_rps": 50.0,
+    "highest_sustained_rps": 50.0,
+    "reject_reasons": {},
+    "rejected_windows": 0,
+    "service_ceiling_reported_windows": 0,
+    "sustained": true,
+    "sustained_primary": true
+  },
+  "window_ms": 1000,
+  "windows_file": "windows-sqlite.jsonl"
+}
