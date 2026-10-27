@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 40" width="200" height="40" role="img" aria-label="flashdb">
+  <title>flashdb</title>
+  <style>
+    .mark { fill: #f0883e; }
+    .word { fill: #57606a; }
+    @media (prefers-color-scheme: dark) { .word { fill: #adbac7; } }
+  </style>
+  <!-- three tiles, each sized by the region it serves: the layout is learned, not declared -->
+  <rect class="mark" x="4" y="8" width="24" height="6" rx="2"/>
+  <rect class="mark" x="4" y="17" width="17" height="6" rx="2" opacity="0.78"/>
+  <rect class="mark" x="4" y="26" width="10" height="6" rx="2" opacity="0.55"/>
+  <!-- the access path crossing them -->
+  <path class="mark" d="M35 5 L28.5 20 L32.5 20 L30.5 35 L37.5 18 L33.5 18 L37 5 Z"/>
+  <!-- wordmark -->
+  <text class="word" x="46" y="27.5"
+        font-family="ui-sans-serif, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif"
+        font-size="21" font-weight="600" letter-spacing="-0.3">flashdb</text>
+</svg>
