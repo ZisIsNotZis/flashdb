@@ -11,7 +11,7 @@
 //! each cursor reads a block. The M1 record measured exactly this: 156 active
 //! tiles (`P|Customer` 3, `P|Stock` 153) and **638,938 B per scan**
 //! = 4,096 B x 156 tiles (`.scratch/82-controlled-m1/report.md` §5;
-//! `.scratch/83-index-probe/issues.md` §The defect; `docs/plan/gap-analysis.md`
+//! `.scratch/83-index-probe/issues.md` §The defect; `docs/6_ARCHITECTURE.md`
 //! §7 fix #1 predicted 638,938 -> 4,096 B per scan).
 //!
 //! This test rebuilds that instance shape (3 customer tiles + 153 stock tiles

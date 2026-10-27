@@ -1,6 +1,4 @@
-Budget: 180 lines / 18,000 chars
-
-# flashdb — the objective
+# EXPLICIT
 
 ## 0. The product bar: an end-to-end win over sqlite and postgres (author-decided)
 
@@ -28,15 +26,53 @@ When flashdb loses or ties, the gap is attributed from the saved records — run
 - **(b) a defect** — a phase exceeds its theoretical floor by more than the error band, with a replicable mechanism that names a code path;
 - **(c) architecture** — every phase is at its floor and the remaining cost is the work itself (bytes moved, IOs issued, barriers per request), i.e. the competitor's design does less work per request.
 
-Each category has its own remedy, and an unattributed gap is not a licence to tune thresholds. The procedure and its instruments are in `dev-loop.md` §Gap attribution.
+Each category has its own remedy, and an unattributed gap is not a licence to tune thresholds. The procedure and its instruments are in `9_IMPLEMENTATION.md` §Gap attribution.
+
+## Endurance is a constraint, not a price (author, 2026-10-06)
+
+Measured on the slice-39 **adversarial** workload (service-time term): the reorganisation write term is **0.083%** for the `declared` arm, **0.669%** for `learned@1.0`, and **0.118%** for `static-derived`; ingest writes are **0.003%** on every arm. No drift-arm ratio was reported — slice 39 ran the adversarial arm only. A priced term of that size cannot move any candidate's argmin however `lambda` is swept, so lambda was never a calibration problem — on these arms endurance is **not** the scarce resource; device service time is.
+
+The form therefore becomes:
+
+```
+maximise   sustained load
+subject to latency ceiling       (hard)
+           write-amplitude budget (hard)
+```
+
+**Scalarisation.** Among candidates that satisfy both hard conditions, rank by **highest sustained offered load**; break ties first by **latency headroom** (the larger measured margin below the ceiling), then by the **reported efficiency metrics** in the pre-registered order (write amplification, bytes read per op per pattern, RSS per data byte, CPU per op, recovery time — `pre-registration.md`). Angriness does not enter this ordering until it is well-posed.
+
+**Empty feasible set.** If no candidate satisfies both hard conditions, the program has no solution: the comparison reports infeasibility and names the binding constraint, and no arm is scored as a winner — the metric cannot be won by abandoning a condition (matching the pre-registration's rule that invalid windows are not counted).
+
+The budget is enforced as a **per-window reorganisation allowance** — the window is the load window the objective aggregates over (1 s in the reported slice-39 runs). The slice-39 churn control is that mechanism: on the adversarial arm it moved `learned@1.0` reorganisation bytes from **33,141,775** (slice-38 adversarial arm) to **28,191,940** (slice-39 adversarial arm), about **1.18×**. (The slice-38 **drift** arm's `learned@1.0` figure was 402,984,851, but the churn control's effect **under drift is not yet measured** — slice 39 ran the adversarial arm only; what was observed on the adversarial arm are the control's counters: **52 restarts, 45 gated switches, 10 budget blocks, 42 cooldown holds**.) The deliverable is a **capacity-versus-budget curve** ("under a reorganisation budget of B bytes per load window, sustained load is X"), not a lambda. A small lambda may remain only as a tie-break, and must be described as such.
+
+# CONFIRMED
+
+## Goals
+
+- Highest throughput on a single modern Linux node; correctness and crash-atomicity never traded away for it.
+- Layout, encoding and scheduling derived from the observed workload at per-tile granularity.
+- One round trip per business request, with the **block** the unit of atomicity and the **request** the unit of learning and attribution.
+- A relational model with no SQL: JSON schema for create/update, a QBE-like structured query surface, single-source-of-truth query canonicity.
+- Continuous background adaptation with no migration project and no downtime.
+
+## Non-goals
+
+- Multi-node, replication, distributed commit. Deferred to the far future; the design must not preclude it, but nothing may be built for it now.
+- SQL, or a text query language. (**Corrected, `review-04` L-16:** an earlier wording said "or string parsing of any kind", which is false — requests and schemas arrive as JSON, constants are strings, and `$1.customer_id` is a string-encoded reference path requiring its own parser. The accurate claim is that there is no *query-language text grammar*.)
+- Interactive (multi-round-trip) transactions.
+- General-purpose engine parity. The target workload is IO-bound lookup and join on a single node; other workloads are allowed to be poor.
+- A physical layout guarantee of any kind, ever.
+
+# INFERRED
 
 ## 1. The internal objective: angriness
 
-**The internal objective is the constrained program** — maximise the highest sustained offered load, subject to the latency ceiling and the write-amplitude budget as hard feasibility conditions (`Endurance is a constraint, not a price`). **Angriness is the internal pricing form**, not a competing objective. Every decision in the system — which layout, when to reorganize, what tier to promote to, whether to speculate, whether to compile — is evaluated as a predicted angriness delta through one calibrated cost model (`design.md` I10).
+**The internal objective is the constrained program** — maximise the highest sustained offered load, subject to the latency ceiling and the write-amplitude budget as hard feasibility conditions (`Endurance is a constraint, not a price`). **Angriness is the internal pricing form**, not a competing objective. Every decision in the system — which layout, when to reorganize, what tier to promote to, whether to speculate, whether to compile — is evaluated as a predicted angriness delta through one calibrated cost model (`6_ARCHITECTURE.md` I10).
 
 Angriness is a **rate**, not a total: angriness per unit of offered load, or per unit time. Reported as a total it can be made to look good by simply receiving less work.
 
-> **Status: not yet well-posed.** 设备层校准常量已由实验 0a-redo 取得（见 `docs/engine.md` 与 `.scratch/05-engine-v0/evidence/0a-redo/analysis.md`）：依赖点读 89–174 µs（按粒度）、批量摊薄 4.9 µs/读、带宽 827 MiB/s、安静设备尾 1.26× 均值。**仍然未决的是 estimand/锚定/聚合**——常量就位不改变 F1–F5 的未决状态。 An adversarial review (aspect: optimisation and learning theory) found that the estimand, the anchor, the parameterisation, the aggregation, the oracle and the estimators are all undefined or self-contradictory. Findings and dispositions are recorded as `review-01` in `.scratch/01-design/issues/01-design.md`. The defects are marked `Open` inline below rather than deleted, because the decisions they need are the author's, not the reviewer's. **The objective cannot be implemented or falsified until F1–F5 are resolved.**
+> **Status: not yet well-posed.** 设备层校准常量已由实验 0a-redo 取得（见 `docs/8_DETAIL.md` 与 `.scratch/05-engine-v0/evidence/0a-redo/analysis.md`）：依赖点读 89–174 µs（按粒度）、批量摊薄 4.9 µs/读、带宽 827 MiB/s、安静设备尾 1.26× 均值。**仍然未决的是 estimand/锚定/聚合**——常量就位不改变 F1–F5 的未决状态。 An adversarial review (aspect: optimisation and learning theory) found that the estimand, the anchor, the parameterisation, the aggregation, the oracle and the estimators are all undefined or self-contradictory. Findings and dispositions are recorded as `review-01` in `.scratch/01-design/issues/01-6_ARCHITECTURE.md`. The defects are marked `Open` inline below rather than deleted, because the decisions they need are the author's, not the reviewer's. **The objective cannot be implemented or falsified until F1–F5 are resolved.**
 
 **How these statements relate (2026-10-06).** The **internal objective** — what the pre-registered comparison scores — is a **constrained program**: maximise the **highest sustained offered load**, subject to the latency ceiling and the write-amplitude budget as **hard feasibility conditions** (`Endurance is a constraint, not a price`). **Angriness is the internal pricing / soft-penalty form**, not a competing objective, and is **not yet well-posed** (F1–F5 open; the banner above stays true). The **adopted decision (2026-10-09, `.scratch/STATUS.md` §7.1)** judges the primary metric on the per-request **schedule lag** p99 against a lag ceiling (default 10 ms — the number `pre-registration.md` writes the metric with); per-request **service latency** has its own ceiling and is reported separately as the latency/efficiency measure, so a throughput result can never be won by abandoning latency. **Decided (2026-10-19, delegated author authority):** lag-only p99 <= 10 ms is the primary throughput-feasibility rule; the service ceiling has no pre-registered veto and is reported beside the device's own fsync floor. Under the KPI ladder (§0) a service-latency breach loses the external comparison only when a baseline holds the same offered level without breaching. The §7.1 reconciliation is closed by that rule and by §0, not by re-reading the old thresholds. The *soft-penalty* section below explains why the internal form is priced; the *endurance* section explains why the ceiling and the budget are feasibility, not prices. The tie-breaks and the empty-feasible-set rule are stated with the endurance decision.
 
@@ -140,26 +176,8 @@ subject to worst-regime angriness ≤ cap
 **Partly resolved (author, 2026-10-06); the rest remains open (`review-01` F5, F7; D1–D3).**
 
 - **The aggregation is unspecified and self-contradictory.** "Either the worst regime, or a chosen percentile of windows" is not a definition, and the constraint uses a third (worst-regime). If angriness is integrated over the load distribution, the total is dominated by whichever regime occupies the most *time* — the long quiet periods, which is exactly the average this document calls actively wrong. **Still open:** this is the *angriness* aggregator, which only bites once angriness is well-posed.
-- **The cap is now a constrained program, not a contradiction (resolved 2026-10-06).** The objective *is* a constrained program: highest sustained offered load under the latency ceiling and the write-amplitude budget as hard feasibility conditions, with I10 corrected (`design.md`) and the scalarisation and empty-feasible-set rule stated in *Endurance is a constraint, not a price*. The `minimize total angriness subject to a worst-regime cap` form above is superseded; angriness remains the internal pricing form and stays not-well-posed.
+- **The cap is now a constrained program, not a contradiction (resolved 2026-10-06).** The objective *is* a constrained program: highest sustained offered load under the latency ceiling and the write-amplitude budget as hard feasibility conditions, with I10 corrected (`6_ARCHITECTURE.md`) and the scalarisation and empty-feasible-set rule stated in *Endurance is a constraint, not a price*. The `minimize total angriness subject to a worst-regime cap` form above is superseded; angriness remains the internal pricing form and stays not-well-posed.
 - **The convexity → fairness claim is false for this form.** `d²σ/dx² ∝ σ'(z)(1 − 2σ(z))`, so the penalty is convex for `x < SLO + a` and **concave for `x > SLO + a`** — concave in the far violation region. The load-spreading argument requires global convexity and does not apply. Fairness must be supplied separately, or the penalty form changed.
-
-## Endurance is a constraint, not a price (author, 2026-10-06)
-
-Measured on the slice-39 **adversarial** workload (service-time term): the reorganisation write term is **0.083%** for the `declared` arm, **0.669%** for `learned@1.0`, and **0.118%** for `static-derived`; ingest writes are **0.003%** on every arm. No drift-arm ratio was reported — slice 39 ran the adversarial arm only. A priced term of that size cannot move any candidate's argmin however `lambda` is swept, so lambda was never a calibration problem — on these arms endurance is **not** the scarce resource; device service time is.
-
-The form therefore becomes:
-
-```
-maximise   sustained load
-subject to latency ceiling       (hard)
-           write-amplitude budget (hard)
-```
-
-**Scalarisation.** Among candidates that satisfy both hard conditions, rank by **highest sustained offered load**; break ties first by **latency headroom** (the larger measured margin below the ceiling), then by the **reported efficiency metrics** in the pre-registered order (write amplification, bytes read per op per pattern, RSS per data byte, CPU per op, recovery time — `pre-registration.md`). Angriness does not enter this ordering until it is well-posed.
-
-**Empty feasible set.** If no candidate satisfies both hard conditions, the program has no solution: the comparison reports infeasibility and names the binding constraint, and no arm is scored as a winner — the metric cannot be won by abandoning a condition (matching the pre-registration's rule that invalid windows are not counted).
-
-The budget is enforced as a **per-window reorganisation allowance** — the window is the load window the objective aggregates over (1 s in the reported slice-39 runs). The slice-39 churn control is that mechanism: on the adversarial arm it moved `learned@1.0` reorganisation bytes from **33,141,775** (slice-38 adversarial arm) to **28,191,940** (slice-39 adversarial arm), about **1.18×**. (The slice-38 **drift** arm's `learned@1.0` figure was 402,984,851, but the churn control's effect **under drift is not yet measured** — slice 39 ran the adversarial arm only; what was observed on the adversarial arm are the control's counters: **52 restarts, 45 gated switches, 10 budget blocks, 42 cooldown holds**.) The deliverable is a **capacity-versus-budget curve** ("under a reorganisation budget of B bytes per load window, sustained load is X"), not a lambda. A small lambda may remain only as a tie-break, and must be described as such.
 
 ## Worked example
 

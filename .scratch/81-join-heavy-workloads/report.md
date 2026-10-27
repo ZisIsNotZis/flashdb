@@ -1,11 +1,11 @@
 # 81 — join-heavy workloads: per-region layout space vs L2 co-location (M2 WP 2.3 / 2.4)
 
-Status: 2026-10-17, branch `wave/m2-join-heavy`. Authority: the M2 acceptance in `docs/roadmap.md`
-(item-by-item status in §8) and the workload hypotheses in `docs/dev-loop.md`; this report's own work
+Status: 2026-10-17, branch `wave/m2-join-heavy`. Authority: the M2 acceptance in `docs/0_ROADMAP.md`
+(item-by-item status in §8) and the workload hypotheses in `docs/9_IMPLEMENTATION.md`; this report's own work
 packages are scoped by `.scratch/81-join-heavy-workloads/issues.md`. The
 pre-registered contract (`.scratch/15-objective-v0/pre-registration.md`) is **not changed**, no engine
 code is touched, L2 is not implemented, and no claim is made that an L2 implementation delivers any
-number below. The L2 go/no-go is an author-reserved decision (`docs/roadmap.md`, "Decisions reserved to
+number below. The L2 go/no-go is an author-reserved decision (`docs/0_ROADMAP.md`, "Decisions reserved to
 the author").
 
 ## 0. Conclusion first
@@ -200,7 +200,7 @@ because the parent rows repeat the same sku.
    the `Supplier` dimension (Supplier rows carry no `sku`), and `multi_hop`'s root `items` rows
    contribute no `order_no` region. Both are uncounted, so the true region count is at least the
    reported value; the method string in `descriptors.json` says so.
-7. **The co-location key is reduced to a single field.** `docs/dev-loop.md` hypothesises co-location
+7. **The co-location key is reduced to a single field.** `docs/9_IMPLEMENTATION.md` hypothesises co-location
    along `(sku, loc, time-bucket)` for the replenishment shape; `CANDIDATE_KEYS` measures single
    fields only (`sku`, `order_no`, `lot_no`, `supplier_no`), and `star_fanout`'s verdict rests on `sku`
    alone. A composite key could co-locate rows no single field does; that is unmeasured.
@@ -473,10 +473,10 @@ the pre-registration's rule stands: no claim about L2 until it is measured on a 
 
 ## 8. M2 acceptance status
 
-`docs/roadmap.md` M2 is the acceptance home. Measured against that row — not against this ticket's
+`docs/0_ROADMAP.md` M2 is the acceptance home. Measured against that row — not against this ticket's
 engine-free slice:
 
-| M2 acceptance item (`docs/roadmap.md` M2) | status | evidence |
+| M2 acceptance item (`docs/0_ROADMAP.md` M2) | status | evidence |
 |---|---|---|
 | fan-out / multi-hop depth / dependent-read share / co-location potential measured | **MET** | §2 and `descriptors.json` (seed 42, 25 requests/shape, corpus `ecc271e4…`), pinned by `test_committed_descriptor_values_are_pinned` |
 | an explicit go/no-go recommendation with evidence | **MET** | §0 and §4, proposed to the author; the L2 go/no-go stays author-reserved |
@@ -504,6 +504,6 @@ Closing the M2 gate therefore needs one of:
 
 1. the engine work above plus the M-B run, which delivers both unmet items; or
 2. an explicit author waiver of the ≥10x headroom item (and of the learned-vs-declared item) for this
-   milestone, recorded in `docs/roadmap.md`, leaving the gate as "2 of 4 delivered by analysis".
+   milestone, recorded in `docs/0_ROADMAP.md`, leaving the gate as "2 of 4 delivered by analysis".
 
 Neither is applied here: this report proposes, and the author decides.

@@ -4,7 +4,7 @@
 不用 `random`、不用浮点累积，因此同一 seed 在任何 Python 版本、
 任何平台上产出**字节级相同**的 trace（JSONL，键排序）。
 
-请求形状遵循 `docs/contracts.md`：命名块 DAG、按块原子、
+请求形状遵循 `docs/7_INTERFACE.md`：命名块 DAG、按块原子、
 probe 即守卫（`where` 内嵌 `$gte`）、多写原子块、`else` 回退。
 
 两组形状，互不影响：
@@ -481,7 +481,7 @@ class Generator:
     #
     # Each is a read-only request in the same JSONL dialect as the flat flow: a
     # named block DAG whose later blocks bind `$block.field` from an earlier
-    # block's rows (the QBE join trick in `docs/contracts.md`). A multi-row parent
+    # block's rows (the QBE join trick in `docs/7_INTERFACE.md`). A multi-row parent
     # therefore makes the child predicate a *set* predicate, which is exactly the
     # fan-out these shapes exist to expose. The engine adapter
     # (`engine/src/request.rs`) accepts none of them today: `validate` demands the
@@ -576,7 +576,7 @@ class Generator:
         location. The probe's *absence* is the answer. Hops: demand (1) -> supply (2).
 
         Marking the lost skus into a `LostSale` row would need an aggregate-to-write
-        shape (`docs/contracts.md`, L-07) that does not exist, so the request stops at
+        shape (`docs/7_INTERFACE.md`, L-07) that does not exist, so the request stops at
         the detection half and the absence is read from `supply.status == empty`.
         """
         day = 1 + self.rng.below(self.world.n_days)

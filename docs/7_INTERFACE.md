@@ -1,6 +1,4 @@
-# flashdb — contracts
-
-Budget: 335 lines / 34,000 chars  <!-- budget debt: see issue 01-design, "Budget debt" -->
+# CONFIRMED
 
 The four interfaces that cannot be changed cheaply after implementation. Everything else in this repository is deferrable; these are not.
 
@@ -73,7 +71,6 @@ Every block reports `{ name, status }` with `status` ∈ `ok | empty | failed | 
 **Closed here:** L-01, L-05, L-06, L-11, L-12, L-13, L-14, L-18, L-20.
 **Still open:** L-04 (`E` as a normalizer, not a list), L-07 (row cap, aggregate-to-write, generated-key round-trip), L-08 (schema canonicity), L-16 (wire-form canonicalization), and the expression grammar (`$name.field`, arithmetic, `where` operators) needs one page of exact rules. **L-02 is resolved (2026-09-29):** historical reads do not exist — reads always see the latest committed state, so compaction may drop every superseded version; dedup-replay responses are not a guarantee (see Idempotency).
 
-
 ### Blocks
 
 Every block carries **two orthogonal annotations**, frozen into the format now because the normalizer's soundness and the scheduler's predication strategy both depend on them (`review-02` F15 — the earlier three-value table was ill-typed: it presented a third exclusive value while saying "additionally", leaving read-set validation and speculation eligibility undecidable).
@@ -116,7 +113,7 @@ Single source of truth: **the same intent must not be expressible two ways.** Th
 
 Users are required to state their requirement precisely, with a clear boundary — no overspill fields. The engine does the dirty work (field duplication, partitioning, physical arrangement) and the user is always given the cleanest possible query surface.
 
-**Withdrawn (`review-04` L-17):** the claim that canonicity is what makes the advisor computable is false. The advisor's rules are statistical and value-dependent — entropy, mutual information, association rules — and those come from the trace, not from canonicity. Canonicity supplies a *stable aggregation key* and nothing more. See `learning.md` for the per-rule input list, including the rules the engine cannot compute at all.
+**Withdrawn (`review-04` L-17):** the claim that canonicity is what makes the advisor computable is false. The advisor's rules are statistical and value-dependent — entropy, mutual information, association rules — and those come from the trace, not from canonicity. Canonicity supplies a *stable aggregation key* and nothing more. See `5_PRODUCT.md` for the per-rule input list, including the rules the engine cannot compute at all.
 
 Two rules that a naive design gets wrong:
 
@@ -141,7 +138,7 @@ Status: settled.
 
 ### Read-set validation
 
-A timing-dependent read-set version mismatch at commit is a candidate for bounded retry on a fresh snapshot. A uniqueness/constraint violation is a business error and must not be retried merely because it shares a legacy `conflict` label. The v0 key/CSN validation design is in `engine.md`; the tile-version scheme below is historical design context.
+A timing-dependent read-set version mismatch at commit is a candidate for bounded retry on a fresh snapshot. A uniqueness/constraint violation is a business error and must not be retried merely because it shares a legacy `conflict` label. The v0 key/CSN validation design is in `8_DETAIL.md`; the tile-version scheme below is historical design context.
 
 This is cheap in the right currency: tiles are immutable, so a tile version is a plausible validation granule. **But the previous claim that "phantom protection comes for free" is false (`review-05` SS-05), for two reasons.**
 
@@ -170,7 +167,7 @@ If a request dies mid-program, the durable commit record holds a **prefix** of i
 
 ### Conflict policy
 
-Do not conflate business conflicts with timing contention. A unique/index constraint collision is a terminal business error (no automatic retry or `else`). Only a read-set validation mismatch attributable to concurrent publication may be retried on a new snapshot, with bounded attempts/backoff; it must not silently become an `else` branch. Coalescing is allowed only where a declared mergeable operation preserves semantics (see `learning.md`).
+Do not conflate business conflicts with timing contention. A unique/index constraint collision is a terminal business error (no automatic retry or `else`). Only a read-set validation mismatch attributable to concurrent publication may be retried on a new snapshot, with bounded attempts/backoff; it must not silently become an `else` branch. Coalescing is allowed only where a declared mergeable operation preserves semantics (see `5_PRODUCT.md`).
 
 ### What this model gives up
 
@@ -185,7 +182,7 @@ Each request carries an explicit class — never an implicit engine guess, or th
 | `durability` | `durable` (fsync before ack) · `batched` (ack after the group's fsync; **default**) · `lossy` (ack immediately, bounded loss window) |
 | `max_staleness` | reader may read a snapshot up to N seconds old. A derived layout is served only when its coverage metadata proves it contains every row matching the predicate **and** its version matches the base snapshot. `max_staleness` governs how stale the base snapshot may be, never how stale a derived copy may be relative to that base (`review-02` F5). |
 | `shedable` | may be dropped under overload, with a priority class |
-| `deadline` | **added (`review-05` SS-19):** `objective.md` prices "requests that exceed a completion deadline" and `dev-loop.md` requires a workload with a hard deadline, but no request field carried one — a priced term with no interface cannot be computed, and deadline-aware batching has no input. Either this field exists or the deadline term and the batching rule are removed. |
+| `deadline` | **added (`review-05` SS-19):** `2_GOAL.md` prices "requests that exceed a completion deadline" and `9_IMPLEMENTATION.md` requires a workload with a hard deadline, but no request field carried one — a priced term with no interface cannot be computed, and deadline-aware batching has no input. Either this field exists or the deadline term and the batching rule are removed. |
 | `recomputable` | never fsync; rebuild or drop on loss. Applies to engine-owned tables (trace, statistics) and to read-only derived tiles. **A `recomputable` tile must never be reachable from a durable root unless its contents are proven rebuildable before first read** — otherwise a crash can leave a durable root pointing at a tile that was never made durable, which is wrongness, not slowness (`review-02` F5). |
 
 `recomputable` is a substantial win, not a footnote: the trace store, statistics and every derived layout stop paying fsync entirely, freeing a large share of the IO budget for foreground work.
@@ -264,7 +261,7 @@ Status: settled.
 - **Immutable.** A tile is never mutated in place.
 - **Self-describing.** The header names the layout, the column group, the clustering key and the encoding, so any reader can consume any tile without external metadata.
 - **Relocatable — with a caveat (`review-05` SS-06, SS-09).** Tile *payloads* are position-independent, but "the tile is self-contained" is not yet true: a parent tile storing child addresses cannot be relocated without rewriting every referrer, and a durable tile-id→file-offset map is itself global state. Nor is a reorg a `memcpy` — `glossary.md` defines it as *rewriting tiles into a different arrangement* (read → regroup → re-encode → rebuild directory → write); only pure *relocation* is a copy. What relocatability costs is unpriced: stable addresses, raw child pointers, page-cache readahead state (relocating a hot tile re-faults its pages), and cross-tile references wider than 32 bits at 10 TB.
-- **Versioned.** A per-tile version field is reserved now, for read-set validation (Contract 2) and for version-checked layout authority (`learning.md`). **Ambiguity to resolve (`review-05` SS-16):** for an *immutable* tile, "version" can only mean content identity (a hash), which lives outside the tile — otherwise the version is mutated in place, contradicting immutability and re-introducing the in-place ordering problem of SS-01. If it lives outside, validation is a question about the root mapping, not the tile, and the tile is no longer fully self-describing. One of the two must give.
+- **Versioned.** A per-tile version field is reserved now, for read-set validation (Contract 2) and for version-checked layout authority (`5_PRODUCT.md`). **Ambiguity to resolve (`review-05` SS-16):** for an *immutable* tile, "version" can only mean content identity (a hash), which lives outside the tile — otherwise the version is mutated in place, contradicting immutability and re-introducing the in-place ordering problem of SS-01. If it lives outside, validation is a question about the root mapping, not the tile, and the tile is no longer fully self-describing. One of the two must give.
 
 ### Directory and offsets
 
@@ -310,7 +307,7 @@ A derived layout is a second arrangement of base data, built by the engine for a
 | product attribute group | catalog listing | column-group pruning |
 | history as cold compressed tiles | replenishment analytics | cheaper scans, no hot-path cost |
 
-- **v1: all derived layouts are read-only** (open question in `design.md`). A read-only derived layout is a pure accelerator with a fallback to the base copy, so the worst case of any bug, lag or crash is slowness, never wrongness (Invariant I2).
+- **v1: all derived layouts are read-only** (open question in `6_ARCHITECTURE.md`). A read-only derived layout is a pure accelerator with a fallback to the base copy, so the worst case of any bug, lag or crash is slowness, never wrongness (Invariant I2).
 - Read-only derived layouts are what make continuous drift safe: layout never has to be *correct*, only *useful*.
 - Promotion of one derived layout to authoritative is a per-layout decision taken by the objective function — never a global switch. The eventual mechanism is **version-checked authority**: serve from the derived copy when its version matches the base, fall back otherwise; a lagging copy then costs latency, not correctness. Aggregates (e.g. a running stock total) are the exception, since they cannot be version-checked cheaply; those carry a dependency version and rely on the caller's `max_staleness`.
 

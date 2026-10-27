@@ -20,9 +20,9 @@ that compares status and row *count*, never row content) and R2/R3 (M3 (a)'s `co
 startup-warm halves are not in this artefact at all and `issues.md` does not say so). Neither is a
 measurement error; both are fixable by wording plus a one-line assertion, without re-measuring.
 
-What I read beyond the contract's read list, and why: `docs/plan/gap-analysis.md` §2/§3/§9 (to
+What I read beyond the contract's read list, and why: `docs/6_ARCHITECTURE.md` §2/§3/§9 (to
 source the `13,268` and `0.047` terms the per-request rows are built from — acceptance item 1
-cannot be discharged from `head.out` alone), `docs/roadmap.md` §Milestones + decision 5 (the clause
+cannot be discharged from `head.out` alone), `docs/0_ROADMAP.md` §Milestones + decision 5 (the clause
 wording the verdict is about), and one 7-line function, `engine/src/engine.rs:3105-3111`
 (`lookup_movement_by_order_no`), to decide whether the `order_no_index_lookups` counter can witness
 "the index was consulted". All read-only; nothing was modified.
@@ -32,7 +32,7 @@ wording the verdict is about), and one 7-line function, `engine/src/engine.rs:31
 ## 1. Re-derivation of the three figures from the logs alone
 
 **All three follow. No number in the table is wrong.** Worked from `logs/head.out` +
-`logs/pre-fix.out` + `gap-analysis.md` §2 (the record's own decomposition):
+`logs/pre-fix.out` + `6_ARCHITECTURE.md` §2 (the record's own decomposition):
 
 ### (i) Index entries vs movement rows
 
@@ -61,7 +61,7 @@ never reaches `Engine::get` (before) reads 0, the two arms that do read exactly 
 ### (iv) The per-request pair `42,240 → 13,466` (and the predicted `43,298 → 13,460`)
 
 The arithmetic the record states is `0.047 × scan_bytes + 13,268`, and every term is the
-record's own, not a reconstruction: `gap-analysis.md` §2 gives the scan row
+record's own, not a reconstruction: `6_ARCHITECTURE.md` §2 gives the scan row
 `count=940, bytes_read=600,601,720, bytes/read=638,938` and the non-scan rows summing to
 `265,360,600`; `940 × 638,938 + 265,360,600 = 865,962,320`, which `/20,000 = 43,298.116` — the
 predicted before figure to the byte. `0.047 = 188/4,000 = 940/20,000`, `13,268.03 =
@@ -175,7 +175,7 @@ touches the milestone row.** `arm()` records
 after_answers`) and line 289 (`tiled_answers == before_answers`) compare those strings. No field
 of any answer is ever compared. What is evidenced is "188 × `ok`, one row each, both arms" —
 which is a real and useful statement — and **not** "the same rows", as `issues.md` §The path taken
-puts it, and **not** "byte-identical answers", as `docs/roadmap.md`'s M3 row puts it ("the
+puts it, and **not** "byte-identical answers", as `docs/0_ROADMAP.md`'s M3 row puts it ("the
 no-index arm returns byte-identical answers (`before_answers == after_answers` in the same
 test)"). The variable names match the roadmap's citation; the content does not. Structurally the
 bytes almost certainly *are* identical — both arms build the row with `document_row` on the same
@@ -227,7 +227,7 @@ of the "hit" is flattered.
   mix. The record's opening sentence ("every reported number is a count, a byte total, or a ratio
   of two counts from the same run") does not describe those two rows, though the table does
   disclose the mixing inline. Reword the opening to exempt them.
-- The µs half of `gap-analysis.md` §7 fix #1 ("scan cost 6,053.6 us → about one 89 us dependent
+- The µs half of `6_ARCHITECTURE.md` §7 fix #1 ("scan cost 6,053.6 us → about one 89 us dependent
   page probe; average read work −~280 us/req") is not measured here at all; §What is NOT measured
   names "latency percentiles", which a reader can take as covering it, but the per-region *mean*
   the prediction also moved is never named.
@@ -289,9 +289,9 @@ the next session that touches the file.
 - `engine/src/request.rs:319` (lookup), `:320` (cross-check `get`), `:334` (scan), `:360-363`
   (`empty` ⇔ zero rows)
 - `engine/src/engine.rs:3105-3110` (the lookups counter increments before the index check)
-- `docs/plan/gap-analysis.md` §2 (the `940 × 638,938` scan row and the `265,360,600` non-scan
+- `docs/6_ARCHITECTURE.md` §2 (the `940 × 638,938` scan row and the `265,360,600` non-scan
   total), §7 fix #1, §9 (`865,962,320/20000`)
-- `docs/plan/open-items.md` row `T-83`; `docs/roadmap.md` §Milestones row M3
+- `docs/9_IMPLEMENTATION.md` row `T-83`; `docs/0_ROADMAP.md` §Milestones row M3
 - `git log --oneline -- engine/tests/index_defect_mechanism.rs` (one commit, `23c4af1`);
   `git diff --stat 23c4af1..HEAD -- engine/` (empty)
 

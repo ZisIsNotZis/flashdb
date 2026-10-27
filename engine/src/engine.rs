@@ -1769,7 +1769,7 @@ impl Engine {
     /// a byte budget allows.
     ///
     /// **Only the newest version per logical key survives.** Reads never see
-    /// historical state (2026-09-29, `docs/contracts.md` L-02 resolution), so
+    /// historical state (2026-09-29, `docs/7_INTERFACE.md` L-02 resolution), so
     /// superseded versions are unreadable garbage: the merged tile keeps the
     /// newest version of every logical key (everything before the trailing
     /// `~csn`), where a tombstone is itself the newest state and is retained.
@@ -3778,7 +3778,7 @@ impl Engine {
     /// deferred-barrier path states. The at-most-one-live-owner-per-prefix
     /// invariant holds at REQUEST granularity after a successful call; a prefix
     /// torn inside a request was never itself validated as a state and follows
-    /// the pre-existing block-atomicity rule (docs/design.md I6: a block is
+    /// the pre-existing block-atomicity rule (docs/6_ARCHITECTURE.md I6: a block is
     /// all-or-nothing, a request is not).
     ///
     /// The promise is bounded on purpose: a `Conflict` drops one request with

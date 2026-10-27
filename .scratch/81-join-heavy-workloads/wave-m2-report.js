@@ -4,7 +4,7 @@ const fixTask = `You are the final report-fix worker for milestone M2 of flashdb
 
 Repo /home/z/vibe/flashdb, branch wave/m2-join-heavy, tree clean. Do not push. Report/analysis correction only: no engine change, no threshold change, no new milestone scope decision.
 
-Read the review in full: /home/z/.pi/agent/sessions/--home-z-vibe-flashdb--/subagent-artifacts/de648176-64af-41eb-bff3-6a5a7794cf9b_reviewer_output.md . Then .scratch/81-join-heavy-workloads/{issues.md,report.md,descriptors.json}, harness/flashdb_harness/{generator.py,join_descriptors.py}, harness/tests/test_join_shapes.py, docs/roadmap.md M2.
+Read the review in full: /home/z/.pi/agent/sessions/--home-z-vibe-flashdb--/subagent-artifacts/de648176-64af-41eb-bff3-6a5a7794cf9b_reviewer_output.md . Then .scratch/81-join-heavy-workloads/{issues.md,report.md,descriptors.json}, harness/flashdb_harness/{generator.py,join_descriptors.py}, harness/tests/test_join_shapes.py, docs/0_ROADMAP.md M2.
 
 Fix the two blocking P1s:
 1. Add an "M2 acceptance status" block to report.md (and reference it from issues.md) that states item by item: descriptors measured (met), recommendation (met), >=10x headroom measurement (UNMET), learned-vs-declared headroom with the latency rule (UNMET). Name the missing engine capabilities that block them (multi-row binding, cust->take validation, aggregate-to-write), point at M-B as the smallest deciding measurement, and record explicitly that closing the gate needs either that engine work or an author waiver of the >=10x item. Do not let the ticket's engine-free scope silently stand as the milestone gate.
@@ -21,7 +21,7 @@ Fix the P2s that affect correctness or honest reading:
 - Normalise the anti_join fanout median type (1.0 vs 1).
 - Verify the multi_hop median 614 claim; if it is a hot-sku tail outcome, phrase it as "the hot sku sets the width" rather than a median, and state the check.
 
-Run: cd harness && uv run --with pytest pytest -q; regenerate the corpus and descriptors and confirm the committed sha256 and JSON; git diff --check. Commit on wave/m2-join-heavy, tree clean. Update docs/roadmap.md M2 status to: descriptors + recommendation delivered; gate UNMET (2/4); author decision needed on the >=10x/learned-vs-declared item.
+Run: cd harness && uv run --with pytest pytest -q; regenerate the corpus and descriptors and confirm the committed sha256 and JSON; git diff --check. Commit on wave/m2-join-heavy, tree clean. Update docs/0_ROADMAP.md M2 status to: descriptors + recommendation delivered; gate UNMET (2/4); author decision needed on the >=10x/learned-vs-declared item.
 
 Report the commit, each P1/P2 with where fixed, the pytest summary, the reconfirmed corpus sha256, and any item still open.`;
 

@@ -11,7 +11,7 @@ Three readings per (block, rung, arm) row, all from `cold_0b.summarize_curve`:
     sustained                          the both-ceilings reading every record was scored with,
                                        recomputed from the row's own windows and compared with the
                                        record's stored `curve[0].sustained`
-    sustained_primary                  the decided lag-only rule (objective.md §1 / T-84)
+    sustained_primary                  the decided lag-only rule (2_GOAL.md §1 / T-84)
     service_ceiling_reported_windows   windows the SERVICE ceiling rejected, reported, never a veto
 
 The counterfactual in `--ceiling-us` (default 10,000, cold_0b's own fixed service ceiling) is NOT the

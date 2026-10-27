@@ -4,7 +4,7 @@ const buildTask = `You are the build worker for milestone M2 (join-heavy workloa
 
 Repo /home/z/vibe/flashdb, branch wave/m2-join-heavy (create it from the current HEAD if it does not exist; work only on it). Do not push.
 
-READ FIRST: .scratch/81-join-heavy-workloads/issues.md (your acceptance), docs/roadmap.md M2, docs/dev-loop.md (the four workload hypotheses), .scratch/29-workload-shapes/issues.md (the finding that the current generator has no join-heavy shapes), harness/flashdb_harness/generator.py, seed.py, load_profile.py, and the engine request dialect in engine/src/request.rs.
+READ FIRST: .scratch/81-join-heavy-workloads/issues.md (your acceptance), docs/0_ROADMAP.md M2, docs/9_IMPLEMENTATION.md (the four workload hypotheses), .scratch/29-workload-shapes/issues.md (the finding that the current generator has no join-heavy shapes), harness/flashdb_harness/generator.py, seed.py, load_profile.py, and the engine request dialect in engine/src/request.rs.
 
 GOAL: add the four join-heavy shapes to the deterministic generator and measure their structural descriptors. This slice does NOT execute the engine and does NOT implement L2.
 
@@ -26,7 +26,7 @@ const analyzeTask = `You are the analysis worker for milestone M2 of flashdb.
 
 Repo /home/z/vibe/flashdb, branch wave/m2-join-heavy. Do not push. Do not change engine code or the pre-registration.
 
-READ: .scratch/81-join-heavy-workloads/issues.md (including the Build record and descriptor table), docs/dev-loop.md, .scratch/29-workload-shapes/issues.md, the pre-registration's layout space and "What is NOT claimed", and the committed descriptor output.
+READ: .scratch/81-join-heavy-workloads/issues.md (including the Build record and descriptor table), docs/9_IMPLEMENTATION.md, .scratch/29-workload-shapes/issues.md, the pre-registration's layout space and "What is NOT claimed", and the committed descriptor output.
 
 TASK: decide, with evidence and honest limits, whether the per-region layout space (page size, bloom bits, compaction trigger, per-tile parameters) can move the cost of each join-heavy shape, or whether the cost is dominated by where related rows live (the L2 co-location question). Then write .scratch/81-join-heavy-workloads/report.md:
 - Conclusion first: the recommendation (per-region parameters sufficient for shape X / L2 required for shape Y / not determinable), and what would falsify it.
@@ -35,7 +35,7 @@ TASK: decide, with evidence and honest limits, whether the per-region layout spa
 - What is unverified: anything needing a real engine run, a calibrated simulator, or an L2 implementation.
 - No claim about L2 beyond the analysis, and no change to the objective.
 
-Also update docs/roadmap.md's M2 status line with the recommendation (one line) and commit on wave/m2-join-heavy. Report the commit and the decisive recommendation.
+Also update docs/0_ROADMAP.md's M2 status line with the recommendation (one line) and commit on wave/m2-join-heavy. Report the commit and the decisive recommendation.
 
 If the descriptors are insufficient to decide, say so and name the smallest measurement that would decide it, rather than inventing a conclusion.`;
 
@@ -43,7 +43,7 @@ const reviewTask = `You are a fresh independent reviewer for milestone M2 of fla
 
 Repo /home/z/vibe/flashdb, branch wave/m2-join-heavy. Read-only; do not edit.
 
-Read .scratch/81-join-heavy-workloads/{issues.md,report.md}, the generator changes, the descriptor script and its committed output, docs/dev-loop.md, .scratch/29-workload-shapes/issues.md, and docs/roadmap.md M2. Try to falsify:
+Read .scratch/81-join-heavy-workloads/{issues.md,report.md}, the generator changes, the descriptor script and its committed output, docs/9_IMPLEMENTATION.md, .scratch/29-workload-shapes/issues.md, and docs/0_ROADMAP.md M2. Try to falsify:
 1. Are the four shapes genuinely deterministic (same seed -> same bytes) and in the existing dialect? Do the tests prove it, and is the existing corpus hash unchanged?
 2. Is each descriptor measured, with a named method, and not invented where the generator does not emit it?
 3. Does the recommendation follow from the descriptors and the cited measured headroom, with the model's calibration limit and the unverified items stated?

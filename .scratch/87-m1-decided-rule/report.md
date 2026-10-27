@@ -10,13 +10,13 @@ pacer, `:1869` for the flashdb arm) and all 45 window files carry `"service_ceil
 between the two verdicts** — and 0 of 47 saved arm-runs once the two `probe-checkpoint` runs are read
 too (§1.1).
 
-Status 2026-10-21, WP-12 of `docs/plan/workplan.md`, revision `1f31c44`. No arm, rung or engine change
+Status 2026-10-21, WP-12 of `docs/0_ROADMAP.md`, revision `1f31c44`. No arm, rung or engine change
 was run and no record was edited: every number below is re-derived from the committed window samples
 in `.scratch/82-controlled-m1/runs/**` by `analysis.py`.
 
 ## 1. Per arm per rung, both readings, with their provenance
 
-Rule read from `docs/objective.md` §1 / row `T-84`: `sustained_primary` = achieved within 5% of offered
+Rule read from `docs/2_GOAL.md` §1 / row `T-84`: `sustained_primary` = achieved within 5% of offered
 `AND` zero error windows `AND` zero windows rejected by the **lag** ceiling `AND` not rate-exceeded;
 `service_ceiling_reported_windows` is reported and never vetoes. `sustained` is the both-ceilings
 reading (`cold_0b.summarize_curve`'s unchanged expression), recomputed here from the same windows and
@@ -87,7 +87,7 @@ window records localise to window 10 of 20 in both blocks. `lag_saturation` and 
 
 To say *how much* the rejected ceiling would have mattered had it been switched on, the same windows
 were re-scored with `summarize_curve(windows, 10_000)` — `cold_0b`'s fixed service ceiling, the value
-`docs/plan/open-items.md` row `PLAN-ceiling-reconciliation` states as "a fixed 10 ms":
+`docs/9_IMPLEMENTATION.md` row `PLAN-ceiling-reconciliation` states as "a fixed 10 ms":
 
 | arm | rung | `sustained_primary` (decided rule) | both ceilings at a 10 ms service ceiling | service-rejected windows (sum) |
 |---|---|---|---|---|
@@ -126,7 +126,7 @@ should stop implying is the reasoning rather than the number: the 3-of-5 is not 
 number that the lag rule also gives", it is a number no ceiling but the lag ceiling ever entered, and
 `flashdb-declared` loses it on two lag breaches inside one ~575 ms group per block, not on service
 latency. The service p99 (403 ms median at 200 rps, 5.5-20x above the device floor) is a real defect
-reported beside the comparison — under `docs/objective.md` §0's KPI ladder it is what makes this
+reported beside the comparison — under `docs/2_GOAL.md` §0's KPI ladder it is what makes this
 comparison a loss on the third KPI, and it is not what rejects the throughput blocks.
 
 ## 4. Does `scripts/m1-controlled-score.py` reproduce `table.md` byte-identically? PASS

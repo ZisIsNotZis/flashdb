@@ -5,7 +5,7 @@ const buildTask = `You are the build worker for milestone M1 (external baseline 
 Repo: /home/z/vibe/flashdb. Branch: wave/m1-baselines (already checked out, clean). Work only in this repo; never push.
 
 READ FIRST (do not open the multi-MB *.json reports):
-- docs/roadmap.md (milestone M1)
+- docs/0_ROADMAP.md (milestone M1)
 - .scratch/80-external-baselines/issues.md (your acceptance) and .scratch/80-external-baselines/env.md (verified environment)
 - harness/flashdb_harness/generator.py (the four request shapes and the deterministic Rng/Zipf)
 - harness/flashdb_harness/seed.py (the seeded dimensions)
@@ -46,7 +46,7 @@ const measureTask = `You are the measurement worker for milestone M1 of flashdb.
 
 Repo: /home/z/vibe/flashdb. Branch: wave/m1-baselines. Do not push.
 
-READ: docs/roadmap.md (M1), .scratch/80-external-baselines/issues.md (including the Build record), .scratch/80-external-baselines/env.md, and the committed harness harness/flashdb_harness/baseline_0b.py. Do not open multi-MB json reports.
+READ: docs/0_ROADMAP.md (M1), .scratch/80-external-baselines/issues.md (including the Build record), .scratch/80-external-baselines/env.md, and the committed harness harness/flashdb_harness/baseline_0b.py. Do not open multi-MB json reports.
 
 TASK: run the committed harness on a cold, cache-evicting instance at >=10x data:memory and report T5/T6/T7 exactly per .scratch/15-objective-v0/pre-registration.md ("External baselines and thresholds"):
 - Arms: flashdb-declared, flashdb-learned, sqlite, postgres.
@@ -73,7 +73,7 @@ const reviewTask = `You are a fresh independent reviewer for milestone M1 of fla
 
 Repo: /home/z/vibe/flashdb. Branch: wave/m1-baselines. You may run commands and read the raw report.json; do not edit files.
 
-READ: docs/roadmap.md (M1), .scratch/80-external-baselines/issues.md, .scratch/80-external-baselines/env.md, .scratch/80-external-baselines/report.md, the pre-registration section "External baselines and thresholds", and harness/flashdb_harness/baseline_0b.py.
+READ: docs/0_ROADMAP.md (M1), .scratch/80-external-baselines/issues.md, .scratch/80-external-baselines/env.md, .scratch/80-external-baselines/report.md, the pre-registration section "External baselines and thresholds", and harness/flashdb_harness/baseline_0b.py.
 
 Judge, actively trying to falsify:
 1. Does the harness execute the SAME deterministic trace (sha256) and the SAME latency/sustained rule for every arm?

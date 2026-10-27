@@ -2,7 +2,7 @@
 
 Status: proposal for the author/orchestrator. Written 2026-09-30. No source modified.
 Scope: answers `.scratch/14-layout-harness/gap-analysis.md` "Layout space" gap and the
-`docs/dev-loop.md` step-0b experiment. Grounded in `docs/{design,objective,learning,engine,dev-loop}.md`,
+`docs/9_IMPLEMENTATION.md` step-0b experiment. Grounded in `docs/{design,objective,learning,engine,dev-loop}.md`,
 `.scratch/12-compaction-amplification/issues.md`, `.scratch/14-layout-harness/gap-analysis.md`,
 `engine/src/keys.rs`, and the tile/publish path in `engine/src/engine.rs`
 (`write_verified_tile`, `merge_run`, `stream_merged_reduction`, `TileWriter::push` in `engine/src/tile.rs`).
@@ -31,7 +31,7 @@ the order and the read path fences on it, or (b) silently requires cross-family
 co-location, which is **L2**. Star-schema fan-out collapse = putting an order_line row in
 the same page as the product/stock rows it references ⇒ a **cross-entity** reordering ⇒ L2.
 **L1 cannot move the star-schema needle.** If 0b's stated hypothesis is the star-schema
-fan-out row of `docs/dev-loop.md`, then L1's omission of co-location *does invalidate that
+fan-out row of `docs/9_IMPLEMENTATION.md`, then L1's omission of co-location *does invalidate that
 first experiment* — it would measure a no-op and could falsely reject the thesis.
 
 ## 1. What actually varies per tile, and the enumerated candidate set
@@ -39,9 +39,9 @@ first experiment* — it would measure a no-op and could falsely reject the thes
 The implementable, per-tile axis behind the existing writer is **composition, not order**:
 *which encoded key families/prefixes a tile materializes*, plus the two already-existing
 physical parameters. A tile that omits a derived family is still correct because
-`docs/engine.md` defines derived prefixes as **recomputable** (rebuilt from `P/` by scan),
+`docs/8_DETAIL.md` defines derived prefixes as **recomputable** (rebuilt from `P/` by scan),
 which is exactly invariant I2. This maps onto the *implemented* "what the learner controls
-in v0" table in `docs/engine.md` (which `U` prefixes to materialize, which `R` prefixes to
+in v0" table in `docs/8_DETAIL.md` (which `U` prefixes to materialize, which `R` prefixes to
 retain, encoding, per-prefix compaction trigger, page size), and it is the smallest
 surface that is (a) behind the writer, (b) brute-forceable, (c) able to show a win.
 
@@ -69,7 +69,7 @@ by the simulator — O(|C| × #regions), trivial at |C|=8.
 **Granularity.** A derived prefix is *cumulative across CSN windows*, so materializing
 `R/Order/line` for one tile but not the next would make its acceleration inconsistent
 across the range. The decision therefore belongs on a **prefix-region** (a (family, entity,
-field) → CSN-range) rather than a single tile. This matches `docs/engine.md`'s
+field) → CSN-range) rather than a single tile. This matches `docs/8_DETAIL.md`'s
 "compaction trigger per prefix-region" and keeps I3 (no global layout state).
 
 **What it CANNOT express:** cross-entity co-location / join-key clustering (**L2**),
@@ -154,14 +154,14 @@ objective charges (F14); (ii) on this device the tail is benign (QD1 p99 = 1.26�
 p99 is *structurally predictable* from dependent-read depth — the calibration is learnable;
 (iii) p99 is estimable at the small sample counts 0b can afford, unlike CVaR/p99.9; and
 (iv) calibrating **service time at QD1** decouples the structural term (layout → dependent
-reads) from the queueing anchor, which `docs/objective.md` still marks Open (F1–F4). Caveat
+reads) from the queueing anchor, which `docs/2_GOAL.md` still marks Open (F1–F4). Caveat
 to pre-register: if the estimand is later chosen as mean or CVaR, this calibration target
 must be redone; p99 is chosen because it is the best-supported first estimand, not because
 F1 is settled.
 
 ## 4. Minimal experiment 0b that could disconfirm the thesis
 
-- **Instance size.** Must exceed cache, or the fan-out premise is untested (`docs/dev-loop.md`).
+- **Instance size.** Must exceed cache, or the fan-out premise is untested (`docs/9_IMPLEMENTATION.md`).
   Use the reference 200 GB / 8 GB cgroup, or the scaled cgroup instance (`MemoryMax` ≥ 1× and
   data ≥ 10× that budget). The relaxed oracle is run *in the simulator* at this size, so it is
   not bounded by RAM.
@@ -187,7 +187,7 @@ F1 is settled.
   2. the **adversarial uniform-random** workload — the anti-overfitting case: the learner
      must recognise there is nothing to win and *not churn* (tie, not loss).
   A third (flat aggregate scan) is recommended but not required, to check specialization has
-  not wrecked scans. **Do not use the star-schema rows of `docs/dev-loop.md` as 0b's win
+  not wrecked scans. **Do not use the star-schema rows of `docs/9_IMPLEMENTATION.md` as 0b's win
   case** unless L1 is reframed/extended (see §1) — L1 cannot move them.
 
 ## 5. Three riskiest assumptions, and the cheapest test for each
@@ -227,7 +227,7 @@ second increment, gated on a 0b win.
 **Adopted, and it is the important part:** the critique is correct. A per-tile *ordering* knob
 does not exist in this engine (`TileWriter::push` requires strictly increasing keys; `Tile::open`
 seeks a monotone fence list), so ordering is a no-op, and cross-entity co-location is L2. The
-star-schema rows of `docs/dev-loop.md` cannot be 0b's win case for this space, and the win case
+star-schema rows of `docs/9_IMPLEMENTATION.md` cannot be 0b's win case for this space, and the win case
 must be scoped to a workload L1 can actually move. Also adopted: |C| small and enumerated,
 per-prefix-region granularity, declaration separate from tiles, one applier, I2-fallback and
 no-rewrite-on-drift, the cost-model terms with their validating statistics, the F14 answer
@@ -235,7 +235,7 @@ no-rewrite-on-drift, the cost-model terms with their validating statistics, the 
 
 **Correction — "materialized families: P only / P+U / P+R" is NOT safe in v0.** I verified the
 claim that an omitted derived prefix is rebuilt "from `P/` by scan" (proposal §1, relying on
-`docs/engine.md` SS-24 and I2). That is a **v1** property: `docs/contracts.md` states derived
+`docs/8_DETAIL.md` SS-24 and I2). That is a **v1** property: `docs/7_INTERFACE.md` states derived
 layouts are read-only accelerators *with a fallback to the base copy*, which requires the base
 copy to contain enough to recompute the derived entry. In today's engine the document payload is
 **opaque to the engine** (the adapter writes `P` and `U`/`R` entries as independent keyed ops;

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Draw the M1 comparison figure from the committed per-rung arm records.
 
-`docs/roadmap.md` M1 asks for "a comparison table + figure". The table is `report.md` §2-§3; this
+`docs/0_ROADMAP.md` M1 asks for "a comparison table + figure". The table is `report.md` §2-§3; this
 script draws the figure: schedule-lag p99 against offered rate, one point per arm per rung, with the
 sustained verdict as the marker fill.
 

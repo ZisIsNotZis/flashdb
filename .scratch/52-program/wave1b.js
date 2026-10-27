@@ -75,7 +75,7 @@ const tenXTask = [
 
 const decisionsTask = [
 "Repo: your current working directory, which IS an isolated git worktree /home/z/vibe/worktrees/flashdb/wave1-decisions on branch wave1/decisions, based on master 93740b6. Do NOT cd to or write anything under /home/z/vibe/flashdb. Commit to your branch wave1/decisions. You are the DOCS writer recording decisions that the orchestrator has ADOPTED under the author's standing autonomy grant (the author stated on 2026-10-09 that the project has one milestone, that decisions should be made from the original philosophy rather than asked, and that work must not stop).",
-"TOUCH ONLY: .scratch/15-objective-v0/pre-registration.md, .scratch/STATUS.md, docs/objective.md, docs/design.md (only the tagged open items this touches), docs/glossary.md, .scratch/active-work.md. Create NO new files. Do not touch engine/ or harness/.",
+"TOUCH ONLY: .scratch/15-objective-v0/pre-registration.md, .scratch/STATUS.md, docs/2_GOAL.md, docs/6_ARCHITECTURE.md (only the tagged open items this touches), docs/glossary.md, .scratch/active-work.md. Create NO new files. Do not touch engine/ or harness/.",
 "",
 "RECORD THESE FOUR DECISIONS with their reasoning, marked as adopted by the orchestrator on 2026-10-09 under the standing autonomy grant, reviewable by the author:",
 "",

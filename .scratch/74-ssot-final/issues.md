@@ -34,7 +34,7 @@ support (label pilot-grade / seed counts where the tickets do).
 - `.scratch/52-program/issues.md` — appended the one-paragraph wave20 WP-V dispatch entry.
 - `.scratch/74-ssot-final/issues.md` — this ticket.
 
-`docs/objective.md` and `docs/engine.md` were read and left unchanged: their objective/design facts
+`docs/2_GOAL.md` and `docs/8_DETAIL.md` were read and left unchanged: their objective/design facts
 (angriness not-well-posed F1-F5; the §7.1 reference; engine design) are unchanged by the T1-T4
 measurement. The engine-latency facts stated in STATUS §1 are not duplicated there (one home per
 fact).

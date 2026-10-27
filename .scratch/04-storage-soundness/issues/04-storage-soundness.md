@@ -9,7 +9,7 @@ Parent: `.scratch/01-design/` (the review that produced this list)
 
 A storage-systems review (`review-05`, aspect: storage systems and hardware) is the first to attack the **engine** rather than the claims around it. It found the durability model unsound in four concrete, independently fatal ways, plus fourteen classes of undefined mechanism. Reviews 01–04 attacked the case *for* the design; this attacks the design.
 
-The false claims it identified have been corrected in place (`contracts.md`, `design.md`, `objective.md`, `learning.md`). What remains is the work, and it is not cosmetic: **two of these four make silent wrongness possible, which breaks I2 — "a bad layout may be slow, never wrong."**
+The false claims it identified have been corrected in place (`7_INTERFACE.md`, `6_ARCHITECTURE.md`, `2_GOAL.md`, `5_PRODUCT.md`). What remains is the work, and it is not cosmetic: **two of these four make silent wrongness possible, which breaks I2 — "a bad layout may be slow, never wrong."**
 
 ## The four soundness defects
 
@@ -32,7 +32,7 @@ The false claims it identified have been corrected in place (`contracts.md`, `de
 
 None of the following exists anywhere in the repository, and each is load-bearing:
 
-1. **Device model as an input.** No probe, no descriptor (class, queue depth, read/write IOPS and bandwidth, sector size, power-loss protection, rotational/FTL), no consumer, no `device_class` field. The HDD policy appears nowhere, and the scheduler row pointed at a document that does not describe it. **Also: no placeholder number in `objective.md` may be read without naming the device class.**
+1. **Device model as an input.** No probe, no descriptor (class, queue depth, read/write IOPS and bandwidth, sector size, power-loss protection, rotational/FTL), no consumer, no `device_class` field. The HDD policy appears nowhere, and the scheduler row pointed at a document that does not describe it. **Also: no placeholder number in `2_GOAL.md` may be read without naming the device class.**
 2. **Access granule.** Device block size, alignment, sub-tile directory layout, readahead policy, and whether a point read touches a page or the whole tile. The entire latency model depends on this.
 3. **Whose cache.** Kernel page cache or engine buffer pool — the 1.3% figure, cache pollution and the telemetry cap all presuppose an owner and an eviction policy that is never named.
 4. **Placement and free-space allocation.** Who assigns a tile's file offset, how holes are chosen, fragmentation, whether the allocator is durable, and how file offsets relate to device physical locality. Without this the sorted-sweep HDD policy is unimplementable above a filesystem.
@@ -54,15 +54,15 @@ None of the following exists anywhere in the repository, and each is load-bearin
 - **SS-17.** The canary cannot supply I11's "demonstrated win" (it is declared a conservative lower bound), and the simulator is admitted uncalibrated — so I11's proof requirement is satisfiable by neither instrument. Say which mechanism supplies the proof, or weaken I11.
 - **SS-08.** No construction enforces the 4 GiB tile ceiling; signedness of "32-bit" is unspecified; an in-tile blob area *is* indirection, contradicting the prior-art row.
 - **SS-26.** A/B root pages tolerate one torn write; two consecutive torn writes leave both invalid. State the always-write-the-non-current-page discipline and the checksum coverage.
-- **SS-28.** Tile size has three owners (`glossary.md` "chosen against the device", `design.md` "8 MB", the layout contract "tile size N"). Pick one.
+- **SS-28.** Tile size has three owners (`glossary.md` "chosen against the device", `6_ARCHITECTURE.md` "8 MB", the layout contract "tile size N"). Pick one.
 
 ## Acceptance criteria
 
-1. SS-01, SS-02, SS-04 and SS-05 each have a stated resolution, and `contracts.md` contains exactly one commit protocol, one validation granule, and one mutation granularity.
+1. SS-01, SS-02, SS-04 and SS-05 each have a stated resolution, and `7_INTERFACE.md` contains exactly one commit protocol, one validation granule, and one mutation granularity.
 2. The global structures are named, and I3 is restated to permit them.
 3. Every item in "Missing mechanisms" either exists in a document or is explicitly declared out of scope with its consequence stated.
 4. A durability test matrix names the supported filesystems and device classes, and a fault-injection harness exists before any throughput number is claimed.
-5. No claim in `contracts.md` rests on in-place overwrite semantics without naming the filesystem assumption.
+5. No claim in `7_INTERFACE.md` rests on in-place overwrite semantics without naming the filesystem assumption.
 
 ## Resolution (partial, 2026-09-15, from the author)
 
@@ -78,13 +78,13 @@ Still open: SS-01 (commit ordering protocol), SS-02 (reader epochs), SS-05 (snap
 
 ## Final resolution (2026-09-15)
 
-The storage layer is now specified in `docs/engine.md`: a log-structured document store (WAL + memtable + immutable tile files + background compaction), one keyspace with four prefix families (primary / x-unique lookup / x-ref reverse), document-CSN versioning, 64 KB page access granule, single-barrier foreground commit, unlink-deferred file lifetime with a snapshot horizon, and ext4/XFS pinned.
+The storage layer is now specified in `docs/8_DETAIL.md`: a log-structured document store (WAL + memtable + immutable tile files + background compaction), one keyspace with four prefix families (primary / x-unique lookup / x-ref reverse), document-CSN versioning, 64 KB page access granule, single-barrier foreground commit, unlink-deferred file lifetime with a snapshot horizon, and ext4/XFS pinned.
 
 Findings resolved: SS-01, SS-02, SS-03, SS-04, SS-05, SS-06, SS-09, SS-10 (dissolved by the document model), SS-11, SS-16, SS-19, SS-20 (publish-time unique checks — a hole found in the first draft of the resolution itself), SS-21, SS-22, SS-24, SS-25, SS-26, SS-28.
 
 Corrections made against this repository's earlier text: "phantom protection comes for free" (withdrawn — snapshot reads + first-committer-wins on matched documents, scans unvalidated by design); "a payload WAL buys nothing" and "the data path is already sequential" (withdrawn); "derived structures skip fsync" (retracted — same LSM); "reorg is a memcpy" and tile relocation (dropped — whole immutable files, no relocation exists); per-tile version field (dropped — CSN in key).
 
-Deferred to v1, with reasons recorded in `docs/engine.md`: clustering-key learning, speculation, canary, multi-hop `$via`, general constraint DSL.
+Deferred to v1, with reasons recorded in `docs/8_DETAIL.md`: clustering-key learning, speculation, canary, multi-hop `$via`, general constraint DSL.
 
 ## Not in scope
 

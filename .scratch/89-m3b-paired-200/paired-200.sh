@@ -4,7 +4,7 @@
 #   bash .scratch/89-m3b-paired-200/paired-200.sh --wait-min 30   # the pair, if the window opens
 #   bash .scratch/89-m3b-paired-200/paired-200.sh --smoke         # plumbing only, never evidence
 #
-# The gate (root's grant, `docs/roadmap.md` decision 7): /proc/loadavg under 2.0 on twelve
+# The gate (root's grant, `docs/0_ROADMAP.md` decision 7): /proc/loadavg under 2.0 on twelve
 # consecutive 5-second readings (one quiet minute). Every poll is written to
 # `logs/paired-200-gate.out`, so a run that never fired still carries the series that shows why.
 # Nothing is run above the gate; `--smoke` skips it and writes `smoke-*` files the scorer does not

@@ -18,7 +18,7 @@ answers carries a row, so two arms cannot agree over a string of `-`.
 
 - Result: the test passes with before, after (index) and after-tiled answers equal **byte for byte**
   over all 188 requests — `logs/index-defect-mechanism-rowbytes.out`, exit 0, 1 passed.
-- The claim in `docs/roadmap.md` (M3 row) and `docs/plan/workplan.md` §M3 status (c) is now what the
+- The claim in `docs/0_ROADMAP.md` (M3 row) and `docs/0_ROADMAP.md` §M3 status (c) is now what the
   test measures. The pre-fix failure is unchanged and still the entries assertion (`left: 0, right:
   2785`), which is what ticket 84's record shows.
 
@@ -53,11 +53,11 @@ window files; both producers call `summarize_curve(windows, None)`). Landed:
 - `README.md` §Status of the thesis: one bullet stating the invariance, the two counts, the cause, and
   the command that recomputes it (`.scratch/87-m1-decided-rule/run.sh`), so the 3 of 5 no longer reads
   as a both-ceilings figure waiting to be restated.
-- `docs/plan/open-items.md` row `T-84`: the premise "every published rung verdict was produced by a
+- `docs/9_IMPLEMENTATION.md` row `T-84`: the premise "every published rung verdict was produced by a
   reducer that treats a service-ceiling breach as a rejection" was **false for these records** and is
   retracted with its reason; what was actually missing is the decided reading (`sustained_primary`
   absent from 45 of 45 `run-*.json`), which now exists and is re-derivable.
-- `docs/plan/open-items.md` leverage item 2: rewritten from "what remains is scoring the records" to
+- `docs/9_IMPLEMENTATION.md` leverage item 2: rewritten from "what remains is scoring the records" to
   what remains after scoring — the two single-window lag breaches (30,430 and 33,747 us) inside one
   ~573 ms group, with service p99 reported and rejecting nothing. The list's numbering had no item 4
   since it was written at `f584ecc`; it is now 1-8.

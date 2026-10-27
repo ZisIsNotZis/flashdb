@@ -1,0 +1,58 @@
+# Lines removed from the doc base by `.scratch/91-docs-migration/migrate.py`,
+# each with the rule that removes it. Read by `scripts/check-docs.py --only preserved`.
+# --- docs/contracts.md (doc title: the filename carries the level and the H1 is the source tier)
+# flashdb — contracts
+# --- docs/design.md (doc title: the filename carries the level and the H1 is the source tier)
+# flashdb — design
+# --- docs/dev-loop.md (doc title: the filename carries the level and the H1 is the source tier)
+# flashdb — development loop
+# --- docs/engine.md (doc title: the filename carries the level and the H1 is the source tier)
+# flashdb — storage engine (v0)
+# --- docs/learning.md (doc title: the filename carries the level and the H1 is the source tier)
+# flashdb — learning and adaptation
+# --- docs/objective.md (doc title: the filename carries the level and the H1 is the source tier)
+# flashdb — the objective
+# --- docs/plan/evidence.md (doc title: the filename carries the level and the H1 is the source tier)
+# Implementation and evidence reconciliation
+# --- docs/plan/gap-analysis.md (doc title: the filename carries the level and the H1 is the source tier)
+# External performance gap — attribution from the saved M1 records (WP-5/M4)
+# --- docs/plan/open-items.md (doc title: the filename carries the level and the H1 is the source tier)
+# Open items — flashdb
+# --- docs/plan/workplan.md (doc title: the filename carries the level and the H1 is the source tier)
+# Work plan — current milestone and the ranked backlog
+# --- docs/prior-art.md (doc title: the filename carries the level and the H1 is the source tier)
+# flashdb — prior art and positioning
+# --- docs/roadmap.md (doc title: the filename carries the level and the H1 is the source tier)
+# flashdb — roadmap (milestone-based)
+# --- docs/design.md §Prior art: restates prior-art.md, which is a section of the same level file: two homes for one meaning
+## Prior art
+Positioning, the unverified-citation ledger, and the demoted novelty claim live in `prior-art.md`. In summary:
+- **Every mechanism in this design is established prior work.** Continuous budgeted re-layout without downtime is shipped (Snowflake, Redshift ATO, Databricks liquid clustering). Fine-grained adaptive layout created from the query mix with the raw data as fallback is **H2O** (SIGMOD 2014) — the closest work in existence to the core mechanism. Adaptive indexing from zero is database cracking. Multiple physical layouts of one logical table with the base as fallback is fractured mirrors and C-Store's WS/RS split. Layout-as-materialized-view is the view-selection literature, which is NP-hard. Per-chunk encoding selection is BtrBlocks. One scalar objective with per-component budgets is Monkey/Dostoevsky. Joint representation and execution specialization is Data Blocks. Automatic tuning with validation and rollback is Oracle Automatic Indexing. And learned physical design synthesised from the workload is **SageDB** (CIDR 2019), which is this thesis's actual neighbourhood.
+- **What survives is narrower:** a per-tile *learned* policy rather than a heuristic selector; sufficiency of one shared budget across heterogeneous decision types; and grammar-enforced canonicity making the learning key exact. All three are claims about method and measurement, and all three are falsifiable.
+- The previous claim here — that nothing combines these — was **false as written** and contradicted the table directly above it.
+# --- docs/plan/workplan.md §Decisions in force (2026-10-19, delegated author authority): restates the roadmap's decisions 1-4 in the same level file: two homes for one meaning
+## Decisions in force (2026-10-19, delegated author authority)
+Recorded in `../roadmap.md` §Decisions. Summary: the external bar replaces T6; §7.1 is closed; M2's
+"no general L2" is accepted; baselines run un-handicapped. Any change to these needs new measured
+evidence, not a preference.
+# --- 1_PROBLEM.md (line rule: the per-source length budget retires with the source's filename; a level file's size is governed by its level, not by a line count)
+Budget: 140 lines / 16,000 chars
+# --- 1_PROBLEM.md (line rule: navigation belongs in README's documentation index, which now lists the levels in reading order)
+Reading order: this file (thesis, invariants, open questions), then `objective.md`, `contracts.md`, `learning.md`, `dev-loop.md`, `glossary.md`.
+# --- 1_PROBLEM.md (line rule: the per-source length budget retires with the source's filename; a level file's size is governed by its level, not by a line count)
+Budget: 150 lines / 24,000 chars
+# --- 2_GOAL.md (line rule: the per-source length budget retires with the source's filename; a level file's size is governed by its level, not by a line count)
+Budget: 180 lines / 18,000 chars
+# --- 5_PRODUCT.md (line rule: the per-source length budget retires with the source's filename; a level file's size is governed by its level, not by a line count)
+Budget: 220 lines / 23,000 chars  <!-- budget debt: see issue 01-design, "Budget debt" -->
+# --- 7_INTERFACE.md (line rule: the per-source length budget retires with the source's filename; a level file's size is governed by its level, not by a line count)
+Budget: 335 lines / 34,000 chars  <!-- budget debt: see issue 01-design, "Budget debt" -->
+# --- 8_DETAIL.md (line rule: the per-source length budget retires with the source's filename; a level file's size is governed by its level, not by a line count)
+Budget: 170 lines / 26,000 chars
+# --- 9_IMPLEMENTATION.md (line rule: the per-source length budget retires with the source's filename; a level file's size is governed by its level, not by a line count)
+Budget: 200 lines / 15,000 chars
+# --- docs/0_ROADMAP.md §Goal and done-criterion: restated the ladder that 2_GOAL.md §0 owns, in the same file's parent level
+  throughput, then tail latency (`objective.md` §0).
+# --- docs/0_ROADMAP.md §Goal and done-criterion: the replaced clause now points at 2_GOAL.md §0 instead of restating it
+  that the engine as a whole beats sqlite and postgres end-to-end on efficiency first, then sustained
+

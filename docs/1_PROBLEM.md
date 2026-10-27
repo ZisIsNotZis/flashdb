@@ -1,6 +1,20 @@
-# flashdb — prior art and positioning
+# INFERRED
 
-Budget: 150 lines / 24,000 chars
+Status: contract-level design draft, **under adversarial review**. Synthesized from a multi-round brainstorm with the author (a data scientist, not a database engineer); the raw attributed decision record lives in `.scratch/01-design/decisions.md`, and review findings and dispositions in `.scratch/01-design/issues/01-6_ARCHITECTURE.md`. This design draft does not own current implementation status; the conflicting prototype, adaptation and measured-status claims must be reconciled through [the implementation/evidence work record](9_IMPLEMENTATION.md). Where a review found a claim false, the claim is corrected and its consequence marked `Open` at the point of use rather than deleted.
+
+## Thesis
+
+flashdb is a relational store for single-node, IO-bound workloads whose **physical layout is learned from the workload rather than declared**.
+
+Three claims distinguish it:
+
+1. **Layout is a materialized view over logical data**, maintained incrementally and drifting continuously. Every intermediate state is fully servable, so layout never needs a migration project — the 1 TB written last year is never migrated as a batch; it is rewritten tile by tile, in the background, forever.
+2. **One scalar objective prices every decision.** Angriness (`2_GOAL.md`) is the only currency: layout choice, reorg timing, promotion tier, speculation, compilation and advice are all evaluated as predicted angriness deltas through one calibrated cost model.
+3. **The database is its own profiler and its own advisor.** It learns from the trace it records, and it tells the user what it cannot fix alone.
+
+Motivating case: ~10 TB of data, ~128 GB RAM, heavily joined lookups. In that regime the scarce resource is not bytes but the number of **dependent** random reads per request. With 8 MB tiles, ~1.3% of the tile set is cache-resident, so the design goal is to collapse each request's fan-out into as few dependent reads as possible and to make the remaining reads independent.
+
+**Corrected (`review-05` SS-14, SS-22).** 1.3% is the *resident fraction of bytes*, and it holds only if all 128 GB is available to base tiles — real RAM must also hold the routing and root structures, tile directories, the trace store (its own ≈1% cap), compiled programs, and derived layouts, which are second copies. More importantly, resident-bytes fraction is the wrong statistic for the conclusion: under the Zipfian skew this design mandates, a 1.3% resident set can serve the majority of *requests*, so "the scarce resource is dependent random reads" does not follow from 1.3%. The metric must be the **hit fraction of requests**, with a stated cache owner and eviction policy. And the fan-out bound is not arbitrary — it is bounded below by the number of logical hops, since hop-3 addresses are not knowable at hop 1; that lower bound is never stated and is not priced.
 
 **Verification status: partial.** Bibliographic checks were run against Crossref on 2026-09-15 (dblp rate-limits aggressively; Crossref is the practical route from this machine). Nine entries are now **verified**, one author list was **wrong and is corrected**, and two entries were **deleted** because the cited name either does not denote a database system or denotes a different one.
 
@@ -31,9 +45,9 @@ This file exists because an earlier single-table version marked as "open" severa
 | Joint representation and execution specialization | **Data Blocks** (Lang, Mühlbauer, Funke, Boncz, Neumann, Kemper, SIGMOD 2016); vectorization-vs-compilation (Sompolski, Zukowski, Boncz, DaMoN 2011; Kersten, Leis, Kemper, Neumann, VLDB 2018) | "layout + code jointly" is established; the residual is only that *the same offline profile drives both*, with the reorg→plan-invalidation coupling priced |
 | Adaptive plan specialization against a profile | Kohn, Leis, Neumann, *Adaptive Execution of Compiled Queries*, ICDE 2018 — **verified**; the Menon et al. CMU work is *Relaxed Operator Fusion*, ICDE 2017, a different paper | per-pattern specialization is established |
 | if-conversion and branchless execution | Allen, Kennedy, Porterfield, Warren (POPL 1983); MonetDB/X100 selection vectors (Boncz, Zukowski, Nes, VLDB 2005) | predication is 40 years old. The database-specific observation — that the guard is itself an IO, so if-conversion is worth more here — is an instantiation, not a technique |
-| SLO operation; penalty methods; queueing law | Google SRE book (Beyer et al., 2016); penalty methods for constrained optimisation; M/M/1 and Kingman response laws; tail latency (Dean & Barroso, CACM 2013) | `objective.md` already concedes angriness is an error budget renamed, so "error budget as the objective function" cannot be listed as open |
+| SLO operation; penalty methods; queueing law | Google SRE book (Beyer et al., 2016); penalty methods for constrained optimisation; M/M/1 and Kingman response laws; tail latency (Dean & Barroso, CACM 2013) | `2_GOAL.md` already concedes angriness is an error budget renamed, so "error budget as the objective function" cannot be listed as open |
 | Learned database systems | **SageDB** (Kraska et al., CIDR 2019); learned index structures (Kraska, Beutel, Chi, Dean, Polyzotis, SIGMOD 2018); self-driving DBMS (Ma, Pavlo et al., CIDR 2017); OtterTune (Van Aken, Pavlo, Gordon, Cabrera, SIGMOD 2017) | **this is the thesis's actual neighbourhood.** SageDB already argues for synthesising layout, index and execution from the workload via learned models. A design claiming learned physical layout without engaging it reads as uninformed rather than novel |
-| Off-policy evaluation and bandits | Precup, Sutton, Singh (2000); Dudík, Langford, Li (2011); UCB and EXP3 (Auer et al., 2002) | `learning.md` calls off-policy evaluation the core methodological risk and names no method |
+| Off-policy evaluation and bandits | Precup, Sutton, Singh (2000); Dudík, Langford, Li (2011); UCB and EXP3 (Auer et al., 2002) | `5_PRODUCT.md` calls off-policy evaluation the core methodological risk and names no method |
 | Trace-replay depth | Napa (VLDB 2021) — maintains multiple physical layouts and reorganises in the background under a cost model **[unverified as to exact mechanisms]** | if accurate, this row is nearly empty rather than open |
 | Anti-join / interval-join execution | (not researched) | relevant because two of the five frozen benchmark workloads may not be expressible in the frozen grammar (`review-02` F11) |
 
@@ -49,9 +63,9 @@ Everything else — continuous budgeted re-layout, per-chunk encoding selection,
 
 ## The claim, demoted
 
-> For a single-node IO-bound workload in the ~10 TB / ~128 GB regime, a single SLO-capability-anchored scalar penalty, scored by a trace-replay cost model, is **sufficient** to drive a per-tile learned layout policy — jointly with encoding, speculation and compilation — to within a measured regret of an oracle layout at equal durability, while grammar-enforced canonicity makes the learning key exact rather than a best-effort digest. Every component is established prior work. **The contribution is a sufficiency-and-unification claim, it is empirical, and it is falsifiable** — and if the measured gain over the `flashdb-declared` and `flashdb-static-derived` controls (`dev-loop.md`) is not material, the claim is dead.
+> For a single-node IO-bound workload in the ~10 TB / ~128 GB regime, a single SLO-capability-anchored scalar penalty, scored by a trace-replay cost model, is **sufficient** to drive a per-tile learned layout policy — jointly with encoding, speculation and compilation — to within a measured regret of an oracle layout at equal durability, while grammar-enforced canonicity makes the learning key exact rather than a best-effort digest. Every component is established prior work. **The contribution is a sufficiency-and-unification claim, it is empirical, and it is falsifiable** — and if the measured gain over the `flashdb-declared` and `flashdb-static-derived` controls (`9_IMPLEMENTATION.md`) is not material, the claim is dead.
 
-The previous formulation — that *nothing* combines these — was false as written and contradicted the table directly above it in `design.md`.
+The previous formulation — that *nothing* combines these — was false as written and contradicted the table directly above it in `6_ARCHITECTURE.md`.
 
 ## Verification and reading order
 

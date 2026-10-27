@@ -16,7 +16,7 @@ Need-review: yes（每个有行为的里程碑）
 
 - 批量并行 = **9.3×**（10.4k → 96.7k IOPS）：独立扇出必须并发下发。
 - **"塌缩成整瓦片读"被证伪**：8 MB 顺序读 ≈ 10 ms > 20 个串行 4K（1.9 ms）。页粒度 + 反向索引 + 批量并发的引擎设计被实测确认。
-- 页大小默认 64K → **16K**（`docs/engine.md` 已按校准更新）。
+- 页大小默认 64K → **16K**（`docs/8_DETAIL.md` 已按校准更新）。
 - 设备尾 p99 ≈ 10× 均值：SLO 分析用 percentile。
 
 ## 下一步（顺序）
@@ -29,7 +29,7 @@ Need-review: yes（每个有行为的里程碑）
 
 作者告知测量期间机器在跑渲染负载。`evidence/analysis.md` 已标记污染：
 绝对常量作废，"设备尾 p99 ≈ 10× 均值"结论最可疑（渲染争用即典型尾延迟来源），
-相对方向降级为假设。`docs/engine.md` 的 16 KB 页默认改为 provisional。
+相对方向降级为假设。`docs/8_DETAIL.md` 的 16 KB 页默认改为 provisional。
 
 **方法论守卫（永久）：基准脚本必须记录运行期间的 `/proc/loadavg` 与 iostat 采样，
 负载超阈值则结果标记 contaminated，不进校准。空闲后重跑 experiment 0a-redo。**
@@ -60,7 +60,7 @@ Fresh reviewer 针对 `761ee4c..2a8f6c4`（审查材料 741 行）确认先前�
 
 ## 2026-09-28 — 作者确认条件与异常边界（Agent）
 
-作者指出 `else` 对应 `if`：只有预期中可作为条件的失败才走回退；业务唯一性冲突是原则性异常，直接失败；仅并发时机造成的锁/乐观验证竞争可能重试。实现将当前唯一性 `Outcome::Conflict { kind: "x_unique" }` 映射 `AlreadyExists`，不再错误地返回表示时机竞争的 `WouldBlock`；未来并发验证失败另设结果类型。测试覆盖发生唯一冲突时不写欠单。通用规则已写回 `docs/contracts.md`，引擎设计 `docs/engine.md` 同步；当前仍无并发读集验证，不声称已支持自动重试。`cargo test --workspace --offline -q` 32 单元 + 6 集成通过，`git diff --check` 通过。
+作者指出 `else` 对应 `if`：只有预期中可作为条件的失败才走回退；业务唯一性冲突是原则性异常，直接失败；仅并发时机造成的锁/乐观验证竞争可能重试。实现将当前唯一性 `Outcome::Conflict { kind: "x_unique" }` 映射 `AlreadyExists`，不再错误地返回表示时机竞争的 `WouldBlock`；未来并发验证失败另设结果类型。测试覆盖发生唯一冲突时不写欠单。通用规则已写回 `docs/7_INTERFACE.md`，引擎设计 `docs/8_DETAIL.md` 同步；当前仍无并发读集验证，不声称已支持自动重试。`cargo test --workspace --offline -q` 32 单元 + 6 集成通过，`git diff --check` 通过。
 
 ## 2026-09-28 — 三层连通夹具（Agent）
 

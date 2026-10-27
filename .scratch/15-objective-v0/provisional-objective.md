@@ -6,7 +6,7 @@
 > and the pre-registration skeleton here are still in force.
 
 Status: **PROVISIONAL**, written 2026-09-30 while the author was away, under their instruction to
-proceed with my recommendation. `docs/objective.md` marks F1–F5 Open; this document does not
+proceed with my recommendation. `docs/2_GOAL.md` marks F1–F5 Open; this document does not
 claim to close them. Its purpose is narrower and honest: **the harness (simulator, cost model,
 controls, scoring) cannot be built without SOME concrete objective, so this fixes a minimal,
 internally consistent one, marks every choice with its alternative, and lists exactly what the
@@ -21,7 +21,7 @@ Why p99 rather than mean: the objective's penalty curve is defined on a per-requ
 its inflection is placed in the tail, so the statistic that consumes the penalty must be a tail
 statistic. Device calibration measured the quiet-device tail at **1.26× the mean** (0a-redo), i.e.
 a mean-based score would hide exactly the damage the S-curve exists to price. Quantile sketches
-(HDR/t-digest) are already specified in `docs/learning.md`.
+(HDR/t-digest) are already specified in `docs/5_PRODUCT.md`.
 
 *Alternative:* CVaR of the per-request latency distribution. Rejected for v0 only because it needs
 the full tail and the sketch budget is ~1% of cache; p99 is the cheapest tail proxy with a known

@@ -5,7 +5,7 @@ Owner: parent agent. Base revision: `77537a0`.
 
 ## Objective
 
-Evolve the current WAL+memtable prototype toward `docs/engine.md`: immutable tile files, bounded-memory reads and scans across memtable plus tiles, a durable manifest, checkpoint/compaction and recovery without losing acknowledged blocks. Preserve per-block WAL atomicity, unique/reverse key semantics, CSN snapshots and idempotent replay. Do not claim 200 GB / 8 GB or layout-learning results until data is actually served from disk under a bounded RAM test.
+Evolve the current WAL+memtable prototype toward `docs/8_DETAIL.md`: immutable tile files, bounded-memory reads and scans across memtable plus tiles, a durable manifest, checkpoint/compaction and recovery without losing acknowledged blocks. Preserve per-block WAL atomicity, unique/reverse key semantics, CSN snapshots and idempotent replay. Do not claim 200 GB / 8 GB or layout-learning results until data is actually served from disk under a bounded RAM test.
 
 ## Risk boundary / dependencies
 
@@ -16,7 +16,7 @@ Evolve the current WAL+memtable prototype toward `docs/engine.md`: immutable til
 
 ## Current facts
 
-`Engine::open` replays the entire WAL into one `Memtable`; `get`, `unique_lookup`, `reverse_lookup` and `scan_primary` read only that memtable. `Wal::open_or_recover` truncates torn tail. There is no tile codec, manifest, compaction, checkpoint, reader registry or fault-injection harness. `docs/engine.md` describes the intended protocol, not implemented behavior.
+`Engine::open` replays the entire WAL into one `Memtable`; `get`, `unique_lookup`, `reverse_lookup` and `scan_primary` read only that memtable. `Wal::open_or_recover` truncates torn tail. There is no tile codec, manifest, compaction, checkpoint, reader registry or fault-injection harness. `docs/8_DETAIL.md` describes the intended protocol, not implemented behavior.
 
 ## Acceptance for first slice
 
@@ -26,7 +26,7 @@ One immutable persisted tile can be written and read through in a test at a snap
 
 Read-only Designer run `228c2b3b-6565-49d9-af91-ee06243d0f57` recommends A: harden WAL write/sync failure poison and define immutable tile codec → B: WAL-retained tile read-through → C: manifest/checkpoint → D: WAL rotation with durable dedup/CSN/handle metadata → E: compaction/snapshot pins → F: scale claims. First tile slice must actually evict covered versions from serving memtable after verified tile creation; on reopen replay WAL for metadata but skip only a verified covered prefix. Cross-tier P/U/R latest-visible/tombstone and uniqueness checks must be tested. A missing/corrupt tile fails closed (or explicitly rebuilds from retained WAL); no silent fallback. No WAL retirement or bounded recovery claim in B. **Residual correctness hazard:** without a durable acknowledged watermark, an incomplete/zeroed tail can still be indistinguishable from externally truncated or zeroed acknowledged data. `wal::replay` now fails closed on a complete CRC-bad frame or impossible nonzero length (without truncating evidence), but incomplete tails remain ambiguous. Do not claim acknowledged-data durability under arbitrary corruption or power loss until separately durable metadata/fault tests cover it.
 
-Two future user-owned choices are not blockers for B: arbitrary historical snapshots vs expiring registered snapshots (recommend leases before version dropping); large manifest layout at 32 MiB/16 KiB = 2,048 pages/tile, not 512 (recommend A/B roots referencing synced immutable directory generations). The arithmetic and unimplemented directory boundary are now corrected in `docs/engine.md`; this does not choose the final manifest representation. L-02 dedup retention remains open, so retain WAL and permanent dedup for now. Routine correction: compaction must keep the newest version at/below the oldest active snapshot, not drop all below it. Source of truth `docs/engine.md` needs this correction before compaction implementation.
+Two future user-owned choices are not blockers for B: arbitrary historical snapshots vs expiring registered snapshots (recommend leases before version dropping); large manifest layout at 32 MiB/16 KiB = 2,048 pages/tile, not 512 (recommend A/B roots referencing synced immutable directory generations). The arithmetic and unimplemented directory boundary are now corrected in `docs/8_DETAIL.md`; this does not choose the final manifest representation. L-02 dedup retention remains open, so retain WAL and permanent dedup for now. Routine correction: compaction must keep the newest version at/below the oldest active snapshot, not drop all below it. Source of truth `docs/8_DETAIL.md` needs this correction before compaction implementation.
 
 ## Tile review blocker — 2026-09-28
 
@@ -64,7 +64,7 @@ Worker `c1ddfa5e-e193-49bc-a4bc-1579f2a28c4b` delivered `d72f7c8` on time; cherr
 
 ## Latest-only reads + superseded-version compaction — 2026-09-29, accepted at `315b49e`
 
-Worker `6c3e732f-35b4-41dd-a26f-3ea17a812d7b` timed out pre-commit; patch recovered from worktree-diffs and completed in the parent as `b1ed377`. Implements both 2026-09-29 resolutions: public reads drop the snapshot parameter (latest committed state only) and `compact()` keeps only the newest version per logical key (tombstone = newest state, retained). Request-id intent dedup removed from the public contract — same id + different payload now executes as a new request guarded by business uniqueness (`unique_violation` + atomic rollback); internal block-id dedup stays for WAL-replay idempotency. Fresh reviewer returned **OK with notes** after a time-limit revival: latest-only merge, uniqueness-across-tiers, compaction verification, dedup semantics and API migration all verified. Two P2 notes fixed: `docs/engine.md` SS-05/snapshot-horizon sections superseded (historical reads withdrawn, version dropping unconditional), and `build_tile` now enforces publish_tile's plain-filename/parent-dir rules.
+Worker `6c3e732f-35b4-41dd-a26f-3ea17a812d7b` timed out pre-commit; patch recovered from worktree-diffs and completed in the parent as `b1ed377`. Implements both 2026-09-29 resolutions: public reads drop the snapshot parameter (latest committed state only) and `compact()` keeps only the newest version per logical key (tombstone = newest state, retained). Request-id intent dedup removed from the public contract — same id + different payload now executes as a new request guarded by business uniqueness (`unique_violation` + atomic rollback); internal block-id dedup stays for WAL-replay idempotency. Fresh reviewer returned **OK with notes** after a time-limit revival: latest-only merge, uniqueness-across-tiers, compaction verification, dedup semantics and API migration all verified. Two P2 notes fixed: `docs/8_DETAIL.md` SS-05/snapshot-horizon sections superseded (historical reads withdrawn, version dropping unconditional), and `build_tile` now enforces publish_tile's plain-filename/parent-dir rules.
 
 **Gate incident (recorded):** `c161bc6` was committed with a type-inference compile break that the `-q` gate grep hid; fixed in `315b49e`. Gate rule going forward: the test command must be asserted on `test result:` lines (or exit code), never on absence of output. Final checks: Rust 88 passed (46 unit + 6 manifest + 10 multi-tile + 7 order-flow + 5 read + 3 replay + 11 tile), Python 10, `git diff --check` passed.
 
@@ -104,7 +104,7 @@ Fresh reviewer on `ca6a87e` returned **BLOCK** with two source-traced P1s, both 
 
 First scaled run (2M docs, MemoryMax 1G): seed throughput collapsed O(n²) — smoke 20k docs in 0.5s, but the 2G run sat at 200k docs for ~9 minutes. Root cause: `publish_tile`'s per-op uniqueness check consults `scan_merged`, whose tile iterator reads and checksums every entry until the U-prefix match — with all docs sharing one unique value, per-op cost = O(published docs). Point reads have the same full-scan shape (no page directory / in-tile index exists). Run killed at 73MB on disk / 200k docs; smoke (20k) passed all phases, RSS ~15MB — small-scale correctness intact.
 
-**Consequence: the data:RAM experiment is blocked until tiles have a key-indexed access path (the 16 KiB page + per-tile directory slice in `docs/engine.md`).** The experiment proved that slice is load-bearing, not optional. Positive validations: rotation + checkpointing + manifest worked at the 200k/63MB scale; RSS 134MB under the 1GB cap.
+**Consequence: the data:RAM experiment is blocked until tiles have a key-indexed access path (the 16 KiB page + per-tile directory slice in `docs/8_DETAIL.md`).** The experiment proved that slice is load-bearing, not optional. Positive validations: rotation + checkpointing + manifest worked at the 200k/63MB scale; RSS 134MB under the 1GB cap.
 
 ## Next action
 

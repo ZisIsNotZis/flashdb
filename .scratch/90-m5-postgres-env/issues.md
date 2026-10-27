@@ -179,7 +179,7 @@ stated wherever it is quoted.
   and no images are local". Read 2026-10-23T20:14: `postgres:16` is local; the daemon has a registry
   mirror (`docker.1ms.run`) that serves pulls slowly; direct Docker Hub is still unreachable (curl
   timeout 25 s). The header now carries both reads instead of the 2026-10-17 one as a present fact.
-- `docs/plan/evidence.md`, `workplan.md` §Known blockers, `open-items.md` row `PLAN-postgres-absent`:
+- `docs/9_IMPLEMENTATION.md`, `0_ROADMAP.md` §Known blockers, `9_IMPLEMENTATION.md` row `PLAN-postgres-absent`:
   "postgres is not installed" → rewritten to the read above.
 - `README.md`: the external loss now names **postgres 18.6 (Ubuntu 18.6-3build2)** with the record
   that carried it, and the roadmap's footprint line says which version it is against.

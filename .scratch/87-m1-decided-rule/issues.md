@@ -1,7 +1,7 @@
 # 87 — what was measured, and what was not
 
-WP-12 of `docs/plan/workplan.md`. The package reads `.scratch/82-controlled-m1/runs/**` under the rule
-decided in `docs/objective.md` §1 and implemented by `T-84`, and reports. **Nothing was run that
+WP-12 of `docs/0_ROADMAP.md`. The package reads `.scratch/82-controlled-m1/runs/**` under the rule
+decided in `docs/2_GOAL.md` §1 and implemented by `T-84`, and reports. **Nothing was run that
 produces load:** no arm, no rung, no 200 rps pair, no engine change, no record edited, and no file
 outside this ticket written (the score script was pointed at `/tmp` for its JSON output so the
 committed `runs/report.json` was not touched).

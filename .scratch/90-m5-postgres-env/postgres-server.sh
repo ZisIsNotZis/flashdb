@@ -17,7 +17,7 @@
 #   postgres-server.sh up       # pull if absent, run the container, wait until it answers
 #   postgres-server.sh down     # stop and remove the container; the data directory stays on disk
 #   postgres-server.sh check    # read the version and every setting back from the running server
-#   postgres-server.sh env      # print `export ...` lines for the harness (open-items.md row PLAN-postgres-absent)
+#   postgres-server.sh env      # print `export ...` lines for the harness (9_IMPLEMENTATION.md row PLAN-postgres-absent)
 #   postgres-server.sh status   # one line: container state, image id, version read back
 #
 # Environment:
@@ -38,7 +38,7 @@ REQUIRE=${M5_PG_REQUIRE:-}
 USER_NAME=postgres
 DATABASE=${M5_PG_DATABASE:-postgres}
 
-# The M1 record's configuration (scripts/baseline-env.sh:86-101; docs/plan/gap-analysis.md §5.1).
+# The M1 record's configuration (scripts/baseline-env.sh:86-101; docs/6_ARCHITECTURE.md §5.1).
 SETTINGS=(
   shared_buffers=16MB
   max_connections=32

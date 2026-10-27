@@ -7,7 +7,7 @@ Each arm file is the driver's raw per-window JSON (one object per line) with a `
 holding its start and end loadavg. The rows go through `cold_0b.window_records` and
 `cold_0b.summarize_curve`, exactly the reducer the M1 record was scored with, so "sustained" here is
 the same quantity that produced the 3-of-5; `sustained_primary` is the decided lag-only rule
-(`docs/objective.md` §1) and is the one the verdict is read on.
+(`docs/2_GOAL.md` §1) and is the one the verdict is read on.
 
 Clause (b): "at 200 rps the indexed arm sustains at least as many paired blocks as declared".
 Exit 0 = met, 1 = falsified, 3 = the data cannot decide it (say which file and why).

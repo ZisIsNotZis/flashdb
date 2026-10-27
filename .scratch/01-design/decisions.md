@@ -1,6 +1,6 @@
 # flashdb — raw decision log
 
-Append-only record of what was decided, round by round, during the design brainstorm. This log holds **decisions and their provenance**; the settled design lives in `docs/` and is not duplicated here (R-DOC.3). Read `docs/design.md` first.
+Append-only record of what was decided, round by round, during the design brainstorm. This log holds **decisions and their provenance**; the settled design lives in `docs/` and is not duplicated here (R-DOC.3). Read `docs/6_ARCHITECTURE.md` first.
 
 Participant A = the user (a data scientist, not a database engineer, by his own statement). Participant B = the assistant. Dates are 2026-09-15 unless noted.
 
@@ -103,4 +103,4 @@ Participant A = the user (a data scientist, not a database engineer, by his own 
 ## Round 14 — write it down
 
 - A: instructs the assistant to create the docs and to spawn criticizing challenger subagents (fork=false) from all kinds of aspects to find holes.
-- B: wrote `docs/design.md`, `docs/objective.md`, `docs/contracts.md`, `docs/learning.md`, `docs/dev-loop.md`, `docs/glossary.md`, the spec, the ticket, this log and a README; committed them; and spawned six fresh-context adversarial reviewers, one per aspect, with findings to be dispositioned in the ticket.
+- B: wrote `docs/6_ARCHITECTURE.md`, `docs/2_GOAL.md`, `docs/7_INTERFACE.md`, `docs/5_PRODUCT.md`, `docs/9_IMPLEMENTATION.md`, `docs/glossary.md`, the spec, the ticket, this log and a README; committed them; and spawned six fresh-context adversarial reviewers, one per aspect, with findings to be dispositioned in the ticket.

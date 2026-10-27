@@ -145,7 +145,7 @@ pacer (breaks the "authoritative reads stay inline" invariant).
   page-in-bound.
 - **Sustained-by-both-ceilings:** NOT sustained (service ceiling still rejected in ~38-39/40 rung-50
   windows by the durability barrier itself, unchanged). The primary-vs-service ceiling reconciliation
-  remains the OPEN AUTHOR ITEM; nothing here edits the pre-registration or `docs/objective.md`.
+  remains the OPEN AUTHOR ITEM; nothing here edits the pre-registration or `docs/2_GOAL.md`.
 
 ## Acceptance verdict
 

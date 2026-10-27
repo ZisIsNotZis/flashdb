@@ -1,14 +1,14 @@
 # Status (ticket-level evidence record — not the SSOT)
 
 > **Superseded as the single source of truth on 2026-10-19.** Project status is now owned by
-> `docs/roadmap.md` (§Where we are, §Milestone status) and `docs/plan/workplan.md`; per-item detail is
-> `docs/plan/open-items.md`. This file stays as the ticket-level measurement record the roadmap cites,
+> `docs/0_ROADMAP.md` (§Where we are, §Milestone status) and `docs/0_ROADMAP.md`; per-item detail is
+> `docs/9_IMPLEMENTATION.md`. This file stays as the ticket-level measurement record the roadmap cites,
 > and it is not updated with new status: add a new measured fact at its owning layer instead.
 
 Facts only: every number names its conditions.
 History and process live in the tickets, not here.
 
-The remaining work is sequenced as milestones in [`docs/roadmap.md`](../docs/roadmap.md).
+The remaining work is sequenced as milestones in [`docs/0_ROADMAP.md`](../docs/0_ROADMAP.md).
 
 **M1 controlled verdict (ticket 82, commit `51c69f3`, 2026-10-18):** at 12.546x, on AC + EPP
 `performance` at 3.6 GHz, 5 paired blocks with snapshot restore and the device floor calibrated,
@@ -119,8 +119,8 @@ tail at seed 42 window 43) with NO build concurrent. The build's own durable flu
 
 ## 5. Open author items (resolved by the 2026-10-19 decisions unless stated below)
 
-- (a) **§7.1 primary-vs-service-ceiling reconciliation** — decided: lag-only is the primary rule, service is reported (`docs/objective.md` §1).
-- (b) **The 10-seed / 15% / 5% / 3x thresholds** — decided: T1-T4 keep 15% / 5% / 10 seeds; the external 3x is withdrawn in favour of the ladder (`docs/objective.md` §0).
+- (a) **§7.1 primary-vs-service-ceiling reconciliation** — decided: lag-only is the primary rule, service is reported (`docs/2_GOAL.md` §1).
+- (b) **The 10-seed / 15% / 5% / 3x thresholds** — decided: T1-T4 keep 15% / 5% / 10 seeds; the external 3x is withdrawn in favour of the ladder (`docs/2_GOAL.md` §0).
 - (c) **T5-T7 baseline harness:** postgres **18.6 (Ubuntu 18.6-3build2)** ran in the ticket-82 arms; the server is not installed on this box today (only `libpq5` remains), so an M5 re-run needs it reinstalled and its settings read back from the running server.
 
 ## 6. Evidence quality and accounting

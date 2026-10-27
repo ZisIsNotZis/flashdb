@@ -6,7 +6,7 @@ Ticket: this file. Decision ticket — question in, decision out.
 
 ## Question
 
-Every prior-art claim in this repository was written from memory. `docs/prior-art.md` marks the unconfirmed ones `[unverified]`, but an unverified citation cannot bound novelty, and at least one entry from an earlier revision (a Google system called "Tesseract") was removed because **neither the author nor the reviewing agent could identify it**. Until the items below are resolved, `docs/prior-art.md` and every novelty sentence in `docs/design.md` and `README.md` are provisional.
+Every prior-art claim in this repository was written from memory. `docs/1_PROBLEM.md` marks the unconfirmed ones `[unverified]`, but an unverified citation cannot bound novelty, and at least one entry from an earlier revision (a Google system called "Tesseract") was removed because **neither the author nor the reviewing agent could identify it**. Until the items below are resolved, `docs/1_PROBLEM.md` and every novelty sentence in `docs/6_ARCHITECTURE.md` and `README.md` are provisional.
 
 ## Items to resolve
 
@@ -19,7 +19,7 @@ Every prior-art claim in this repository was written from memory. `docs/prior-ar
 | 5 | "LSM-bush" | Exact title, authors, venue. Monkey (SIGMOD 2017) and Dostoevsky (SIGMOD 2018) are confirmed. |
 | 6 | Amazon Redshift Automatic Table Optimization | Is it described in "Amazon Redshift Re-invented", SIGMOD 2022, or only in product documentation? |
 | 7 | Umbra's variable-length representation / compressed tuple identifiers | Confirm the specific paper and mechanism. "Neumann et al." is not a citation; Neumann & Freitag, CIDR 2020 is the likely one. |
-| 8 | Canonical citation for speculative prefetching in query execution | The reviewing agent deliberately declined to invent one. If none exists, `learning.md`'s speculation section must say so rather than implying a lineage. |
+| 8 | Canonical citation for speculative prefetching in query execution | The reviewing agent deliberately declined to invent one. If none exists, `5_PRODUCT.md`'s speculation section must say so rather than implying a lineage. |
 
 ## Results (Crossref, 2026-09-15)
 
@@ -35,9 +35,9 @@ Every prior-art claim in this repository was written from memory. `docs/prior-ar
 | — | H2O | **Verified.** Alagiannis, Idreos, Ailamaki, SIGMOD 2014. |
 | — | Harinarayan, Rajaraman, Ullman | **Verified** (SIGMOD 1996; Crossref returns the 1999 reprint volume). |
 | — | "Tesseract" | **Deleted.** The only match is the dictionary word; no database system of that name was found, by the author or by the reviewing agent. |
-| 8 | Speculative prefetching in query execution | **Still unresolved.** If no canonical paper exists, `learning.md` must say so rather than implying a lineage. |
+| 8 | Speculative prefetching in query execution | **Still unresolved.** If no canonical paper exists, `5_PRODUCT.md` must say so rather than implying a lineage. |
 
-Still open, all in `docs/prior-art.md` as `[unverified]`: SageDB's CIDR venue, Napa's mechanisms, Data Blocks, Fractured Mirrors, Dostoevsky, Agrawal/Chaudhuri/Narasayya VLDB 2000, Oracle Automatic Indexing, and the Snowflake/BigQuery/Databricks product features.
+Still open, all in `docs/1_PROBLEM.md` as `[unverified]`: SageDB's CIDR venue, Napa's mechanisms, Data Blocks, Fractured Mirrors, Dostoevsky, Agrawal/Chaudhuri/Narasayya VLDB 2000, Oracle Automatic Indexing, and the Snowflake/BigQuery/Databricks product features.
 
 ## Comments
 
@@ -46,10 +46,10 @@ Still open, all in `docs/prior-art.md` as `[unverified]`: SageDB's CIDR venue, N
 
 ## Acceptance criteria
 
-1. Every entry in `docs/prior-art.md` either carries a verified citation or is marked `[unverified]` with the reason.
+1. Every entry in `docs/1_PROBLEM.md` either carries a verified citation or is marked `[unverified]` with the reason.
 2. Items 1, 4, 5 and 6 are resolved as verified, corrected, or deleted.
 3. H2O and SageDB have been read, and the delta claimed against each is stated in one sentence that a reader of those papers would accept.
-4. Any novelty sentence that the verification invalidates is narrowed or removed from `design.md`, `README.md` and `prior-art.md` in the same change.
+4. Any novelty sentence that the verification invalidates is narrowed or removed from `6_ARCHITECTURE.md`, `README.md` and `1_PROBLEM.md` in the same change.
 
 ## Not in scope
 

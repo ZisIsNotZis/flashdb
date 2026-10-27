@@ -21,10 +21,10 @@ Model, with every constant measured (never invented):
   c_block ~ L_dep(page) - the measured numbers reproduce within ~10%.
 - Patterns are declared, not sampled: each is (dependent reads, independent fan-out, bytes
   touched, whether it probes indexes, whether it scans). The mix below is the inventory shape
-  from `docs/dev-loop.md` and `harness/flashdb_harness/generator.py`, with a Zipfian hot/cold
+  from `docs/9_IMPLEMENTATION.md` and `harness/flashdb_harness/generator.py`, with a Zipfian hot/cold
   split: hot regions are assumed to receive 90% of the traffic (documented assumption, swept).
 
-Scoring uses the provisional objective in `.scratch/15-objective-v0/provisional-objective.md`
+Scoring uses the provisional objective in `.scratch/15-objective-v0/provisional-2_GOAL.md`
 (piecewise penalty, CVaR over windows). The output is a spread, not a verdict: the question is
 only whether the best candidate differs from the current default by more than the provisional
 15% threshold.

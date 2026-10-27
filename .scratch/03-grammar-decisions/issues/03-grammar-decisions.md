@@ -7,9 +7,9 @@ Parent: `.scratch/01-design/` (the review that produced this list)
 
 ## Why this exists
 
-`contracts.md` froze a request grammar that a language review (`review-04`, aspect: language design and canonicity) found to be **a sketch, not a specification**. Fourteen items are undefined or incoherent, and four of them are load-bearing for the motivating inventory workload. Freezing this grammar as-is would mean implementing semantics that were never decided.
+`7_INTERFACE.md` froze a request grammar that a language review (`review-04`, aspect: language design and canonicity) found to be **a sketch, not a specification**. Fourteen items are undefined or incoherent, and four of them are load-bearing for the motivating inventory workload. Freezing this grammar as-is would mean implementing semantics that were never decided.
 
-The items were recorded inline in `contracts.md`, which pushed that file past its size budget and put a decision backlog inside a design document. Both are structural defects, so the backlog now lives here and the contract carries a pointer.
+The items were recorded inline in `7_INTERFACE.md`, which pushed that file past its size budget and put a decision backlog inside a design document. Both are structural defects, so the backlog now lives here and the contract carries a pointer.
 
 ## Author decisions — five, each changing design truth
 
@@ -18,7 +18,7 @@ The items were recorded inline in `contracts.md`, which pushed that file past it
 | # | Question | Why it matters | Recommendation |
 |---|---|---|---|
 | D1 | **Program-level fallback: allow or not?** | The stage-level restriction makes two-stage conditional branches inexpressible ("if not stocked here, create a transfer request *and then* reserve incoming stock; otherwise decrement *and then* write a movement row"), each needing a second round trip — contradicting I5. It also **silently overrode the author's own round-7 instruction** that "one single request for all business is more important" than grammar purity. | **Allow it.** The server normalizer is already authoritative (I12), so the cost is one dependency-aware algorithm, not an API redesign. |
-| D2 | **Reject non-canonical requests, or normalize and accept?** | Three documents say three things: the architecture table says non-canonical forms are rejected, I12 says clients may normalize as a convenience, and `contracts.md` says the server normalizer covers what the grammar cannot. The client cannot predict its own pattern key without an answer. | **Normalize always**, return the canonical form in the outcome so clients can learn it, and return `non_canonical: true` as a warning rather than an error. Reserve rejection for malformed trees. |
+| D2 | **Reject non-canonical requests, or normalize and accept?** | Three documents say three things: the architecture table says non-canonical forms are rejected, I12 says clients may normalize as a convenience, and `7_INTERFACE.md` says the server normalizer covers what the grammar cannot. The client cannot predict its own pattern key without an answer. | **Normalize always**, return the canonical form in the outcome so clients can learn it, and return `non_canonical: true` as a warning rather than an error. Reserve rejection for malformed trees. |
 | D3 | **Are predicate-addressed writes first-class?** | Without `update-by-predicate` / `delete-by-predicate`, "expire reservations older than 30 minutes" or "mark all lines of order N shipped" force the client to enumerate keys it does not have — at 10 TB. | **Yes, with a bounded row cap** and a defined oversized-result behaviour. |
 | D4 | **Are results ordered? How are top-N and pagination expressed?** | "The 3 most recent open orders", "top 10 SKUs by days-of-cover", and every paginated listing are currently inexpressible. A cursor also needs a stable order. | **Add `order` / `limit` / `after` to the read shapes**, and accept that a sort becomes part of the intent and therefore of the pattern key. |
 | D5 | **Request-level or per-block atomicity?** | Per-block atomicity (the author's round-6 instruction) contradicts the motivating correctness oracle, which needs `decrement stock iff insert lines` to be atomic. Carried over from `review-02` F4; the same gap appears from the contract side as `review-04` L-18. | **Request-level by default**, per-block as opt-in. Nearly free: one commit record already covers the whole request, so only *publishing* a partial prefix costs extra. |
@@ -46,8 +46,8 @@ The items were recorded inline in `contracts.md`, which pushed that file past it
 
 ## Acceptance criteria
 
-1. Every item above is either specified in `contracts.md` or explicitly withdrawn from the design.
-2. `contracts.md` is back within its declared budget, with the open backlog pointing here.
+1. Every item above is either specified in `7_INTERFACE.md` or explicitly withdrawn from the design.
+2. `7_INTERFACE.md` is back within its declared budget, with the open backlog pointing here.
 3. A golden-corpus test exists that fails when a canonicalization rule is removed.
 4. No item remains in an undecidable state: for each, a fresh agent can determine compliance by reading the contract.
 
@@ -131,7 +131,7 @@ The items were recorded inline in `contracts.md`, which pushed that file past it
 
 ## Clarification（2026-09-28，作者：`else` 是条件，不是异常处理）
 
-本节覆盖前文 D5 中“guard-false **或 conflict** 都进入 `else`”的过宽表述，而不改动每块原子性。`else` 仅接预期中的条件不满足：读 probe 无匹配、写 probe/`when` 为 false；业务唯一性或其他约束冲突是原则性错误，直接失败，绝不默认重试或走 `else`。仅由并发时机造成的乐观读集验证不一致可在新快照上有界重试；重试后若业务条件不满足，才进入 `else`。`docs/contracts.md` 的请求树、结果分类与冲突策略和 `docs/engine.md` 的发布行为已按此解释更新。当前窄版适配器把 `x_unique` 映射为 `AlreadyExists`；未来瞬时竞争需单独结果类型，不能复用同一 `Conflict` 概念。
+本节覆盖前文 D5 中“guard-false **或 conflict** 都进入 `else`”的过宽表述，而不改动每块原子性。`else` 仅接预期中的条件不满足：读 probe 无匹配、写 probe/`when` 为 false；业务唯一性或其他约束冲突是原则性错误，直接失败，绝不默认重试或走 `else`。仅由并发时机造成的乐观读集验证不一致可在新快照上有界重试；重试后若业务条件不满足，才进入 `else`。`docs/7_INTERFACE.md` 的请求树、结果分类与冲突策略和 `docs/8_DETAIL.md` 的发布行为已按此解释更新。当前窄版适配器把 `x_unique` 映射为 `AlreadyExists`；未来瞬时竞争需单独结果类型，不能复用同一 `Conflict` 概念。
 
 ## Decision addendum（2026-09-29，作者：幂等 = 业务唯一 + 块原子性）
 
@@ -140,7 +140,7 @@ The items were recorded inline in `contracts.md`, which pushed that file past it
 - **不允许读历史数据。** 所有读只看最新提交状态；compaction 丢弃每个逻辑键的全部被取代版本（最新版本与墓碑语义保留——墓碑即"最新状态为已删除"）。快照租约、版本保留期整体取消，不需要注册表。
 - **幂等由引擎通过 schema 唯一强制：** 客户端在意图创建时铸造一次业务键（如订单号），重试原样携带；重试命中 `unique_violation` 且**整块原子回滚**（含无键写，如库存扣减）。满足"重试间键值稳定"的块是幂等的；不满足的块可能重复执行，这是客户端契约。
 - **request-id 去重降级为内部细节：** 引擎只在 fsync 后 ack（单向，不需回执）；现有内存去重随当前 WAL 段消亡，不做跨段持久化，`retry_horizon_s` 不用于保留。
-- `docs/contracts.md` 的 Idempotency 与 L-02 状态已同步。
+- `docs/7_INTERFACE.md` 的 Idempotency 与 L-02 状态已同步。
 
 ## Not in scope
 

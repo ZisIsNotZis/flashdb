@@ -6,8 +6,8 @@ id:      answers mail/2026-10-23-answer-postgres-present.md; M5's postgres leg s
 
 # The postgres leg is unblocked at 16.15 — server, settings, connection and migration read back — and the throughput work is still `unmeasured` because the box was never quiet
 
-**Node whose roadmap changes:** `flashdb` (`docs/roadmap.md` decision 8, `docs/plan/workplan.md`
-WP-13, `docs/plan/evidence.md`, `docs/plan/open-items.md` row `PLAN-postgres-absent`, `README.md`,
+**Node whose roadmap changes:** `flashdb` (`docs/0_ROADMAP.md` decision 8, `docs/0_ROADMAP.md`
+WP-13, `docs/9_IMPLEMENTATION.md`, `docs/9_IMPLEMENTATION.md` row `PLAN-postgres-absent`, `README.md`,
 `AGENTS.md`, ticket `.scratch/90-m5-postgres-env/`).
 
 ## Which postgres, which version, and how each was read
@@ -59,7 +59,7 @@ offline path; the fix belongs to WP-13, not to a run.
 
 ## What is left on this leg, and where it sits
 
-`workplan.md` WP-13: (i) the container wired into `scripts/m1-baseline-run.sh`,
+`0_ROADMAP.md` WP-13: (i) the container wired into `scripts/m1-baseline-run.sh`,
 `m1-ladder-run.sh`, `m1-controlled-run.sh` as the postgres arm's start/stop/restore (a digest-verified
 copy of `/var/tmp/m5-pg/data` is the instance); (ii) the `psycopg` pin above; (iii) the run record's
 `postgres_settings` carrying `server_version` read from the server. A `docker pull postgres:18`

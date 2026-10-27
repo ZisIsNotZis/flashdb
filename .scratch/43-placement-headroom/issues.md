@@ -17,7 +17,7 @@ request, and reduction against today's layout. Verdict at the end.
 Metric - **dependent random reads per request**: walk a request's reads in the
 order `engine/src/request.rs` issues them; a read counts when it cannot be served
 from the same tile as the previous read of that request. The first read always
-counts (*dependent depth = 1 + independent fan-out*, `docs/engine.md`), so a
+counts (*dependent depth = 1 + independent fan-out*, `docs/8_DETAIL.md`), so a
 request whose reads all land in one tile counts 1. Counts only - no wall-clock.
 
 Trace - the repository's own deterministic inventory workload

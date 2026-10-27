@@ -1,12 +1,12 @@
 # 14 — 0b prerequisite gap analysis (what stands between us and the layout experiment)
 
 Written 2026-09-30, after the engine reached its first honest measurement point. This is a gap
-analysis against the plan the author already wrote (`docs/dev-loop.md`, `docs/learning.md`,
-`docs/objective.md`) — not a new plan.
+analysis against the plan the author already wrote (`docs/9_IMPLEMENTATION.md`, `docs/5_PRODUCT.md`,
+`docs/2_GOAL.md`) — not a new plan.
 
 ## Already in place
 
-| prerequisite (from `docs/dev-loop.md`) | status |
+| prerequisite (from `docs/9_IMPLEMENTATION.md`) | status |
 |---|---|
 | Frozen, hashed replay corpora | DONE — `mixed_seed42_20.jsonl` (sha 92982259…), `hot_orders_seed42.jsonl` (sha d803afa5…) |
 | Deterministic replay | DONE — ticket 06, `flashdb-replay` CLI |
@@ -18,7 +18,7 @@ analysis against the plan the author already wrote (`docs/dev-loop.md`, `docs/le
 | gap | owner | blocker for 0b? |
 |---|---|---|
 | **Layout space**: what a layout *is* per tile and how it is declared/applied | author (research design) | YES — without it there is nothing to learn or vary |
-| **Objective function F1–F5** (estimand, anchor, parameterisation, aggregation, oracle) | author — `docs/objective.md` marks them Open after review-01 | YES — scoring and promotion cannot be implemented |
+| **Objective function F1–F5** (estimand, anchor, parameterisation, aggregation, oracle) | author — `docs/2_GOAL.md` marks them Open after review-01 | YES — scoring and promotion cannot be implemented |
 | **Pre-registered falsification contract** (threshold, metric + reference, minimum instance size > cache, seed count, CI, acceptable cost-model error, Postgres tuning protocol) | author — required before any engine existed; still not registered | YES — results without it are not evidence |
 | **Simulator + calibrated cost model** | parent can build *after* the objective fixes the calibrated statistic (`review-01` F14) | partially |
 | **Controls**: `flashdb-declared` (one fixed layout) and `flashdb-static-derived` (offline layout from the trace) | needs the layout space first | YES as comparison, no as construction |
@@ -36,7 +36,7 @@ concrete and testable:
   engine except the ability to *declare* the choice and to build a tile in a non-default order.
 - **L2 — key-family co-location.** Which families share a tile (e.g. an order row next to its
   lines and its stock row) versus being separated. This is what the join fan-out hypothesis in
-  `docs/dev-loop.md` actually tests, and it is the first option that cannot be a per-tile choice
+  `docs/9_IMPLEMENTATION.md` actually tests, and it is the first option that cannot be a per-tile choice
   alone — it needs a grouping decision.
 - **L3 — per-tile heterogeneity with learned packing** (the ambition): mixed families, learned
   page layout, quantized widths. Most powerful, most invasive, and it needs L1's declaration
@@ -132,7 +132,7 @@ request grammar.
 Consequences:
 - Any workload that needs pre-existing dimensions (which is the whole inventory scenario, and
   therefore every 0b workload) must be seeded out-of-band, which is what the harness will now do.
-- The gap is a grammar/contract question, not an engine one: `docs/contracts.md` already carries
+- The gap is a grammar/contract question, not an engine one: `docs/7_INTERFACE.md` already carries
   open decisions about the request surface (L-04, L-07, the expression grammar, and the
   "one intent must not be expressible two ways" rule). Widening the grammar is the author's call,
   so I deliberately did NOT add an ad-hoc `put` shape. It is recorded here for them.

@@ -48,3 +48,8 @@ block p1 declared done: loadavg 4.21 3.72 2.09
 block p1 indexed done: loadavg 4.10 3.71 2.10
 == blocks done 2026-10-27T15:36:12+08:00; scoring ==
 smoke: not scored — a smoke block is plumbing, and its file names are outside the scorer's pattern
+== paired 200 rps, started 2026-10-27T15:37:16+08:00 ==
+# loadavg at start: 4.00 3.71 2.20 7/2117 3143288
+# paths modified in the tree (for the record; another agent mid-write is a judgement, not a file count): 2
+# preflight ok: snapshot 1.6G (1682111093 B per its record), trace sha 6472cf46477e037b
+== gate (before the run): loadavg < 2.0 on twelve consecutive 5-second readings, deadline 55 min from the run's start ==

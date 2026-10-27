@@ -4,7 +4,7 @@ const fixTask = `You are the fix worker for milestone M1 of flashdb (external ba
 
 Repo: /home/z/vibe/flashdb. Branch: wave/m1-baselines (clean). Do not push. Do not change the pre-registration, the roadmap thresholds, or engine code. Work only where the defects below require it.
 
-A fresh independent reviewer returned FAIL on the M1 measurement report. Read the full review at /home/z/.pi/agent/sessions/--home-z-vibe-flashdb--/subagent-artifacts/cf6cda41-7451-452c-9693-aa934a1da62a_reviewer_output.md, then docs/roadmap.md (M1), .scratch/80-external-baselines/report.md, report.json, issues.md, env.md, and harness/flashdb_harness/baseline_0b.py.
+A fresh independent reviewer returned FAIL on the M1 measurement report. Read the full review at /home/z/.pi/agent/sessions/--home-z-vibe-flashdb--/subagent-artifacts/cf6cda41-7451-452c-9693-aa934a1da62a_reviewer_output.md, then docs/0_ROADMAP.md (M1), .scratch/80-external-baselines/report.md, report.json, issues.md, env.md, and harness/flashdb_harness/baseline_0b.py.
 
 Fix every P1 defect and the P2 items that affect correctness or honest disclosure:
 
@@ -41,7 +41,7 @@ const reviewTask = `You are a fresh independent re-reviewer for milestone M1 of 
 
 Repo: /home/z/vibe/flashdb. Branch: wave/m1-baselines. Do not edit files. You may run read-only commands.
 
-Read the previous review (/home/z/.pi/agent/sessions/--home-z-vibe-flashdb--/subagent-artifacts/cf6cda41-7451-452c-9693-aa934a1da62a_reviewer_output.md), the corrected report.md/report.json/issues.md, the pre-registration's "External baselines and thresholds" and "Metric" sections, docs/roadmap.md M1, and the harness/scripts changes. A separate fresh gate runner produced .scratch/80-external-baselines/gates.txt; read it rather than re-running the full suites.
+Read the previous review (/home/z/.pi/agent/sessions/--home-z-vibe-flashdb--/subagent-artifacts/cf6cda41-7451-452c-9693-aa934a1da62a_reviewer_output.md), the corrected report.md/report.json/issues.md, the pre-registration's "External baselines and thresholds" and "Metric" sections, docs/0_ROADMAP.md M1, and the harness/scripts changes. A separate fresh gate runner produced .scratch/80-external-baselines/gates.txt; read it rather than re-running the full suites.
 
 Judge whether each previous P1 is actually fixed, trying to falsify:
 1. Is the latency/sustained rule now provably identical for flashdb and the SQL arms, including the 3-consecutive-window growth clause, and is the SQL reducer tested against the flashdb semantics?

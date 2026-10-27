@@ -2,7 +2,7 @@
 
 Status 2026-10-17, `wave/m1-baselines`. Authority: the pre-registered contract
 (`.scratch/15-objective-v0/pre-registration.md` §"External baselines and thresholds") and the
-milestone's acceptance (`docs/roadmap.md` M1). Nothing pre-registered was changed; no engine code was
+milestone's acceptance (`docs/0_ROADMAP.md` M1). Nothing pre-registered was changed; no engine code was
 touched. The method changes this report depends on — the per-engine memory boundary, seeding as
 setup, verification as a separate step — are recorded in
 `.scratch/80-external-baselines/issues.md` §"Measurement record".

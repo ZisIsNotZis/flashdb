@@ -6,9 +6,9 @@ id:      answers your answer on the postgres version; the M5 postgres arm runs a
 
 # The postgres arm runs through one command and reports **16.15, read back from its own server**; one quiet-window block measures it at 200 rps, and the three-arm comparison is still open
 
-**Node whose roadmap changes:** `flashdb` (`docs/roadmap.md` §Current milestone and decision 8,
-`docs/plan/workplan.md` WP-13 and §Known blockers, `docs/plan/evidence.md`,
-`docs/plan/open-items.md` row `PLAN-postgres-absent`, `README.md` unchanged in substance,
+**Node whose roadmap changes:** `flashdb` (`docs/0_ROADMAP.md` §Current milestone and decision 8,
+`docs/0_ROADMAP.md` WP-13 and §Known blockers, `docs/9_IMPLEMENTATION.md`,
+`docs/9_IMPLEMENTATION.md` row `PLAN-postgres-absent`, `README.md` unchanged in substance,
 `AGENTS.md`, ticket `.scratch/90-m5-postgres-env/`).
 
 ## The arm, at 16.15

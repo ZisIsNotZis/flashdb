@@ -8,7 +8,7 @@ workload's `movements_scan` (`find StockMovement where order_no=X`) has **no `or
 it runs a full-entity primary scan of `P|StockMovement` — JSON-parsing every movement doc on the
 single pacer (~89-94% of wall time). Both arms fail identically, so the pre-registered win workload
 offers **no layout-dependent headroom** to the current learner action space (merge threshold / page
-size / bloom bits), and the learner churns. `docs/learning.md` already states the learned surface
+size / bloom bits), and the learner churns. `docs/5_PRODUCT.md` already states the learned surface
 must be able to act on PLACEMENT/co-location and that a new axis is added only after its headroom is
 measured with deterministic counts, never by intuition.
 

@@ -34,7 +34,7 @@ construction.
 So before concluding anything about the thesis:
 
 1. Generate the missing shapes (multi-hop trace, as-of join, anti-join, plus the flat aggregate) per
-   `docs/dev-loop.md`, deterministically and at a stated scale.
+   `docs/9_IMPLEMENTATION.md`, deterministically and at a stated scale.
 2. Measure their **access-pattern statistics**: fan-out per hop, multi-hop depth, the fraction of a
    request's cost that is dependent random reads across entities, and the co-location potential
    (how often the rows a request touches were written together / share a natural grouping key).

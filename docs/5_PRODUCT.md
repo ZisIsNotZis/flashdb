@@ -1,6 +1,4 @@
-# flashdb — learning and adaptation
-
-Budget: 220 lines / 23,000 chars  <!-- budget debt: see issue 01-design, "Budget debt" -->
+# INFERRED
 
 How the engine learns, how it changes, and how it talks to a human. Governed by Invariants I4 (off-path and scheduled), I10 (one scalar objective) and I11 (funded, proven, deployed).
 
@@ -19,13 +17,13 @@ Two rules:
 - **Shapes, not values.** Column *statistics* are permitted; raw values and per-row data are not. This is a privacy boundary and a size boundary at once.
 - **Two classes of recorded data, with different durability** (`review-03` §3). *Measurements* — counters, histograms, residency, per-tile statistics — are `recomputable`: losing them costs learning time and nothing else. *Decisions* — the human accept/reject record and the deploy changelog — are **not** recomputable and must be durable, because they record an irreversible human act. Treating both as `recomputable` was a contradiction: it would drop the only record of what a human approved.
 - **The recording path must be specified, or I4 is false.** Per-request counters and latency histograms are written on the request path; I4 permits that only as bounded measurement, never as analysis. The write path is per-CPU lock-free ring buffers flushed off-path, with a stated bound on the on-path cost (`review-02` F14).
-- **The telemetry store obeys its own design.** It is a tiled, tiered, quantized store: sketch-based counters (HLL for cardinality, HDR/t-digest for latency), tiered rollup (minute → hour → day, recent fine, aged coarse, then evicted), percentiles never means, and a hard cap on its share of cache (target ≈1%; `design.md` still lists the exact share as an open question). **Open (`review-02` F14):** whether that share is carved out of the single shared budget that promotions compete for is unstated, and it changes the promotion economics. If the engine cannot store its own metrics efficiently, that is the first thing it has to say about itself.
+- **The telemetry store obeys its own design.** It is a tiled, tiered, quantized store: sketch-based counters (HLL for cardinality, HDR/t-digest for latency), tiered rollup (minute → hour → day, recent fine, aged coarse, then evicted), percentiles never means, and a hard cap on its share of cache (target ≈1%; `6_ARCHITECTURE.md` still lists the exact share as an open question). **Open (`review-02` F14):** whether that share is carved out of the single shared budget that promotions compete for is unstated, and it changes the promotion economics. If the engine cannot store its own metrics efficiently, that is the first thing it has to say about itself.
 
 ## Pattern keys
 
 - **Template versus instance.** Learn on shape with constants stripped; execute on instance. Otherwise every literal is a new pattern.
 - `pattern_key = (normalizer_version, canonical_form)`. Without the version, a normalizer upgrade silently invalidates all accumulated learning.
-- **Canonicalize before learning** (`contracts.md`). The same intent spelled five ways is five patterns, and the signal shatters.
+- **Canonicalize before learning** (`7_INTERFACE.md`). The same intent spelled five ways is five patterns, and the signal shatters.
 
 ### The learning unit is the request, not the block
 
@@ -35,7 +33,7 @@ The request boundary is where the access-pattern signal lives (confirmed by the 
 
 ## Weights are time series
 
-A pattern's weight is not a scalar. It is a series over load windows, because deployments are long quiet periods punctuated by short intense bursts and optimizing the average is actively wrong (`objective.md`).
+A pattern's weight is not a scalar. It is a series over load windows, because deployments are long quiet periods punctuated by short intense bursts and optimizing the average is actively wrong (`2_GOAL.md`).
 
 Consequences: the objective is over regimes; a regime needs a minimum sample count before it may influence a decision; and a rising weight is a *drift signal*. **Open (`review-01` F8):** the aggregator (worst regime / CVaR / which percentile) is unchosen; a maximum taken over many noisy windows is upward-biased by construction, so more windows manufacture apparently bad regimes; the minimum-sample gate **excludes the peak by construction**, since a short burst is by definition the least-sampled regime; and "earlier than the raw average" means acting on the fewest and noisiest points.
 
@@ -62,7 +60,7 @@ Established precedents for this ladder: JVM tiered compilation (interpreter → 
 
 **Open — none of the three is decidable as written (`review-01` F12).** "Stability" has no statistic, window or threshold. "A demonstrated win" has no effect size, no significance criterion and no matched-durability rule at promotion time. And "proof, not a prediction" is self-contradictory as previously stated, because the only instruments offered are replay — which *is* the simulator whose trust this document admits is unknown — and a canary, which this document elsewhere declares to be a conservative lower bound and therefore incapable of demonstrating superiority. Promotion proof is circular until an explicit calibration order breaks it (for example: small randomised trial, calibrate from it, then promote).
 
-The steepness estimate that this section previously hung on the accept/reject record is separately unidentifiable — see `objective.md`.
+The steepness estimate that this section previously hung on the accept/reject record is separately unidentifiable — see `2_GOAL.md`.
 
 ### One shared budget, and stop at the knee
 
@@ -91,15 +89,15 @@ Two traps that make a canary lie:
 - **Regime mismatching.** A canary measured in a quiet window against a baseline measured in a burst will lie confidently. Canary comparison must sample matched load regimes — a second reason the time-series weights are load-bearing rather than a nicety.
 - **Contamination.** A canary shares the cache and the device queue with everything else, so it is not a clean A/B. Treat a canary result as a **conservative lower bound**, never as a measurement.
 - **Which means a canary cannot serve as the promotion proof it was offered as (`review-01` F14, D7).** A conservative lower bound can never establish superiority. Together with the replay problem above, promotion proof is circular as written.
-- **No power analysis exists anywhere (`review-01` F9, F12).** Nothing in this document or `dev-loop.md` states an effect size, a variance, a cluster count or a sample size — not for the sample-count gate, not for the canary, not for promotion, and not for a traffic split. A traffic split over tiles is a *cluster-randomised* design with a small number of Zipfian-weighted clusters, so the effect is confounded with which keys landed in treatment, and a request touching both arms has a mixed path belonging to neither.
+- **No power analysis exists anywhere (`review-01` F9, F12).** Nothing in this document or `9_IMPLEMENTATION.md` states an effect size, a variance, a cluster count or a sample size — not for the sample-count gate, not for the canary, not for promotion, and not for a traffic split. A traffic split over tiles is a *cluster-randomised* design with a small number of Zipfian-weighted clusters, so the effect is confounded with which keys landed in treatment, and a request touching both arms has a mixed path belonging to neither.
 
 ## Layout and schema changes are deploys
 
-Versioned, canaried, rollback-able, changelogged, exactly like software. The changelog is what lets a regression be correlated with a change. The suggestions/feedback table (`learning.md`, advisor) is the natural home: one table, three consumers.
+Versioned, canaried, rollback-able, changelogged, exactly like software. The changelog is what lets a regression be correlated with a change. The suggestions/feedback table (`5_PRODUCT.md`, advisor) is the natural home: one table, three consumers.
 
 ## Prediction and predication
 
-Default to **predication (if-conversion)**, not prediction. `contracts.md` marks blocks `harmless-if-not-applicable` precisely so the scheduler can run them unconditionally without deciding anything — this skips the guard, and in a database the guard is itself an IO (tens to hundreds of microseconds), so if-conversion is worth *more* here than in a CPU, not less.
+Default to **predication (if-conversion)**, not prediction. `7_INTERFACE.md` marks blocks `harmless-if-not-applicable` precisely so the scheduler can run them unconditionally without deciding anything — this skips the guard, and in a database the guard is itself an IO (tens to hundreds of microseconds), so if-conversion is worth *more* here than in a CPU, not less.
 
 The general form is **access prediction** (temporal), of which branch prediction is the conditional case. It subsumes speculative prefetch of the next stage. Layout optimization is the spatial half; this is the temporal half of the same solve.
 
@@ -142,7 +140,7 @@ Constraints, each of which decides whether this is an asset or a liability:
 - **The LLM proposes; the cost model disposes.** Layer 1's what-if model validates every structured suggestion before it is shown or applied. An LLM that invents a schema change and gets it applied is a data-loss bug with extra steps. Generator–verifier, and the verifier is mechanical.
 - **Strict ordering: facts → LLM → validation.** Wrong in either direction and it is either a hallucination or a useless parrot.
 - **Never in the hot path.** A budgeted periodic pass over the trace.
-- **Structured output is the valuable half.** Because the request surface is canonical, a suggestion about a *request* is a machine-actionable diff the engine can validate. **Qualified (`review-04` L-17):** this holds only for request-shaped suggestions. A schema change has no canonical form to diff against (`contracts.md`, L-08), so layer 2's schema proposals are advice in prose, not a diff.
+- **Structured output is the valuable half.** Because the request surface is canonical, a suggestion about a *request* is a machine-actionable diff the engine can validate. **Qualified (`review-04` L-17):** this holds only for request-shaped suggestions. A schema change has no canonical form to diff against (`7_INTERFACE.md`, L-08), so layer 2's schema proposals are advice in prose, not a diff.
 - **Nondeterminism and churn.** Version the advisor, keep output comparable over time, dedupe and rate-limit suggestions, or the advice itself oscillates exactly when the workload is drifting.
 
 ### Privacy tiers
@@ -171,7 +169,7 @@ What is still required:
 
 ### The human record is a label set
 
-The feedback table records accept/reject and, crucially, **what is changeable and what is not**. That is a labelled training set for *which relaxations this user will actually concede* — so the engine stops asking for concessions the user never grants and asks for the ones he does. It also fits the angriness steepness (`objective.md`): the risk-aversion knob is learned from accepted versus rejected advice, on a much slower timescale than layout decisions.
+The feedback table records accept/reject and, crucially, **what is changeable and what is not**. That is a labelled training set for *which relaxations this user will actually concede* — so the engine stops asking for concessions the user never grants and asks for the ones he does. It also fits the angriness steepness (`2_GOAL.md`): the risk-aversion knob is learned from accepted versus rejected advice, on a much slower timescale than layout decisions.
 
 ### Do not build an alert-fatigue machine
 
@@ -181,7 +179,7 @@ A database that can page a human at 3 a.m. will, and then it will be muted — t
 
 The learner's feedback is **censored**: it only ever observes the cost of the layout it chose. Counterfactuals are unobservable in production. Three routes, all used:
 
-1. **Simulator** — a calibrated cost model predicting the counterfactual (`dev-loop.md`).
+1. **Simulator** — a calibrated cost model predicting the counterfactual (`9_IMPLEMENTATION.md`).
 2. **Deliberate small-scale experiment** — traffic split, bounded and reversible.
 3. **Shadow tiles** — a small population of tiles maintained under an alternate layout purely to measure it.
 
@@ -198,4 +196,26 @@ Traffic-split randomisation must be independent of the policy, and the estimand 
 
 **Credit assignment is unspecified (`review-01` §2.14).** Angriness is a property of a *request*; the decision is per *tile*; one request touches many tiles that interfere through a shared cache. Which tile is credited or blamed for a request's angriness delta is stated nowhere, and without it the per-tile policy has no consistent reward signal.
 
-Metric: **regret against an oracle layout**, not absolute throughput — with the caveat that `dev-loop.md` records serious problems with that metric. And the honest caveat that must not be forgotten: uncalibrated what-if prediction is optimistic in the literature, so replay and canary calibration keep the predictor honest. A promotion decided on an uncalibrated prediction is a guess wearing a number.
+Metric: **regret against an oracle layout**, not absolute throughput — with the caveat that `9_IMPLEMENTATION.md` records serious problems with that metric. And the honest caveat that must not be forgotten: uncalibrated what-if prediction is optimistic in the literature, so replay and canary calibration keep the predictor honest. A promotion decided on an uncalibrated prediction is a guess wearing a number.
+## Open questions
+
+Honest list of what is not settled. Each is a real design fork, not a research nicety.
+
+- **Derived layout authority.** v1 keeps derived layouts strictly read-only. The eventual design is `5_PRODUCT.md`'s version-checked authority; the per-tile version field is reserved for it.
+- **Request grammar depth.** Whether program-level (whole-flow) fallback is ever needed. If yes, an effect-aware server normalizer becomes mandatory; if fallback stays stage-level, the distributivity equivalence class cannot be expressed at all.
+- **Heterogeneity ceiling.** How complex a layout policy the reader, solver, simulator and learner can actually sustain per table.
+- **Cost-model honesty.** Uncalibrated what-if prediction is optimistic in the literature. How much replay and canary calibration is needed before the predictor can be trusted for promotions is unknown and must be measured.
+- **Cold-start quality.** Whether layouts learned in the first weeks of a zero-data deployment are worth keeping or should be aggressively rewritten once the steady-state trace exists.
+- **Telemetry budget.** The exact share of cache and IO the trace store may consume; `5_PRODUCT.md` gives ≈1% as a working target, which is a target and not a settled number.
+
+The optimisation and learning-theory review (`review-01`) added the following, all of which block implementation of the learner rather than of the engine:
+
+- **The estimand and the anchor.** Which functional of latency is penalised (mean / p95 / p99 / CVaR), whether the SLO anchor is a capability model for *that* functional, and what `k` is. Until this is settled the objective cannot be implemented (`2_GOAL.md`; `review-01` F1–F4).
+- **Aggregation and scalarisation.** **Resolved for the objective form (author, 2026-10-06):** it is a constrained program — highest sustained offered load under hard feasibility conditions (the **schedule-lag** p99 ceiling at the pre-registration's 10 ms, the write-amplitude budget) — with the tie-break order and the empty-feasible-set rule stated in `2_GOAL.md`. Still open: the *angriness* window aggregator (worst regime / CVaR / which percentile — `review-01` F8), which only matters once angriness is well-posed (`review-01` F5, D1–D3).
+- **Identification for off-policy evaluation.** Estimator, overlap / ignorability / SUTVA / stationarity assumptions, and a randomisation scheme independent of the policy under test (`review-01` F9).
+- **Regret and the oracle.** Normalisation, static-versus-dynamic framing, and how the oracle can be made independent of the learner's own cost model (`review-01` F10).
+- **Per-tile estimation.** With ~10⁶ tiles and few pulls per arm, what pooling or shrinkage makes per-tile decisions statistically defensible (`review-01` F16).
+- **Credit assignment.** Angriness belongs to a request; the decision is per tile; tiles interfere through a shared cache. Which tile is credited or blamed for a request's angriness delta (`review-01` §2.14).
+- **Estimators and power.** No effect size, variance, sample size or cluster count is stated anywhere — for the sample gate, for canaries, for promotions or for traffic splits (`review-01` F8, F12).
+- **The request grammar is not a specification.** Fifteen undefined or incoherent items, and the five author decisions they depend on, are enumerated with consequences in `.scratch/03-grammar-decisions/`. They cover block result types and `ifEmpty` semantics, the outcome document and the client-continuation protocol, the predicate and expression language, the equivalence relation behind canonicity, the pattern key, intra-request write-write conflicts, and request-size bounds. **No contract in this repository may be frozen until those are settled.**
+- **Author decisions outstanding** — each changes design truth and is therefore not the agent's to take: (1) program-level fallback versus the stage-level restriction, which silently reversed an earlier author instruction that "one single request for all business is more important" (`review-04` L-05); (2) reject versus normalize non-canonical requests (`L-15`); (3) whether predicate-addressed writes are first-class (`L-07`); (4) whether results are ordered, and how top-N and pagination are expressed (`L-14`); (5) request-level versus per-block atomicity (`review-02` F4).

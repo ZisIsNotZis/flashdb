@@ -17,7 +17,7 @@ Two independent facts fall out of the table:
    `next_matching` (engine.rs:885) walks the tile from its first entry and
    `Entries` (tile.rs:200) *allocates two `Vec`s and checksums every entry* until the
    prefix matches. The memtable side is already indexed (`BTreeMap` range seek, ~2 µs):
-   the asymmetry is a missing tile index, not a design defect — `docs/engine.md`
+   the asymmetry is a missing tile index, not a design defect — `docs/8_DETAIL.md`
    already prescribes 16 KiB pages.
 2. **Even the sequential scan rate is only 55 MB/s** (vs 831 MiB/s measured device
    sequential), i.e. the whole engine currently runs ~15× below the device on its

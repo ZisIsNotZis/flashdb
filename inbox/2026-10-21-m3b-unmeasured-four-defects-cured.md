@@ -6,8 +6,8 @@ id:      answers `inbox/2026-10-21-next-contract.md`; lands the verdict's four d
 
 # The four defects are cured at source with before/after runs, and M3 clause (b) is `unmeasured` with its instrument built — the box never opened
 
-**Node whose roadmap changes:** `flashdb` (`docs/roadmap.md`, `docs/plan/workplan.md`,
-`docs/plan/gap-analysis.md`, `AGENTS.md`, `README.md`, and ticket `.scratch/89-m3b-paired-200/`).
+**Node whose roadmap changes:** `flashdb` (`docs/0_ROADMAP.md`, `docs/0_ROADMAP.md`,
+`docs/6_ARCHITECTURE.md`, `AGENTS.md`, `README.md`, and ticket `.scratch/89-m3b-paired-200/`).
 
 ## What is now true
 
@@ -19,7 +19,7 @@ id:      answers `inbox/2026-10-21-next-contract.md`; lands the verdict's four d
    each citation now matches its log's line 1 (13.20 / 21.43 / 23.35 / 8.24), command `head -1
    .scratch/88-m3-notes/logs/*.out`; d3 max-over-rows is cited to `engine/tests/order_no_index.rs:171`
    and `:221`, the tests that bind it (run, 2 passed, `logs/d3-cited-tests.out`), and
-   `flashdb-load.rs:3065` keeps only the narrower fact it asserts; d4 `gap-analysis.md` §2.1 is the M3
+   `flashdb-load.rs:3065` keeps only the narrower fact it asserts; d4 `6_ARCHITECTURE.md` §2.1 is the M3
    record's per-phase ledger, its time column marked historical.
 2. **`mail/` is `inbox/`, with four header lines.** The two messages were landed (decision 7, the
    defects, the mailbox shape) and deleted; `AGENTS.md`, `README.md`, `evidence.md`, the roadmap and

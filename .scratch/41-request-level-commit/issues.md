@@ -1,6 +1,6 @@
 # 41 — the commit group is not a validation unit; make uniqueness per request
 
-Opened 2026-10-06 from `STATUS.md` §4 defect 8 and `docs/contracts.md` ("A commit group is not a
+Opened 2026-10-06 from `STATUS.md` §4 defect 8 and `docs/7_INTERFACE.md` ("A commit group is not a
 validation unit"). The contract's validation unit is the REQUEST; the implementation's was the
 group.
 
@@ -221,7 +221,7 @@ only t4, t5 and a1 discriminate it.
 - p1 `engine.rs` `commit_batch` doc: the crash-prefix sentence no longer claims the invariant holds
   for a torn prefix. It now states the invariant holds at REQUEST granularity after a successful
   call, and that a prefix torn inside a request was never validated as a state and follows the
-  pre-existing block-atomicity rule (docs/design.md I6: a block is all-or-nothing, a request is
+  pre-existing block-atomicity rule (docs/6_ARCHITECTURE.md I6: a block is all-or-nothing, a request is
   not).
 - p2 `engine/src/replay.rs`: the `execute_requests_grouped` doc said a crash before the barrier
   "can lose the whole group"; it now says a crash can leave a durable PREFIX of the group's records
@@ -283,4 +283,4 @@ of the build gate and are not introduced by this change.)
 - The `debug_assert_eq!` invariant check is debug-only; release builds rely on the structural
   argument (duplicate refused up front, retries skip the fold).
 - p1/p2 are comment corrections only; the durable block-atomicity behaviour was already as now
-  documented (docs/design.md I6), so no runtime change accompanies them.
+  documented (docs/6_ARCHITECTURE.md I6), so no runtime change accompanies them.

@@ -17,7 +17,7 @@ Metric
 request adapter (`engine/src/request.rs`) issues them; a read counts when it
 cannot be served from the same tile as the previous read of that request. The
 first read always counts, so a request whose every read lands in one tile counts
-1 (*dependent depth = 1 + independent fan-out*, `docs/engine.md`). This is a
+1 (*dependent depth = 1 + independent fan-out*, `docs/8_DETAIL.md`). This is a
 count of tiles touched in sequence, not a latency.
 
 The trace is the repository's own deterministic inventory workload
@@ -280,7 +280,7 @@ def dependent_reads(tile_sequence) -> int:
     """Reads that cannot be served from the previous read's tile.
 
     ``1 + number of tile changes``; 0 for an empty sequence, 1 for a single read
-    or a run inside one tile. This is the dependent depth of ``docs/engine.md``.
+    or a run inside one tile. This is the dependent depth of ``docs/8_DETAIL.md``.
     """
     if not tile_sequence:
         return 0

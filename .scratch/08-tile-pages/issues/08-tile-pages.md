@@ -118,7 +118,7 @@ What remains genuinely deferred/absent:
    aggregate invariants. The generalization is a declarative surface where each form
    provides (a) how to derive its affected key set from a block's ops and (b) how to
    evaluate it over the post-state. Unique is instance #1; every listed form has the
-   same shape. This is a v1 design item (links `docs/contracts.md`).
+   same shape. This is a v1 design item (links `docs/7_INTERFACE.md`).
 2. **Global/aggregate/audit invariants** (e.g. "sum of lines = header total", cross-
    entity aggregates) have an unbounded affected set, so they cannot be validated by
    probes at publish. They are the honest home of the "deferred" idea: an explicit

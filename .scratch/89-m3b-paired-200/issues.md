@@ -1,7 +1,7 @@
 # 89 — M3 clause (b): the paired 200 rps block, and the four defects the verdict names
 
 Contract: `inbox/2026-10-21-next-contract.md` (root), answering `inbox/2026-10-21-advance-review-verdict.md`.
-Both are landed (`docs/roadmap.md` decision 7, `docs/plan/workplan.md` §M3 status, the four defect
+Both are landed (`docs/0_ROADMAP.md` decision 7, `docs/0_ROADMAP.md` §M3 status, the four defect
 repairs) and deleted; this ticket is what the contract asks for.
 
 ## What this ticket is for
@@ -25,7 +25,7 @@ run is the test.
 | d1 mailbox README | the header count it claims equals the lines it lists | claims four, lists five (`kind from to spend id`) | claims four, lists four | `logs/defect-repros-before-e5fb0e1.out`, `-after-4eb236d.out` |
 | d2 loadavg claim | a claim about "every log" is traceable to the logs | one mail asserts "loadavg 13.20 on the first line of every log"; the logs read 13.20 / 21.43 / 23.35 and 8.24 | no document claims one reading for every log; each citation matches its log's line 1 | same |
 | d3 M3 (a) citation | max-over-rows is cited to the test that binds it | `coverage_csn` = max covered csn attributed to `flashdb-load.rs:3065`, hits for `order_no_index.rs:171`: 0 | attributed to `order_no_index.rs:171` and `:221`; 3065 keeps only "a rebuild advances coverage" | same |
-| d4 M4 deliverable | a per-phase ledger for the M1 **and M3** records | `gap-analysis.md` §2 ledgers M1 only | §2.1 is the M3 record's ledger, time column marked historical | same |
+| d4 M4 deliverable | a per-phase ledger for the M1 **and M3** records | `6_ARCHITECTURE.md` §2 ledgers M1 only | §2.1 is the M3 record's ledger, time column marked historical | same |
 
 The tests d3 now cites were run at this revision rather than assumed:
 `logs/d3-cited-tests.out` — `index_build_covers_rows_that_live_only_in_the_memtable` and

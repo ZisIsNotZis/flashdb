@@ -383,7 +383,7 @@ def summarize_curve(windows: list[dict], ceiling_us: int | None = None) -> list[
     ``ceiling_us`` or the per-request schedule-lag p99 against the lag ceiling). ``reject_reasons``
     counts the windows each rule fired for, so a report can state WHICH ceiling rejected them.
 
-    Two readings, because the decided rule is lag-only (`docs/objective.md` §1) and the recorded
+    Two readings, because the decided rule is lag-only (`docs/2_GOAL.md` §1) and the recorded
     evidence was scored with both ceilings. ``sustained`` above is unchanged, so every record and
     verdict written before the decision stays comparable; ``sustained_primary`` is the decided
     throughput-feasibility rule - achieved within tolerance, zero error windows, zero windows

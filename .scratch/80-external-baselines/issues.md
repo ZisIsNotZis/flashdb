@@ -7,7 +7,7 @@ flashdb (`declared`, `learned`) and the external baselines (`sqlite`, `postgres`
 frozen trace at matched durability in the same memory-capped regime, and report T5/T6/T7 with the
 conditions named on every number.
 
-Owning milestone: M1 in `docs/roadmap.md`. Authoritative contract:
+Owning milestone: M1 in `docs/0_ROADMAP.md`. Authoritative contract:
 `.scratch/15-objective-v0/pre-registration.md` §"External baselines and thresholds".
 
 ## Environment facts (verified this session)

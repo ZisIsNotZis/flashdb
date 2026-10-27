@@ -1,23 +1,23 @@
 # flashdb — where a session starts
 
-This checkout is one node's project: it holds its own roadmap (`docs/roadmap.md`), its work packages
-(`docs/plan/workplan.md`) and its mailbox (`inbox/`). A session launched to do a package inside it
+This checkout is one node's project: it holds its own roadmap (`docs/0_ROADMAP.md`, which also holds
+the work packages and the decisions in force) and its mailbox (`inbox/`). A session launched to do a package inside it
 writes only the area its contract names and reports to `inbox/`; the top-level docs belong to the node
 that owns the project. The law is `/home/z/vibe/agent-policy/AGENTS.md`.
 
 ## Start
 
 Read `inbox/` first — a message that arrived while the node was asleep changes what you would do —
-then `docs/roadmap.md` §Where we are (measured) and §Current milestone, then
-`docs/plan/workplan.md` §M3 status and §Known blockers. Land what a message says in those files
+then `docs/0_ROADMAP.md` §Where we are (measured), §Current milestone, §M3 status and §Known blockers. Land what a message says in those files
 before deleting it: the next session reads the files, not the conversation.
 
 ## Where a thing is
 
-- Milestone state and the decisions in force → `docs/roadmap.md`. Work packages with owner,
-  acceptance and spend → `docs/plan/workplan.md`. Item inventory with leverage ranking →
-  `docs/plan/open-items.md`. Which claim rests on which code path or record →
-  `docs/plan/evidence.md`.
+- Milestone state, the decisions in force and the work packages with owner, acceptance and spend →
+  `docs/0_ROADMAP.md`. The item inventory with leverage ranking, and which claim rests on which code
+  path or record → `docs/9_IMPLEMENTATION.md`.
+- Where a new fact belongs: the level map and the rejected alternatives are `docs/0_ROADMAP.md` §How
+  the doc base is filed; the rule it enforces is `/home/z/vibe/AGENTS.md` §Docs.
 - A measured ticket → `.scratch/<nn>-<slug>/`: `issues.md` (what was measured, and what was not),
   `run.sh` (the command that reproduces it), `logs/*.out` (the output as produced). Ticket 84 is the
   index-defect mechanism, 83 the index probe, 82 the external M1 scoreboard, 85 the M3 clause (c) run,

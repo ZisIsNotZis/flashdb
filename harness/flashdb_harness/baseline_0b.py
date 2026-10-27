@@ -1381,7 +1381,7 @@ def run_sql_arm(
 
 
 # ---------------------------------------------------------------------------
-# The KPI ladder's instruments (`docs/objective.md` §0)
+# The KPI ladder's instruments (`docs/2_GOAL.md` §0)
 # ---------------------------------------------------------------------------
 KPI_SCHEMA = "flashdb.baseline.kpi.v1"
 

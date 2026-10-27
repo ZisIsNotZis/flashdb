@@ -74,7 +74,7 @@ probe's non-emptiness assertion fails on it** (`logs/pre-fix.out`, `left: 0, rig
 
 ## Against the prediction (43,298 -> 13,460 B/request)
 
-`docs/plan/gap-analysis.md` §7 fix #1 predicts read bytes/request **43,298 ->
+`docs/6_ARCHITECTURE.md` §7 fix #1 predicts read bytes/request **43,298 ->
 13,460 (-69%)**, decomposed as 638,938 B per scan -> 4,096 B (one dependent page
 probe), at the M1 trace's 0.047 scans/request and its non-scan read work of
 265,360,600 B / 20,000 requests = 13,268 B/request.
@@ -136,7 +136,7 @@ counters.
   which interleaves the arms under whatever load the box carries - this box carries
   foreign load and the person deferred the window, so the run would produce the
   same invalid artefact as the twelve files now marked invalid. Recorded as
-  deferred in `docs/plan/open-items.md` row T-83.
+  deferred in `docs/9_IMPLEMENTATION.md` row T-83.
 - **The seeded 1.6 GB M1 instance**: its snapshot is git-ignored and absent, so the
   instance is rebuilt to the record's *shape* (tile count, append-only movement
   region, request mix), not restored. The scan term is a function of the active

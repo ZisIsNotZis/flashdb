@@ -52,15 +52,15 @@ echo "  documents claiming it: ${claims:-none}"
 if [ -n "$claims" ]; then verdict 1 "$claims"; else verdict 0 "no document claims one reading for every log"; fi
 
 echo
-echo "## d3 docs/roadmap.md M3 (a): max-over-rows cited to the test that binds it"
-weak=$(file_at docs/roadmap.md | grep -c 'coverage_csn` half is bound by `a_stale_adopted_index_is_rebuilt_and_coverage_advances`' || true)
-strong=$(file_at docs/roadmap.md | grep -c 'order_no_index.rs:171' || true)
+echo "## d3 docs/0_ROADMAP.md M3 (a): max-over-rows cited to the test that binds it"
+weak=$(file_at docs/0_ROADMAP.md | grep -c 'coverage_csn` half is bound by `a_stale_adopted_index_is_rebuilt_and_coverage_advances`' || true)
+strong=$(file_at docs/0_ROADMAP.md | grep -c 'order_no_index.rs:171' || true)
 echo "  cites order_no_index.rs:171 (max over the rows): $strong   attributes max-csn to flashdb-load.rs:3065: $weak"
 if [ "$weak" -ge 1 ] || [ "$strong" = 0 ]; then verdict 1 "strong=$strong weak=$weak"; else verdict 0 "strong=$strong weak=$weak"; fi
 
 echo
-echo "## d4 docs/plan/gap-analysis.md: the M3 record's per-phase ledger the M4 deliverable names"
-ledger=$(file_at docs/plan/gap-analysis.md | grep -c '2.1 The M3 record' || true)
+echo "## d4 docs/6_ARCHITECTURE.md: the M3 record's per-phase ledger the M4 deliverable names"
+ledger=$(file_at docs/6_ARCHITECTURE.md | grep -c '2.1 The M3 record' || true)
 echo "  §2.1 present: $ledger"
 if [ "$ledger" = 0 ]; then verdict 1 "the ledger is M1-only"; else verdict 0 "§2.1 present"; fi
 echo "  re-derived from the committed log (115,888,464/188 and 793,037/188):"

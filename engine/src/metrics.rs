@@ -3,7 +3,7 @@
 //! This module is the *measurement substrate* for the layout experiment: it
 //! records, per pattern and per window, the latency samples that the objective
 //! scores as `p99(pattern, window)`
-//! (`.scratch/15-objective-v0/provisional-objective.md` §1, §6), and - slice 26
+//! (`.scratch/15-objective-v0/provisional-2_GOAL.md` §1, §6), and - slice 26
 //! - per **region** (`keys::region_prefix`, the `(key family, entity)` unit) the
 //! access/shape counters a per-region layout learner needs. It is strictly
 //! **observational**: nothing here is persisted, and no read or write decision
@@ -13,11 +13,11 @@
 //!
 //! ## PROVISIONAL pattern vocabulary
 //!
-//! The design is from `docs/learning.md` ("The telemetry store obeys its own
+//! The design is from `docs/5_PRODUCT.md` ("The telemetry store obeys its own
 //! design ... sketch-based counters ... percentiles never means ... a hard cap").
 //! The key spelling below is **PROVISIONAL** and is fixed only so the driver,
 //! the learner and the simulator agree on one string; it is not an author
-//! decision (see `.scratch/15-objective-v0/provisional-objective.md` §8):
+//! decision (see `.scratch/15-objective-v0/provisional-2_GOAL.md` §8):
 //!
 //! | key | engine call |
 //! |---|---|

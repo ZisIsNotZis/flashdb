@@ -45,7 +45,7 @@ const t4VerifyTask = [
 const ssotTask = [
 "flashdb work package V: refresh the current-fact SSOT to the completed T1/T2/T3/T4 state. Single writer in " + WS + " (isolated worktree, branch wave20/ssot, based on integrated master AFTER the WP-U merge; the integrator creates this worktree). Run 'source $HOME/.cargo/env' first. Do NOT cd to /home/z/vibe/flashdb. Doc-only.",
 "",
-"READ the SSOT (.scratch/STATUS.md, docs/objective.md, docs/engine.md) and the terminal tickets: 64 (learned access path), 65 (WP-N), 66 (learner churn), 67 (write stall), 68 (WP-Q), 69 (startup warm), 70 (oscillation), 71 (WP-S decisive), 73 (T4 drift). Verify against the tickets, not memory.",
+"READ the SSOT (.scratch/STATUS.md, docs/2_GOAL.md, docs/8_DETAIL.md) and the terminal tickets: 64 (learned access path), 65 (WP-N), 66 (learner churn), 67 (write stall), 68 (WP-Q), 69 (startup warm), 70 (oscillation), 71 (WP-S decisive), 73 (T4 drift). Verify against the tickets, not memory.",
 "",
 "OBJECTIVE: state, as current fact and nothing else, the re-derived thresholds on the >=10x instance under the author's adopted SS7.1 lag-only primary reading: (1) T1 -- the learned/static `order_no` access-path layout sustains rung 100 lag-only (static-derived 8/8 seeds, learned 6/8) while declared never sustains any rung, +42.7-52.9% throughput (median +48.6%, outside the 2.48% noise band); rung-50 0/40 is NOT reached (residual: compaction-adjacent cold reads + the device fsync tail); (2) T2 -- reorg median ~0.93x (<=1.5x), learned at/better than declared on adversarial, 0 index builds on the 0-scan region; (3) T3 -- win reorg median ~0.93x (<=3x), no single-region blowup; (4) T4 -- the WP-U verdict (positive or honestly underivable, per ticket 73); (5) the engine-latency facts (compaction off-path, overlapped WAL barrier + deferred append, non-blocking boundary, read-ahead warming incl. eager startup; 304 Rust / 140 Python tests); (6) the open author items: the SS7.1 primary-vs-service-ceiling reconciliation, the tile-cap fix (7.4, adopted-unimplemented), and any T4/residual gap. Point to the ticket paths for history.",
 "",
@@ -56,7 +56,7 @@ const ssotTask = [
 
 const ssotVerifyTask = [
 "You are a fresh independent verifier for WP-V (SSOT refresh), worktree " + WS + ". Run 'source $HOME/.cargo/env' first. READ-ONLY: create/edit/commit nothing.",
-"Bind to `git rev-parse HEAD` (paste it); list new commits with `git log --oneline -8`. Scope: .scratch/STATUS.md, docs/objective.md, docs/engine.md, .scratch/74-ssot-final/issues.md.",
+"Bind to `git rev-parse HEAD` (paste it); list new commits with `git log --oneline -8`. Scope: .scratch/STATUS.md, docs/2_GOAL.md, docs/8_DETAIL.md, .scratch/74-ssot-final/issues.md.",
 "PASTE exact output for: " + gates + ".",
 "FALSIFY: (a) does every changed statement match its source ticket (64-73) -- spot-check T1 (static 8/8, learned 6/8 at rung 100; declared never; +42.7-52.9%), T2/T3 medians, the T4 verdict, the rung-50 residual, and the test counts? (b) current-fact-only, one home per fact, no stale contradiction? (c) pre-registration untouched? (d) open author items still open? (e) no unearned 10-seed claim? Report blocking defects with location and the contradicting ticket evidence.",
 "End with `VERDICT: PASS|FAIL|CANNOT-VERIFY` and numbered findings."

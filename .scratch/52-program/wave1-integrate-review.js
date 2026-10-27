@@ -59,9 +59,9 @@ reviewCommon,
 
 const decisionsReview = [
 reviewCommon,
-"SCOPE: package `decisions` - docs commit 7589beb on top of 93740b6. Files: .scratch/15-objective-v0/pre-registration.md, .scratch/STATUS.md, docs/design.md, docs/glossary.md.",
+"SCOPE: package `decisions` - docs commit 7589beb on top of 93740b6. Files: .scratch/15-objective-v0/pre-registration.md, .scratch/STATUS.md, docs/6_ARCHITECTURE.md, docs/glossary.md.",
 "ACCEPTANCE: the four adopted decisions are recorded with their reasoning and are CONSISTENT across all touched documents: (1) the primary validity rule is the lag ceiling at the pre-registration's 10 ms, service latency reported separately; (2) T5/T6/T7 are adopted (not 'awaiting sign-off') with the superseded no-absolute-throughput clause removed and the sign-off list updated; (3) the 10x floor is a requirement, not a qualification, and sub-floor verdicts are provisional; (4) the tile-cap defect is fixed on both sides. Also: the first valid primary-metric evaluation (commit 9bae6fe) is recorded as NO sustained rung, latency-tail failure, and T1/T2/T4 underived.",
-"CHECK FOR: stale or contradictory statements left in place, process narrative in fact documents, duplicated facts with different homes, and any claim not matching the committed STATUS/pre-registration. Cross-check docs/objective.md, which the base 93740b6 already touched.",
+"CHECK FOR: stale or contradictory statements left in place, process narrative in fact documents, duplicated facts with different homes, and any claim not matching the committed STATUS/pre-registration. Cross-check docs/2_GOAL.md, which the base 93740b6 already touched.",
 "BLOCKING: a contradiction with a higher-authority document, or a decision recorded with the wrong content."
 ].join("\n");
 

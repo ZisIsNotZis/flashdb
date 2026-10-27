@@ -1,6 +1,41 @@
-# External performance gap — attribution from the saved M1 records (WP-5/M4)
+# CONFIRMED
 
-Analysis only: no benchmark was run, no engine code edited. Authority: `../objective.md` §0 (KPI ladder, gap-attribution rule) and `../dev-loop.md` §Gap attribution. Classification is exactly (a) not learned enough / (b) defect / (c) architecture.
+## Invariants
+
+Invariants are load-bearing. A change that breaks one of these is an architecture change, not an implementation detail.
+
+- **I1 — No layout guarantee.** Physical layout may change at any time, at any granularity, without notifying users. Every intermediate state is fully servable, correct and performant-enough; no operation requires a database-wide barrier.
+- **I2 — A bad layout may be slow, never wrong.** Correctness may never depend on a layout being current. Derived layouts are accelerators; the base copy is the truth.
+- **I3 — No global layout state.** Every layout decision is scoped to one tile and made independently; mixed layouts in one table are normal. **The shared budget of I11 is not layout state** (`review-03` PA-10): it is a global *resource constraint* arbitrated from local statistics, not a global descriptor of how any tile is arranged. As originally worded I3 and the shared budget appeared to contradict each other, which also undercut the novelty claim.
+- **I4 — Analysis and optimization are off-path and scheduled.** No learning, inference, advice generation or cost-model evaluation happens on a request's critical path. The request path only *records* counters and histograms; measurement is unavoidable and is not analysis (`review-01` D10 — the earlier wording said "no profiling", which the per-request trace contradicts). Expensive background work is scheduled into quiet load windows.
+- **I5 — One business request = one DB request.** The request is the unit of pattern learning and the unit of angriness attribution. **It is not the unit of atomicity** — that is the block (I6). This conflicts with the motivating inventory workload's `decrement stock iff insert lines`; the conflict and its options are recorded in the ticket as `review-02` F4 and need an author decision.
+- **I6 — Per-block atomicity, per-request commit record.** A block is all-or-nothing; a request is not. One commit record covers the request's blocks in one fsync. The database commits a durable prefix and reports it, and **never resumes a request**.
+- **I7 — No locks.** Read-set validation by tile version gives serializability for the single-round-trip model. The only failure mode is retry; deadlock is impossible by construction.
+- **I8 — Tiles are immutable and self-describing.** Reorg is: write a new tile, fsync, flip the root, garbage-collect the old tile. A tile header describes its own layout so any reader can consume any tile.
+- **I9 — Speculate reads, never writes.** A wasted read is free on an unsaturated device; a speculative write requires undo and would reintroduce the machinery this design removes.
+- **I10 — One scalar objective, a constrained program at the top.** The governing objective is a constrained program: maximise sustained offered load under hard feasibility conditions (the latency ceiling and the write-amplitude budget, `2_GOAL.md`), and angriness (`2_GOAL.md`) is the internal pricing form and cost-model predictor used to compare candidates inside it. Any new mechanism must express its cost and benefit in angriness. **Corrected (author, 2026-10-06):** the earlier wording — "angriness is the only currency" — contradicted the hard constraint and is superseded (`review-01` F5).
+- **I11 — Promotions are funded, proven and deployed.** Every promotion draws from one shared finite budget, requires weight **and** stability **and** a demonstrated win, rolls out as a canary with an O(1) rollback, is recorded in the changelog, and stops at the knee.
+- **I12 — The server normalizer is authoritative.** Clients may normalize as a convenience; the server's canonical form is the pattern key. Requests are trees, never text.
+- **I13 — Reserved interfaces.** The list is stated **once**, in `7_INTERFACE.md` under "Reserved interfaces (frozen now)". It was previously duplicated here with four items while the contract listed six, and an invariant list that disagrees with the contract it summarizes is a live source-of-truth conflict (`review-04` L-23). Freezing `harmless-if-not-applicable` before its semantics are coherent (L-01, L-21) is also the wrong thing to freeze.
+
+# INFERRED
+
+## Architecture at a glance
+
+| Component | Responsibility | Detail lives in |
+|---|---|---|
+| Front-end normalizer | Parse the structured request tree, canonicalize it, reject non-canonical forms, enforce leanness | `7_INTERFACE.md` (logical model) |
+| Block evaluator | Execute the stage/block program with per-block atomicity and effect-aware conditions | `7_INTERFACE.md` (logical model, transaction model) |
+| Planner / compiler | Turn a canonical pattern into a specialized program plus a declared set of required physical properties | `7_INTERFACE.md` (layout contract) |
+| Batcher / scheduler | Merge in-flight requests, issue one batched IO submission, allocate outstanding-IO slots and the commit group | **No document — this pointer was dangling (`review-05` SS-18).** `9_IMPLEMENTATION.md` describes the development loop and contains none of it. Mergeability, maximum wait, slot allocation, admission control, group-commit sizing, head-of-line rules and the group-fsync protocol are all unspecified. Tracked in `04-storage-soundness`. |
+| Executor | Read tiles through the self-describing tile directory; pure reads may be predicated or speculated | `7_INTERFACE.md` (layout contract) |
+| Storage | Immutable, self-describing, relocatable tiles; one root pointer flip per commit record | `7_INTERFACE.md` (layout, durability) |
+| Durability | Commit record plus group fsync; orphan GC; no payload WAL | `7_INTERFACE.md` (durability and failure) |
+| Trace store | Shapes, counters, latency histograms, load windows — itself a tiled, tiered store | `5_PRODUCT.md` |
+| Learner | Per-tile layout policy, funded from one shared budget, evaluated by the angriness predictor | `5_PRODUCT.md` |
+| Advisor | Mechanical detector layer plus an LLM layer, both downstream of the trace and upstream of validation | `5_PRODUCT.md` |
+
+Analysis only: no benchmark was run, no engine code edited. Authority: `2_GOAL.md` §0 (KPI ladder, gap-attribution rule) and `9_IMPLEMENTATION.md` §Gap attribution. Classification is exactly (a) not learned enough / (b) defect / (c) architecture.
 
 ## 1. Records and revision
 
@@ -77,7 +112,7 @@ Sources: `.scratch/88-m3-notes/logs/index-defect-mechanism-rowbytes.out` (rev `f
 
 ## 3. Theoretical floor per phase
 
-Constants from `../engine.md` (experiment 0a-redo): dependent point read 89 us (4 KiB) / 111-117 us (16 KiB) / 174 us (64 KiB); batched independent read 4.9 us/read at QD32; sequential bandwidth 827 MiB/s; quiet-device tail 1.26× mean. The session's own fsync floor is `FL(before/after)` p50 3,105.5/3,566 us, p99 9,821/9,905 us.
+Constants from `8_DETAIL.md` (experiment 0a-redo): dependent point read 89 us (4 KiB) / 111-117 us (16 KiB) / 174 us (64 KiB); batched independent read 4.9 us/read at QD32; sequential bandwidth 827 MiB/s; quiet-device tail 1.26× mean. The session's own fsync floor is `FL(before/after)` p50 3,105.5/3,566 us, p99 9,821/9,905 us.
 
 | phase | floor | arithmetic | applicability |
 |---|---|---|---|
@@ -104,7 +139,7 @@ Constants from `../engine.md` (experiment 0a-redo): dependent point read 89 us (
 
 ## 5. Why the competitors are faster, per commit
 
-All three run one commit per ~1.006 requests; the difference is what that commit writes and syncs. Settings read back from the runs, not assumed: sqlite `journal_mode=wal`, `synchronous=2 (FULL)`, `wal_autocheckpoint=0`, `journal_size_limit=-1`, `cache_size=-8192` (`Rs`, `durability_observed`; `B0:129-147,614-670`). postgres `fsync=on`, `synchronous_commit=on`, `shared_buffers=16MB`, `work_mem=4MB`, `maintenance_work_mem=16MB`, `wal_level=minimal`, `max_wal_senders=0` (`scripts/baseline-env.sh:86-101`; `P82` §1). flashdb `--group-requests 64`, one `fdatasync(WAL)` per group (`B0` docstring; `../engine.md` §Foreground commit).
+All three run one commit per ~1.006 requests; the difference is what that commit writes and syncs. Settings read back from the runs, not assumed: sqlite `journal_mode=wal`, `synchronous=2 (FULL)`, `wal_autocheckpoint=0`, `journal_size_limit=-1`, `cache_size=-8192` (`Rs`, `durability_observed`; `B0:129-147,614-670`). postgres `fsync=on`, `synchronous_commit=on`, `shared_buffers=16MB`, `work_mem=4MB`, `maintenance_work_mem=16MB`, `wal_level=minimal`, `max_wal_senders=0` (`scripts/baseline-env.sh:86-101`; `P82` §1). flashdb `--group-requests 64`, one `fdatasync(WAL)` per group (`B0` docstring; `8_DETAIL.md` §Foreground commit).
 
 | mechanism | flashdb | sqlite | postgres |
 |---|---|---|---|
@@ -141,9 +176,9 @@ Neither (1) nor (2) can be settled from the saved records; both are cheap enough
 | postgres | `pg_database_size()` logical, WAL excluded | 1,103,713,983 | **104.1** | `P82` §7 |
 | postgres | cluster data dir, WAL included (pre-load snapshot) | 2,201,362,806 | **207.7** | `Rf/Rs/Rp` `restore.bytes`; `P82` §7 |
 
-The three numerators are different instruments (`P82` §7): flashdb's is a directory walk, sqlite's file+sidecars, postgres's either a catalog figure or a directory copy. **flashdb's WAL bytes, manifest bytes and any index tile are `unmeasured`**: `instance_files` keeps only the 4 largest files, all tiles, and the snapshot directory's bytes are git-ignored/absent here. What the record can say: tiles dominate (158 files averaging 10.7 MB; the footprint is 3.11× the sqlite database), and the format stores P/U/R entries with 4 KiB pages and per-page key bounds/checksums, against sqlite's fixed-schema B-tree pages and postgres's heap+two indexes. Which fraction of flashdb's 159.1 B/row is duplication vs page overhead vs WAL is **not attributable from this record**; instrument = per-category directory walk (tiles / index / WAL / manifest) at restore time, already named in `dev-loop.md` §Gap attribution step 3.
+The three numerators are different instruments (`P82` §7): flashdb's is a directory walk, sqlite's file+sidecars, postgres's either a catalog figure or a directory copy. **flashdb's WAL bytes, manifest bytes and any index tile are `unmeasured`**: `instance_files` keeps only the 4 largest files, all tiles, and the snapshot directory's bytes are git-ignored/absent here. What the record can say: tiles dominate (158 files averaging 10.7 MB; the footprint is 3.11× the sqlite database), and the format stores P/U/R entries with 4 KiB pages and per-page key bounds/checksums, against sqlite's fixed-schema B-tree pages and postgres's heap+two indexes. Which fraction of flashdb's 159.1 B/row is duplication vs page overhead vs WAL is **not attributable from this record**; instrument = per-category directory walk (tiles / index / WAL / manifest) at restore time, already named in `9_IMPLEMENTATION.md` §Gap attribution step 3.
 
-**In memory:** flashdb `memory.peak` per block is 65,990,656 / 65,880,064 / 65,830,912 / 66,129,920 / 66,170,880 B = **62.9 / 62.8 / 62.8 / 63.1 / 63.1 MiB** (`Rf(1..5)`), against a 1,686,590,701 B instance = **0.0391 resident B per data B** (about 25.6:1 data:RAM). The doc's in-memory candidates are memtable `BTreeMap<Vec,Vec>` overhead, fence RAM, page cache (kernel, outside the scope) and allocator arenas (`dev-loop.md`). `I83` records `serving_memtable_entries = 19,495` after serving; if all 62.9 MiB were entries that would be 3.4 KiB/entry, implausible for small inventory rows — so most of the peak is **not** attributable to entries, but the record has no breakdown. `unmeasured`; instrument = allocator stats or a heap profile inside the 128 MiB scope, plus `/proc/<pid>/smaps_rollup` for page-cache separation.
+**In memory:** flashdb `memory.peak` per block is 65,990,656 / 65,880,064 / 65,830,912 / 66,129,920 / 66,170,880 B = **62.9 / 62.8 / 62.8 / 63.1 / 63.1 MiB** (`Rf(1..5)`), against a 1,686,590,701 B instance = **0.0391 resident B per data B** (about 25.6:1 data:RAM). The doc's in-memory candidates are memtable `BTreeMap<Vec,Vec>` overhead, fence RAM, page cache (kernel, outside the scope) and allocator arenas (`9_IMPLEMENTATION.md`). `I83` records `serving_memtable_entries = 19,495` after serving; if all 62.9 MiB were entries that would be 3.4 KiB/entry, implausible for small inventory rows — so most of the peak is **not** attributable to entries, but the record has no breakdown. `unmeasured`; instrument = allocator stats or a heap profile inside the 128 MiB scope, plus `/proc/<pid>/smaps_rollup` for page-cache separation.
 
 ## 7. Ranked fix list (ranking is inference; facts named)
 

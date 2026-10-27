@@ -4,12 +4,12 @@
 
 Test the thesis premise that ticket 29 left open: the current generator produces four roughly
 independent access shapes, and the measured win is per-region parameter adaptation, not
-cross-entity co-location. Add the four join-heavy shapes named in `docs/dev-loop.md` (star-schema
+cross-entity co-location. Add the four join-heavy shapes named in `docs/9_IMPLEMENTATION.md` (star-schema
 fan-out, multi-hop traceability, as-of join, anti-join), measure their structural descriptors and
 co-location potential, and recommend whether the layout space should stay per-region parameters or
 move to L2 co-location.
 
-Owning milestone: M2 in `docs/roadmap.md`. Ticket 29 is the originating finding.
+Owning milestone: M2 in `docs/0_ROADMAP.md`. Ticket 29 is the originating finding.
 
 ## Scope
 
@@ -27,14 +27,14 @@ In scope (this slice, no engine execution, no L2 implementation):
 Out of scope: implementing L2, changing the engine, any claim about L2 before it is measured on a
 real run, changing the pre-registration.
 
-This slice's scope is not the M2 gate. `docs/roadmap.md` M2 also asks for a ≥10x headroom measurement
+This slice's scope is not the M2 gate. `docs/0_ROADMAP.md` M2 also asks for a ≥10x headroom measurement
 and learned-vs-declared headroom with the latency rule; the engine cannot execute these shapes, so this
 ticket cannot deliver them. The gate is **UNMET (2 of 4)** — item-by-item status, the missing engine
 capabilities and the closing routes are in [report.md §8](report.md#8-m2-acceptance-status).
 
 ## Authoritative inputs
 
-- `docs/dev-loop.md` (the four shapes and their hypotheses).
+- `docs/9_IMPLEMENTATION.md` (the four shapes and their hypotheses).
 - `.scratch/29-workload-shapes/issues.md` (the measured headroom table and the plan).
 - `harness/flashdb_harness/generator.py`, `seed.py`, `load_profile.py` (determinism and corpus rules).
 - `.scratch/15-objective-v0/pre-registration.md` (the layout space and the "no L2 claim before a real

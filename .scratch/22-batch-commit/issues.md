@@ -25,7 +25,7 @@ Two methodology notes that must travel with these numbers:
 - An earlier run of the same shape reported a 41 us commit p50. I cannot reproduce it; the device
   probe (which was broken at the time: it truncated and synced without writing, reporting 0 us)
   cannot confirm the device state then. Treat it as an unexplained outlier, not as a reference.
-- `docs/objective.md`/`design.md` already specify the fix in principle ("one WAL barrier on the
+- `docs/2_GOAL.md`/`6_ARCHITECTURE.md` already specify the fix in principle ("one WAL barrier on the
   foreground", the group-commit scheduler contract); it is unimplemented.
 
 ## Required work

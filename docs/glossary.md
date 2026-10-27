@@ -2,6 +2,12 @@
 
 Terms used in this repository's docs, explained for a reader who is not a database engineer. One line each; the docs use these freely without re-defining them.
 
+This file is the declared index of terms: it defines each term once and names the level file that owns
+the meaning when the meaning is argued rather than defined — `1_PROBLEM.md` (why), `2_GOAL.md` (the bar),
+`5_PRODUCT.md` (the learner), `6_ARCHITECTURE.md` (invariants, components), `7_INTERFACE.md` (contracts),
+`8_DETAIL.md` (the engine), `9_IMPLEMENTATION.md` (method, evidence, open items). It carries no level of
+its own; a definition that grows an argument moves there.
+
 ## Storage
 
 - **Base copy** — the single authoritative record of what a user wrote. Exactly one per row. Source of truth.
@@ -45,7 +51,7 @@ Terms used in this repository's docs, explained for a reader who is not a databa
 
 - **Trace** — the recorded workload: pattern shapes, counters, bytes, misses, latency histograms, load windows. The training set.
 - **Off-policy evaluation** — estimating what a *different* layout would have cost, when only the chosen layout was ever observed.
-- **Angriness** — the engine's **internal pricing / soft-penalty form**: a bounded S-curve penalty for exceeding the latency SLO under the current load, plus credit terms (served fraction, deadline met) and penalty terms for unserved, wasted work, space and reorg/compile cost. One primitive covers every term — σ for penalty, 1 − σ for credit. It is **not** the governing objective of the pre-registered comparison, which maximises sustained offered load under hard feasibility conditions (the latency ceiling and the write-amplitude budget), and angriness is **not yet well-posed**. See `objective.md` for the full term list, the scalarisation, and its still-unresolved defects.
+- **Angriness** — the engine's **internal pricing / soft-penalty form**: a bounded S-curve penalty for exceeding the latency SLO under the current load, plus credit terms (served fraction, deadline met) and penalty terms for unserved, wasted work, space and reorg/compile cost. One primitive covers every term — σ for penalty, 1 − σ for credit. It is **not** the governing objective of the pre-registered comparison, which maximises sustained offered load under hard feasibility conditions (the latency ceiling and the write-amplitude budget), and angriness is **not yet well-posed**. See `2_GOAL.md` for the full term list, the scalarisation, and its still-unresolved defects.
 - **SLO** — service level objective: the latency target a request is expected to meet.
 - **Schedule lag** — the delay between a request's due time under the paced offered load and its actual dispatch; the primary metric is bounded on this, not on completion.
 - **Lag ceiling** — the bound on per-request schedule-lag p99 that decides whether a window is valid; default 10 ms (`--lag-ceiling-us`), the number the pre-registration's primary metric is written with.

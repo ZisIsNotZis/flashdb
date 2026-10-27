@@ -2,7 +2,7 @@
 
 Status: draft, 2026-09-30. Author approved drafting; nothing here is implemented.
 Companion: `.scratch/08-tile-pages/issues/08-tile-pages.md` (engine work),
-`docs/contracts.md` (L-items this would extend).
+`docs/7_INTERFACE.md` (L-items this would extend).
 
 ## 1. Semantics (already settled, restated so the surface follows from it)
 

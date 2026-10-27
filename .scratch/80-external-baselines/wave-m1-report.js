@@ -22,7 +22,7 @@ P2 (all from the review):
 #6 give run-B T5/T7 a tri-state field (pass / fail / not-robustly-determined) so a JSON-only reader cannot read them as PASS.
 #7 soften report.md:127 to what the committed loadavg readings support.
 #8 report.md:190 heading overclaims "observed": flashdb's durability_observed is null; retitle.
-#9 add the missing comparison figure required by docs/roadmap.md M1 (a chart of latency p99 vs offered rate with sustained markers, generated from committed per-rung records), save it under .scratch/80-external-baselines/ (e.g. figure.svg or .png) and reference it from §2/§3.
+#9 add the missing comparison figure required by docs/0_ROADMAP.md M1 (a chart of latency p99 vs offered rate with sustained markers, generated from committed per-rung records), save it under .scratch/80-external-baselines/ (e.g. figure.svg or .png) and reference it from §2/§3.
 #10 state that run-flashdb-declared.json oracle_s 6.53e-06 is a pre-fix timer artifact and the real cost is the measured 38 min.
 #12 label the flashdb-declared 100 rps vs flashdb-learned 200 rps pair as run-to-run variance of the same declared wiring, not two T6 readings.
 
