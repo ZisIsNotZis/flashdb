@@ -1,6 +1,14 @@
+**English** | [简体中文](README.zh-CN.md)
+
+<p align="center"><img src="assets/logo.svg" alt="flashdb" width="200"></p>
+
 # flashdb
 
-A single-node document store that learns its own physical layout from a workload trace instead of asking the user to declare one. It is a research prototype whose central claim is under test, not a database to adopt: the comparison it is judged by, on one machine against sqlite and postgres, was lost (see [Status of the thesis](#status-of-the-thesis)).
+*A single-node, log-structured document store whose per-region physical layout is learned from the workload rather than declared by the user.*
+
+**Declaring a layout before the data exists is a guess paid for over the life of the instance: page size, merge threshold and whether a secondary index is worth building are all choices an engine normally fixes up front, and a wrong one is invisible until it is expensive. flashdb observes the trace and re-chooses those per region of the keyspace at run time, so the layout can follow the data.**
+
+It is a research prototype whose central claim is under test, not a database to adopt: the comparison it is judged by, on one machine against sqlite and postgres, was lost (see [Status of the thesis](#status-of-the-thesis)).
 
 **Not for:** production data, multi-node deployment, SQL, or any workload other than the committed inventory trace — the request adapter accepts exactly one block graph, `cust → take` (see [What is absent](#what-is-absent)).
 
@@ -31,17 +39,7 @@ That is a WAL-backed seed, a read-back verification, a memtable→tile publish t
 
 What the cargo line cannot rebuild: the crates themselves. `--offline` never fetches, so the cache must already hold them; on a cache that has never fetched them, drop `--offline` and the same pinned form resolves its dependencies from the mirror (verified with an empty `CARGO_HOME`: the workspace builds). It also builds neither the Python harness environment (`cd harness && uv run --with pytest pytest`, which needs `uv`), nor the discarded measurement instances and pre-seeded snapshots, nor the device calibration (needs `fio` and an idle NVMe).
 
-## Run the tests
-
-```sh
-cargo --config 'source.crates-io.replace-with="aliyun"' \
-      --config 'source.aliyun.registry="sparse+https://mirrors.aliyun.com/crates.io-index/"' \
-      test --workspace --offline
-```
-
-Measured at revision `24c94f2`: 339 passed, 0 failed, 0 ignored, 27 test binaries, no compiler warnings. The Python harness is separate: `cd harness && env -u VIRTUAL_ENV uv run --with pytest pytest -q` -> 210 passed. Without the two `--config` flags cargo resolves against crates.io instead of the mirror; `--offline` also requires a warm cache, and an empty `CARGO_HOME` with `--offline` fails at resolution (`no matching package named serde`).
-
-## What is in the tree
+## What it can do now
 
 Every item names the code path or the test that pins it.
 
@@ -65,6 +63,47 @@ Each absence is a limit with a consequence, not a missing feature nobody needs y
 - **No multi-node operation, no second writer.** One process, one directory, one writer.
 - **No persisted layout policy.** Reopening an instance with different flags serves existing tiles correctly only because each tile carries its own page size; region mode and the policy table are not durable (`docs/9_IMPLEMENTATION.md` row `PLAN-encoding-not-persisted`).
 
+## Architecture
+
+One process owns one directory. It recovers from its own WAL, reads an A/B manifest that names the live
+segment and the active tiles, and serves requests through a request adapter that pins exactly one block
+graph (`cust → take` over `sku/loc/qty/email/order_no`). Writes land in a memtable and are made durable
+by a background `fdatasync` worker per commit group; a checkpoint publishes the memtable as a tile in the
+`FDBTILE3` format and chains it into the manifest; rotation retires a fully published WAL onto a fresh
+segment. Nothing is maintained in the background except that barrier — checkpoint, rotate and merge are
+calls the driver makes on its own byte thresholds. The learned axis sits beside the request path: a policy
+file (per-region `page_size`, `merge_min_tiles`, `index_order_no`) is re-read per window by the driver and
+reaches the engine as `LayoutPolicy`, and the derived `order_no → handle` index is built off the request
+path from the merged memtable+tile view, consulted only as a hint, and rebuilt at every open.
+
+```
+engine/               Rust crate: the engine and the three binaries that drive it
+  src/lib.rs          crate root; Engine, the request path, per-block commit
+  src/request.rs      the one block graph the adapter accepts (cust → take)
+  src/keys.rs         versioned P/U/R keys ordered by commit sequence number
+  src/wal.rs          CRC-framed write-ahead log, torn-tail cut, fail-closed on a bad frame
+  src/memtable.rs     serving memtable and the merged memtable+tile view
+  src/tile.rs         FDBTILE3: pages, fence directory, sparse index, bloom, superblock, trailer
+  src/manifest.rs     A/B root manifest chaining continuation pages (MAX_TILES = 4096)
+  src/index.rs        derived order_no → handle, durable base + RAM delta
+  src/readahead.rs    startup scan warm and the read-ahead warner
+  src/bin/            flashdb-scale (seed/verify/checkpoint/tileinfo), flashdb-load, flashdb-replay
+  tests/              the integration tests that pin each claim above
+harness/              Python: deterministic inventory generator, open-loop pacer, KPI instruments, scoring
+scripts/              the M1/M5 runs and their scorers, plus check-docs.py
+bench/                nvme-bench and 0a-redo.sh — the device calibration the numbers are conditioned on
+docs/                 the numbered doc base: one question per level, in reading order
+.scratch/             the measurement record — one directory per ticket, with its issues.md and run.sh
+inbox/, mail/         this node's mailbox and the messages it answered
+```
+
+The Python side never links against the engine: `harness/` writes a byte-frozen JSONL trace and a policy
+file, `flashdb-load` accepts the trace open-loop at a declared rate and writes one JSON record per window
+(rate, service and lag percentiles, bytes, index decisions), and `scripts/` plus the harness's scorers turn
+those records into the tables this README quotes. Every number in this file is traceable to one of those
+records by path; `docs/6_ARCHITECTURE.md` owns the invariants and the component map, `docs/7_INTERFACE.md`
+the contracts, `docs/8_DETAIL.md` the internals.
+
 ## Status of the thesis
 
 The thesis is that a learned layout beats a declared one. Two different questions are measured, and only the first is favourable.
@@ -76,6 +115,36 @@ The thesis is that a learned layout beats a declared one. Two different question
 The loss is attributed to a defect rather than to the thesis: the derived `order_no` index was built from tiles only, so on that workload, whose movements were still in the memtable, it held 0 entries and every scan request paid a 5.6 MB full scan (`docs/9_IMPLEMENTATION.md` row `T-83`; `.scratch/83-index-probe/issues.md`). The index is built from the merged view at `8640a80`, bound by `engine/tests/order_no_index.rs`, and the defect is now **measured as work per request** rather than argued (`.scratch/84-index-defect-mechanism/issues.md`): on a rebuilt append-heavy instance of the M1 record's shape (156 tiles, 2,785 movements in the serving memtable, 188 scan requests) the index holds **2,785 entries for 2,785 rows** where the pre-fix build held **0**; **0 of 188** scan requests enter the merged scan (188 index consultations, 188 cross-checked point probes, the same 188 answers); and tile bytes per scan request fall from **616,428** to **0** while the rows are memtable-resident or **4,218** once they are tile-resident — at the record's 0.047 scan mix, **42,240 → 13,466** read bytes per request against the predicted 43,298 → 13,460 (`docs/6_ARCHITECTURE.md` §7 fix #1; the *after* figure hits to 0.05%, the *before* figure sits 2.4% low because the rebuilt tiles' block fill is 3,951 B against the record's 4,096 B). `engine/tests/index_defect_mechanism.rs` binds that and fails on pre-fix code with `left: 0, right: 2785`.
 
 The 200 rps comparison is **unmeasured.** It is the one part of the claim that needs a quiet box; the window is granted on a trigger (`uptime` reading loadavg under 2 for one minute, no other agent writing in the tree) and no paired block has run yet, so this repository claims **no throughput number** for the fix: what stands is the work-per-request measurement above and the internal learner result below. It must not be re-run under foreign load — the twelve `.scratch/83-index-probe/runs/` probe files carry an `# INVALID - do not cite:` first line for exactly that reason, and a contended pair measures the load as much as the engine. Its instrument is `.scratch/89-m3b-paired-200/`: two arms on the same frozen trace, the chain that regenerates the trace and the instance from committed specs, a gate that refuses an arm whose start loadavg is above the trigger, and a digest-verified restore per arm. The gate polled 191 times over 16 minutes on 2026-10-21 without a single reading under 2.0 (min 4.92), so the block is queued and nothing here is timed. A borrowed machine of the same storage class is still the fallback; a laptop is not a substitute, because the 5.6 MB scan is a property of this device. The clause-by-clause state sits in `docs/0_ROADMAP.md` §M3 status (WP-2).
+
+## Develop
+
+Rust 1.98.1, edition 2021; Python 3.12 for the harness. The two `--config` flags pin the crate source to the
+aliyun mirror and `--offline` forbids a fetch, which is the hermetic form the repository's own runners use.
+The suite measured at revision `24c94f2`: **339 passed, 0 failed, 0 ignored, 27 test binaries, no compiler
+warnings**; the harness, measured separately, 210 passed. `--offline` needs a warm cache (an empty
+`CARGO_HOME` fails at resolution with `no matching package named serde`), and without the two `--config`
+flags cargo resolves against crates.io instead of the mirror.
+
+```sh
+cargo --config 'source.crates-io.replace-with="aliyun"' \
+      --config 'source.aliyun.registry="sparse+https://mirrors.aliyun.com/crates.io-index/"' \
+      build --workspace --offline
+cargo --config 'source.crates-io.replace-with="aliyun"' \
+      --config 'source.aliyun.registry="sparse+https://mirrors.aliyun.com/crates.io-index/"' \
+      test --workspace --offline
+
+cd harness && env -u VIRTUAL_ENV uv run --with pytest pytest -q     # 210 passed
+python3 scripts/check-docs.py                     # level names, source tiers, every docs/ reference
+```
+
+There is no separate lint or format configuration: the bar is the suite above, compiling without warnings,
+and `scripts/check-docs.py` exiting 0. The measurement scripts (`scripts/m1-*.sh`, `scripts/scale-run.sh`,
+`scripts/m1-ladder-run.sh`) are not part of that bar — they need the frozen traces, a memory-capped
+cgroup, an idle NVMe, and for the postgres arm a container started by
+`.scratch/90-m5-postgres-env/postgres-server.sh`; each is documented with its evidence in
+`docs/9_IMPLEMENTATION.md`. Every measurement record states the loadavg it started at, and a timing claim
+taken under foreign load is invalid rather than approximate — the twelve files marked
+`# INVALID - do not cite:` in `.scratch/83-index-probe/runs/` are the measured cost of ignoring that rule.
 
 ## Documentation
 
@@ -101,8 +170,47 @@ lost in a move.
 
 Reference target: one NVMe and data:RAM ≥20:1 in a cgroup-limited experiment (for example 200 GB / 8 GB).
 
-## Licence and problems
+## Roadmap
+
+**Implemented** — the engine and everything the thesis is currently judged on:
+
+- Log-structured substrate with a torn-tail-tolerant WAL, A/B manifest, `FDBTILE3` tiles and per-block
+  atomic commit; group commit with one `fdatasync` per group.
+- The learned axis: a per-region policy surface (page size, merge threshold, derived-index flag) reloaded
+  per window, and a durable-base + RAM-delta `order_no` index built from the merged memtable+tile view.
+- The internal learner result at pilot grade: T1 (throughput) and T3 (drift recovery) supported, T2
+  (reorganisation cost) supported, T4 (write-spike recovery) **not** supported.
+- The external baseline scoreboard measured and lost, the gap attributed to a defect by ticket, and the
+  fix measured as work per request rather than argued.
+- The workload harness (deterministic generator with byte-frozen fixtures, open-loop pacer, KPI
+  instruments, scoring), the level-filed doc base, and `scripts/check-docs.py` as its standing check.
+
+**Planned** — in dependency order, from `docs/0_ROADMAP.md`:
+
+- **M5 — the fair three-arm re-run.** The one part of the claim that needs a quiet box: 200 rps against
+  sqlite and postgres on the same frozen trace, with every efficiency instrument wired. Held, not idle:
+  the instrument, the regeneration chain and a loadavg gate that refuses an arm above the trigger are
+  written (`.scratch/89-m3b-paired-200/`), the postgres leg now runs from a checked container that
+  reports the version it measured, and no throughput number may be claimed before a pair lands.
+- **M6 — the pre-registered 10-seed verdict and publication.** T1-T4 at 10 independent seeds on the
+  ≥10x instance with the thresholds exactly as pre-registered, reviewed independently and published
+  whatever it says.
+- Box-free work that can run under load in the meantime: the per-group phase timer that the ~573 ms
+  barrier group has no substitute for, and the verdict on WAL preallocation (code half built and
+  unit-tested, timing unmeasured).
+- Explicitly **not** planned: general L2 co-location, multi-node operation, and a query language wider
+  than the one committed block graph — each is a decision in `docs/0_ROADMAP.md`, not a backlog item.
+
+Where this is going: the interesting result is not that a learned layout can be built, it is whether it
+can be shown to win on hardware someone else can also buy. The repository is arranged so that a negative
+answer is publishable — the loss is already recorded, attributed and partly cured — and so that the
+remaining number, once the box is quiet, is read from a record rather than asserted.
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md): scope, the checks that must pass, and what a pull request is
+expected to carry. Report a problem at <https://github.com/ZisIsNotZis/flashdb/issues>.
+
+## Licence
 
 GNU Affero General Public License v3 — see [LICENSE.md](LICENSE.md).
-
-Report a problem by opening an issue at <https://github.com/ZisIsNotZis/flashdb/issues>.
