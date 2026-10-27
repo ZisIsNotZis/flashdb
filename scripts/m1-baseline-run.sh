@@ -21,12 +21,12 @@
 #   * the same memory regime: every arm runs inside `systemd-run --user --scope
 #     -p MemoryMax=<cap>M -p MemorySwapMax=0`, and the arm record carries the scope's own
 #     `memory.peak`;
-#   * postgres is a container this tree starts and checks
-#     (`.scratch/90-m5-postgres-env/postgres-server.sh`): the SERVER (the engine) is a container capped with `--memory` and the
-#     client stays OUTSIDE it, so the cap covers the engine and not the instrument. The image's
-#     settings block is the M1 record's, read back from the running server; a setting that differs
-#     stops the arm, and `M5_PG_REQUIRE` stops an arm measured against a version nobody named. The
-#     user-space cluster `scripts/baseline-env.sh` builds stays as the M1 record's route.
+#   * postgres is the user-space 18.6 cluster `scripts/baseline-env.sh` builds, extracts and
+#     starts; the SERVER (the engine) runs in its own `systemd-run` scope so the cap covers it while
+#     the client stays outside, and `baseline-env.sh check` reads the version and the M1 record's
+#     settings block back from the running server. A setting that differs stops the arm, and
+#     `M1_PG_REQUIRE` (default 18.6, the version ticket 82 measured) stops an arm measured against
+#     another version. No Docker, no container: the box has no images and the Hub pull times out.
 #
 # Artefacts: $WORKDIR/{manifest,spec}.json, windows-<arm>.jsonl, run-<arm>.json, scoreboard.{md,json}.
 # Regenerable state (the trace, the engines' instances, the sqlite file, driver logs) stays out of
@@ -133,12 +133,16 @@ record_load() {
 record_runner() {
     python3 - "$WORKDIR/spec.json" "$CAP_MIB" "$SEED_CAP_MIB" "$LOCK" \
         "${M1_PG_ROOT:-}" "$RUNNER_CMD" "$RUNNER_CWD" "$MODE" "$SNAPSHOT_DIR" \
-        "$INSTANCE_ROOT" "$DATABASE" "${LOCK_HELD_BY:-}" <<'PY'
+        "$INSTANCE_ROOT" "$DATABASE" "${LOCK_HELD_BY:-}" "${M1_PG_PORT:-}" \
+        "${M1_PG_REQUIRE:-}" <<'PY'
 import json, sys
-path, cap, seed_cap, lock, pg_root, argv, cwd, mode, snap, live, db, held = sys.argv[1:13]
+(path, cap, seed_cap, lock, pg_root, argv, cwd, mode, snap, live, db, held,
+ pg_port, pg_require) = sys.argv[1:15]
 spec = json.load(open(path))
 spec["runner"] = {"argv": argv, "cwd": cwd, "engine_cap_mib": int(cap),
                   "seed_cap_mib": int(seed_cap), "lock": lock, "postgres_root": pg_root,
+                  "postgres_port": int(pg_port) if pg_port else None,
+                  "postgres_require": pg_require or None,
                   "mode": mode, "snapshot_dir": snap or None, "instance_root": live or None,
                   "postgres_database": db, "lock_held_by_caller": held == "1"}
 json.dump(spec, open(path, "w"), sort_keys=True, indent=2)
@@ -161,10 +165,12 @@ record_machine_state() {
 # what the arm step measures.
 restore_arm() {
     # The postgres instance is the server's data directory, so the server must not be running while
-    # the snapshot is written under it: a container left up would serve the pre-restore bytes under
+    # the snapshot is written under it: a server left up would serve the pre-restore bytes under
     # the restored record's name, and the record would then describe one state and measure another.
     if [ "$1" = postgres ]; then
-        M5_PG_IMAGE=$M5_PG_IMAGE M5_PG_ROOT=$M1_PG_ROOT "$POSTGRES_SERVER" down >/dev/null
+        M1_PG_ROOT=$M1_PG_ROOT M1_PG_PORT=$M1_PG_PORT "$BASELINE_ENV" stop >/dev/null 2>&1 || true
+        # Say it in the run log: the directory the restore is about to write is one no server holds.
+        M1_PG_ROOT=$M1_PG_ROOT M1_PG_PORT=$M1_PG_PORT "$BASELINE_ENV" status
     fi
     ( cd "$HARNESS" && uv run python -m flashdb_harness.baseline_0b restore \
         --workdir "$WORKDIR" --arms "$1" --snapshot-dir "$SNAPSHOT_DIR" \
@@ -212,18 +218,23 @@ prepare() {
 # The payloads are written with a QUOTED heredoc: they expand their own variables at run time, and
 # the parameters reach them through the environment (`M1_*`), never through shell interpolation.
 # One cluster root for the whole chain: the harness that restores the data directory and the
-# container that serves it must resolve the SAME path (the container bind-mounts `$M1_PG_ROOT/data`
-# at that same path and PGDATA points at it, so `show data_directory` reports what the harness
-# restored — the harness refuses a restored run whose served directory is another one).
+# server that serves it must resolve the SAME path (baseline-env's `data_directory` is
+# `$M1_PG_ROOT/data`, so `show data_directory` reports what the harness restored — the harness
+# refuses a restored run whose served directory is another one).
 #
-# The postgres leg is a container, not a host cluster: `M5_PG_IMAGE` names the image (default 18,
-# the major version M1 measured), `M5_PG_REQUIRE` names the version a result may claim, and the
-# server's settings block is checked against the M1 record by `postgres-server.sh` on every start.
-M5_PG_IMAGE=${M5_PG_IMAGE:-postgres:18}
-M5_PG_REQUIRE=${M5_PG_REQUIRE:-}
-POSTGRES_SERVER=$REPO/.scratch/90-m5-postgres-env/postgres-server.sh
-export M5_PG_IMAGE M5_PG_REQUIRE
-export M1_PG_ROOT=${M1_PG_ROOT:-/var/tmp/m5-pg}
+# The postgres leg is the M1 record's user-space 18.6 cluster, not a container: the M1 extraction
+# survives at `/var/tmp/m1-pg`, `M1_PG_ROOT` overrides it, `M1_PG_PORT` is its socket's port, and
+# `M1_PG_REQUIRE` names the version a result may claim (default 18.6, the one ticket 82 measured).
+# `baseline-env.sh check` refuses any other setting or version on every arm start.
+BASELINE_ENV=$REPO/scripts/baseline-env.sh
+M1_PG_REQUIRE=${M1_PG_REQUIRE:-18.6}
+M1_PG_PORT=${M1_PG_PORT:-55432}
+export M1_PG_PORT M1_PG_REQUIRE
+# The postgres server must outlive one `start` call, so its scope is kept alive by an idle `sleep`;
+# the pid of that scope is only used to stop it, never to measure. The M1 record's cluster is the
+# default; a controlled run may point M1_PG_ROOT at a cluster of its own (and symlink the
+# extraction into it), and the restore check then compares the path both sides resolve.
+export M1_PG_ROOT=${M1_PG_ROOT:-/var/tmp/m1-pg}
 export M1_CAP_MIB=$CAP_MIB M1_SEED_CAP_MIB=$SEED_CAP_MIB M1_WORKDIR=$WORKDIR
 export M1_HARNESS=$HARNESS M1_REPO=$REPO M1_SKIP_VERIFY=$SKIP_VERIFY
 export M1_INSTANCE_ROOT=$INSTANCE_ROOT M1_DATABASE=$DATABASE
@@ -292,38 +303,59 @@ EOF
         postgres)
             cat > "$payload" <<'EOF'
 set -euo pipefail
-export M1_PG_ROOT=${M1_PG_ROOT:-/var/tmp/m5-pg}
-# The server is the container `postgres-server.sh` starts and checks: no host `pg_ctl`, no system
-# package. `down` first, so the step serves the data directory on disk and not a container left
-# behind by an earlier step; `up` pulls if the image is absent, starts it under `--memory`, waits
-# for `pg_isready`, then checks every setting against the M1 record and refuses a mismatch (and
-# refuses a version `M5_PG_REQUIRE` does not name).
-server="$M1_REPO/.scratch/90-m5-postgres-env/postgres-server.sh"
-export M5_PG_IMAGE M5_PG_REQUIRE M5_PG_ROOT="$M1_PG_ROOT"
-"$server" down >/dev/null
-"$server" up
-# The container's cap IS the engine's budget, and it is refused when it is not the one the run
-# record states: a cap that drifted makes every resident-byte number a different measurement.
-container="${M5_PG_NAME:-flashdb-m5-pg}"
-cap_bytes=$(docker inspect -f '{{.HostConfig.Memory}}' "$container")
-[ "$cap_bytes" = "$((M1_CAP_MIB * 1024 * 1024))" ] || {
-    echo "postgres container cap is $cap_bytes bytes, the arm's recorded cap is ${M1_CAP_MIB} MiB" >&2
-    exit 1
+export M1_PG_ROOT=${M1_PG_ROOT:-/var/tmp/m1-pg}
+export M1_PG_PORT=${M1_PG_PORT:-55432}
+envsh="$M1_REPO/scripts/baseline-env.sh"
+unit="m1-pg-postgres-$$"
+scope_pid=
+# One shutdown path, used before the start and by every exit: the server must never be left from an
+# earlier step, because this step serves the data directory on disk and a restore has just rewritten
+# it. The trap also runs when the check or the harness fails.
+cleanup() {
+    rc=$?
+    "$envsh" stop >/dev/null 2>&1 || true
+    systemctl --user stop "$unit.scope" >/dev/null 2>&1 || true
+    wait "$scope_pid" 2>/dev/null || true
+    exit $rc
 }
-eval "$("$server" env)"
-# The version is read back here, not inherited from the image tag, and it is written beside the
-# step that measured it so a report can name it without guessing.
-printf '{"step": "%s", "at": "%s", "image": "%s", "require": "%s", "server_version": "%s", "data_directory": "%s"}\n' \
-    "$M1_STEP" "$(date -Is)" "$M5_PG_IMAGE" "${M5_PG_REQUIRE:-none}" "$M1_PG_SERVER_VERSION" \
-    "$(docker exec "$container" psql -U "$M1_PGUSER" -d postgres -tAc 'show data_directory')" \
+trap cleanup EXIT
+"$envsh" stop >/dev/null 2>&1 || true
+# The postgres server IS the engine, so it runs in its own capped scope and the client stays
+# outside it: `pg_ctl` daemonises, so `exec sleep` keeps the scope (and its cgroup) alive for the
+# arm. The version and settings are read back through `baseline-env.sh check`, never inherited
+# from a tag or a comment.
+systemd-run --user --scope -q --unit="$unit" -p "MemoryMax=${M1_CAP_MIB}M" -p MemorySwapMax=0 \
+    bash -c "M1_PG_ROOT=$(printf %q "$M1_PG_ROOT") M1_PG_PORT=$(printf %q "$M1_PG_PORT") $(printf %q "$envsh") start >/dev/null && exec sleep 7200" &
+scope_pid=$!
+ready=0
+for _ in $(seq 1 300); do
+    if "$envsh" status 2>/dev/null | grep -q '^running:'; then ready=1; break; fi
+    sleep 0.1
+done
+[ "$ready" = 1 ] || { echo "postgres did not start in 30 s (data $M1_PG_ROOT/data)" >&2; exit 1; }
+# Read the version and the M1 record's block back from the RUNNING server. `check` exits non-zero
+# and names each difference, so a drifted setting or a version M1_PG_REQUIRE does not name stops
+# this arm before it can measure under another configuration.
+check_out=$("$envsh" check)
+printf '%s\n' "$check_out"
+printf '%s\n' "$check_out" >> "$M1_WORKDIR/pg-server.log"
+server_version=$(printf '%s\n' "$check_out" | sed -n 's/^server_version: //p')
+full_version=$(printf '%s\n' "$check_out" | sed -n 's/^version: //p')
+data_directory=$(printf '%s\n' "$check_out" | sed -n 's/^data_directory: //p')
+[ -n "$server_version" ] || { echo "baseline-env check did not report a server_version" >&2; exit 1; }
+export M1_PG_SERVER_VERSION=${server_version%% *}
+# The version travels with the step that measured it, so a report can name it without guessing.
+printf '{"step": "%s", "at": "%s", "root": "%s", "port": "%s", "require": "%s", "server_version": "%s", "version": "%s", "data_directory": "%s", "settings_checked": true}\n' \
+    "$M1_STEP" "$(date -Is)" "$M1_PG_ROOT" "$M1_PG_PORT" "${M1_PG_REQUIRE:-none}" \
+    "$server_version" "$full_version" "$data_directory" \
     >> "$M1_WORKDIR/postgres-server.jsonl"
-rc=0
-# The container's cgroup is the ENGINE's; hand its path to the client so the client can sample the
-# SERVER's `memory.current` across the measured phase (the client itself stays outside the cap).
-pid=$(docker inspect -f '{{.State.Pid}}' "$container")
-cg=$(awk -F: '$1==0{print $3}' "/proc/$pid/cgroup")
-[ -n "$cg" ] || { echo "the postgres container has no cgroup" >&2; exit 1; }
+# The server's scope is the ENGINE's cgroup; hand its path to the client so the client can sample
+# the SERVER's `memory.current` across the measured phase (the client itself stays outside the cap).
+cg=$(systemctl --user show --property=ControlGroup --value "$unit.scope")
+[ -n "$cg" ] || { echo "the postgres scope has no cgroup" >&2; exit 1; }
 export M1_ENGINE_CGROUP="/sys/fs/cgroup$cg"
+eval "$("$envsh" env)"
+rc=0
 cd "$M1_HARNESS"
 if [ "$M1_STEP" = instance ]; then
     uv run --with 'psycopg[binary]==3.3.6' python -m flashdb_harness.baseline_0b \
@@ -354,10 +386,8 @@ record["arm_scope_peak_bytes"] = peak
 json.dump(record, open(path, "w"), sort_keys=True, indent=2)
 PYINNER
 fi
-# The peak, while the container still exists, is reported as the arm-scope number: it holds the
-# bulk load too, so it is not the serving peak — the harness samples that itself. The container is
-# then removed (its data directory stays) so the next restore writes a directory nobody serves.
-"$server" down
+# The trap stops the server through baseline-env (one shutdown path) and then the scope. The data
+# directory stays on disk; the next restore writes a directory nobody serves.
 exit $rc
 EOF
             chmod +x "$payload"

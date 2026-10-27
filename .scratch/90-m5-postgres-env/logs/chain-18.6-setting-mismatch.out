@@ -1,0 +1,10 @@
+# start 2026-10-27T21:50:36+08:00 loadavg 9.07 12.51 11.03, root /var/tmp/m1-pg:55432
+warning: `VIRTUAL_ENV=/home/z/.venv` does not match the project environment path `.venv` and will be ignored; use `--active` to target the active environment instead
+machine-state before: loadavg=9.07 epp=performance freq_khz=2499376,2499985,2499987,2499996,2500002,2500008,2500009,2500306
+stopped: data=/var/tmp/m1-pg/data
+warning: `VIRTUAL_ENV=/home/z/.venv` does not match the project environment path `.venv` and will be ignored; use `--active` to target the active environment instead
+restore postgres: 65979191 bytes from /home/z/vibe/worktrees/flashdb/wp15-postgres-leg/.scratch/90-m5-postgres-env/runs/chain-18.6/snapshot/postgres (sha256 verified, 0.7 s)
+mismatch: work_mem reported "8MB", the M1 record says "4MB"
+baseline-env: the running server differs from the M1 record's block; refusing to measure under another one
+m1-baseline-run: arm postgres failed (see /home/z/vibe/worktrees/flashdb/wp15-postgres-leg/.scratch/90-m5-postgres-env/runs/chain-18.6)
+rc=1

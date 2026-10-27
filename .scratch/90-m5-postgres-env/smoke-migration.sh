@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+# HISTORICAL 2026-10-23 (the 16.15 container). This setup proof drives the superseded container
+# script and `docker exec`; the current server is `scripts/baseline-env.sh`'s user-space 18.6, and
+# the current setup/serve/oracle proof is `.scratch/90-m5-postgres-env/run.sh`. Kept as the record
+# of `logs/smoke-migration-16.15.out`.
+#
 # setup + connection + migration for the postgres arm against the running M5 server.
 #
 # This is setup, not a measurement: the harness's own seeding path (`prepare` then

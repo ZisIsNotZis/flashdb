@@ -1,0 +1,25 @@
+# start 2026-10-27T21:50:29+08:00 loadavg 9.05 12.63 11.05, root /var/tmp/m1-pg:55432
+warning: `VIRTUAL_ENV=/home/z/.venv` does not match the project environment path `.venv` and will be ignored; use `--active` to target the active environment instead
+machine-state before: loadavg=9.05 epp=performance freq_khz=2499982,2499992,2499993,2500010,2500021,2500028,2500035
+# read at 2026-10-27T21:50:30+08:00 on z, user z from the running server at /var/tmp/m1-pg/socket:55432
+# method: /var/tmp/m1-pg/root/usr/lib/postgresql/18/bin/psql -h /var/tmp/m1-pg/socket -p 55432 -tAc 'select version()' / 'show <name>'
+version: PostgreSQL 18.6 (Ubuntu 18.6-3build2) on x86_64-pc-linux-gnu, compiled by x86_64-linux-gnu-gcc (Ubuntu 15.3.0-3ubuntu1) 15.3.0, 64-bit
+server_version: 18.6 (Ubuntu 18.6-3build2)
+data_directory: /var/tmp/m1-pg/data
+setting: shared_buffers = 16MB
+setting: max_connections = 32
+setting: work_mem = 4MB
+setting: maintenance_work_mem = 16MB
+setting: fsync = on
+setting: synchronous_commit = on
+setting: wal_level = minimal
+setting: max_wal_senders = 0
+checked: version and every setting above match the M1 record's block
+warning: `VIRTUAL_ENV=/home/z/.venv` does not match the project environment path `.venv` and will be ignored; use `--active` to target the active environment instead
+build-instance postgres: seed_s=0.1 bytes=8304319
+warning: `VIRTUAL_ENV=/home/z/.venv` does not match the project environment path `.venv` and will be ignored; use `--active` to target the active environment instead
+snapshot postgres: 65979191 bytes, 1298 files, sha256=9874ab1a0c455d65e2876a9f90734832f665df1a8d60410c0333d71b69a89da4
+warning: `VIRTUAL_ENV=/home/z/.venv` does not match the project environment path `.venv` and will be ignored; use `--active` to target the active environment instead
+machine-state after: loadavg=8.64 epp=performance freq_khz=2399959,2399980,2399988,2399990,2399991,2399994,2400011,2400015
+m1-baseline-run: mode instance, artefacts in /home/z/vibe/worktrees/flashdb/wp15-postgres-leg/.scratch/90-m5-postgres-env/runs/chain-18.6
+rc=0
