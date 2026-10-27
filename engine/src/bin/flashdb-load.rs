@@ -26,7 +26,7 @@
 //!                [--window-ms 1000] [--ceiling-us N] [--lag-ceiling-us N] [--patterns]
 //!                [--metrics-json] [--commit-batch B] [--group-requests B] [--no-tiles]
 //!                [--policy-file PATH] [--policy-reload] [--peak-report]
-//!                [--checkpoint-bytes N] [--rotate-bytes N] [--region-mode global|per_region]
+//!                [--checkpoint-bytes N] [--rotate-bytes N] [--region-mode global|per_region] [--wal-prealloc-bytes N]
 //!                [--compact-bytes N]
 //!
 //! External policy control (slice 27): `--policy-file PATH` (or the
@@ -131,6 +131,10 @@ struct Args {
     region_mode: Option<RegionMode>,
     key_encoding: KeyEncoding,
     compact_bytes: Option<u64>,
+    /// WAL preallocation chunk in bytes (WP-14): `None` keeps the default
+    /// off-by-default WAL (file length == valid length); `Some(n)` reserves the
+    /// WAL in whole `n`-byte chunks that are really allocated.
+    wal_prealloc_bytes: Option<u64>,
     /// Host-stall control (slice 55): `--dry-run` replaces a request's engine
     /// execution with a bounded busy-wait (`--dry-run-busy-us`) after parsing
     /// the trace line, so the pacer/window bookkeeping is exercised with no
@@ -165,6 +169,7 @@ fn parse_args(argv: Vec<String>) -> Result<Args, String> {
         region_mode: None,
         key_encoding: KeyEncoding::FamilyFirst,
         compact_bytes: None,
+        wal_prealloc_bytes: None,
         dry_run: false,
         dry_run_busy_us: 0,
     };
@@ -252,6 +257,13 @@ fn parse_args(argv: Vec<String>) -> Result<Args, String> {
                 args.compact_bytes = Some(n);
                 i += 2;
             }
+            "--wal-prealloc-bytes" => {
+                let n: u64 = argv.get(i + 1).ok_or("--wal-prealloc-bytes needs a value")?
+                    .parse().map_err(|_| "--wal-prealloc-bytes must be a positive integer")?;
+                if n == 0 { return Err("--wal-prealloc-bytes must be a positive integer".into()); }
+                args.wal_prealloc_bytes = Some(n);
+                i += 2;
+            }
             "--dry-run" => { args.dry_run = true; i += 1; }
             "--dry-run-busy-us" => {
                 let n: u64 = argv.get(i + 1).ok_or("--dry-run-busy-us needs a value")?
@@ -310,16 +322,17 @@ fn rate_for(index: u64, total: u64, rates: &[f64], segment_requests: Option<u64>
 /// Resolve the CLI target. A directory opens tile-aware with `Engine::open_discover` unless
 /// `discover` is false, in which case (and for a WAL file path) the engine is opened by WAL
 /// path with tiles ignored: `--no-tiles` is the memtable-only control for the same data.
-fn open_target(target: &str, discover: bool, encoding: KeyEncoding) -> io::Result<Engine> {
+fn open_target(target: &str, discover: bool, encoding: KeyEncoding,
+               wal_prealloc_bytes: u64) -> io::Result<Engine> {
     let path = Path::new(target);
     if path.is_dir() {
         if discover {
-            Engine::open_discover_with_encoding(path, encoding)
+            Engine::open_discover_with_encoding_and_prealloc(path, encoding, wal_prealloc_bytes)
         } else {
-            Engine::open_with_encoding(path.join("data.wal"), encoding)
+            Engine::open_with_encoding_and_prealloc(path.join("data.wal"), encoding, wal_prealloc_bytes)
         }
     } else {
-        Engine::open_with_encoding(path, encoding)
+        Engine::open_with_encoding_and_prealloc(path, encoding, wal_prealloc_bytes)
     }
 }
 
@@ -696,11 +709,33 @@ struct GroupPhaseReport {
     apply_us: u64,
     /// The group's single WAL `fdatasync` (0 for a read-only group).
     fsync_us: u64,
+    /// The barrier's queue wait (WP-14): from enqueueing the group's WAL job to
+    /// the worker thread beginning it. 0 for the synchronous path, which has no
+    /// queue. Before this field the term sat unnamed inside `completion_us`,
+    /// which is why a ~0.5 s group with a 20 ms fdatasync looked unattributed.
+    barrier_wait_us: u64,
     /// Request-path WAL maintenance (publish/rotate) charged to this group.
     maintain_us: u64,
     /// Group completion minus its first member's due time (the `group_us`
     /// diagnostic, which bounds every member's service latency).
     completion_us: u64,
+}
+
+impl GroupPhaseReport {
+    /// The part of `completion_us` the named phases do not explain: schedule
+    /// lag + barrier queue wait + append + fsync + apply + maintenance are
+    /// subtracted. What remains is the pacer's dispatch-to-submit work (request
+    /// execution and frame encoding) plus the collect/overflow of the sums, so a
+    /// stall is "attributed" only when this stays far below the stall itself.
+    fn residual_us(&self) -> u64 {
+        self.completion_us.saturating_sub(
+            self.due_dispatch_us
+                .saturating_add(self.barrier_wait_us)
+                .saturating_add(self.append_us)
+                .saturating_add(self.fsync_us)
+                .saturating_add(self.apply_us)
+                .saturating_add(self.maintain_us))
+    }
 }
 
 /// One overlapped write group whose WAL barrier is still in flight (slice 56).
@@ -742,8 +777,10 @@ struct PendingGroup {
 fn group_phase_print(window_index: u64, seq: u64, requests: u64, p: GroupPhaseReport) {
     eprintln!(
         "group_phase window={window_index} seq={seq} requests={requests} \
-         due_dispatch_us={} append_us={} apply_us={} fsync_us={} maintain_us={} completion_us={}",
-        p.due_dispatch_us, p.append_us, p.apply_us, p.fsync_us, p.maintain_us, p.completion_us);
+         due_dispatch_us={} barrier_wait_us={} append_us={} apply_us={} fsync_us={} \
+         maintain_us={} residual_us={} completion_us={}",
+        p.due_dispatch_us, p.barrier_wait_us, p.append_us, p.apply_us, p.fsync_us,
+        p.maintain_us, p.residual_us(), p.completion_us);
 }
 
 /// Burn `us` microseconds of wall clock without I/O (the host-stall control's
@@ -770,14 +807,15 @@ fn window_stall_print(window_index: u64, c: ProcCounters, trim_us: u64, group_fs
         "window_stall window={window_index} minflt={} majflt={} rchar={} read_bytes={} \
          wchar={} write_bytes={} vol_csw={} invol_csw={} utime_ticks={} stime_ticks={} \
          trim_us={trim_us} group_fsync_us={group_fsync_us} maintain_us={maintain_us} \
-         stall_due_dispatch_us={} stall_append_us={} stall_apply_us={} stall_fsync_us={} \
-         stall_maintain_us={} stall_completion_us={} \
+         stall_due_dispatch_us={} stall_barrier_wait_us={} stall_append_us={} \
+         stall_apply_us={} stall_fsync_us={} \
+         stall_maintain_us={} stall_residual_us={} stall_completion_us={} \
          max_sleep_us={max_sleep_us} max_sleep_request_us={max_sleep_request_us} \
          max_latency_us={max_latency_us} max_lag_us={max_lag_us} max_group_us={max_group_us}",
         c.minflt, c.majflt, c.rchar, c.read_bytes, c.wchar, c.write_bytes,
         c.vol_csw, c.invol_csw, c.utime_ticks, c.stime_ticks,
-        stall.due_dispatch_us, stall.append_us, stall.apply_us, stall.fsync_us,
-        stall.maintain_us, stall.completion_us);
+        stall.due_dispatch_us, stall.barrier_wait_us, stall.append_us, stall.apply_us,
+        stall.fsync_us, stall.maintain_us, stall.residual_us(), stall.completion_us);
 }
 
 /// Record one dispatched group's per-request schedule-lag and service-latency
@@ -903,6 +941,7 @@ fn finalize_one_pending_group(
         append_us: completion.append_us,
         apply_us: group.apply_us,
         fsync_us: completion.fsync_us,
+        barrier_wait_us: completion.wait_us,
         maintain_us: 0,
         completion_us: group_us,
     };
@@ -1527,7 +1566,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // depending on what else is running, so a load run without a device baseline cannot be
     // interpreted: "saturation" may be the device, not the engine. Same session, same directory.
     let device = probe_device(&probe_dir(&args.target), 100);
-    let mut engine = open_target(&args.target, args.discover, args.key_encoding)?;
+    let wal_prealloc_bytes = args.wal_prealloc_bytes.unwrap_or(0);
+    let mut engine = open_target(&args.target, args.discover, args.key_encoding, wal_prealloc_bytes)?;
+    eprintln!("wal_prealloc_bytes={wal_prealloc_bytes}");
     // External policy control: apply the JSON policy file (CLI wins over the
     // `FLASHDB_POLICY_FILE` env var) before any work. A malformed file is a hard
     // error at start: the controller asked for a policy it did not get.
@@ -1995,6 +2036,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     append_us: phase.append_us,
                     apply_us: phase.apply_us,
                     fsync_us: phase.fsync_us,
+                    barrier_wait_us: 0,
                     maintain_us,
                     completion_us: group_us,
                 };

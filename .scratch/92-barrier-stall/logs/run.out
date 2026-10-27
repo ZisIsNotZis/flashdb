@@ -1,0 +1,15 @@
+loadavg 7.78 9.28 10.06 9/1121 261897
+snapshot=/home/z/vibe/flashdb/.scratch/82-controlled-m1/runs/snapshot/flashdb-declared
+trace=/home/z/vibe/flashdb/.scratch/82-controlled-m1/runs/b2/rung-200/trace.jsonl
+rate=200 blocks=5 window_ms=1000 group_requests=64 cap_mib=0 prealloc=16777216
++ block arm=on b=1 copy+run 2026-10-27T21:56:17+08:00
+wal_after len=16777216 blocks=32768
++ block arm=on b=2 copy+run 2026-10-27T21:56:41+08:00
+wal_after len=16777216 blocks=32768
++ block arm=on b=3 copy+run 2026-10-27T21:57:04+08:00
+wal_after len=16777216 blocks=32768
++ block arm=on b=4 copy+run 2026-10-27T21:57:28+08:00
+wal_after len=16777216 blocks=32768
++ block arm=on b=5 copy+run 2026-10-27T21:57:52+08:00
+wal_after len=16777216 blocks=32768
++ done 2026-10-27T21:58:16+08:00; summary /home/z/vibe/worktrees/flashdb/wp14-barrier-stall/.scratch/92-barrier-stall/logs/summary-nocap-on.out

@@ -944,6 +944,10 @@ struct WalAppendSyncJob {
     /// The worker `write_all`s these verbatim, so the on-disk framing is
     /// byte-identical to the synchronous path.
     frames: Vec<u8>,
+    /// The instant the pacer enqueued this job (WP-14). `started_at - submitted_at`
+    /// on the worker is the group's barrier queue wait: the time it spent behind
+    /// earlier jobs before its own append/`fdatasync` could begin.
+    submitted_at: Instant,
     /// Test-only: when armed, the worker appends the frames and then reports an
     /// `fdatasync` failure instead of calling the OS, so the fail-closed
     /// barrier path is exercisable deterministically. Compiled out of the
@@ -954,16 +958,18 @@ struct WalAppendSyncJob {
 
 impl WalAppendSyncJob {
     /// Append the buffered frames to the shared WAL handle, then `fdatasync`.
-    /// Returns `(result, append_us, fsync_us, appended_bytes)`. A failed append
-    /// returns `Err` without syncing (nothing was appended) and with
+    /// Returns `(result, append_us, fsync_us, appended_bytes, wait_us)`. A failed
+    /// append returns `Err` without syncing (nothing was appended) and with
     /// `appended_bytes == 0`; the injected test fault appends first and then
     /// fails the sync, so a complete-but-unacknowledged frame is recoverable —
-    /// exactly the synchronous path's prefix semantics.
-    fn run(self) -> (io::Result<()>, u64, u64, u64) {
+    /// exactly the synchronous path's prefix semantics. `wait_us` is measured
+    /// from job submission to the worker beginning this job.
+    fn run(self, started_at: Instant) -> (io::Result<()>, u64, u64, u64, u64) {
+        let wait_us = started_at.saturating_duration_since(self.submitted_at).as_micros() as u64;
         let append_t0 = Instant::now();
         if let Err(e) = (&self.handle).write_all(&self.frames) {
             let append_us = append_t0.elapsed().as_micros() as u64;
-            return (Err(e), append_us, 0, 0);
+            return (Err(e), append_us, 0, 0, wait_us);
         }
         let append_us = append_t0.elapsed().as_micros() as u64;
         let appended_bytes = self.frames.len() as u64;
@@ -971,13 +977,13 @@ impl WalAppendSyncJob {
         {
             if self.fail {
                 return (Err(io::Error::new(io::ErrorKind::Other, "injected overlapped WAL sync failure")),
-                    append_us, 0, appended_bytes);
+                    append_us, 0, appended_bytes, wait_us);
             }
         }
         let sync_t0 = Instant::now();
         let result = self.handle.sync_data();
         let fsync_us = sync_t0.elapsed().as_micros() as u64;
-        (result, append_us, fsync_us, appended_bytes)
+        (result, append_us, fsync_us, appended_bytes, wait_us)
     }
 }
 
@@ -991,6 +997,11 @@ struct BarrierResult {
     fsync_us: u64,
     /// The frame bytes the worker appended for this group.
     appended_bytes: u64,
+    /// The barrier's queue wait (us): from `submit_group` enqueueing the job to
+    /// the worker beginning it (WP-14). Together with `append_us`, `fsync_us`
+    /// and the driver's dispatch/apply terms this closes the group's latency
+    /// budget with no unexplained residual.
+    wait_us: u64,
     /// The wall-clock instant the `fdatasync` returned on the worker thread.
     completed_at: Instant,
 }
@@ -1004,6 +1015,9 @@ struct BarrierResult {
 pub struct BarrierCompletion {
     pub append_us: u64,
     pub fsync_us: u64,
+    /// From job submission to the worker starting the job (WP-14): the time the
+    /// barrier waited in the FIFO queue before its own append/`fdatasync`.
+    pub wait_us: u64,
     pub completed_at: Instant,
 }
 
@@ -1023,9 +1037,10 @@ impl BarrierWorker {
         let (result_tx, result_rx) = mpsc::channel::<BarrierResult>();
         std::thread::spawn(move || {
             for job in job_rx {
-                let (result, append_us, fsync_us, appended_bytes) = job.run();
+                let started_at = Instant::now();
+                let (result, append_us, fsync_us, appended_bytes, wait_us) = job.run(started_at);
                 let completed_at = Instant::now();
-                if result_tx.send(BarrierResult { result, append_us, fsync_us, appended_bytes, completed_at }).is_err() {
+                if result_tx.send(BarrierResult { result, append_us, fsync_us, appended_bytes, wait_us, completed_at }).is_err() {
                     break;
                 }
             }
@@ -1037,8 +1052,15 @@ impl BarrierWorker {
 impl Engine {
     /// 新建（空库）。
     pub fn create(wal_path: impl AsRef<Path>) -> io::Result<Engine> {
+        Self::create_with_prealloc(wal_path, 0)
+    }
+
+    /// [`Engine::create`] with the WAL preallocation switch (WP-14):
+    /// `prealloc_bytes == 0` is the default, off-by-default path; a non-zero
+    /// value reserves the WAL in whole real-allocated chunks.
+    pub fn create_with_prealloc(wal_path: impl AsRef<Path>, prealloc_bytes: u64) -> io::Result<Engine> {
         Ok(Engine {
-            wal: Wal::create(&wal_path)?,
+            wal: Wal::create_with_prealloc(&wal_path, prealloc_bytes)?,
             mt: Memtable::new(),
             tiles: Vec::new(),
             max_tiles: manifest::MAX_TILES,
@@ -1074,14 +1096,22 @@ impl Engine {
     /// Recover wholly from WAL under the default [`keys::KeyEncoding::FamilyFirst`];
     /// does not automatically discover tile candidates.
     pub fn open(wal_path: impl AsRef<Path>) -> io::Result<Engine> {
-        Self::open_impl(wal_path.as_ref(), Vec::new(), None, keys::KeyEncoding::FamilyFirst)
+        Self::open_impl(wal_path.as_ref(), Vec::new(), None, keys::KeyEncoding::FamilyFirst, 0)
     }
 
     /// [`Engine::open`] with an explicit key encoding. The WAL holds ops, not
     /// keys, so replay re-encodes them and must use the same spelling the data
     /// was written with; the encoding is not persisted.
     pub fn open_with_encoding(wal_path: impl AsRef<Path>, encoding: keys::KeyEncoding) -> io::Result<Engine> {
-        Self::open_impl(wal_path.as_ref(), Vec::new(), None, encoding)
+        Self::open_impl(wal_path.as_ref(), Vec::new(), None, encoding, 0)
+    }
+
+    /// [`Engine::open_with_encoding`] with the WAL preallocation switch: recovery
+    /// replays the existing WAL exactly as the default path, then reserves the
+    /// next chunk so subsequent appends fill preallocated space.
+    pub fn open_with_encoding_and_prealloc(wal_path: impl AsRef<Path>, encoding: keys::KeyEncoding,
+                                           prealloc_bytes: u64) -> io::Result<Engine> {
+        Self::open_impl(wal_path.as_ref(), Vec::new(), None, encoding, prealloc_bytes)
     }
 
     /// Explicit prototype recovery: a missing, corrupt or WAL-mismatched tile fails
@@ -1100,7 +1130,7 @@ impl Engine {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "tile path must be a plain filename inside the engine directory"));
         }
         let tile = Tile::open(tile_path)?;
-        Self::open_impl(wal_path.as_ref(), vec![TileHandle { tile: Arc::new(tile), name }], None, keys::KeyEncoding::FamilyFirst)
+        Self::open_impl(wal_path.as_ref(), vec![TileHandle { tile: Arc::new(tile), name }], None, keys::KeyEncoding::FamilyFirst, 0)
     }
 
     /// Durable-root recovery: select the highest valid manifest page in `dir`, open
@@ -1127,6 +1157,14 @@ impl Engine {
     /// [`keys::KeyEncoding::EntityFirst`]: replay re-encodes the ops, so the
     /// encoding is a recovery input, not a persisted fact (slice 50).
     pub fn open_discover_with_encoding(dir: impl AsRef<Path>, encoding: keys::KeyEncoding) -> io::Result<Engine> {
+        Self::open_discover_with_encoding_and_prealloc(dir, encoding, 0)
+    }
+
+    /// [`Engine::open_discover_with_encoding`] with the WAL preallocation switch:
+    /// the recovered suffix is replayed and truncated exactly as the default
+    /// path, then the live segment reserves its next chunk.
+    pub fn open_discover_with_encoding_and_prealloc(dir: impl AsRef<Path>, encoding: keys::KeyEncoding,
+                                                    prealloc_bytes: u64) -> io::Result<Engine> {
         let dir = dir.as_ref();
         let manifest = Manifest::open(&dir.join(manifest::MANIFEST_NAME))?;
         // The root names the live WAL segment once rotation has happened; before
@@ -1148,7 +1186,7 @@ impl Engine {
                 tiles.push(TileHandle { tile: Arc::new(opened), name: t.name.clone() });
             }
         }
-        let mut e = Self::open_impl(&dir.join(wal_name), tiles, segment.as_ref().map(|s| s.start_csn), encoding)?;
+        let mut e = Self::open_impl(&dir.join(wal_name), tiles, segment.as_ref().map(|s| s.start_csn), encoding, prealloc_bytes)?;
         if let Some(m) = &manifest {
             let cp = m.root().checkpoint;
             match &segment {
@@ -1183,7 +1221,8 @@ impl Engine {
     /// (their state is durable in the tiles) and cannot be re-verified against
     /// the suffix; tiles above the floor are verified against the above-floor
     /// suffix range exactly as in full replay.
-    fn open_impl(wal_path: &Path, tiles: Vec<TileHandle>, floor: Option<u64>, encoding: keys::KeyEncoding) -> io::Result<Engine> {
+    fn open_impl(wal_path: &Path, tiles: Vec<TileHandle>, floor: Option<u64>, encoding: keys::KeyEncoding,
+                 prealloc_bytes: u64) -> io::Result<Engine> {
         // The active list is ordered by `(cutoff, region)` strictly increasing.
         // A whole-keyspace tile spans every region, so for a legacy list the
         // region is constant per tile and this reduces to strictly increasing
@@ -1195,7 +1234,7 @@ impl Engine {
         }) {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "tile list is not strictly increasing by (cutoff, region)"));
         }
-        let (wal, records) = match Wal::open_or_recover(wal_path) {
+        let (wal, records) = match Wal::open_or_recover_with_prealloc(wal_path, prealloc_bytes) {
             Ok(opened) => opened,
             // A rotated directory no longer has `data.wal`; only `open_discover`
             // (which follows the manifest's segment reference) can open it.
@@ -1739,7 +1778,11 @@ impl Engine {
         // `ok` pattern, which made the Err arm dead code: the `?` still returned the
         // error but `wal_detached` was never set. Caught by a rustc unreachable-pattern
         // warning, not by a test - hence the warnings gate.)
-        let (wal, records) = match Wal::open_or_recover(&path) {
+        // Preserve the preallocation switch across the rebind: rotation opens a
+        // born-empty segment, and with the switch on it must reserve like the
+        // segment it replaces (off is the default and is a no-op here).
+        let prealloc_bytes = self.wal.prealloc_bytes();
+        let (wal, records) = match Wal::open_or_recover_with_prealloc(&path, prealloc_bytes) {
             Ok(recovered) => recovered,
             Err(e) => {
                 self.wal_detached = true;
@@ -3549,9 +3592,16 @@ impl Engine {
         let handle = self.wal.sync_handle()?;
         let worker = self.barrier_worker.get_or_insert_with(BarrierWorker::spawn);
         let frames = std::mem::take(&mut self.group_frames);
+        // Reserve room before the worker may write these frames, so with
+        // preallocation on a group never straddles an allocation boundary.
+        if let Err(e) = self.wal.reserve_for_group(frames.len() as u64) {
+            self.wal.poison();
+            return Err(e);
+        }
         let job = WalAppendSyncJob {
             handle,
             frames,
+            submitted_at: Instant::now(),
             #[cfg(test)]
             fail: self.wal.take_barrier_error(),
         };
@@ -3631,7 +3681,7 @@ impl Engine {
                 // Every `valid_len` consumer already runs with no barrier in
                 // flight, so it never needs the bytes of a still-pending group.
                 self.wal.record_appended(result.appended_bytes);
-                Ok(BarrierCompletion { append_us: result.append_us, fsync_us: result.fsync_us, completed_at: result.completed_at })
+                Ok(BarrierCompletion { append_us: result.append_us, fsync_us: result.fsync_us, wait_us: result.wait_us, completed_at: result.completed_at })
             }
             Err(e) => {
                 self.wal.poison();
@@ -4747,6 +4797,71 @@ mod tests {
         assert!(e.end_group().is_err(), "end_group refuses a barrier in flight");
 
         assert!(e.wait_group_barrier().is_ok(), "the overlapped barrier still completes");
+        remove(&p);
+    }
+
+    /// WP-14: a submitted barrier carries its queue wait (enqueue -> worker
+    /// start) plus its own append/`fdatasync` times, and those never exceed the
+    /// wall time the completion took. Queued jobs report a wait too, so the
+    /// driver can split a stall into queue wait / append / fsync instead of an
+    /// unexplained residual.
+    #[test]
+    fn barrier_completion_reports_queue_wait() {
+        let p = tmp("barrier_wait.wal");
+        let mut e = Engine::create(&p).unwrap();
+        let t0 = Instant::now();
+        for i in 0..4u64 {
+            e.begin_group_deferred().unwrap();
+            e.commit_block_grouped(format!("g{i}").as_bytes(),
+                &[Op::PutDoc { entity: b"E".to_vec(), handle: i + 1, doc: b"d".to_vec() }]).unwrap();
+            assert!(e.submit_group().unwrap());
+        }
+        for _ in 0..4 {
+            let c = e.wait_group_barrier().unwrap();
+            let elapsed = t0.elapsed().as_micros() as u64;
+            assert!(c.completed_at >= t0, "completion instant is measured on the worker");
+            assert!(c.wait_us <= elapsed, "wait {} cannot exceed elapsed {}", c.wait_us, elapsed);
+            assert!(c.append_us <= elapsed);
+            assert!(c.fsync_us <= elapsed);
+        }
+        assert_eq!(e.pending_barriers(), 0);
+        remove(&p);
+    }
+
+    /// WP-14: with the preallocation switch on at the `Wal` construction site,
+    /// the engine's WAL is really allocated in whole chunks, every committed
+    /// block survives recovery exactly, and the recovered file's zero tail is
+    /// truncated back to the valid data length.
+    #[test]
+    fn prealloc_engine_appends_in_chunks_and_recovers_exactly() {
+        const CHUNK: u64 = 64 * 1024;
+        let p = tmp("engine_prealloc.wal");
+        let mut e = Engine::create_with_prealloc(&p, CHUNK).unwrap();
+        let docs: Vec<Vec<u8>> = (0..200u64).map(|i| format!("doc-{i}").into_bytes()).collect();
+        for (i, doc) in docs.iter().enumerate() {
+            e.commit_block(format!("b{i}").as_bytes(),
+                &[Op::PutDoc { entity: b"E".to_vec(), handle: i as u64 + 1, doc: doc.clone() }]).unwrap();
+        }
+        let valid = e.wal_valid_len();
+        let len = p.metadata().unwrap().len();
+        assert_eq!(len % CHUNK, 0, "the file grows in whole preallocated chunks: len={len}");
+        assert!(len > valid, "the preallocated zero tail is present: len={len} valid={valid}");
+        drop(e);
+        // Default recovery (switch off) still replays exactly the appended blocks
+        // and truncates the zero tail.
+        let e = Engine::open(&p).unwrap();
+        assert_eq!(e.csn(), docs.len() as u64, "every committed block replayed");
+        for (i, doc) in docs.iter().enumerate() {
+            assert_eq!(e.get(b"E", i as u64 + 1).unwrap().as_deref(), Some(doc.as_slice()));
+        }
+        drop(e);
+        assert_eq!(p.metadata().unwrap().len(), valid, "the zero tail is truncated on recovery");
+        // Reopening with the switch on reserves the next chunk and keeps working.
+        let mut e = Engine::open_with_encoding_and_prealloc(&p, keys::KeyEncoding::FamilyFirst, CHUNK).unwrap();
+        assert!(p.metadata().unwrap().len() > valid);
+        e.commit_block(b"after",
+            &[Op::PutDoc { entity: b"E".to_vec(), handle: 9999, doc: b"after".to_vec() }]).unwrap();
+        assert_eq!(e.get(b"E", 9999).unwrap().as_deref(), Some(b"after".as_slice()));
         remove(&p);
     }
 
