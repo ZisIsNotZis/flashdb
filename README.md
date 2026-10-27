@@ -196,10 +196,11 @@ Reference target: one NVMe and data:RAM ≥20:1 in a cgroup-limited experiment (
 - **M6 — the pre-registered 10-seed verdict and publication.** T1-T4 at 10 independent seeds on the
   ≥10x instance with the thresholds exactly as pre-registered, reviewed independently and published
   whatever it says.
-- Box-free work that can run under load in the meantime: the per-group phase timer already exists and
-  splits the stall into append/apply/fsync; the open work is the missing **barrier queue-wait**
-  timestamp and the WAL-preallocation verdict (WP-14), and the postgres leg's move onto the surviving
-  18.6 cluster (WP-15).
+- Box-free work completed under load: the per-group timer now carries the **barrier queue wait**, so
+the ~0.5 s stall splits with no residual; it is a FIFO of slow device `fdatasync`s amplified by one
+barrier per request, and WAL preallocation was tested and **rejected** as its cause. The postgres leg
+now runs on the surviving 18.6 cluster. The next code lever is the barrier count (grouping), which
+must apply the same group cap to every arm or it breaks equal durability.
 - Explicitly **not** planned: general L2 co-location, multi-node operation, and a query language wider
   than the one committed block graph — each is a decision in `docs/0_ROADMAP.md`, not a backlog item.
 
