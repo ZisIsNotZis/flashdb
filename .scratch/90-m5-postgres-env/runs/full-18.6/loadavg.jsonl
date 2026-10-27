@@ -1,0 +1,5 @@
+{"phase": "prepare-before", "at": "2026-10-27T21:50:16+08:00", "loadavg": "9.96 12.92 11.12", "nproc": 8}
+{"phase": "prepare-after", "at": "2026-10-27T21:50:17+08:00", "loadavg": "9.96 12.92 11.12", "nproc": 8}
+{"phase": "full-postgres-before", "at": "2026-10-27T21:50:17+08:00", "loadavg": "9.96 12.92 11.12", "nproc": 8}
+{"phase": "full-postgres-after", "at": "2026-10-27T21:50:22+08:00", "loadavg": "9.40 12.75 11.08", "nproc": 8}
+{"phase": "done", "at": "2026-10-27T21:50:23+08:00", "loadavg": "9.40 12.75 11.08", "nproc": 8}

@@ -5,6 +5,66 @@ ticket is the environment read with its moment and method, the one command that 
 M5 server, the setup/connection/migration proof taken through it, and the exact place the quiet window
 still stops the work. No throughput number is measured or claimed here.
 
+## WP-15 (2026-10-27) — the server is the M1 user-space 18.6, not the vanished container
+
+**Current fact, read 2026-10-27T21:37 +08 on `z`, user `z`:** `docker version` is 29.9.1 but
+`docker ps -a` and `docker images` are both empty; `pull-postgres18.sh` fails with an i/o timeout to
+Docker Hub (rc=1, `logs/pull-postgres18-20261027.out`, mirror list `[]`). The M1 record's user-space
+extraction survives at `/var/tmp/m1-pg/`: the `postgresql-18 18.6-3build2`, `postgresql-client-18`,
+`postgresql-common` and `libpq5` debs under `debs/`, the extracted tree under `root/`, the cluster
+under `data/`. It is started by `scripts/baseline-env.sh`, which now defaults to that root
+(`M1_PG_ROOT=/var/tmp/m1-pg`, `M1_PG_PORT=55432`) and has a `check` action that reads the version and
+the M1 record's settings block back from the running server. The container script
+`.scratch/90-m5-postgres-env/postgres-server.sh` is superseded (its header says so), as is
+`smoke-migration.sh` (it drove that container; the current setup/serve/oracle proof is `run.sh`);
+the 16.15 section below is the historical record of that route.
+
+What changed in the chain:
+
+- `scripts/baseline-env.sh`: the header states the present route and that Docker is not a dependency;
+  the default root is the M1 extraction (`/var/tmp/m1-pg`), port 55432; `SETTINGS` is the one home of
+  the M1 block, rendered by `write_config` and compared by `check`; `check` refuses any setting that
+  differs and a `M1_PG_REQUIRE` version that does not match, naming each difference. `download`
+  follows a symlinked `debs/` (`find -L`), which is what lets an override root reuse the extraction
+  offline instead of reaching for apt.
+- `scripts/m1-baseline-run.sh`: the postgres branch no longer calls Docker. It stops any earlier
+  server through `baseline-env.sh stop`, starts the cluster inside its own `systemd-run` scope (so the
+  128 MiB cap covers the server and the client stays outside), calls `baseline-env.sh check`, writes
+  `server_version`/`version`/`data_directory` into `postgres-server.jsonl` from that read-back, and
+  stops through the same `baseline-env.sh stop` in a trap. `restore_arm` stops the server and prints
+  `stopped: data=...` before the snapshot is written. `M1_PG_ROOT` defaults to `/var/tmp/m1-pg`,
+  `M1_PG_PORT` to 55432, and `M1_PG_REQUIRE` to **18.6** (override it to claim another version).
+- `scripts/m1-ladder-run.sh` and `scripts/m1-controlled-run.sh` already build their clusters through
+  `baseline-env.sh`; they call the fixed `m1-baseline-run.sh`, so no container path remains.
+
+Evidence (loadavg is line 1 of every log; `run.sh` produces every row except the override root,
+whose command is in the row):
+
+| what | command | result | log |
+|---|---|---|---|
+| matching check | `baseline-env.sh check` | version `18.6 (Ubuntu 18.6-3build2)`, every setting matches, rc=0 | `logs/check-18.6.out` |
+| version mismatch | `M1_PG_REQUIRE=16.15 baseline-env.sh check` | `version mismatch: the server reports "18.6 (Ubuntu 18.6-3build2)", M1_PG_REQUIRE="16.15"`, rc=1 | `logs/check-version-mismatch.out` |
+| setting mismatch | `PGOPTIONS='-c work_mem=8MB' baseline-env.sh check` | `mismatch: work_mem reported "8MB", the M1 record says "4MB"`, rc=1 | `logs/check-setting-mismatch.out` |
+| one-command arm | `m1-baseline-run.sh --mode full --arms postgres --requests 200 --rate 50 --skip-build --workdir runs/full-18.6` | check passes, oracle PASS, rc=0 | `logs/arm-18.6-full.out` |
+| snapshot | `--mode instance ... --snapshot-dir .../snapshot --instance-root .../live` | 65,970,999 B, 1,298 files, sha256 in `snapshot/postgres.json` | `logs/chain-18.6-instance.out` |
+| restored arm | `--mode arm ...` | `stopped: data=/var/tmp/m1-pg/data`, `restore postgres: ... (sha256 verified)`, check, oracle PASS, rc=0 | `logs/chain-18.6-arm-restored.out` |
+| runner refusals | same arm with `M1_PG_REQUIRE=16.15` / `PGOPTIONS='-c work_mem=8MB'` | named difference, rc=1, no arm run | `logs/chain-18.6-require-mismatch.out`, `logs/chain-18.6-setting-mismatch.out` |
+| override root | a root whose `root/` and `debs/` are symlinks to `/var/tmp/m1-pg`, port 55433: `setup`, `start`, `check`, `stop` | offline setup from the symlinked debs, check passes, rc=0 | `logs/override-root.out` |
+
+The arm record's `postgres_settings.server_version` is `18.6 (Ubuntu 18.6-3build2)` and
+`postgres-server.jsonl` carries the same value with `settings_checked: true`; the restored record's
+`restore.verified` is `true` and its `sha256` equals the snapshot digest. Full records are under
+`runs/full-18.6/` and `runs/chain-18.6/` (the 66 MB snapshot and trace are regenerable and
+`runs/.gitignore` keeps them out of git).
+
+**This is a chain check, not a rate.** The logs start at loadavg 9.6-11.0 (1-minute), far above the
+quiet-window trigger of under 2, so the 200-request / 50 rps row is a window rule and no throughput
+number is claimed; the three-arm comparison still waits for the granted window.
+
+Still unverified: the three-arm comparison and any rate (quiet window unmet), and the same chain
+against a different extracted major version (none is installed; `M1_PG_REQUIRE` is what would refuse
+it). The 2026-10-23 sections below remain the record of the container route and the 16.15 reading.
+
 ## What is true at the moment it was read
 
 All reads 2026-10-23 between 20:10 and 20:24 +08:00, on `z3`, user `z`. Log:

@@ -1,0 +1,53 @@
+{
+  "argv": [
+    "baseline_0b.py",
+    "prepare",
+    "--workdir",
+    "/home/z/vibe/worktrees/flashdb/wp15-postgres-leg/.scratch/90-m5-postgres-env/runs/chain-18.6",
+    "--seed",
+    "42",
+    "--requests",
+    "200",
+    "--rate",
+    "50",
+    "--customers",
+    "200",
+    "--skus",
+    "500",
+    "--locs",
+    "4",
+    "--batch",
+    "64",
+    "--on-hand",
+    "1000000"
+  ],
+  "batch": 64,
+  "lag_ceiling_us": 10000,
+  "on_hand": 1000000,
+  "order_flow_requests": 143,
+  "runner": {
+    "argv": "/home/z/vibe/worktrees/flashdb/wp15-postgres-leg/scripts/m1-baseline-run.sh --mode arm --arms postgres --requests 200 --rate 50 --skip-build --workdir /home/z/vibe/worktrees/flashdb/wp15-postgres-leg/.scratch/90-m5-postgres-env/runs/chain-18.6 --snapshot-dir /home/z/vibe/worktrees/flashdb/wp15-postgres-leg/.scratch/90-m5-postgres-env/runs/chain-18.6/snapshot --instance-root /home/z/vibe/worktrees/flashdb/wp15-postgres-leg/.scratch/90-m5-postgres-env/runs/chain-18.6/live ",
+    "cwd": "/home/z/vibe/worktrees/flashdb/wp15-postgres-leg",
+    "engine_cap_mib": 128,
+    "instance_root": "/home/z/vibe/worktrees/flashdb/wp15-postgres-leg/.scratch/90-m5-postgres-env/runs/chain-18.6/live",
+    "lock": "/tmp/m1-measure.lock",
+    "lock_held_by_caller": false,
+    "mode": "arm",
+    "postgres_database": "m1-controlled",
+    "postgres_port": 55432,
+    "postgres_require": "18.6",
+    "postgres_root": "/var/tmp/m1-pg",
+    "seed_cap_mib": 192,
+    "snapshot_dir": "/home/z/vibe/worktrees/flashdb/wp15-postgres-leg/.scratch/90-m5-postgres-env/runs/chain-18.6/snapshot"
+  },
+  "schema": "flashdb.baseline.run-spec.v1",
+  "seed_trace": {
+    "blocks": 3,
+    "bytes": 283505,
+    "method": "generate",
+    "sha256": "335d1ffb972e887fe7b33259f7115b47f4e7595e3962a24851f423e1fabddf9c",
+    "source": "regenerated from the manifest's own seed and dimensions"
+  },
+  "trace_sha256": "99afa54ecf2caea95467fa52fcb4463ab07cd8c424d7605e93ca477accc58946",
+  "window_ms": 1000
+}

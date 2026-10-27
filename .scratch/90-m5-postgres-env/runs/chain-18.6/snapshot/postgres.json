@@ -1,0 +1,12 @@
+{
+  "arm": "postgres",
+  "at": "2026-10-27T21:50:33",
+  "bytes": 65979191,
+  "files": 1298,
+  "live_path": "/var/tmp/m1-pg/data",
+  "schema": "flashdb.baseline.instance-snapshot.v1",
+  "sha256": "9874ab1a0c455d65e2876a9f90734832f665df1a8d60410c0333d71b69a89da4",
+  "snapshot_path": "/home/z/vibe/worktrees/flashdb/wp15-postgres-leg/.scratch/90-m5-postgres-env/runs/chain-18.6/snapshot/postgres",
+  "snapshot_s": 1.036,
+  "source": "the pre-load state built by `build-instance` (seeded; no request served)"
+}

@@ -1,0 +1,15 @@
+# Regenerable state of the WP-15 postgres chain check: the trace, the seed and the 66 MB snapshot
+# come back from `spec.json`/`manifest.json` plus the harness's seed, so they are not committed. The
+# evidence IS committed: manifest.json, spec.json, loadavg.jsonl, machine-state.jsonl,
+# windows-postgres.jsonl, run-postgres.json, run-postgres-full.json, instance-build.json,
+# postgres-server.jsonl, pg-server.log, pg-server-peak.json, scoreboard.md and snapshot/*.json
+# (the digest and its size).
+trace.jsonl
+seed.jsonl
+**/snapshot/*
+!**/snapshot/*.json
+**/live/
+**/pg/
+*.db
+*.db-wal
+*.db-shm

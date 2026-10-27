@@ -1,4 +1,11 @@
 #!/usr/bin/env bash
+# SUPERSEDED 2026-10-27 (WP-15) — historical record only, do not use it to start a server.
+# The box has no Docker containers and no images, and `pull-postgres18.sh` times out against Docker
+# Hub (docs/0_ROADMAP.md §Known blockers). The M5 postgres arm's server is now
+# `scripts/baseline-env.sh`'s user-space 18.6 cluster at M1_PG_ROOT=/var/tmp/m1-pg, and that script's
+# `check` action replaced this one's. This file stays as the record of the 16.15 container chain
+# check (logs/arm-16.15-chain-203101.out) and of how that route was wired.
+#
 # The M5 postgres leg's server: a container from an image already on this box or pulled from the
 # configured registry mirror. No system package is installed; `apt-get download` is not used here.
 #
