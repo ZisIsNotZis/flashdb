@@ -1,0 +1,12 @@
+{
+  "arm": "sqlite",
+  "at": "2026-10-17T20:51:44",
+  "bytes": 541876224,
+  "files": 1,
+  "live_path": "/home/z/vibe/flashdb/.scratch/82-controlled-m1/runs/live/sqlite.db",
+  "schema": "flashdb.baseline.instance-snapshot.v1",
+  "sha256": "46c6f1e1e2a149f8e55bb4f29a39b2ca57a53d1a50daa0ae5a3e30c2d4367130",
+  "snapshot_path": "/home/z/vibe/flashdb/.scratch/82-controlled-m1/runs/snapshot/sqlite.db",
+  "snapshot_s": 1.74,
+  "source": "the pre-load state built by `build-instance` (seeded; no request served)"
+}

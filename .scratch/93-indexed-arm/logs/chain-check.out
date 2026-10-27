@@ -1,0 +1,79 @@
+# loadavg: 2.91 5.93 8.27 at 2026-10-27T22:28:59+08:00
++ M1_SNAPSHOT=/home/z/vibe/flashdb/.scratch/82-controlled-m1/runs/snapshot M1_SOURCE=/home/z/vibe/flashdb/.scratch/80-external-baselines/runs/m1-10x/rung-50 bash .scratch/93-indexed-arm/run.sh chain
+warning: `VIRTUAL_ENV=/home/z/.venv` does not match the project environment path `.venv` and will be ignored; use `--active` to target the active environment instead
+warning: `VIRTUAL_ENV=/home/z/.venv` does not match the project environment path `.venv` and will be ignored; use `--active` to target the active environment instead
+machine-state floor-before-before: loadavg=2.84 epp=performance freq_khz=3598483,3599281,3599596,3599998,3600010,3600036,3600085,3600100
+warning: `VIRTUAL_ENV=/home/z/.venv` does not match the project environment path `.venv` and will be ignored; use `--active` to target the active environment instead
+floor idle: lag p99 1769 us, service p99 1772 us, rejected 0/5 windows, achieved 50.0 rps
+floor fsync: lag p99 278 us, service p99 11537 us, rejected 0/5 windows, achieved 50.0 rps
+warning: `VIRTUAL_ENV=/home/z/.venv` does not match the project environment path `.venv` and will be ignored; use `--active` to target the active environment instead
+machine-state floor-before-after: loadavg=2.62 epp=performance freq_khz=3596536,3599939,3599974,3600000,3600009,3600073,3600076,3600595
+m1-controlled-run: artefacts in /home/z/vibe/worktrees/flashdb/wp16-indexed-arm/.scratch/93-indexed-arm/runs/chain
+m1-baseline-run: using the caller's /tmp/m1-measure.lock (held for the whole measured phase)
+warning: `VIRTUAL_ENV=/home/z/.venv` does not match the project environment path `.venv` and will be ignored; use `--active` to target the active environment instead
+machine-state before: loadavg=2.62 epp=performance freq_khz=3596174,3599976,3599990,3600007,3600368,3600423,3600428,3604518
+warning: `VIRTUAL_ENV=/home/z/.venv` does not match the project environment path `.venv` and will be ignored; use `--active` to target the active environment instead
+restore flashdb-declared: 1683012213 bytes from /home/z/vibe/flashdb/.scratch/82-controlled-m1/runs/snapshot/flashdb-declared (sha256 verified, 5.1 s)
+warning: `VIRTUAL_ENV=/home/z/.venv` does not match the project environment path `.venv` and will be ignored; use `--active` to target the active environment instead
+flashdb-declared: oracle DEFERRED; sustained=True highest=50 rps rejected_windows=0 serving_peak=63799296 cap_mib=128 sha256=13404d21548b5acbf9d95ef171e961f4e731fa30c202b44cad338b5a3b84bed0
+flashdb read-back DEFERRED (--skip-verify): see the run record
+warning: `VIRTUAL_ENV=/home/z/.venv` does not match the project environment path `.venv` and will be ignored; use `--active` to target the active environment instead
+machine-state after: loadavg=2.71 epp=performance freq_khz=3598259,3599906,3599979,3599984,3600027,3600245,3600668,3601372
+m1-baseline-run: mode arm, artefacts in /home/z/vibe/worktrees/flashdb/wp16-indexed-arm/.scratch/93-indexed-arm/runs/chain/b1/rung-50
+m1-baseline-run: using the caller's /tmp/m1-measure.lock (held for the whole measured phase)
+warning: `VIRTUAL_ENV=/home/z/.venv` does not match the project environment path `.venv` and will be ignored; use `--active` to target the active environment instead
+machine-state before: loadavg=2.71 epp=performance freq_khz=3598753,3599896,3600002,3600010,3600382,3601115,3601768,3602961
+warning: `VIRTUAL_ENV=/home/z/.venv` does not match the project environment path `.venv` and will be ignored; use `--active` to target the active environment instead
+restore flashdb-indexed: 1683012213 bytes from /home/z/vibe/flashdb/.scratch/82-controlled-m1/runs/snapshot/flashdb-declared (sha256 verified, 4.6 s)
+warning: `VIRTUAL_ENV=/home/z/.venv` does not match the project environment path `.venv` and will be ignored; use `--active` to target the active environment instead
+flashdb-indexed: oracle DEFERRED; sustained=True highest=50 rps rejected_windows=0 serving_peak=63967232 cap_mib=128 sha256=13404d21548b5acbf9d95ef171e961f4e731fa30c202b44cad338b5a3b84bed0
+flashdb read-back DEFERRED (--skip-verify): see the run record
+warning: `VIRTUAL_ENV=/home/z/.venv` does not match the project environment path `.venv` and will be ignored; use `--active` to target the active environment instead
+machine-state after: loadavg=2.59 epp=performance freq_khz=3599927,3599988,3599989,3600001,3600026,3600040,3600099,3600109
+m1-baseline-run: mode arm, artefacts in /home/z/vibe/worktrees/flashdb/wp16-indexed-arm/.scratch/93-indexed-arm/runs/chain/b1/rung-50
+m1-baseline-run: using the caller's /tmp/m1-measure.lock (held for the whole measured phase)
+warning: `VIRTUAL_ENV=/home/z/.venv` does not match the project environment path `.venv` and will be ignored; use `--active` to target the active environment instead
+machine-state before: loadavg=2.59 epp=performance freq_khz=3599997,3600001,3600005,3600006,3600017,3600129,3600255,3600521
+warning: `VIRTUAL_ENV=/home/z/.venv` does not match the project environment path `.venv` and will be ignored; use `--active` to target the active environment instead
+restore sqlite: 541876224 bytes from /home/z/vibe/flashdb/.scratch/82-controlled-m1/runs/snapshot/sqlite.db (sha256 verified, 1.6 s)
+warning: `VIRTUAL_ENV=/home/z/.venv` does not match the project environment path `.venv` and will be ignored; use `--active` to target the active environment instead
+sqlite: oracle PASS; sustained=True highest=50 rps rejected_windows=0 serving_peak=27430912 cap_mib=128 sha256=13404d21548b5acbf9d95ef171e961f4e731fa30c202b44cad338b5a3b84bed0
+warning: `VIRTUAL_ENV=/home/z/.venv` does not match the project environment path `.venv` and will be ignored; use `--active` to target the active environment instead
+machine-state after: loadavg=2.06 epp=performance freq_khz=3599981,3599998,3600009,3600110,3600242,3600387,3601986
+m1-baseline-run: mode arm, artefacts in /home/z/vibe/worktrees/flashdb/wp16-indexed-arm/.scratch/93-indexed-arm/runs/chain/b1/rung-50
+m1-baseline-run: using the caller's /tmp/m1-measure.lock (held for the whole measured phase)
+warning: `VIRTUAL_ENV=/home/z/.venv` does not match the project environment path `.venv` and will be ignored; use `--active` to target the active environment instead
+machine-state before: loadavg=2.06 epp=performance freq_khz=3598856,3599966,3600006,3600017,3600021,3600155,3601573,3603136
+stopped: data=/home/z/vibe/worktrees/flashdb/wp16-indexed-arm/.scratch/93-indexed-arm/runs/chain/pg/data
+warning: `VIRTUAL_ENV=/home/z/.venv` does not match the project environment path `.venv` and will be ignored; use `--active` to target the active environment instead
+restore postgres: 2201362806 bytes from /home/z/vibe/flashdb/.scratch/82-controlled-m1/runs/snapshot/postgres (sha256 verified, 8.0 s)
+# read at 2026-10-27T22:30:22+08:00 on z, user z from the running server at /home/z/vibe/worktrees/flashdb/wp16-indexed-arm/.scratch/93-indexed-arm/runs/chain/pg/socket:55432
+# method: /home/z/vibe/worktrees/flashdb/wp16-indexed-arm/.scratch/93-indexed-arm/runs/chain/pg/root/usr/lib/postgresql/18/bin/psql -h /home/z/vibe/worktrees/flashdb/wp16-indexed-arm/.scratch/93-indexed-arm/runs/chain/pg/socket -p 55432 -tAc 'select version()' / 'show <name>'
+version: PostgreSQL 18.6 (Ubuntu 18.6-3build2) on x86_64-pc-linux-gnu, compiled by x86_64-linux-gnu-gcc (Ubuntu 15.3.0-3ubuntu1) 15.3.0, 64-bit
+server_version: 18.6 (Ubuntu 18.6-3build2)
+data_directory: /home/z/vibe/worktrees/flashdb/wp16-indexed-arm/.scratch/93-indexed-arm/runs/chain/pg/data
+setting: shared_buffers = 16MB
+setting: max_connections = 32
+setting: work_mem = 4MB
+setting: maintenance_work_mem = 16MB
+setting: fsync = on
+setting: synchronous_commit = on
+setting: wal_level = minimal
+setting: max_wal_senders = 0
+checked: version and every setting above match the M1 record's block
+warning: `VIRTUAL_ENV=/home/z/.venv` does not match the project environment path `.venv` and will be ignored; use `--active` to target the active environment instead
+postgres: oracle PASS; sustained=True highest=50 rps rejected_windows=0 serving_peak=26865664 cap_mib=128 sha256=13404d21548b5acbf9d95ef171e961f4e731fa30c202b44cad338b5a3b84bed0
+warning: `VIRTUAL_ENV=/home/z/.venv` does not match the project environment path `.venv` and will be ignored; use `--active` to target the active environment instead
+machine-state after: loadavg=1.85 epp=performance freq_khz=3599932,3599964,3599997,3600005,3600012,3600031,3600390,3600659
+m1-baseline-run: mode arm, artefacts in /home/z/vibe/worktrees/flashdb/wp16-indexed-arm/.scratch/93-indexed-arm/runs/chain/b1/rung-50
+warning: `VIRTUAL_ENV=/home/z/.venv` does not match the project environment path `.venv` and will be ignored; use `--active` to target the active environment instead
+machine-state floor-after-before: loadavg=1.85 epp=performance freq_khz=3598204,3598910,3599247,3599979,3599981,3600002,3600218,3601494
+warning: `VIRTUAL_ENV=/home/z/.venv` does not match the project environment path `.venv` and will be ignored; use `--active` to target the active environment instead
+floor idle: lag p99 315 us, service p99 317 us, rejected 0/5 windows, achieved 50.0 rps
+floor fsync: lag p99 323 us, service p99 11991 us, rejected 0/5 windows, achieved 50.0 rps
+warning: `VIRTUAL_ENV=/home/z/.venv` does not match the project environment path `.venv` and will be ignored; use `--active` to target the active environment instead
+machine-state floor-after-after: loadavg=1.72 epp=performance freq_khz=3599798,3599985,3599989,3599999,3600011,3600020,3600050,3600120
+m1-controlled-run: artefacts in /home/z/vibe/worktrees/flashdb/wp16-indexed-arm/.scratch/93-indexed-arm/runs/chain
+93: chain artefacts in .scratch/93-indexed-arm/runs/chain (no rate claimed; score step not run)
+CHAIN_RC=0
+# loadavg at end: 1.72 4.43 7.41 at 2026-10-27T22:31:08+08:00
