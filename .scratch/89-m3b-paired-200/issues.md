@@ -136,3 +136,110 @@ evidence** — the arms were taken above the trigger, which is the measured cost
 
 **Clause (b) is still `unmeasured`.** One command away, unchanged:
 `SNAP_RECORD=.scratch/89-m3b-paired-200/instance-record.json bash .scratch/89-m3b-paired-200/paired-200.sh --wait-min 55`.
+
+## WP-17 — the harvest rule: a lost trigger keeps the pairs it completed
+
+The defect WP-17 repairs is not the gate, which is right to refuse an arm above 2.0: it is what the
+gate did to evidence already taken. On 2026-10-27 the trigger held for one minute, the first pair ran
+inside it (p1 declared start 0.88, p1 indexed start 1.63, both `errors=0`), the box then carried
+2.15-6.75, and the old `refuse_run` moved **every** block of the invocation — the completed pair with
+the refused ones — into `runs/invalid-2026-10-27/`. A rare window's one complete pair was thrown away
+because a later arm was refused.
+
+### The rule now
+
+A pair is **complete valid evidence** only when all four hold:
+
+1. both `pN-declared.out` and `pN-indexed.out` exist;
+2. each arm's `# loadavg at start:` reading is **below 2.0** (the granted trigger);
+3. each arm's window JSON / `load_summary` reports **`errors=0`**;
+4. the restore was verified before the arm — the script compares the copy's tree digest and byte
+   total against the snapshot record, and writes `# restore: verified sha256=… bytes=…` into the
+   arm's header.
+
+A later trigger loss moves **only the pairs that fail the rule** to `runs/invalid-<stamp>/`, each
+prefixed `# INVALID - do not cite:`, and leaves every earlier valid pair in `runs/`. The manifest
+`runs/pairs.json` then names, per pair, the two arms' start loadavgs, `errors`, restore state and
+valid/invalid with the reason.
+
+**Why the completed pair is evidence and the partial one is not.** A pair is one controlled
+comparison: the same frozen trace and the same snapshotted instance, one arm declared and one indexed,
+one process at a time. When both arms started under the trigger, the difference between them is
+`--policy-file` and the reading is about the index. A half-pair has only one arm, so the comparison
+does not exist; a pair with one arm started above 2.0 measures the load in that arm. Neither can be
+added to a later invocation's arms and called a pair, which is why the invalid files leave the
+scorer's `p*-*.out` glob instead of being annotated in place.
+
+**One pair is still not the clause.** Keep the pre-registered unit: `score-pair.py` counts only
+complete valid pairs, prints `partial: N/5` and returns 3 for N < 5, and can return 0/1 only at 5.
+The vacuous `0 >= 0` refusal is unchanged.
+
+### Resume: the next invocation continues, never overwrites
+
+Resume is the **default**; `--resume` says so explicitly and `--fresh` refuses when any pair files
+already exist (no silent overwrite). On start the script finds the highest contiguous valid pair and
+sets `START_PAIR` to the next number. Stale files at or above it (a crash mid-pair, or a refusal from
+an earlier invocation) are quarantined with the INVALID marker before anything runs, so a pair number
+is never reused. If valid pairs are non-contiguous the script stops with exit 3 rather than score a
+mixture. When the target already holds five valid pairs, a re-run runs no arm and goes straight to
+scoring — it does not need a quiet window.
+
+### Exit codes
+
+0 met · 1 falsified · 3 cannot decide / preflight / non-contiguous series · 4 the trigger was lost
+(gate unmet, or an arm's recorded start loadavg was already ≥ 2.0) · 5 a restore did not verify ·
+6 an arm completed but is inadmissible (`errors>0`).
+The scorer uses 0/1/3 only; `--arm-facts`, `--pair-valid` and `--manifest` are its machine-readable
+modes, and all three read the same parser as the verdict.
+
+### Commands
+
+```bash
+# the real pair; resumes by default at the next pair after the valid ones
+SNAP_RECORD=.scratch/89-m3b-paired-200/instance-record.json \
+  bash .scratch/89-m3b-paired-200/paired-200.sh --wait-min 55
+# or say resume explicitly / refuse to touch existing pairs
+bash .scratch/89-m3b-paired-200/paired-200.sh --resume --wait-min 55
+bash .scratch/89-m3b-paired-200/paired-200.sh --fresh  --wait-min 55
+# score what is on disk; partial: N/5 and exit 3 below five valid pairs
+python3 .scratch/89-m3b-paired-200/score-pair.py .scratch/89-m3b-paired-200/runs
+# (re)write the manifest
+python3 .scratch/89-m3b-paired-200/score-pair.py --manifest .scratch/89-m3b-paired-200/runs
+
+# the fixture test: no box, no real pair, no engine
+bash .scratch/89-m3b-paired-200/fixtures/test-pair-harvest.sh
+```
+
+### Fixture evidence
+
+`bash .scratch/89-m3b-paired-200/fixtures/test-pair-harvest.sh` — **ALL CHECKS PASSED**, exit 0.
+It writes driver-shaped `pN-*.out` fixtures (`fixtures/fake-arm.sh`, `fixtures/make-fixtures.py`) and
+exercises the real script (via `--simulate`, fake loadavg, fixture arms) and the real scorer:
+
+- (a) after two valid pairs the fake box leaves the quiet window; the run exits **4**, keeps
+  `p1`/`p2` in `runs/`, and moves exactly **one** file, `p3-declared.out`, into `invalid-<stamp>/`
+  with the INVALID marker; the manifest records 2 valid pairs and names p3 invalid.
+- (b) the next invocation resumes at p3 (`resuming after 2 valid pair(s); next pair is p3`), reaches
+  5 valid pairs, exits 0, and p1/p2 are byte-identical before and after (sha256 checked).
+- (c) two valid pairs: `partial: 2/5`, exit 3; four valid pairs: `partial: 4/5`, exit 3.
+- (d) five valid pairs: exit 0 (MET in the fixture) and exit 1 in the falsified fixture — both paths
+  are exercised; five valid pairs with no sustained block stay exit 3 (vacuous refusal).
+- (e) a pair whose declared arm started at 2.50 is excluded and named
+  (`p3-declared: start loadavg 2.50 >= 2.0`); a pair whose indexed arm reports `errors=1` is
+  excluded and named (`p4-indexed: errors=1 != 0`); only 3 valid pairs remain (`partial: 3/5`,
+  exit 3). A standalone `errors>0` arm exits 6 and its pair is quarantined.
+
+### What remains untested, and what is still not claimed
+
+- **The real-box transition through the gate to a scored pair is still unexercised.** There was no
+  quiet window; no real paired run was taken, and no throughput number is claimed here.
+- The fixture arms are shaped like the driver's dumps but are not the driver; the real arm's argv,
+  restore path and `systemd-run` scope were not re-run in WP-17 (they are unchanged from the
+  2026-10-27 smoke evidence in `logs/paired-200.out`).
+- Resume has not been exercised against real arm files, only fixture files; the parser reads the
+  same header fields either way.
+- The completed 2026-10-27 p1 pair stays in `runs/invalid-2026-10-27/`. It is not retroactively
+  promoted: the old script wrote no `# restore: verified` header, so by the file-level rule above it
+  cannot be certified, and that directory is outside WP-17's write scope. The repair applies to runs
+  taken from now on.
+- Clause (b) remains **unmeasured**, one command away as before.
