@@ -144,19 +144,12 @@ the evidence (PASS with notes) landed its three text notes at `31c85c6` with the
 `.scratch/88-m3-notes/`. `docs/0_ROADMAP.md` §M3 status carries the clause-by-clause state and the
 reopening condition. **M4** is met at `docs/6_ARCHITECTURE.md` — one reading, the ~573 ms group, is
 recorded **unmeasured** with its instrument named, and that instrument needs the same quiet box. So
-**the next milestone is M5**, and it is held, not idle: it needs a quiet window (person), and the
-postgres leg's server is no longer the blocker it was — this box carries 16.15 in container
-`jolly_lamarr` (read 2026-10-23, method in `.scratch/90-m5-postgres-env/issues.md`), the M5 server
-starts and checks on 5433 with the M1 record's settings, and `scripts/m1-baseline-run.sh` now runs
-the **postgres arm through that checked container**: the version is read back from the running server
-and carried in the record (`16.15 (Debian 16.15-1.pgdg13+2)`, arm log
-`.scratch/90-m5-postgres-env/logs/arm-16.15-chain-203101.out`), a setting or a required version that
-differs stops the arm, and the data directory is restored under a stopped container. That run was
-under loadavg 3.77, so it is a chain check and no rate is claimed; one further block, taken inside
-the quiet trigger at 20:34 (1-minute loadavg 0.92), measured the arm at **200 rps: 199.87 achieved,
-21 windows, 0 rejected, service p99 41,652 µs, serving peak 39.5 MiB**, with the version 16.15
-stated — not the three-arm comparison and not comparable to ticket 82's 200k/2.65M rung. An 18.x
-arm follows only if the image pull lands (`pull-postgres18.sh`), and then it names the 18.x it reads. Nothing in this tree can
+**the next milestone is M5**, and it is held, not idle: it needs a quiet window (person), while the
+postgres leg's server **is present again at the M1 version** — Docker is empty and the 18.x pull
+timed out (read 2026-10-27T21:37), but the M1 record's user-space extraction at `/var/tmp/m1-pg`
+starts through `scripts/baseline-env.sh` and reads back **18.6 (Ubuntu 18.6-3build2)** with the M1
+settings block (read 2026-10-27T21:39, `docs/0_ROADMAP.md` §Known blockers). WP-15 points the M5
+chain at that cluster; the 16.15 container readings become historical. Nothing in this tree can
 produce the quiet window. What
 the project does while it is held is the box-free work on M4's own ranked fix list, because that can be
 done under load and it re-ranks what M5's re-run has to measure: the record-side re-scoring of the M1
