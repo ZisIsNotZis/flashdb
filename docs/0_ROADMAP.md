@@ -214,7 +214,9 @@ explicit resume trigger instead of reporting a contended result as a verdict.
 
 | id | status | owner | scope (exact files) | acceptance and proof | depends |
 |---|---|---|---|---|---|
-| WP-13 | **the postgres arm runs through the checked container at 16.15; the refusal is in the chain** — `postgres-server.sh check` read back `PostgreSQL 16.15 (Debian 16.15-1.pgdg13+2)` and the M1 record's settings block (shared_buffers 16MB, max_connections 32, work_mem 4MB, maintenance_work_mem 16MB, fsync on, synchronous_commit on, wal_level minimal, max_wal_senders 0) from the running container at 128 MiB; `smoke-migration.sh` built the harness's postgres instance (database `m1-controlled`, 200 customers, 2,000 stocks, 8,150,039 B) and read the counts back from the server. `scripts/m1-baseline-run.sh`'s postgres branch now starts/stops that container, refuses a setting or a `M5_PG_REQUIRE` version that differs, refuses a cap other than `--cap-mib`, removes the container before a restore writes the data directory, and writes `server_version` read back from the server into `postgres-server.jsonl`; the arm ran end to end through the chain at 16.15 (`.scratch/90-m5-postgres-env/logs/arm-16.15-chain-203101.out`, loadavg 3.77 at start — a chain check, not a rate), and one block inside the quiet trigger (1-minute loadavg 1.84 → 0.92 → 0.95, 20:32:35-20:34:57) measured it at **200 rps: achieved 199.87, 21 windows, 0 rejected, service p99 41,652 µs, lag p99 4 µs, serving peak 39.5 MiB, oracle PASS** (`.scratch/90-m5-postgres-env/logs/arm-16.15-200rps-quiet-203431.out`); not the three-arm comparison, and not comparable to ticket 82's 200k-customer / 2.65M-SKU rung. `psycopg[binary]==3.3.6` resolves offline (re-read 2026-10-23T20:30). Open: the 18.x arm (pull in flight) and the three-arm comparison's own window | worker (fresh) | `.scratch/90-m5-postgres-env/*`, `scripts/m1-baseline-run.sh`, `scripts/m1-ladder-run.sh`, `scripts/m1-controlled-run.sh` (postgres arm only), `scripts/baseline-env.sh` (header fact) | one committed command starts the postgres arm's server and refuses when a setting or a required version differs; the M1/ladder chains launch the postgres arm against it with a digest-verified restore of `/var/tmp/m5-pg/data`; the run record's `postgres_settings` carries `server_version` read from the running server; the `psycopg[binary]==3.3.6` pin resolves offline or is replaced by a version read from `import psycopg`; `scripts/baseline-env.sh` no longer claims Docker Hub is unreachable as a present fact | none |
+| WP-13 | **historical (2026-10-23; superseded by WP-15 on 2026-10-27 — Docker is empty and the pull times out, so the server is the M1 user-space 18.6 at `/var/tmp/m1-pg`)**: the postgres arm ran through the checked container at 16.15; the refusal is in the chain — `postgres-server.sh check` read back `PostgreSQL 16.15 (Debian 16.15-1.pgdg13+2)` and the M1 record's settings block (shared_buffers 16MB, max_connections 32, work_mem 4MB, maintenance_work_mem 16MB, fsync on, synchronous_commit on, wal_level minimal, max_wal_senders 0) from the running container at 128 MiB; `smoke-migration.sh` built the harness's postgres instance (database `m1-controlled`, 200 customers, 2,000 stocks, 8,150,039 B) and read the counts back from the server. `scripts/m1-baseline-run.sh`'s postgres branch now starts/stops that container, refuses a setting or a `M5_PG_REQUIRE` version that differs, refuses a cap other than `--cap-mib`, removes the container before a restore writes the data directory, and writes `server_version` read back from the server into `postgres-server.jsonl`; the arm ran end to end through the chain at 16.15 (`.scratch/90-m5-postgres-env/logs/arm-16.15-chain-203101.out`, loadavg 3.77 at start — a chain check, not a rate), and one block inside the quiet trigger (1-minute loadavg 1.84 → 0.92 → 0.95, 20:32:35-20:34:57) measured it at **200 rps: achieved 199.87, 21 windows, 0 rejected, service p99 41,652 µs, lag p99 4 µs, serving peak 39.5 MiB, oracle PASS** (`.scratch/90-m5-postgres-env/logs/arm-16.15-200rps-quiet-203431.out`); not the three-arm comparison, and not comparable to ticket 82's 200k-customer / 2.65M-SKU rung. `psycopg[binary]==3.3.6` resolves offline (re-read 2026-10-23T20:30). Open: the 18.x arm (pull in flight) and the three-arm comparison's own window | worker (fresh) | `.scratch/90-m5-postgres-env/*`, `scripts/m1-baseline-run.sh`, `scripts/m1-ladder-run.sh`, `scripts/m1-controlled-run.sh` (postgres arm only), `scripts/baseline-env.sh` (header fact) | one committed command starts the postgres arm's server and refuses when a setting or a required version differs; the M1/ladder chains launch the postgres arm against it with a digest-verified restore of `/var/tmp/m5-pg/data`; the run record's `postgres_settings` carries `server_version` read from the running server; the `psycopg[binary]==3.3.6` pin resolves offline or is replaced by a version read from `import psycopg`; `scripts/baseline-env.sh` no longer claims Docker Hub is unreachable as a present fact | none |
+
+| WP-15 | **dispatched 2026-10-27** — the postgres leg moves from the vanished container to the M1 user-space 18.6 extraction | worker (fresh, worktree) | `scripts/m1-baseline-run.sh`, `scripts/m1-ladder-run.sh`, `scripts/m1-controlled-run.sh` (postgres arm), `scripts/baseline-env.sh` (header and defaults), `.scratch/90-m5-postgres-env/*` | (i) the postgres branch starts `M1_PG_ROOT=/var/tmp/m1-pg M1_PG_PORT=55432` through `baseline-env.sh` with no Docker dependency; (ii) it reads back the M1 settings block and `PostgreSQL 18.6 (Ubuntu 18.6-3build2)` from the running server and refuses a mismatch; (iii) it restores from a digest-verified snapshot and writes `server_version` into `postgres-server.jsonl`; (iv) a chain check at 18.6 completes end to end (oracle PASS, no rate claimed under load); (v) the header no longer presents the container or Docker Hub reachability as present fact | WP-13 |
 
 ## M4 — gap attribution (after M3)
 
@@ -243,23 +245,27 @@ explicit resume trigger instead of reporting a contended result as a verdict.
 
 ## Known blockers
 
-- **Postgres: the arm runs at 16.15, and a result never inherits another version's sentence.**
-  Root's answer of 2026-10-23 reads this box as carrying **16.15 (Debian 16.15-1.pgdg13+2)** in
-  container `jolly_lamarr` on 5432 and no 18.x. The M5 server is a container this tree starts and
-  checks (`.scratch/90-m5-postgres-env/postgres-server.sh up|check|env`), and
-  `scripts/m1-baseline-run.sh`'s postgres branch now drives it: `down` before each step, `up` with a
-  pull only when the image is absent, the M1 record's settings and an optional `M5_PG_REQUIRE` read
-  back with a non-zero refusal on any difference, the container cap compared with `--cap-mib`, the
-  container removed before a restore writes `$M1_PG_ROOT/data`, and `server_version` written into
-  `postgres-server.jsonl` from the running server. The arm ran end to end at **16.15**
-  (`logs/arm-16.15-chain-203101.out`, oracle PASS, 128 MiB, serving peak 36.8 MiB) under loadavg 3.77,
-  so it is a chain check and **no rate is claimed there**. One block inside the quiet trigger measured
-the arm at 200 rps (above); what still blocks M5: (i) the 18.x arm — the
-  image pull is a repeatable background attempt (`pull-postgres18.sh`, no layer completed at 20:32),
-  and if it lands the arm is re-run and names the 18.x it reads, never 18.6 by inheritance; (ii) the
-  quiet window, which no work in this tree can produce. `scripts/m1-ladder-run.sh` and
-  `m1-controlled-run.sh` build their own clusters through `baseline-env.sh` in their own setup and
-  still need the same wiring before they drive postgres end to end.
+- **Postgres: Docker is empty, but the M1 user-space 18.6 extract still runs — use it.** Root's
+  answer of 2026-10-23 read the box as carrying **16.15 (Debian 16.15-1.pgdg13+2)** in container
+  `jolly_lamarr`; **re-read 2026-10-27T21:37 +08** with `docker version` (29.9.1), `docker ps -a` and
+  `docker images` (both empty): the container and the `postgres:16` image are gone. A
+  `pull-postgres18.sh` attempt then failed with an i/o timeout to Docker Hub
+  (`logs/pull-postgres18-20261027.out`, rc=1), mirror list `[]`. **The M1 record's own
+  user-space extraction survives** at `/var/tmp/m1-pg/` — the `postgresql-18 18.6-3build2`,
+  `postgresql-client-18`, `postgresql-common` and `libpq5` debs under `debs/`, the extracted tree
+  under `root/`, the cluster under `data/`. Started on 2026-10-27T21:39 +08 with
+  `M1_PG_ROOT=/var/tmp/m1-pg M1_PG_PORT=55432 bash scripts/baseline-env.sh start`, it reports
+  **PostgreSQL 18.6 (Ubuntu 18.6-3build2)** and reads back the M1 record's settings block exactly:
+  `shared_buffers` 16MB, `max_connections` 32, `work_mem` 4MB, `maintenance_work_mem` 16MB,
+  `fsync` on, `synchronous_commit` on, `wal_level` minimal, `max_wal_senders` 0. So the M5
+  postgres leg has a server at the version ticket 82 measured, without Docker and without the
+  network; the remaining work is to point the M5 chain's postgres branch at this cluster (WP-15)
+  and to take the three-arm comparison inside the quiet window. The 16.15 chain check
+  (`logs/arm-16.15-chain-203101.out`) and its one quiet-window 200 rps block
+  (`logs/arm-16.15-200rps-quiet-203431.out`) remain historical readings of that version. Decision 8's
+  "16.15 today" and WP-13's container path are historical for the same reason. `scripts/m1-ladder-run.sh`
+  and `m1-controlled-run.sh` build their own clusters through `baseline-env.sh` and still need the
+  same wiring before they drive postgres end to end.
 - **The quiet window for M3 clause (b) is granted and armed, not denied.** Root granted one exclusive
   window (root's contract, `e5fb0e1:inbox/2026-10-21-next-contract.md`, landed as `0_ROADMAP.md`
   decision 7): the trigger is `uptime` reading loadavg under 2 for one minute with no other agent
