@@ -1,6 +1,6 @@
 # spec — flashdb design contracts
 
-Ticket: `.scratch/01-design/issues/01-6_ARCHITECTURE.md`
+Ticket: `.scratch/01-design/issues/01-design.md`
 
 ## Problem
 

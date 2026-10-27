@@ -6,7 +6,7 @@ can hold up under high throughput and high load**. Everything else is delegated 
 orchestrator under the project's existing philosophy (I2: a bad layout may be slow, never wrong;
 declared controls; deterministic replay; evidence before claims).
 
-This SUPERSEDES the estimand choice in `provisional-2_GOAL.md`, which was written while the
+This SUPERSEDES the estimand choice in `provisional-objective.md`, which was written while the
 author was away. It keeps that document's measurement discipline (deterministic metrics primary,
 seeds reported, calibration error stated) and replaces the latency-penalty formulation.
 

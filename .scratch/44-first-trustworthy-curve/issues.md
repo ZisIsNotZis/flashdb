@@ -20,7 +20,7 @@ pre-registration's own number, not a post-hoc pick; it is NOT circular - the dri
 stated validity bound per window and the rung cannot be scored sustained if any window breaches it.
 
 Sign-off-list alternative (same file, "Sign-off list" item 4): the p99 SLO from
-`provisional-2_GOAL.md` sec. 2 is 2x the **reference-load** p99, which would need a
+`provisional-objective.md` sec. 2 is 2x the **reference-load** p99, which would need a
 reference-load p99 measured first; not measured here. We chose the pre-registration's own absolute
 bound instead.
 

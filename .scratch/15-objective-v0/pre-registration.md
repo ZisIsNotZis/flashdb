@@ -97,7 +97,7 @@ and the relaxed oracle over the published candidate set is the stated reference.
 1. The 15% / 5% / 3x thresholds and the 10-seed count.
 2. The instance size (10x cache; 512 MiB cap + 5 GiB data as the engineering scale).
 3. The reference rate used to define the load steps.
-4. ~~Whether the latency ceiling is the p99 SLO from `provisional-2_GOAL.md` sec. 2 (2x the
+4. ~~Whether the latency ceiling is the p99 SLO from `provisional-objective.md` sec. 2 (2x the
    reference-load p99) or a fixed absolute number.~~ **Resolved 2026-10-09:** the primary metric is
    judged on the lag ceiling at this document's own 10,000 us; service latency has its own ceiling and
    is reported separately; the relative variant is deferred until a reference-load p99 exists.

@@ -45,6 +45,7 @@ RETIRED = [
 DROPPED = REPO / ".scratch" / "91-docs-migration" / "docs-dropped.txt"
 LEVEL_RE = re.compile(r"^\d+_[A-Z][A-Z_]*\.md$")
 REF_RE = re.compile(r"docs/[A-Za-z0-9_./-]+\.md")
+GLUED_RE = re.compile(r"-[0-9]_[A-Z][A-Z_]*\.md")
 TEXT_SUFFIXES = {".md", ".sh", ".py", ".rs", ".toml", ".json", ".txt", ".yml", ".yaml"}
 
 
@@ -139,6 +140,8 @@ def check_refs() -> list[str]:
             text = p.read_text(encoding="utf-8")
         except UnicodeDecodeError:
             continue
+        for m in GLUED_RE.finditer(text):
+            bad.append(f"{p.relative_to(REPO)} glues a level filename to a hyphen: {m.group(0)!r} (a swept ticket or file name)")
         for m in REF_RE.finditer(text):
             ref = m.group(0)
             if ref.startswith("docs/"):

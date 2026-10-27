@@ -301,5 +301,12 @@ Migrated 2026-10-27 out of twelve files that mixed levels. What the move did, an
   reference. The migration's own acceptance is `--only preserved` against the commit before it, which
   fails on a line of the previous doc base that left without an entry in the dropped list.
 
+- **One sweep rule was too greedy, and the checker now carries the scar.** The bare-name rule that turned
+  a design reference into its level file also fired inside two ticket-side filenames — the design
+  ticket's issue file and the provisional objective — where a level filename landed after a hyphen and
+  produced nine broken references across nine files. The cause was a character-class guard that excluded
+  letters and `/` but not `-`; the fix is those nine files repaired, plus a standing check that fails when
+  a level filename is glued to a hyphen, a shape that has no legitimate use.
+
 A source-tier judgement is not permanent: a claim that moves from `INFERRED` to `CONFIRMED` moves when
 the author agrees to it, and the line changes tier rather than being duplicated.

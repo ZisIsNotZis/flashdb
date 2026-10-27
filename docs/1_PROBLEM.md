@@ -1,6 +1,6 @@
 # INFERRED
 
-Status: contract-level design draft, **under adversarial review**. Synthesized from a multi-round brainstorm with the author (a data scientist, not a database engineer); the raw attributed decision record lives in `.scratch/01-design/decisions.md`, and review findings and dispositions in `.scratch/01-design/issues/01-6_ARCHITECTURE.md`. This design draft does not own current implementation status; the conflicting prototype, adaptation and measured-status claims must be reconciled through [the implementation/evidence work record](9_IMPLEMENTATION.md). Where a review found a claim false, the claim is corrected and its consequence marked `Open` at the point of use rather than deleted.
+Status: contract-level design draft, **under adversarial review**. Synthesized from a multi-round brainstorm with the author (a data scientist, not a database engineer); the raw attributed decision record lives in `.scratch/01-design/decisions.md`, and review findings and dispositions in `.scratch/01-design/issues/01-design.md`. This design draft does not own current implementation status; the conflicting prototype, adaptation and measured-status claims must be reconciled through [the implementation/evidence work record](9_IMPLEMENTATION.md). Where a review found a claim false, the claim is corrected and its consequence marked `Open` at the point of use rather than deleted.
 
 ## Thesis
 
