@@ -45,4 +45,6 @@ M3 clause (b) is the only reading here that needs a quiet box, and it is the onl
 taken under load: a pair taken under load measures the load. Root granted the window in its contract
 (`e5fb0e1:inbox/2026-10-21-next-contract.md`); the trigger is `uptime` reading **loadavg under 2 for one
 minute** with no other agent writing in this tree. Record the reading at the start of each arm and
-in every log; refuse the arm above the threshold. Everything else in the tree runs under load.
+in every log; refuse the arm above the threshold. `paired-200.sh` now enforces that itself — `await_quiet`
+before every arm, `refuse_run` moving a lost run's blocks out of the scorer's glob — because gating once
+per run let nine blocks be spent above 2.0 on 2026-10-27. Everything else in the tree runs under load.

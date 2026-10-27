@@ -37,6 +37,51 @@ done
 mkdir -p "$L" "$R"
 say() { echo "$*" | tee -a "$L/paired-200.out"; }
 
+# The gate, as `AGENTS.md` §The quiet window states it: an arm above the trigger is **refused**, not
+# merely logged, and the check runs again before every arm because the box can be quiet for one minute
+# and pick up foreign load again before the next one. The 2026-10-27 run is the failing example that
+# put this here: the gate opened once (0.87), the first pair ran inside it (0.88/1.63), and arms 2-5
+# started at 2.15-6.75 while the script never looked again — so nine blocks were spent on a reading
+# nobody may cite (`runs/invalid-2026-10-27/`).
+DEADLINE=$(( $(date +%s) + WAIT_MIN * 60 ))
+await_quiet() {
+    local phase=$1 quiet=0 l1
+    say "== gate ($phase): loadavg < 2.0 on twelve consecutive 5-second readings, deadline ${WAIT_MIN} min from the run's start =="
+    while :; do
+        read -r l1 _ < /proc/loadavg
+        echo "$(date -Is) phase=$phase loadavg1=$l1 quiet=${quiet}/12" >> "$L/paired-200-gate.out"
+        if awk -v l="$l1" 'BEGIN { exit !(l < 2.0) }'; then
+            quiet=$(( quiet + 1 ))
+        else
+            quiet=0
+        fi
+        [ "$quiet" -ge 12 ] && { say "GATE MET ($phase) at $(date -Is): loadavg $(cat /proc/loadavg)"; return 0; }
+        if [ "$(date +%s)" -ge "$DEADLINE" ]; then
+            say "GATE UNMET ($phase): loadavg never held under 2.0 for one minute before the deadline (series in logs/paired-200-gate.out)"
+            return 1
+        fi
+        sleep 5
+    done
+}
+
+# A run whose trigger was lost mid-way is not partial evidence, it is no evidence: the partial blocks
+# are moved out of the scorer's glob and marked, so the next reader cannot put them together with a
+# later run's blocks and call the mixture a pair.
+refuse_run() {
+    local phase=$1 stamp inv f
+    stamp=$(date +%Y-%m-%dT%H%M%S)
+    inv=$R/invalid-$stamp
+    mkdir -p "$inv"
+    for f in "$R"/p*-*.out "$R"/p*-*.err; do
+        [ -e "$f" ] || continue
+        { echo "# INVALID - do not cite: run abandoned $phase at $(date -Is), arm start loadavg above the 2.0 trigger"; cat "$f"; } > "$inv/$(basename "$f")"
+        rm -f "$f"
+    done
+    rm -rf "$R"/live-*
+    gzip -9 "$inv"/*.err 2>/dev/null || true
+    say "REFUSED: the trigger was lost $phase; the blocks taken so far were moved to ${inv#"$R"/} and marked INVALID, and nothing in this run is a verdict"
+}
+
 say "== paired 200 rps, started $(date -Is) =="
 say "# loadavg at start: $(cat /proc/loadavg)"
 say "# paths modified in the tree (for the record; another agent mid-write is a judgement, not a file count): $(git status --porcelain | wc -l)"
@@ -64,32 +109,16 @@ if [ "$SMOKE" = 1 ]; then
     TRACE="$R/smoke-trace.jsonl"; RATE=50; PAIRS=1
     say "== SMOKE: gate skipped, 1 pair at ${RATE} rps on $(wc -l < "$TRACE") requests — NOT evidence =="
 else
-    # --- the gate
-    say "== gate: loadavg < 2.0 on twelve consecutive 5-second readings (--wait-min $WAIT_MIN) =="
-    deadline=$(( $(date +%s) + WAIT_MIN * 60 ))
-    quiet=0
-    while :; do
-        read -r l1 _ < /proc/loadavg
-        echo "$(date -Is) loadavg1=$l1 quiet=${quiet}/12" >> "$L/paired-200-gate.out"
-        if awk -v l="$l1" 'BEGIN { exit !(l < 2.0) }'; then
-            quiet=$(( quiet + 1 ))
-        else
-            quiet=0
-        fi
-        [ "$quiet" -ge 12 ] && break
-        if [ "$(date +%s)" -ge "$deadline" ]; then
-            say "GATE UNMET after ${WAIT_MIN} min: loadavg never held under 2.0 for one minute (series in logs/paired-200-gate.out)"
-            exit 4
-        fi
-        sleep 5
-    done
-    say "GATE MET at $(date -Is): loadavg $(cat /proc/loadavg)"
+    await_quiet "before the run" || exit 4
 fi
 
 # --- the blocks
 for p in $(seq 1 "$PAIRS"); do
     if [ $(( p % 2 )) = 1 ]; then order="declared indexed"; else order="indexed declared"; fi
     for variant in $order; do
+        if [ "$SMOKE" = 0 ]; then
+            await_quiet "before p$p $variant" || { refuse_run "before p$p $variant"; exit 4; }
+        fi
         inst=$R/live-$variant
         rm -rf "$inst"
         cp -a --reflink=auto "$SNAP" "$inst"

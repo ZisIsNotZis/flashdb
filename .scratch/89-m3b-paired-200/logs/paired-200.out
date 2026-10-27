@@ -18,3 +18,33 @@ smoke: not scored — a smoke block is plumbing, and its file names are outside 
 # paths modified in the tree (for the record; another agent mid-write is a judgement, not a file count): 2
 # preflight ok: snapshot 1.6G (1682111093 B per its record), trace sha 6472cf46477e037b
 == gate: loadavg < 2.0 on twelve consecutive 5-second readings (--wait-min 55) ==
+== paired 200 rps, started 2026-10-27T15:29:08+08:00 ==
+# loadavg at start: 0.82 1.09 0.76 6/2031 3136689
+# paths modified in the tree (for the record; another agent mid-write is a judgement, not a file count): 2
+# preflight ok: snapshot 1.6G (1682111093 B per its record), trace sha 6472cf46477e037b
+== gate: loadavg < 2.0 on twelve consecutive 5-second readings (--wait-min 55) ==
+GATE MET at 2026-10-27T15:30:03+08:00: loadavg 0.87 1.07 0.77 4/2012 3136987
+block p1 declared done: loadavg 1.42 1.18 0.82
+block p1 indexed done: loadavg 2.16 1.38 0.90
+block p2 indexed done: loadavg 3.03 1.63 0.99
+block p2 declared done: loadavg 3.20 1.79 1.06
+block p3 declared done: loadavg 3.30 1.94 1.14
+block p3 indexed done: loadavg 3.69 2.14 1.23
+block p4 indexed done: loadavg 6.99 3.03 1.55
+block p4 declared done: loadavg 6.02 3.11 1.62
+block p5 declared done: loadavg 7.04 3.70 1.86
+== paired 200 rps, started 2026-10-27T15:35:52+08:00 ==
+# loadavg at start: 4.09 3.67 2.06 6/2117 3142577
+# paths modified in the tree (for the record; another agent mid-write is a judgement, not a file count): 5
+# preflight ok: snapshot 1.6G (1682111093 B per its record), trace sha 6472cf46477e037b
+== gate (before the run): loadavg < 2.0 on twelve consecutive 5-second readings, deadline 0 min from the run's start ==
+GATE UNMET (before the run): loadavg never held under 2.0 for one minute before the deadline (series in logs/paired-200-gate.out)
+== paired 200 rps, started 2026-10-27T15:35:54+08:00 ==
+# loadavg at start: 4.09 3.67 2.06 13/2118 3142625
+# paths modified in the tree (for the record; another agent mid-write is a judgement, not a file count): 5
+# preflight ok: snapshot 1.6G (1682111093 B per its record), trace sha 6472cf46477e037b
+== SMOKE: gate skipped, 1 pair at 50 rps on 100 requests — NOT evidence ==
+block p1 declared done: loadavg 4.21 3.72 2.09
+block p1 indexed done: loadavg 4.10 3.71 2.10
+== blocks done 2026-10-27T15:36:12+08:00; scoring ==
+smoke: not scored — a smoke block is plumbing, and its file names are outside the scorer's pattern

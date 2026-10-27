@@ -3,3 +3,18 @@
 # paths modified in the tree (for the record; another agent mid-write is a judgement, not a file count): 2
 # preflight ok: snapshot 1.6G (1682111093 B per its record), trace sha 6472cf46477e037b
 == gate: loadavg < 2.0 on twelve consecutive 5-second readings (--wait-min 55) ==
+== paired 200 rps, started 2026-10-27T15:29:08+08:00 ==
+# loadavg at start: 0.82 1.09 0.76 6/2031 3136689
+# paths modified in the tree (for the record; another agent mid-write is a judgement, not a file count): 2
+# preflight ok: snapshot 1.6G (1682111093 B per its record), trace sha 6472cf46477e037b
+== gate: loadavg < 2.0 on twelve consecutive 5-second readings (--wait-min 55) ==
+GATE MET at 2026-10-27T15:30:03+08:00: loadavg 0.87 1.07 0.77 4/2012 3136987
+block p1 declared done: loadavg 1.42 1.18 0.82
+block p1 indexed done: loadavg 2.16 1.38 0.90
+block p2 indexed done: loadavg 3.03 1.63 0.99
+block p2 declared done: loadavg 3.20 1.79 1.06
+block p3 declared done: loadavg 3.30 1.94 1.14
+block p3 indexed done: loadavg 3.69 2.14 1.23
+block p4 indexed done: loadavg 6.99 3.03 1.55
+block p4 declared done: loadavg 6.02 3.11 1.62
+block p5 declared done: loadavg 7.04 3.70 1.86

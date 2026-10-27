@@ -103,3 +103,36 @@ named, built and exercised to the point the quiet box allows.
   snapshot record). Both arms run on the same rebuild, so the pair is controlled; what it cannot do is
   compare its *level* against the M1 3-of-5, because the instance's bytes differ. The clause asks only
   for declared vs indexed in the same block, which the pair does answer.
+
+## 2026-10-27 — the gate opened for one minute, and the run was refused for losing it
+
+The trigger finally held on this box: `/proc/loadavg` read 0.82 at 15:29:08 and 0.87 at 15:30:03,
+twelve consecutive readings under 2.0, so the gate opened after 55 s of polling and the pair started
+inside it (p1 declared 0.88, p1 indexed 1.63). Load then climbed on its own: arms 2-5 started at 2.15,
+3.10, 3.19, 3.27, 3.80, 6.34 and 6.75, and the box's 1-minute average stayed 4-7 for the rest of the
+afternoon (the 5-minute average was 3.7, i.e. sustained foreign work, not the run's own 20 s blocks —
+the copies are btrfs reflinks and every block reported `errors=0`).
+
+**Those arms are refused, not reported.** `AGENTS.md` §The quiet window says "refuse the arm above the
+threshold", and `paired-200.sh` did not: it gated once, before the loop, and never looked again. Nine
+blocks were spent before that was noticed (the tenth, p5 indexed, was cut mid-arm by the launcher's own
+five-minute cap). All of them sit in `runs/invalid-2026-10-27/`, each with `# INVALID - do not cite:` on
+its first line, and the scorer's `p*-*.out` glob no longer reaches them (the 3,800-line per-group
+`.err` telemetry is kept gzipped beside each `.out`: an invalid block's phase narrative has no
+reader, and 6 MB of it would be paid for by every clone).
+
+The instrument now refuses per arm: `await_quiet` runs before the run and before every block, keeps one
+deadline for the whole invocation, and on expiry calls `refuse_run`, which moves the partial blocks into
+`runs/invalid-<stamp>/` with the INVALID marker and deletes the restored instances. Two runs stand as its
+test, both in `logs/paired-200.out`: `--wait-min 0` under loadavg 4.09 exits 4 with
+`GATE UNMET (before the run)`, and `--smoke` still exercises restore + both arms + rotation with the gate
+skipped (exit 0).
+
+What the invalid blocks hint, and nothing more: per 20-window block, lag-rejected windows were 11, 11,
+13, 11, 11 on the declared arm against 5, 2, 5, 5 on the indexed arm. That direction is what clause (b)
+predicts, it is consistent across the four `errors=0` pairs that started under load, and it is **not
+evidence** — the arms were taken above the trigger, which is the measured cost the twelve
+`83-index-probe/runs/` files already record.
+
+**Clause (b) is still `unmeasured`.** One command away, unchanged:
+`SNAP_RECORD=.scratch/89-m3b-paired-200/instance-record.json bash .scratch/89-m3b-paired-200/paired-200.sh --wait-min 55`.
