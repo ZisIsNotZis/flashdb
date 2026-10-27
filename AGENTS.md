@@ -21,10 +21,12 @@ before deleting it: the next session reads the files, not the conversation.
 - A measured ticket → `.scratch/<nn>-<slug>/`: `issues.md` (what was measured, and what was not),
   `run.sh` (the command that reproduces it), `logs/*.out` (the output as produced). Ticket 84 is the
   index-defect mechanism, 83 the index probe, 82 the external M1 scoreboard, 85 the M3 clause (c) run,
-89 the M3 clause (b) paired block and the quiet-window trigger it waits on (90 is the M5 postgres server:
-`postgres-server.sh` starts and checks it, `scripts/m1-baseline-run.sh` runs the postgres arm through
-it at the version it reads back, `pull-postgres18.sh` is the repeatable 18.x attempt, and `issues.md`
-carries the environment read with its moment).
+  89 the M3 clause (b) paired block and the quiet-window trigger it waits on (WP-17 made it
+  harvest-based), 92 the barrier queue-wait measurement (which rejects WAL preallocation as the
+  stall's cause), and 93 the indexed product arm in the M5 chain. The postgres leg is the M1
+  user-space **18.6** extraction at `/var/tmp/m1-pg` (`scripts/baseline-env.sh start|check` reads the
+  version and the M1 settings back); the 2026-10-23 container path is historical, and Docker has no
+  images on this box (2026-10-27 read).
 - Code: `engine/` — the request path in `engine/src/request.rs`, the derived index in
   `engine/src/index.rs`, the driver in `engine/src/bin/flashdb-load.rs`; `harness/` is Python;
   `scripts/` holds the M1 runs and their scoring.
@@ -42,10 +44,12 @@ carries the environment read with its moment).
 
 ## The quiet window
 
-M3 clause (b) is the only reading here that needs a quiet box, and it is the only one that may not be
-taken under load: a pair taken under load measures the load. Root granted the window in its contract
-(`e5fb0e1:inbox/2026-10-21-next-contract.md`); the trigger is `uptime` reading **loadavg under 2 for one
-minute** with no other agent writing in this tree. Record the reading at the start of each arm and
-in every log; refuse the arm above the threshold. `paired-200.sh` now enforces that itself — `await_quiet`
-before every arm, `refuse_run` moving a lost run's blocks out of the scorer's glob — because gating once
-per run let nine blocks be spent above 2.0 on 2026-10-27. Everything else in the tree runs under load.
+M3 clause (b) and M5's KPI comparison are the readings that need a quiet box, and they are the ones
+that may not be taken under load: a pair taken under load measures the load. Root granted the window in
+its contract (`e5fb0e1:inbox/2026-10-21-next-contract.md`); the trigger is `uptime` reading **loadavg
+under 2 for one minute** with no other agent writing in this tree. Record the reading at the start of
+each arm and in every log; refuse the arm above the threshold. `paired-200.sh` enforces that itself —
+`await_quiet` before every arm, and a lost arm is refused rather than reported. A completed pair whose
+both arms started under 2.0, recorded `errors=0` and verified their restore is evidence and is **kept**
+when a later arm is refused; a normal run resumes at the next pair, and the scorer will not decide the
+clause below five valid pairs (`partial: N/5`, exit 3). Everything else in the tree runs under load.
