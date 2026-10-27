@@ -53,3 +53,4 @@ smoke: not scored — a smoke block is plumbing, and its file names are outside 
 # paths modified in the tree (for the record; another agent mid-write is a judgement, not a file count): 2
 # preflight ok: snapshot 1.6G (1682111093 B per its record), trace sha 6472cf46477e037b
 == gate (before the run): loadavg < 2.0 on twelve consecutive 5-second readings, deadline 55 min from the run's start ==
+GATE UNMET (before the run): loadavg never held under 2.0 for one minute before the deadline (series in logs/paired-200-gate.out)
