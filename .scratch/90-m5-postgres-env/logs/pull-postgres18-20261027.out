@@ -1,0 +1,3 @@
+# attempt 2026-10-27T21:37:37+08:00 image=postgres:18 mirrors=[]
+Error response from daemon: failed to resolve reference "docker.io/library/postgres:18": failed to do request: Head "https://registry-1.docker.io/v2/library/postgres/manifests/18": dial tcp 108.160.165.173:443: i/o timeout
+# result: rc=1 at 2026-10-27T21:38:08+08:00
