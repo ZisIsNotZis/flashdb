@@ -28,11 +28,23 @@ const MAX_RECORD: usize = 1 << 26; // 64 MiB，防御性上界
 pub use crate::crc::crc32c;
 
 /// 追加日志句柄。单写者；`sync` 调 `fdatasync`。
+///
+/// 预分配（WP-14 的机制开关，默认关闭）：`prealloc_bytes > 0` 时文件按该粒度
+/// 提前 `posix_fallocate` 到下一个整块边界，追加写落在已分配的块内，越界时再
+/// 扩一块。关闭时 `prealloc_bytes == 0`，文件长度始终等于 `valid_len`。预分配
+/// 只改变文件的物理布局，不改变记录格式、顺序或持久化时序：恢复扫描在第一个
+/// 全零区域停止并截断零尾，因此读到的记录恰是已追加的载荷。
 pub struct Wal {
     file: File,
     #[allow(dead_code)]
     path: PathBuf,
     valid_len: u64,
+    /// 预分配粒度（字节）；0 表示关闭。
+    prealloc_bytes: u64,
+    /// 已经 `posix_fallocate` 保留到的文件长度；关闭时始终为 0。
+    reserved_len: u64,
+    /// 已提交给屏障工作线程、尚未 `record_appended` 的帧字节数。
+    pending_bytes: u64,
     poisoned: bool,
     #[cfg(test)]
     inject_partial_append: bool,
@@ -45,6 +57,13 @@ pub struct Wal {
 impl Wal {
     /// 仅新建：绝不截断已有 WAL；同步父目录使新文件名先于提交可持久。
     pub fn create(path: impl AsRef<Path>) -> io::Result<Wal> {
+        Self::create_with_prealloc(path, 0)
+    }
+
+    /// [`Wal::create`] with the preallocation switch. `prealloc_bytes == 0` is
+    /// exactly [`Wal::create`]; a non-zero value reserves the first chunk via
+    /// `posix_fallocate` so the file is really allocated, not a sparse hole.
+    pub fn create_with_prealloc(path: impl AsRef<Path>, prealloc_bytes: u64) -> io::Result<Wal> {
         let path = path.as_ref();
         let file = OpenOptions::new()
             .read(true)
@@ -53,26 +72,96 @@ impl Wal {
             .open(path)?;
         let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
         File::open(parent)?.sync_all()?;
-        Ok(Wal { file, path: path.to_path_buf(), valid_len: 0, poisoned: false,
+        let mut wal = Wal { file, path: path.to_path_buf(), valid_len: 0, prealloc_bytes,
+            reserved_len: 0, pending_bytes: 0, poisoned: false,
             #[cfg(test)] inject_partial_append: false, #[cfg(test)] inject_sync_error: false,
-            #[cfg(test)] inject_barrier_error: false })
+            #[cfg(test)] inject_barrier_error: false };
+        if prealloc_bytes > 0 {
+            wal.reserve_to(prealloc_bytes)?;
+        }
+        Ok(wal)
     }
 
     /// 打开已存在的 WAL：扫描到最后的完整记录，截断撕裂尾，定位到文件尾。
     /// 返回句柄与恢复出的记录（按序）。
     pub fn open_or_recover(path: impl AsRef<Path>) -> io::Result<(Wal, Vec<Vec<u8>>)> {
+        Self::open_or_recover_with_prealloc(path, 0)
+    }
+
+    /// [`Wal::open_or_recover`] with the preallocation switch: recovery always
+    /// replays exactly the appended payloads and truncates the zero tail first,
+    /// then the next chunk (if enabled) is reserved past the recovered end.
+    pub fn open_or_recover_with_prealloc(path: impl AsRef<Path>, prealloc_bytes: u64)
+        -> io::Result<(Wal, Vec<Vec<u8>>)> {
         let (records, valid_len) = replay(path.as_ref())?;
         let mut file = OpenOptions::new().read(true).write(true).open(path.as_ref())?;
         file.set_len(valid_len)?;
         file.seek(SeekFrom::Start(valid_len))?;
-        Ok((Wal { file, path: path.as_ref().to_path_buf(), valid_len, poisoned: false,
+        let mut wal = Wal { file, path: path.as_ref().to_path_buf(), valid_len, prealloc_bytes,
+            reserved_len: 0, pending_bytes: 0, poisoned: false,
             #[cfg(test)] inject_partial_append: false, #[cfg(test)] inject_sync_error: false,
-            #[cfg(test)] inject_barrier_error: false }, records))
+            #[cfg(test)] inject_barrier_error: false };
+        if prealloc_bytes > 0 {
+            let target = if valid_len % prealloc_bytes == 0 {
+                valid_len.saturating_add(prealloc_bytes)
+            } else {
+                round_up(valid_len, prealloc_bytes)?
+            };
+            wal.reserve_to(target)?;
+        }
+        Ok((wal, records))
+    }
+
+    /// Preallocation chunk size in bytes (0 = off). Observational.
+    pub fn prealloc_bytes(&self) -> u64 { self.prealloc_bytes }
+
+    /// Reserve room for `additional` more appended bytes, growing the file by
+    /// whole chunks when the switch is on. A no-op when it is off.
+    fn reserve_for(&mut self, additional: u64) -> io::Result<()> {
+        if self.prealloc_bytes == 0 { return Ok(()); }
+        let end = self.valid_len
+            .checked_add(self.pending_bytes)
+            .and_then(|n| n.checked_add(additional))
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "WAL preallocation overflow"))?;
+        if end <= self.reserved_len { return Ok(()); }
+        let target = round_up(end, self.prealloc_bytes)?;
+        self.reserve_to(target)
+    }
+
+    /// Reserve the open file up to `target` bytes with `posix_fallocate`, which
+    /// really allocates blocks (unlike `set_len`, which on ext4 leaves a sparse
+    /// hole). The file cursor is left at the data end, so the next append still
+    /// lands immediately after the last record.
+    fn reserve_to(&mut self, target: u64) -> io::Result<()> {
+        let current = self.file.metadata()?.len();
+        let current = current.max(self.reserved_len);
+        if target <= current {
+            self.reserved_len = self.reserved_len.max(target);
+            return Ok(());
+        }
+        posix_fallocate(&self.file, current, target - current)?;
+        self.reserved_len = target;
+        Ok(())
+    }
+
+    /// Reserve room for a submitted overlapped barrier's frames before the
+    /// worker is allowed to write them, so a group never straddles an
+    /// allocation boundary. Counts barriers already in flight.
+    pub(crate) fn reserve_for_group(&mut self, additional: u64) -> io::Result<()> {
+        self.reserve_for(additional)?;
+        if self.prealloc_bytes > 0 {
+            self.pending_bytes = self.pending_bytes.saturating_add(additional);
+        }
+        Ok(())
     }
 
     /// 追加一条记录（未持久化；调用方随后 `sync`）。拒绝空载荷和恢复器无法读取的超长载荷。
     pub fn append(&mut self, payload: &[u8]) -> io::Result<()> {
         let frame = self.encode_frame(payload)?;
+        if let Err(e) = self.reserve_for(frame.len() as u64) {
+            self.poisoned = true;
+            return Err(e);
+        }
         #[cfg(test)]
         if self.inject_partial_append {
             self.inject_partial_append = false;
@@ -120,6 +209,7 @@ impl Wal {
     /// the watermark never needs to see an in-flight group's bytes.
     pub(crate) fn record_appended(&mut self, len: u64) {
         self.valid_len += len;
+        self.pending_bytes = self.pending_bytes.saturating_sub(len);
     }
 
     /// `fdatasync`：失败后写者中毒，必须重新打开并重放 WAL 才能继续。
@@ -299,6 +389,35 @@ pub fn replay_file(file: &File, limit: u64) -> io::Result<(Vec<Vec<u8>>, u64)> {
     Ok((records, valid))
 }
 
+/// Round `value` up to a whole number of `chunk`-byte chunks.
+fn round_up(value: u64, chunk: u64) -> io::Result<u64> {
+    let rem = value % chunk;
+    if rem == 0 { return Ok(value); }
+    value.checked_add(chunk - rem)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "WAL preallocation overflow"))
+}
+
+/// `posix_fallocate(3)`: really allocate `len` bytes at `offset`, failing closed
+/// on an unsupported filesystem instead of silently leaving a sparse hole.
+fn posix_fallocate(file: &File, offset: u64, len: u64) -> io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+    let offset = i64::try_from(offset)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "WAL preallocation offset out of range"))?;
+    let len = i64::try_from(len)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "WAL preallocation length out of range"))?;
+    let rc = unsafe { posix_fallocate_raw(file.as_raw_fd(), offset, len) };
+    if rc == 0 { Ok(()) } else { Err(io::Error::from_raw_os_error(rc)) }
+}
+
+unsafe fn posix_fallocate_raw(fd: std::os::raw::c_int, offset: i64, len: i64) -> std::os::raw::c_int {
+    extern "C" {
+        fn posix_fallocate(fd: std::os::raw::c_int, offset: i64, len: i64) -> std::os::raw::c_int;
+    }
+    // SAFETY: `fd` is a live descriptor borrowed from `file` for this call, and
+    // posix_fallocate only mutates that descriptor's file's allocation.
+    posix_fallocate(fd, offset, len)
+}
+
 fn replay_reader(mut r: impl Read, mut visit: impl FnMut(&[u8]) -> io::Result<()>) -> io::Result<u64> {
     let mut valid: u64 = 0;
     loop {
@@ -356,6 +475,7 @@ pub(crate) fn remove(path: impl AsRef<Path>) {
 mod tests {
     use super::*;
     use std::fs;
+    use std::os::unix::fs::MetadataExt;
     use std::process;
 
     fn tmp(name: &str) -> PathBuf {
@@ -591,5 +711,102 @@ mod tests {
         assert_eq!(w.valid_len(), 0);
         assert_eq!(p.metadata().unwrap().len(), 0);
         remove(&p);
+    }
+
+    /// WP-14 off-by-default invariant: with the switch off the file has no
+    /// preallocated tail, so its length is exactly the valid data length.
+    #[test]
+    fn prealloc_off_keeps_file_len_equal_to_valid_len() {
+        let p = tmp("prealloc-off.wal");
+        let mut w = Wal::create(&p).unwrap();
+        assert_eq!(w.prealloc_bytes(), 0);
+        for i in 0..64u32 {
+            w.append(format!("record-{i}").as_bytes()).unwrap();
+            assert_eq!(p.metadata().unwrap().len(), w.valid_len());
+        }
+        w.sync().unwrap();
+        assert_eq!(p.metadata().unwrap().len(), w.valid_len());
+        remove(&p);
+    }
+
+    /// With the switch on the file is *really* allocated in whole chunks (not
+    /// a sparse hole), and it only grows when an append crosses a boundary.
+    #[test]
+    fn prealloc_reserves_really_allocated_chunks() {
+        let chunk = 1u64 << 20; // 1 MiB
+        let p = tmp("prealloc-on.wal");
+        let mut w = Wal::create_with_prealloc(&p, chunk).unwrap();
+        let meta = p.metadata().unwrap();
+        assert_eq!(meta.len(), chunk, "create reserves exactly one chunk");
+        assert!(meta.blocks() * 512 >= chunk * 3 / 4,
+            "preallocated file must be really allocated: blocks*512={} < 3/4 chunk={}",
+            meta.blocks() * 512, chunk);
+        // A record that fits inside the reserved chunk must not grow the file.
+        w.append(b"first").unwrap();
+        assert_eq!(p.metadata().unwrap().len(), chunk);
+        // Fill past the first chunk: the file grows by exactly one whole chunk.
+        let payload = vec![0x5au8; 4096];
+        while w.valid_len() + (HEADER as u64 + payload.len() as u64) <= chunk {
+            w.append(&payload).unwrap();
+        }
+        assert_eq!(p.metadata().unwrap().len(), chunk, "still inside the first chunk");
+        w.append(&payload).unwrap();
+        assert_eq!(p.metadata().unwrap().len(), 2 * chunk, "crossing a boundary reserves one whole chunk");
+        let meta = p.metadata().unwrap();
+        assert!(meta.blocks() * 512 >= 2 * chunk * 3 / 4,
+            "the second chunk must be allocated too: blocks*512={}", meta.blocks() * 512);
+        w.sync().unwrap();
+        remove(&p);
+    }
+
+    /// Recovery over a preallocated file replays exactly the appended payloads
+    /// and truncates the zero tail back to the valid data length.
+    #[test]
+    fn prealloc_recovery_replays_exactly_and_truncates_zero_tail() {
+        let chunk = 64 * 1024; // 64 KiB
+        let p = tmp("prealloc-recover.wal");
+        let expected: Vec<Vec<u8>> = (0..8u32).map(|i| format!("payload-{i}").into_bytes()).collect();
+        let valid_len;
+        {
+            let mut w = Wal::create_with_prealloc(&p, chunk).unwrap();
+            for rec in &expected {
+                w.append(rec).unwrap();
+            }
+            w.sync().unwrap();
+            valid_len = w.valid_len();
+            drop(w);
+        }
+        assert!(p.metadata().unwrap().len() > valid_len, "the zero tail must actually be there");
+        {
+            let (mut w, records) = Wal::open_or_recover(&p).unwrap();
+            assert_eq!(records, expected, "recovery replays exactly the appended payloads");
+            assert_eq!(w.valid_len(), valid_len);
+            assert_eq!(p.metadata().unwrap().len(), valid_len, "the zero tail is truncated");
+            w.append(b"after-recovery").unwrap();
+            w.sync().unwrap();
+        }
+        let (records, len) = replay(&p).unwrap();
+        let mut all = expected.clone();
+        all.push(b"after-recovery".to_vec());
+        assert_eq!(records, all);
+        remove(&p);
+        // The switch-on recovery reserves a fresh chunk past the recovered end.
+        let p2 = tmp("prealloc-recover-on.wal");
+        {
+            let mut w = Wal::create_with_prealloc(&p2, chunk).unwrap();
+            w.append(b"only").unwrap();
+            w.sync().unwrap();
+            drop(w);
+        }
+        {
+            let (w, records) = Wal::open_or_recover_with_prealloc(&p2, chunk).unwrap();
+            assert_eq!(records, vec![b"only".to_vec()]);
+            let meta = p2.metadata().unwrap();
+            assert_eq!(meta.len(), chunk, "recovery reserves one chunk past the data");
+            assert!(meta.blocks() * 512 >= chunk * 3 / 4, "recovered reservation is real");
+            drop(w);
+        }
+        remove(&p2);
+        assert_eq!(len, valid_len + (HEADER as u64 + b"after-recovery".len() as u64));
     }
 }

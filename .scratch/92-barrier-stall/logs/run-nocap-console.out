@@ -1,0 +1,55 @@
+loadavg 7.79 10.94 10.69 12/1120 253059
+snapshot=/home/z/vibe/flashdb/.scratch/82-controlled-m1/runs/snapshot/flashdb-declared
+trace=/home/z/vibe/flashdb/.scratch/82-controlled-m1/runs/b2/rung-200/trace.jsonl
+rate=200 blocks=5 window_ms=1000 group_requests=64 cap_mib=0 prealloc=16777216
++ block arm=off b=1 copy+run 2026-10-27T21:53:20+08:00
+wal_after len=6900595 blocks=13480
++ block arm=off b=2 copy+run 2026-10-27T21:53:44+08:00
+wal_after len=6900595 blocks=13480
++ block arm=off b=3 copy+run 2026-10-27T21:54:08+08:00
+wal_after len=6900595 blocks=13480
++ block arm=off b=4 copy+run 2026-10-27T21:54:32+08:00
+wal_after len=6900595 blocks=13480
++ block arm=off b=5 copy+run 2026-10-27T21:54:56+08:00
+wal_after len=6900595 blocks=13480
++ done 2026-10-27T21:55:20+08:00; summary /home/z/vibe/worktrees/flashdb/wp14-barrier-stall/.scratch/92-barrier-stall/logs/summary-nocap.out
+block arm=off b=1 loadavg='7.79 10.94 10.69 12/1121 253075' groups=3887 write_groups=2720 max_completion_us=35778 max_wait_us=11520 groups_over_100ms=0 windows_with_max_over_100ms=0 wal_len=6900595 wal_blocks=13480
+  max_completion: window=12 seq=13 requests=1 completion_us=35778 due_dispatch_us=135 barrier_wait_us=0 append_us=0 fsync_us=0 apply_us=0 maintain_us=0 residual_us=35643
+  max_completion_write: window=12 seq=149 requests=2 completion_us=17915 due_dispatch_us=9507 barrier_wait_us=18 append_us=39 fsync_us=3051 apply_us=14 maintain_us=0 residual_us=5286
+  max_wait: window=11 seq=143 requests=1 completion_us=15831 due_dispatch_us=65 barrier_wait_us=11520 append_us=19 fsync_us=3548 apply_us=16 maintain_us=0 residual_us=663
+  max_wait_backlog: prior_barriers=2706 prior_append_fsync_us=8860419 wait_us=11520 unexplained_wait_us=0
+  window10_max_completion: window=10 seq=5 requests=1 completion_us=22794 due_dispatch_us=102 barrier_wait_us=0 append_us=0 fsync_us=0 apply_us=0 maintain_us=0 residual_us=22692
+  window10_max_wait: window=10 seq=8 requests=1 completion_us=14948 due_dispatch_us=219 barrier_wait_us=10972 append_us=39 fsync_us=3227 apply_us=18 maintain_us=0 residual_us=473
+  window10_window_stall: stall_completion_us=22794 stall_barrier_wait_us=0 stall_append_us=0 stall_fsync_us=0 stall_residual_us=22692 max_group_us=30158
+block arm=off b=2 loadavg='7.27 10.57 10.57 2/1064 253667' groups=3861 write_groups=2706 max_completion_us=222351 max_wait_us=204921 groups_over_100ms=66 windows_with_max_over_100ms=2 wal_len=6900595 wal_blocks=13480
+  max_completion: window=4 seq=198 requests=1 completion_us=222351 due_dispatch_us=60 barrier_wait_us=204921 append_us=10 fsync_us=17009 apply_us=7 maintain_us=0 residual_us=344
+  max_completion_write: window=4 seq=198 requests=1 completion_us=222351 due_dispatch_us=60 barrier_wait_us=204921 append_us=10 fsync_us=17009 apply_us=7 maintain_us=0 residual_us=344
+  max_wait: window=4 seq=198 requests=1 completion_us=222351 due_dispatch_us=60 barrier_wait_us=204921 append_us=10 fsync_us=17009 apply_us=7 maintain_us=0 residual_us=344
+  max_wait_backlog: prior_barriers=13 prior_append_fsync_us=213493 wait_us=204921 wait_minus_prior_us=-8572
+  window10_max_completion: window=10 seq=7 requests=1 completion_us=11335 due_dispatch_us=91 barrier_wait_us=0 append_us=0 fsync_us=0 apply_us=0 maintain_us=0 residual_us=11244
+  window10_max_wait: window=10 seq=2 requests=1 completion_us=6864 due_dispatch_us=873 barrier_wait_us=3148 append_us=22 fsync_us=3034 apply_us=11 maintain_us=0 residual_us=0
+  window10_window_stall: stall_completion_us=11335 stall_barrier_wait_us=0 stall_append_us=0 stall_fsync_us=0 stall_residual_us=11244 max_group_us=11426
+block arm=off b=3 loadavg='6.00 10.00 10.38 14/1198 254579' groups=3630 write_groups=2560 max_completion_us=297524 max_wait_us=290258 groups_over_100ms=77 windows_with_max_over_100ms=1 wal_len=6900595 wal_blocks=13480
+  max_completion: window=3 seq=44 requests=1 completion_us=297524 due_dispatch_us=71 barrier_wait_us=286115 append_us=24 fsync_us=10679 apply_us=12 maintain_us=0 residual_us=623
+  max_completion_write: window=3 seq=44 requests=1 completion_us=297524 due_dispatch_us=71 barrier_wait_us=286115 append_us=24 fsync_us=10679 apply_us=12 maintain_us=0 residual_us=623
+  max_wait: window=3 seq=45 requests=1 completion_us=295556 due_dispatch_us=1679 barrier_wait_us=290258 append_us=40 fsync_us=4594 apply_us=11 maintain_us=0 residual_us=0
+  max_wait_backlog: prior_barriers=9 prior_append_fsync_us=331417 wait_us=290258 wait_minus_prior_us=-41159
+  window10_max_completion: window=10 seq=133 requests=1 completion_us=40366 due_dispatch_us=143 barrier_wait_us=0 append_us=0 fsync_us=0 apply_us=0 maintain_us=0 residual_us=40223
+  window10_max_wait: window=10 seq=156 requests=1 completion_us=16522 due_dispatch_us=71 barrier_wait_us=9919 append_us=24 fsync_us=5896 apply_us=14 maintain_us=0 residual_us=598
+  window10_window_stall: stall_completion_us=40366 stall_barrier_wait_us=0 stall_append_us=0 stall_fsync_us=0 stall_residual_us=40223 max_group_us=56023
+block arm=off b=4 loadavg='7.11 9.95 10.35 10/1127 255558' groups=3726 write_groups=2625 max_completion_us=209784 max_wait_us=195662 groups_over_100ms=37 windows_with_max_over_100ms=1 wal_len=6900595 wal_blocks=13480
+  max_completion: window=3 seq=102 requests=1 completion_us=209784 due_dispatch_us=17 barrier_wait_us=190076 append_us=23 fsync_us=19232 apply_us=8 maintain_us=0 residual_us=428
+  max_completion_write: window=3 seq=102 requests=1 completion_us=209784 due_dispatch_us=17 barrier_wait_us=190076 append_us=23 fsync_us=19232 apply_us=8 maintain_us=0 residual_us=428
+  max_wait: window=3 seq=104 requests=1 completion_us=199600 due_dispatch_us=3542 barrier_wait_us=195662 append_us=14 fsync_us=3321 apply_us=9 maintain_us=0 residual_us=0
+  max_wait_backlog: prior_barriers=10 prior_append_fsync_us=200850 wait_us=195662 wait_minus_prior_us=-5188
+  window10_max_completion: window=10 seq=3 requests=1 completion_us=15099 due_dispatch_us=62 barrier_wait_us=0 append_us=0 fsync_us=0 apply_us=0 maintain_us=0 residual_us=15037
+  window10_max_wait: window=10 seq=21 requests=1 completion_us=14830 due_dispatch_us=159 barrier_wait_us=10394 append_us=36 fsync_us=3846 apply_us=12 maintain_us=0 residual_us=383
+  window10_window_stall: stall_completion_us=15099 stall_barrier_wait_us=0 stall_append_us=0 stall_fsync_us=0 stall_residual_us=15037 max_group_us=20686
+block arm=off b=5 loadavg='7.80 9.87 10.32 8/1078 256504' groups=3945 write_groups=2758 max_completion_us=188970 max_wait_us=183276 groups_over_100ms=38 windows_with_max_over_100ms=1 wal_len=6900595 wal_blocks=13480
+  max_completion: window=3 seq=53 requests=1 completion_us=188970 due_dispatch_us=64 barrier_wait_us=182803 append_us=23 fsync_us=5389 apply_us=11 maintain_us=0 residual_us=680
+  max_completion_write: window=3 seq=53 requests=1 completion_us=188970 due_dispatch_us=64 barrier_wait_us=182803 append_us=23 fsync_us=5389 apply_us=11 maintain_us=0 residual_us=680
+  max_wait: window=3 seq=54 requests=1 completion_us=187267 due_dispatch_us=85 barrier_wait_us=183276 append_us=19 fsync_us=3291 apply_us=10 maintain_us=0 residual_us=586
+  max_wait_backlog: prior_barriers=6 prior_append_fsync_us=197565 wait_us=183276 wait_minus_prior_us=-14289
+  window10_max_completion: window=10 seq=6 requests=1 completion_us=10623 due_dispatch_us=59 barrier_wait_us=0 append_us=0 fsync_us=0 apply_us=0 maintain_us=0 residual_us=10564
+  window10_max_wait: window=10 seq=193 requests=1 completion_us=6318 due_dispatch_us=107 barrier_wait_us=2965 append_us=15 fsync_us=2974 apply_us=7 maintain_us=0 residual_us=250
+  window10_window_stall: stall_completion_us=10623 stall_barrier_wait_us=0 stall_append_us=0 stall_fsync_us=0 stall_residual_us=10564 max_group_us=10682
