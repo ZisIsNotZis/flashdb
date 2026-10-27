@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """One command that decides whether the doc base obeys the level rule.
 
-    python3 scripts/check-docs.py                     # all checks against HEAD
-    python3 scripts/check-docs.py --base <rev>        # preservation against another revision
+    python3 scripts/check-docs.py                     # the standing checks: names, tiers, refs
+    python3 scripts/check-docs.py --only preserved    # the migration's own acceptance, once
     python3 scripts/check-docs.py --only refs
 
 Checks, each a property a newcomer can verify by reading this file:
@@ -11,8 +11,10 @@ Checks, each a property a newcomer can verify by reading this file:
   tiers      every level doc's H1 headings are the source tiers, ascending, no repeats, non-empty
   refs       every `docs/...md` path mentioned in a tracked text file exists, and no retired
              path (`docs/plan/`, `docs/objective.md`, ...) is still mentioned anywhere
-  preserved  every non-blank line of the previous doc base appears in the new one, byte for byte
-             after whitespace collapsing, except lines listed in DROPPED (each with a reason)
+  preserved  every non-blank line of the pre-migration doc base appears in the new one, byte for byte
+             after whitespace collapsing, except lines listed in DROPPED (each with a reason). It is
+             the migration's acceptance, run against `--base` (default: the commit before it), not a
+             standing check: after the move, a doc's own history belongs to git.
 
 Exit 0 when every check passes, 1 when any fails, 2 on a usage error.
 """
@@ -209,7 +211,7 @@ def check_preserved(base: str) -> list[str]:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--base", default="HEAD")
+    ap.add_argument("--base", default="3af8a04^", help="pre-migration revision for --only preserved")
     ap.add_argument("--only", choices=["names", "tiers", "refs", "preserved"])
     args = ap.parse_args()
     checks = {
@@ -218,7 +220,7 @@ def main() -> int:
         "refs": check_refs,
         "preserved": lambda: check_preserved(args.base),
     }
-    todo = [args.only] if args.only else list(checks)
+    todo = [args.only] if args.only else [c for c in checks if c != "preserved"]
     failed = 0
     for name in todo:
         problems = checks[name]()

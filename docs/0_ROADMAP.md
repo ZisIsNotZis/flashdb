@@ -296,9 +296,10 @@ Migrated 2026-10-27 out of twelve files that mixed levels. What the move did, an
 - **Refused.** A full editorial rewrite, and sentence-level zoning of every section: the move is
   section-granular and byte-preserving (`.scratch/91-docs-migration/migrate.py`), so no measured number
   or revision pin was retyped, and the mixed sections are zoned by hand as they are next touched.
-- **Enforced.** `scripts/check-docs.py` fails on a non-level filename, an out-of-order or missing tier,
-  a duplicated heading, a dangling `docs/` reference, or a line of the previous doc base that left
-  without an entry in the dropped list.
+- **Enforced.** `python3 scripts/check-docs.py` before every commit that touches docs: it fails on a
+  non-level filename, an out-of-order or missing tier, a duplicated heading, or a dangling `docs/`
+  reference. The migration's own acceptance is `--only preserved` against the commit before it, which
+  fails on a line of the previous doc base that left without an entry in the dropped list.
 
 A source-tier judgement is not permanent: a claim that moves from `INFERRED` to `CONFIRMED` moves when
 the author agrees to it, and the line changes tier rather than being duplicated.
