@@ -36,8 +36,9 @@ carries the environment read with its moment).
 - `.scratch/83-index-probe/runs/*` — all twelve files begin with `# INVALID - do not cite:`. They were
   taken under foreign load with an empty index in both arms. They are not evidence, and nothing
   unmarked may be added beside them.
-- `8.8-9.7` (0 B, tracked at the root since `59861dd`) is a shell-redirect artefact: no content, no
-  owner, kept rather than deleted because deleting to tidy is not allowed. Nothing depends on it.
+- `8.8-9.7` was a shell-redirect artefact (0 B, tracked at the root since `59861dd`, nothing depending on
+  it) and is deleted. A redirect that lands in the tree root is removed when it is seen, not kept: a
+  tracked file with no content has no owner to ask and no reader to serve.
 
 ## The quiet window
 
