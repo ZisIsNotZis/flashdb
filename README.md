@@ -4,6 +4,8 @@
 
 # flashdb
 
+**项目状态 · 未完成（2026-11-26）**。公开代码和 README 有单机业务请求与从工作负载学习布局的原型；单机效益对照未达标，真实发布来源链仍待验。 独立重建两个平台的交付并核对完整业务事务与布局收益边界。
+
 *A single-node, log-structured document store whose per-region physical layout is learned from the workload rather than declared by the user.*
 
 **Declaring a layout before the data exists is a guess paid for over the life of the instance: page size, merge threshold and whether a secondary index is worth building are all choices an engine normally fixes up front, and a wrong one is invisible until it is expensive. flashdb observes the trace and re-chooses those per region of the keyspace at run time, so the layout can follow the data.**
